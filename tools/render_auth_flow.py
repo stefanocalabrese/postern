@@ -70,6 +70,13 @@ ROW_TOP_PAD = 22
 ARROW_GAP = 16
 ROW_BOTTOM_PAD = 34
 
+# Phase B rows are tighter than phase A: same content, less padding, so the
+# image is not taller than it needs to be.
+ROW_TOP_PAD_B = 14
+ARROW_GAP_B = 10
+ROW_BOTTOM_PAD_B = 18
+LOOP_DEPTH_B = 50
+
 LOOP_WIDTH = 150
 LOOP_DEPTH = 70
 
@@ -85,6 +92,16 @@ GAP_BETWEEN_PHASES = 30
 GAP_TO_LEGEND = 60
 LEGEND_HEIGHT = 70
 BOTTOM_MARGIN = 40
+
+# Startup-precondition band (Vault key fetch), drawn below the phase B header
+# and above step 13, outside the numbered sequence.
+PRECONDITION_FILL = "#EFEAF5"
+PRECONDITION_RULE = "#9AA3B2"
+PRECONDITION_TOP_PAD = 18
+PRECONDITION_ARROW_GAP = 14
+PRECONDITION_BOTTOM_PAD = 18
+GAP_BAND_TO_PRECONDITION = 20
+GAP_PRECONDITION_TO_STEPS = 26
 
 ARROW_WIDTH_NORMAL = 4
 ARROW_WIDTH_ACCENT = 7
@@ -199,22 +216,15 @@ PHASE_B_STEPS: list[Step] = [
     Step(14, "self", 2, 2, "JWTVerifier checks jwks_uri, issuer, audience"),
     Step(
         15,
-        "call",
-        5,
-        2,
-        "READ signing key, fetched at startup via AWS IAM auth, cached",
-    ),
-    Step(
-        16,
         "self",
         2,
         2,
         "mints internal JWT locally: RS256, 60s, sub=cust ref, act=svc:postern, aud=accounts.svc",
         highlight=True,
     ),
-    Step(17, "call", 2, 6, "GET /accounts, Bearer internal JWT"),
+    Step(16, "call", 2, 6, "GET /accounts, Bearer internal JWT"),
     Step(
-        18,
+        17,
         "self",
         6,
         6,
@@ -222,22 +232,30 @@ PHASE_B_STEPS: list[Step] = [
         "checks issuer (read vs write)",
     ),
     Step(
-        19,
+        18,
         "self",
         6,
         6,
         "forwardOriginalToken; the domain service enforces on sub",
         highlight=True,
     ),
-    Step(20, "call", 6, 2, "rows"),
+    Step(19, "call", 6, 2, "rows"),
     Step(
-        21,
+        20,
         "call",
         2,
         0,
         "projected and masked result: refs, masked IBAN, no counterparty account",
     ),
 ]
+
+# The Vault key fetch is a startup precondition, not a per-request hop: "Sign
+# locally; do not call Vault per request. Fetch the key at startup, cache in
+# memory, refresh periodically." It is drawn out of the numbered sequence,
+# below the phase B header, as a dashed arrow.
+VAULT_LANE = 5
+POSTERN_LANE = 2
+PRECONDITION_LABEL = "at startup, once: READ signing key via AWS IAM auth, cached in memory"
 
 
 @dataclass
@@ -247,6 +265,16 @@ class RowLayout:
     top: int
     arrow_y: int
     height: int
+    top_pad: int
+    loop_depth: int
+
+
+@dataclass
+class PreconditionLayout:
+    lines: list[str]
+    top: int
+    bottom: int
+    arrow_y: int
 
 
 @dataclass
@@ -258,6 +286,7 @@ class Diagram:
     phase_a_rows: list[RowLayout] = field(default_factory=list)
     phase_b_band_top: int = 0
     phase_b_band_bottom: int = 0
+    precondition: PreconditionLayout | None = None
     phase_b_rows: list[RowLayout] = field(default_factory=list)
     lifeline_bottom: int = 0
     legend_y: int = 0
@@ -288,7 +317,16 @@ def label_geometry(step: Step, lane_x: list[int]) -> tuple[int, float]:
     return center_x, float(max_width)
 
 
-def build_rows(steps: list[Step], lane_x: list[int], start_top: int) -> list[RowLayout]:
+def build_rows(
+    steps: list[Step],
+    lane_x: list[int],
+    start_top: int,
+    *,
+    top_pad: int = ROW_TOP_PAD,
+    arrow_gap: int = ARROW_GAP,
+    bottom_pad: int = ROW_BOTTOM_PAD,
+    loop_depth: int = LOOP_DEPTH,
+) -> list[RowLayout]:
     rows: list[RowLayout] = []
     top = start_top
     for step in steps:
@@ -296,14 +334,35 @@ def build_rows(steps: list[Step], lane_x: list[int], start_top: int) -> list[Row
         text = f"{step.number}. {step.label}"
         lines = wrap_text(text, LABEL_FONT, max_width)
         label_block_height = len(lines) * LINE_HEIGHT
-        arrow_y = top + ROW_TOP_PAD + label_block_height + ARROW_GAP
+        arrow_y = top + top_pad + label_block_height + arrow_gap
         if step.kind == "self":
-            height = ROW_TOP_PAD + label_block_height + ARROW_GAP + LOOP_DEPTH + ROW_BOTTOM_PAD
+            height = top_pad + label_block_height + arrow_gap + loop_depth + bottom_pad
         else:
-            height = ROW_TOP_PAD + label_block_height + ARROW_GAP + ROW_BOTTOM_PAD
-        rows.append(RowLayout(step=step, lines=lines, top=top, arrow_y=arrow_y, height=height))
+            height = top_pad + label_block_height + arrow_gap + bottom_pad
+        rows.append(
+            RowLayout(
+                step=step,
+                lines=lines,
+                top=top,
+                arrow_y=arrow_y,
+                height=height,
+                top_pad=top_pad,
+                loop_depth=loop_depth,
+            )
+        )
         top += height
     return rows
+
+
+def build_precondition(lane_x: list[int], top: int) -> PreconditionLayout:
+    """Layout the out-of-band Vault key fetch, drawn once, not per request."""
+    span = abs(lane_x[VAULT_LANE] - lane_x[POSTERN_LANE])
+    max_width = max(span - CALL_LABEL_PADDING, 240)
+    lines = wrap_text(PRECONDITION_LABEL, LABEL_FONT, max_width)
+    label_block_height = len(lines) * LINE_HEIGHT
+    arrow_y = top + PRECONDITION_TOP_PAD + label_block_height + PRECONDITION_ARROW_GAP
+    bottom = arrow_y + PRECONDITION_BOTTOM_PAD
+    return PreconditionLayout(lines=lines, top=top, bottom=bottom, arrow_y=arrow_y)
 
 
 def compute_layout() -> Diagram:
@@ -326,8 +385,19 @@ def compute_layout() -> Diagram:
     diagram.phase_b_band_top = phase_a_bottom + GAP_BETWEEN_PHASES
     diagram.phase_b_band_bottom = diagram.phase_b_band_top + PHASE_BAND_HEIGHT
 
-    steps_b_top = diagram.phase_b_band_bottom + GAP_BAND_TO_STEPS
-    diagram.phase_b_rows = build_rows(PHASE_B_STEPS, diagram.lane_x, steps_b_top)
+    precondition_top = diagram.phase_b_band_bottom + GAP_BAND_TO_PRECONDITION
+    diagram.precondition = build_precondition(diagram.lane_x, precondition_top)
+
+    steps_b_top = diagram.precondition.bottom + GAP_PRECONDITION_TO_STEPS
+    diagram.phase_b_rows = build_rows(
+        PHASE_B_STEPS,
+        diagram.lane_x,
+        steps_b_top,
+        top_pad=ROW_TOP_PAD_B,
+        arrow_gap=ARROW_GAP_B,
+        bottom_pad=ROW_BOTTOM_PAD_B,
+        loop_depth=LOOP_DEPTH_B,
+    )
     phase_b_bottom = diagram.phase_b_rows[-1].top + diagram.phase_b_rows[-1].height
 
     diagram.lifeline_bottom = phase_b_bottom
@@ -381,6 +451,53 @@ def draw_phase_band(draw: ImageDraw.ImageDraw, top: int, bottom: int, title: str
     draw.text((CANVAS_WIDTH / 2 - w / 2, y), title, font=PHASE_FONT, fill=BAND_TEXT, stroke_width=1)
 
 
+def draw_dashed_hline(
+    draw: ImageDraw.ImageDraw, x1: int, x2: int, y: int, color: str, width: int
+) -> None:
+    dash, gap = 16, 12
+    x_start, x_end = (x1, x2) if x1 <= x2 else (x2, x1)
+    x = x_start
+    while x < x_end:
+        seg_end = min(x + dash, x_end)
+        draw.line([(x, y), (seg_end, y)], fill=color, width=width)
+        x += dash + gap
+
+
+def draw_precondition(draw: ImageDraw.ImageDraw, diagram: Diagram) -> None:
+    """Draw the Vault key fetch as an out-of-band precondition, not a step.
+
+    Dashed arrow, unnumbered label, and a tinted band with thin rules so it
+    reads as "happens once at startup" rather than a hop in the numbered
+    tool-call sequence.
+    """
+    precondition = diagram.precondition
+    if precondition is None:
+        return
+    draw.rectangle([0, precondition.top, CANVAS_WIDTH, precondition.bottom], fill=PRECONDITION_FILL)
+    draw.line(
+        [(0, precondition.top), (CANVAS_WIDTH, precondition.top)],
+        fill=PRECONDITION_RULE,
+        width=1,
+    )
+    draw.line(
+        [(0, precondition.bottom), (CANVAS_WIDTH, precondition.bottom)],
+        fill=PRECONDITION_RULE,
+        width=1,
+    )
+
+    x_src = diagram.lane_x[VAULT_LANE]
+    x_dst = diagram.lane_x[POSTERN_LANE]
+    y = precondition.arrow_y
+    draw_dashed_hline(draw, x_src, x_dst, y, INK, ARROW_WIDTH_NORMAL)
+    draw.polygon(
+        arrowhead(x_dst, y, False, ARROWHEAD_LEN_NORMAL, ARROWHEAD_HALF_WIDTH_NORMAL), fill=INK
+    )
+
+    center_x = (x_src + x_dst) // 2
+    label_top = precondition.top + PRECONDITION_TOP_PAD
+    draw_label_block(draw, precondition.lines, center_x, label_top, INK, False)
+
+
 def arrowhead(
     tip_x: int, tip_y: int, pointing_right: bool, length: int, half_width: int
 ) -> list[tuple[int, int]]:
@@ -426,7 +543,7 @@ def draw_call(draw: ImageDraw.ImageDraw, row: RowLayout, lane_x: list[int]) -> N
     draw.polygon(arrowhead(x_dst, y, pointing_right, head_len, half_w), fill=color)
 
     center_x, _ = label_geometry(step, lane_x)
-    label_top = row.top + ROW_TOP_PAD
+    label_top = row.top + row.top_pad
     draw_label_block(draw, row.lines, center_x, label_top, color, step.highlight)
 
 
@@ -439,7 +556,7 @@ def draw_self_call(draw: ImageDraw.ImageDraw, row: RowLayout, lane_x: list[int])
 
     x = lane_x[step.src]
     y_top = row.arrow_y
-    y_bottom = y_top + LOOP_DEPTH
+    y_bottom = y_top + row.loop_depth
     flip = self_call_flip(step)
     x_out = x - LOOP_WIDTH if flip else x + LOOP_WIDTH
 
@@ -449,7 +566,7 @@ def draw_self_call(draw: ImageDraw.ImageDraw, row: RowLayout, lane_x: list[int])
     draw.polygon(arrowhead(x, y_bottom, flip, head_len, half_w), fill=color)
 
     center_x, _ = label_geometry(step, lane_x)
-    label_top = row.top + ROW_TOP_PAD
+    label_top = row.top + row.top_pad
     draw_label_block(draw, row.lines, center_x, label_top, color, step.highlight)
 
 
@@ -482,6 +599,7 @@ def render() -> Image.Image:
     draw_lifelines(draw, diagram)
     draw_phase_band(draw, diagram.phase_a_band_top, diagram.phase_a_band_bottom, PHASE_A_TITLE)
     draw_phase_band(draw, diagram.phase_b_band_top, diagram.phase_b_band_bottom, PHASE_B_TITLE)
+    draw_precondition(draw, diagram)
     draw_steps(draw, diagram.phase_a_rows, diagram.lane_x)
     draw_steps(draw, diagram.phase_b_rows, diagram.lane_x)
     draw_headers(draw, diagram)
