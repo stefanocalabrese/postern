@@ -69,6 +69,24 @@ def test_masked_pan_serializes_as_a_plain_string() -> None:
     assert Card(pan="4111111111114417").model_dump_json() == '{"pan":"•••• 4417"}'
 
 
+def test_plain_errors_leaks_the_raw_input_by_design() -> None:
+    """Pydantic attaches the raw input to the error object. The type cannot
+    prevent this. Callers MUST use errors(include_input=False).
+
+    This is a characterization test, not a regression test: it asserts the
+    hazard exists, on purpose. Every other test in this file that checks
+    `errors(include_input=False)` proves the safe call pattern is safe; none
+    of them prove the unsafe default is unsafe, because a call that is
+    clean by construction passes regardless of what the type does. If a
+    future Pydantic version changes this behaviour, this test fails loudly
+    and someone re-reads the rule in the module docstring, rather than the
+    hazard silently disappearing (fine) or silently worsening (not fine)."""
+    with pytest.raises(ValidationError) as exc_info:
+        Card(pan="card 4111111111114417 exp 12/28")
+    assert "4111111111114417" in repr(exc_info.value.errors())
+    assert "4111111111114417" not in repr(exc_info.value.errors(include_input=False))
+
+
 def test_pan_with_mask_prefix_and_appended_full_pan_is_rejected() -> None:
     """A value that merely starts with the mask marker must not be coerced
     into a well-formed mask. Strict-parse rejects it outright instead of

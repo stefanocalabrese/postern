@@ -3,17 +3,13 @@
 These types exist so that a handler which forgets to mask fails validation
 rather than leaking. Never replace them with a `str` plus a helper function.
 
-Validation-failure boundary, not closable by the type alone: Pydantic's
-`ValidationError` always attaches the raw offending input to its structured
-`errors()` output and to `.json()`, regardless of the validator's own
-message and regardless of `model_config = ConfigDict(hide_input_in_errors=
-True)` on the consuming model -- that setting only changes `str()`/`repr()`
-of the exception itself, per Pydantic's docs ("hide inputs when *printing*
-errors"). Any code that serializes a masking `ValidationError` for a
-client-visible surface (an HTTP error body, a tool-error payload, a log
-line) MUST call `errors(include_input=False)` / `json(include_input=False)`
-at that boundary, or the full PAN/IBAN still reaches the client through the
-exception even though the validator's message never echoes it.
+Validation-failure boundary, not closable by the type alone: a
+`ValidationError` raised by these types carries the raw PAN or IBAN
+regardless of the validator's own message, so any code that serializes one
+toward a client MUST call `errors(include_input=False)` or
+`json(include_input=False)`; `hide_input_in_errors` covers only `str()` and
+`repr()` of the exception, not its structured `errors()` output or
+`.json()`.
 """
 
 import re

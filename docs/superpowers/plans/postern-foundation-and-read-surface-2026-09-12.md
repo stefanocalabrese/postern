@@ -57,7 +57,7 @@ Checked against primary sources on 2026-09-12. Anything not here is design reaso
 
 **Libraries:** pydantic 2.13.5 (`AfterValidator` preferred over `BeforeValidator`; `Annotated` metadata applies right-to-left), import-linter 2.15 (`lint-imports`, exits 1 on violation), uv 0.12.13, pytest-asyncio 1.4.0 (set both `asyncio_default_fixture_loop_scope` and `asyncio_default_test_loop_scope` or session teardown raises), httpx2 2.12.0 (the Task 1 spike found the `httpx`-mocking library cannot mock it; see `docs/decisions/0001-facade-http-client.md`), testcontainers 4.15.0 (`testcontainers.community.postgres`).
 
-**Pydantic 2.13 validation-bypass surface for `Annotated[str, AfterValidator]`**, measured during the Task 2 review against a model with `model_config = ConfigDict(extra="forbid", frozen=True)` and a `MaskedPan` field: `Strict(pan="4111111111114417").model_dump_json()` masks correctly; `Strict.model_construct(pan="4111111111114417").model_dump_json()` returns the raw PAN; `ok.model_copy(update={"pan": "4111111111114417"}).model_dump_json()` also returns the raw PAN, even under `frozen=True`. Plain attribute assignment (`ok.pan = "..."`) is the one idiom `frozen=True` blocks, raising `ValidationError`. No `ConfigDict` option closes `model_construct`; `model_copy(update=...)` is closed only by overriding the method to re-validate. Separately, `ValidationError.__str__` embeds `input_value=...` by default, confirmed by constructing with a raw PAN embedded in a string and finding it in `str(exc)`; `hide_input_in_errors=True` removes it, confirmed the same way.
+**Pydantic 2.13 validation-bypass surface for `Annotated[str, AfterValidator]`**, measured during the Task 2 review against a model with `model_config = ConfigDict(extra="forbid", frozen=True)` and a `MaskedPan` field: `Strict(pan="4111111111114417").model_dump_json()` masks correctly; `Strict.model_construct(pan="4111111111114417").model_dump_json()` returns the raw PAN; `ok.model_copy(update={"pan": "4111111111114417"}).model_dump_json()` also returns the raw PAN, even under `frozen=True`. Plain attribute assignment (`ok.pan = "..."`) is the one idiom `frozen=True` blocks, raising `ValidationError`. No `ConfigDict` option closes `model_construct`; `model_copy(update=...)` is closed only by overriding the method to re-validate. Separately, `ValidationError.__str__` embeds `input_value=...` by default, confirmed by constructing with a raw PAN embedded in a string and finding it in `str(exc)`; `hide_input_in_errors=True` removes it from `str(exc)` and `repr(exc)` only, confirmed the same way. It does **not** remove it from `exc.errors()` or `exc.json()`, which still carry the raw PAN by default regardless of that setting — measured against Task 2's final commit (`3b0020d`): `"4111111111114417" in repr(exc.errors())` → `True`, `in exc.json()` → `True`, `in repr(exc.errors(include_input=False))` → `False`. Closing the leak for any client-facing error payload requires calling `errors(include_input=False)` / `json(include_input=False)` explicitly at the point of serialization; `hide_input_in_errors` alone is not sufficient.
 
 ---
 
@@ -769,9 +769,8 @@ while backends refactor. Counterparty account identifiers are absent by design
 (§6.5): name only, never an account number.
 """
 
-from collections.abc import Mapping
 from datetime import datetime
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, StringConstraints
 
@@ -786,14 +785,7 @@ class _Strict(BaseModel):
         extra="forbid",
         frozen=True,
         validate_assignment=True,
-        hide_input_in_errors=True,
     )
-
-    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
-        """Re-validate on update, so masking cannot be bypassed (see Task 2 review)."""
-        if update:
-            return type(self).model_validate({**self.model_dump(), **update})
-        return super().model_copy(deep=deep)
 
 
 class Account(_Strict):
@@ -875,12 +867,41 @@ def test_validation_error_never_echoes_the_raw_identifier() -> None:
 Run: `uv run pytest tests/test_domain_models.py -q`
 Expected: FAIL against a `_Strict` without `hide_input_in_errors=True`, the raw digits are present in `str(exc_info.value)`.
 
-- [ ] **Step 8: Run the full test file to verify it passes**
+- [ ] **Step 8: Add the fix that makes both failing tests pass**
+
+Add `Mapping` and `Self` to the imports at the top of `models.py`
+(`from collections.abc import Mapping` and `from typing import ..., Any, Self`),
+then replace `_Strict`:
+
+```python
+class _Strict(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        validate_assignment=True,
+        hide_input_in_errors=True,
+    )
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Re-validate on update, so masking cannot be bypassed (see Task 2 review)."""
+        if update:
+            return type(self).model_validate({**self.model_dump(), **update})
+        return super().model_copy(deep=deep)
+```
+
+Run: `uv run pytest tests/test_domain_models.py -q`
+Expected: PASS. The `model_copy` override closes Step 6's failure; `hide_input_in_errors=True`
+closes Step 7's failure. `hide_input_in_errors` scrubs only `str()`/`repr()` of a
+`ValidationError`, not its `errors()` output or `.json()` (see the "Verified facts" entry
+above) — that gap is why `postern_core.domain.masking` documents the caller obligation
+directly and why Task 2's tests assert against `errors(include_input=False)`.
+
+- [ ] **Step 9: Run the full test file to verify it passes**
 
 Run: `uv run pytest tests/test_domain_models.py -q`
 Expected: PASS, 11 passed
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add packages/postern-core/src/postern_core/domain/money.py \
