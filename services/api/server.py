@@ -63,8 +63,25 @@ def build_server(
     resolver: CustomerResolver,
     backend: BackendReader | None,
 ) -> FastMCP:
+    has_jwks_uri = settings.customer_jwks_uri is not None
+    has_issuer = settings.customer_token_issuer is not None
+    if has_jwks_uri != has_issuer:
+        # Exactly one set is a config typo, not a deliberate choice: neither
+        # set is the documented no-auth path (`Settings.for_testing()`, the
+        # local docker-compose stack); both set is normal production. Failing
+        # open here -- silently returning `auth=None`, indistinguishable from
+        # the deliberate no-auth path -- would serve a bank-facing MCP server
+        # with no authentication at all on a forgotten or misspelled
+        # environment variable. Fail startup instead.
+        raise ValueError(
+            "customer_jwks_uri and customer_token_issuer must both be set or "
+            "both be unset (got customer_jwks_uri="
+            f"{settings.customer_jwks_uri!r}, customer_token_issuer="
+            f"{settings.customer_token_issuer!r})"
+        )
+
     auth = None
-    if settings.customer_jwks_uri and settings.customer_token_issuer:
+    if has_jwks_uri and has_issuer:
         auth = JWTVerifier(
             jwks_uri=settings.customer_jwks_uri,
             issuer=settings.customer_token_issuer,

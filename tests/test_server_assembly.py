@@ -56,6 +56,32 @@ async def test_cache_ttl_seconds_and_scope_reach_the_wire() -> None:
         assert dumped["cacheScope"] == "private"
 
 
+def test_build_server_rejects_jwks_uri_set_without_issuer() -> None:
+    settings = Settings(
+        backend_base_url="https://backend.test",
+        customer_jwks_uri="https://issuer.test/.well-known/jwks.json",
+    )
+    with pytest.raises(ValueError, match="customer_jwks_uri.*customer_token_issuer"):
+        build_server(settings, resolver=lambda: _REF, backend=None)
+
+
+def test_build_server_rejects_issuer_set_without_jwks_uri() -> None:
+    settings = Settings(
+        backend_base_url="https://backend.test",
+        customer_token_issuer="https://issuer.test",  # noqa: S106
+    )
+    with pytest.raises(ValueError, match="customer_jwks_uri.*customer_token_issuer"):
+        build_server(settings, resolver=lambda: _REF, backend=None)
+
+
+def test_build_server_stays_unauthenticated_when_neither_is_set() -> None:
+    """`Settings.for_testing()` and the local docker-compose stack rely on
+    this: deliberately no auth, not a half-configured one.
+    """
+    server = build_server(Settings.for_testing(), resolver=lambda: _REF, backend=None)
+    assert server.auth is None
+
+
 def test_token_customer_resolver_with_no_access_token_raises_permission_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

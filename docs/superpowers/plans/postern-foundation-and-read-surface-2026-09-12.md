@@ -1338,8 +1338,25 @@ def build_server(
     resolver: CustomerResolver,
     backend: BackendReader | None,
 ) -> FastMCP:
+    has_jwks_uri = settings.customer_jwks_uri is not None
+    has_issuer = settings.customer_token_issuer is not None
+    if has_jwks_uri != has_issuer:
+        # Exactly one set is a config typo, not a deliberate choice: neither
+        # set is the documented no-auth path (`Settings.for_testing()`, the
+        # local docker-compose stack); both set is normal production. Failing
+        # open here -- silently returning `auth=None`, indistinguishable from
+        # the deliberate no-auth path -- would serve a bank-facing MCP server
+        # with no authentication at all on a forgotten or misspelled
+        # environment variable. Fail startup instead.
+        raise ValueError(
+            "customer_jwks_uri and customer_token_issuer must both be set or "
+            "both be unset (got customer_jwks_uri="
+            f"{settings.customer_jwks_uri!r}, customer_token_issuer="
+            f"{settings.customer_token_issuer!r})"
+        )
+
     auth = None
-    if settings.customer_jwks_uri and settings.customer_token_issuer:
+    if has_jwks_uri and has_issuer:
         auth = JWTVerifier(
             jwks_uri=settings.customer_jwks_uri,
             issuer=settings.customer_token_issuer,
@@ -1358,12 +1375,14 @@ def build_server(
 
 `required_scopes=None` is deliberate: scope checks are per tool, not global (Plan 2 adds them through consent-scoped visibility). `cache_scope="private"` is design decision D4; `cache_ttl=settings.cache_ttl_seconds` is now genuinely seconds (fixed defect 2 above).
 
-**Not fixed here, reported instead (adversarial pass):** `build_server` only builds a `JWTVerifier` when *both* `customer_jwks_uri` and `customer_token_issuer` are set. Verified empirically that setting exactly one of the two (a plausible partial-misconfiguration or typo'd env var, though `Settings.from_env()` itself cannot produce this state since both reads are mandatory) yields `server.auth is None` — indistinguishable from the deliberate no-auth state `Settings.for_testing()` produces. Silently serving an unauthenticated bank-facing MCP server on a config typo is a dangerous default. Recommendation: `build_server` should raise (e.g. `ValueError`) when exactly one of the two is set, so misconfiguration fails startup instead of failing open. Left as a recommendation, not implemented, pending a decision on where that validation belongs.
+**`SERVER_INSTRUCTIONS` describes the finished server, not this task's.** It tells the calling agent to "Call `banking_start_session` first"; no such tool exists until Task 11. A client connecting to exactly this build today would get a tool-not-found error on that first call. Not a bug in this task -- Task 11 registers the tool before any real deployment is implied to follow -- but noted here so the gap between what the instructions promise and what Task 4 actually registers (`test_server_starts_with_no_tools_registered`, `test_client_can_list_tools_in_process` above) is not mistaken for one later.
+
+**Adversarial-pass finding, now fixed rather than only recommended:** `build_server` used to build a `JWTVerifier` only when *both* `customer_jwks_uri` and `customer_token_issuer` were set, so setting exactly one of the two (a plausible partial-misconfiguration or typo'd env var, though `Settings.from_env()` itself cannot produce this state since both reads are mandatory) silently yielded `server.auth is None` -- indistinguishable from the deliberate no-auth state `Settings.for_testing()` produces. Reproduced: `build_server(Settings(backend_base_url="x", customer_jwks_uri="https://j"), ...).auth is None` was `True`. Fixed by raising `ValueError` when exactly one of the two is set, naming both variables in the message; both set still builds the `JWTVerifier`, neither set still yields `auth=None` for the deliberate no-auth path.
 
 - [ ] **Step 6: Run the test to verify it passes**
 
 Run: `uv run pytest tests/test_server_assembly.py -q`
-Expected: PASS, 8 passed (3 from the original draft plus 5 covering the adversarial-pass findings)
+Expected: PASS, 11 passed (3 from the original draft, 5 from the first adversarial pass, 3 from the fail-closed auth-config fix)
 
 - [ ] **Step 7: Commit**
 
