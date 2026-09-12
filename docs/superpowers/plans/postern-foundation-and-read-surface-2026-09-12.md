@@ -1137,11 +1137,18 @@ passed.
 ### Task 4: Server assembly with an injected resolver
 
 **Files:**
+- Create: `packages/postern-core/src/postern_core/facade/protocol.py`
 - Create: `services/api/settings.py`
 - Create: `services/api/server.py`
 - Test: `tests/conftest.py`, `tests/test_server_assembly.py`
 
 Handoff §3.2 and the `2026-07-28` revision: no in-process session state, any request lands on any instance. `stateless_http=True` and `json_response=True` are what keep that true behind a plain load balancer.
+
+**Corrected against execution (Task 4, 2026-09-12).** Three defects surfaced while implementing this task from the original draft below; all three are fixed in the code blocks that follow, not just noted:
+
+1. **`from postern_core.facade.client import BackendClient` does not exist at this point in the sequence** — that module is Task 6's. `build_server` never calls the backend itself (no tool exists yet to do so), so it has no business depending on Task 6's concrete, httpx2-based client. Fixed by adding a minimal `Protocol` (`postern_core.facade.protocol.BackendReader`, one async method, `get_json`) and typing the `backend` parameter with it — the same seam `postern_core.identity.CustomerResolver` already uses for the resolver. Task 6's `BackendClient` satisfies it structurally; see the note added to Task 6 below.
+2. **`cache_ttl=settings.cache_ttl_ms` passed a milliseconds value into a seconds parameter.** Confirmed empirically: `fastmcp/server/caching.py` builds `CacheHint(ttl_ms=cache_ttl * 1000, ...)`, and its own module docstring states `cache_ttl` is "(seconds)". A server built with `FastMCP(cache_ttl=60, cache_scope="private")` and probed through the in-process `Client`'s `list_tools_mcp()` emits `ttlMs: 60000` on the wire (`raw.model_dump(by_alias=True)`) — confirming the seconds-to-milliseconds multiply, and confirming `cacheScope: "private"` does reach the wire. Passing the old `cache_ttl_ms` default of `60_000` straight through would have produced a `ttlMs` of 60,000,000 (≈16.7 hours) instead of the intended 60 seconds. Fixed by renaming the field to `cache_ttl_seconds` (default `60`) and the env var to `POSTERN_CACHE_TTL_SECONDS`.
+3. **`from tests.conftest import TEST_CUSTOMER` was checked, not just trusted.** `tests/__init__.py` already exists, making `tests` a real package; pytest's own conftest auto-load and the explicit `from tests.conftest import ...` both resolve to the same `sys.modules["tests.conftest"]` entry (verified: a print statement in the module body executed exactly once across the whole suite, and `id(sys.modules["tests.conftest"])` was stable across test files). Kept as originally drafted; no fragility found in this repo.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1174,25 +1181,60 @@ async def test_client_can_list_tools_in_process() -> None:
 # tests/conftest.py
 import pytest
 
-from postern_core.identity import CustomerRef
+from postern_core.identity import CustomerRef, CustomerResolver
 
 TEST_CUSTOMER = CustomerRef(value="cust_7f3a")
 
 
 @pytest.fixture
-def resolver():
+def resolver() -> CustomerResolver:
     """Stands in for the access-token resolver (design decision D3)."""
     return lambda: TEST_CUSTOMER
 ```
 
 Add `_REF = TEST_CUSTOMER` by importing it in the test module: `from tests.conftest import TEST_CUSTOMER as _REF`.
 
+The fixture needs a return type (`-> CustomerResolver`) or `mypy --strict` rejects it with `Function is missing a return type annotation` — found running the `type` gate, not drafting the code.
+
+The executed version of `tests/test_server_assembly.py` also adds tests for the adversarial-pass findings below (`Settings.from_env()` against an empty environment, the `ttlMs`/`cacheScope` wire measurement, and three cases for `token_customer_resolver`, including the leak check in finding 2). See the file itself; not reproduced here to avoid drift between two copies of the same tests.
+
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run pytest tests/test_server_assembly.py -q`
-Expected: FAIL, `ModuleNotFoundError: No module named 'services.api.settings'`
+Expected: FAIL, `ModuleNotFoundError: No module named 'services.api.server'` (import order in the executed test file resolves `services.api.server` before `services.api.settings`, so this is the module actually reported missing first)
 
-- [ ] **Step 3: Write `settings.py`**
+- [ ] **Step 3: Write the backend Protocol**
+
+```python
+# packages/postern-core/src/postern_core/facade/protocol.py
+"""The structural contract `build_server` requires of a backend (Task 4).
+
+Mirrors the seam `postern_core.identity.CustomerResolver` already uses for the
+customer resolver. Kept to exactly the one read method later tasks use. Task
+6's `BackendClient` must satisfy this Protocol structurally; it does not
+import it.
+"""
+
+from collections.abc import Mapping
+from typing import Any, Protocol
+
+from postern_core.identity import CustomerRef
+
+
+class BackendReader(Protocol):
+    """The one read operation a tool handler needs from the backend façade."""
+
+    async def get_json(
+        self,
+        path: str,
+        *,
+        customer: CustomerRef,
+        audience: str = "accounts.svc",
+        params: Mapping[str, Any] | None = None,
+    ) -> Any: ...
+```
+
+- [ ] **Step 4: Write `settings.py`**
 
 ```python
 # services/api/settings.py
@@ -1207,7 +1249,7 @@ class Settings:
     customer_token_issuer: str | None = None
     audience: str = "postern"
     strict_headers: bool = False
-    cache_ttl_ms: int = 60_000
+    cache_ttl_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -1217,7 +1259,7 @@ class Settings:
             customer_token_issuer=os.environ["POSTERN_TOKEN_ISSUER"],
             audience=os.environ.get("POSTERN_AUDIENCE", "postern"),
             strict_headers=os.environ.get("POSTERN_STRICT_HEADERS") == "1",
-            cache_ttl_ms=int(os.environ.get("POSTERN_CACHE_TTL_MS", "60000")),
+            cache_ttl_seconds=int(os.environ.get("POSTERN_CACHE_TTL_SECONDS", "60")),
         )
 
     @classmethod
@@ -1225,9 +1267,9 @@ class Settings:
         return cls(backend_base_url="https://backend.test")
 ```
 
-`from_env` uses `os.environ[...]` for the three that have no safe default, so a missing one fails at startup rather than at the first customer request.
+`from_env` uses `os.environ[...]` for the three that have no safe default, so a missing one fails at startup rather than at the first customer request. Verified with an empty environment: the resulting `KeyError`'s `args[0]` is exactly the variable name (e.g. `POSTERN_BACKEND_BASE_URL`), which is a clear enough signal in a startup traceback, but it is a bare `KeyError`, not a purpose-built configuration exception — flagged in the adversarial pass, not changed.
 
-- [ ] **Step 4: Write `server.py`**
+- [ ] **Step 5: Write `server.py`**
 
 ```python
 # services/api/server.py
@@ -1237,12 +1279,18 @@ The customer resolver is injected (design decision D3) so that:
   - there is exactly one place that answers "which customer is this?", and
   - tools are testable without an auth round trip, which FastMCP's in-process
     Client does not support (it accepts no auth argument).
+
+`backend` is typed as `postern_core.facade.protocol.BackendReader`, a minimal
+Protocol, not the concrete `postern_core.facade.client.BackendClient`
+(Task 6): that module does not exist yet, and `build_server` never calls the
+backend itself, only passes it through to tools registered in later tasks.
 """
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import JWTVerifier
+from pydantic import ValidationError
 
-from postern_core.facade.client import BackendClient
+from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef, CustomerResolver
 from services.api.settings import Settings
 
@@ -1268,13 +1316,27 @@ def token_customer_resolver() -> CustomerRef:
     subject = token.claims.get("sub")
     if not isinstance(subject, str):
         raise PermissionError("access token carries no subject claim")
-    return CustomerRef(value=subject)
+    try:
+        return CustomerRef(value=subject)
+    except ValidationError:
+        # `subject` is minted by the token issuer; identity.py's own comment
+        # is explicit that this is a provenance convention, not proof of
+        # opacity -- a compromised issuer could mint a PAN-, IBAN- or
+        # DNI-shaped `sub`. `CustomerRef.hide_input_in_errors` scrubs only
+        # `str()`/`repr()` of the resulting `ValidationError`; its structured
+        # `.errors()` still carries the raw value, and that is exactly what
+        # FastMCP's own dispatcher logs if a raw `pydantic.ValidationError`
+        # escapes a tool. Re-raising a plain, unchained `PermissionError`
+        # keeps the raw subject out of both the wire response and the log.
+        raise PermissionError(
+            "access token subject is not a recognized customer reference"
+        ) from None
 
 
 def build_server(
     settings: Settings,
     resolver: CustomerResolver,
-    backend: BackendClient | None,
+    backend: BackendReader | None,
 ) -> FastMCP:
     auth = None
     if settings.customer_jwks_uri and settings.customer_token_issuer:
@@ -1290,21 +1352,23 @@ def build_server(
         instructions=SERVER_INSTRUCTIONS,
         auth=auth,
         cache_scope="private",
-        cache_ttl=settings.cache_ttl_ms,
+        cache_ttl=settings.cache_ttl_seconds,
     )
 ```
 
-`required_scopes=None` is deliberate: scope checks are per tool, not global (Plan 2 adds them through consent-scoped visibility). `cache_scope="private"` is design decision D4.
+`required_scopes=None` is deliberate: scope checks are per tool, not global (Plan 2 adds them through consent-scoped visibility). `cache_scope="private"` is design decision D4; `cache_ttl=settings.cache_ttl_seconds` is now genuinely seconds (fixed defect 2 above).
 
-- [ ] **Step 5: Run the test to verify it passes**
+**Not fixed here, reported instead (adversarial pass):** `build_server` only builds a `JWTVerifier` when *both* `customer_jwks_uri` and `customer_token_issuer` are set. Verified empirically that setting exactly one of the two (a plausible partial-misconfiguration or typo'd env var, though `Settings.from_env()` itself cannot produce this state since both reads are mandatory) yields `server.auth is None` — indistinguishable from the deliberate no-auth state `Settings.for_testing()` produces. Silently serving an unauthenticated bank-facing MCP server on a config typo is a dangerous default. Recommendation: `build_server` should raise (e.g. `ValueError`) when exactly one of the two is set, so misconfiguration fails startup instead of failing open. Left as a recommendation, not implemented, pending a decision on where that validation belongs.
+
+- [ ] **Step 6: Run the test to verify it passes**
 
 Run: `uv run pytest tests/test_server_assembly.py -q`
-Expected: PASS, 3 passed
+Expected: PASS, 8 passed (3 from the original draft plus 5 covering the adversarial-pass findings)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add services/api/settings.py services/api/server.py tests/conftest.py tests/test_server_assembly.py
+git add packages/postern-core/src/postern_core/facade/protocol.py services/api/settings.py services/api/server.py tests/conftest.py tests/test_server_assembly.py
 git commit -m "feat(api): server assembly with injected customer resolver"
 ```
 
@@ -1642,6 +1706,8 @@ git commit -m "feat(api): reject Mcp-Method/Mcp-Name body mismatch with 400 and 
 - Test: `tests/test_facade_client.py`
 
 Handoff §8.6: this layer is not a proxy. It attaches the internal token, projects responses, and translates errors. The token minter is injected as a seam: this plan ships a stub that Plan 3 replaces with the Vault-backed `InternalTokenMinter`, so the Authorization header shape is right from the first call.
+
+**Must satisfy Task 4's `Protocol`.** `services/api/server.py`'s `build_server` types its `backend` parameter as `postern_core.facade.protocol.BackendReader`, not this module's `BackendClient` — Task 4 was implemented before this module existed. `BackendClient` must expose an async `get_json(self, path: str, *, customer: CustomerRef, audience: str = "accounts.svc", params: Mapping[str, Any] | None = None) -> Any` matching that Protocol's signature structurally (no import of `BackendReader` needed in this file); `mypy --strict` on `services/api/server.py` is what will catch a drift between the two.
 
 - [ ] **Step 1: Write the failing test**
 
