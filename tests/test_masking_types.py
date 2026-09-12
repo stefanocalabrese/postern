@@ -1,15 +1,15 @@
-import re
-
 import pytest
-from postern_core.domain.masking import MaskedIban, MaskedPan
+from postern_core.domain.masking import _IBAN_MASKED_RE, _PAN_MASKED_RE, MaskedIban, MaskedPan
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 
 class Card(BaseModel):
     # Masking is a type property, but Pydantic's own error formatting still
     # echoes the raw offending input via `input_value` in every
-    # ValidationError unless the consuming model opts out. Any real model
-    # built on MaskedPan/MaskedIban must set this too (see report).
+    # ValidationError unless the consuming model opts out. This scrubs
+    # str()/repr() of the exception; it does NOT scrub errors()/.json() --
+    # see the module docstring and the leak tests below. Any real model
+    # built on MaskedPan/MaskedIban must set this too.
     model_config = ConfigDict(hide_input_in_errors=True)
 
     pan: MaskedPan
@@ -38,6 +38,16 @@ def test_pan_too_short_is_rejected() -> None:
         Card(pan="417")
 
 
+def test_pan_with_nbsp_separators_is_masked() -> None:
+    """A PAN copy-pasted from a rendered HTML statement is commonly grouped
+    with non-breaking spaces, not plain ones."""
+    assert Card(pan="4111\xa01111\xa01111\xa04417").pan == "•••• 4417"
+
+
+def test_pan_with_non_breaking_hyphen_separators_is_masked() -> None:
+    assert Card(pan="4111‑1111‑1111‑4417").pan == "•••• 4417"
+
+
 def test_iban_keeps_country_code_and_last_four() -> None:
     assert Account(iban="ES9121000418450200051332").iban == "ES•• •••• 1332"
 
@@ -49,6 +59,10 @@ def test_iban_without_country_code_is_rejected() -> None:
 
 def test_iban_already_masked_is_idempotent() -> None:
     assert Account(iban="ES•• •••• 1332").iban == "ES•• •••• 1332"
+    # Maltese IBANs end in letters, not digits; a mask regex requiring
+    # [0-9]{4} silently rejects an already-masked value like this one on
+    # any re-validation (cache rehydration, model_validate(model_dump())).
+    assert Account(iban="MT•• •••• 001S").iban == "MT•• •••• 001S"
 
 
 def test_masked_pan_serializes_as_a_plain_string() -> None:
@@ -58,11 +72,19 @@ def test_masked_pan_serializes_as_a_plain_string() -> None:
 def test_pan_with_mask_prefix_and_appended_full_pan_is_rejected() -> None:
     """A value that merely starts with the mask marker must not be coerced
     into a well-formed mask. Strict-parse rejects it outright instead of
-    accepting whatever digits happen to be attached after it."""
+    accepting whatever digits happen to be attached after it. The raw PAN
+    must not leak through any representation of the resulting error:
+    str()/repr() are scrubbed by hide_input_in_errors, but errors() and
+    .json() are not unless called with include_input=False -- that is a
+    caller obligation the type cannot enforce, so this test locks in the
+    call shape that actually closes the leak."""
     leaky = "•••• 4417 extra 4111111111114417"
     with pytest.raises(ValidationError) as exc_info:
         Card(pan=leaky)
-    assert "4111111111114417" not in str(exc_info.value)
+    exc = exc_info.value
+    assert "4111111111114417" not in str(exc)
+    assert "4111111111114417" not in repr(exc.errors(include_input=False))
+    assert "4111111111114417" not in exc.json(include_input=False)
 
 
 def test_iban_with_mask_substring_and_appended_full_iban_is_rejected() -> None:
@@ -71,7 +93,10 @@ def test_iban_with_mask_substring_and_appended_full_iban_is_rejected() -> None:
     leaky = "ES•••• 1332 ES9121000418450200051332"
     with pytest.raises(ValidationError) as exc_info:
         Account(iban=leaky)
-    assert "9121000418450200051332" not in str(exc_info.value)
+    exc = exc_info.value
+    assert "9121000418450200051332" not in str(exc)
+    assert "9121000418450200051332" not in repr(exc.errors(include_input=False))
+    assert "9121000418450200051332" not in exc.json(include_input=False)
 
 
 def test_bogus_and_attacker_controlled_values_are_rejected() -> None:
@@ -103,9 +128,33 @@ def test_two_ibans_sharing_last_four_render_identically() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "iban",
+    [
+        "ES9121000418450200051332",  # ends in digits
+        "GB29NWBK60161331926819",  # ends in digits
+        "MT84MALT011000012345MTLCAST001S",  # ends in letters
+        "SC18SSCB11010000000000001497USD",  # ends in letters
+        "BR9700360305000010009795493P1",  # ends in letters
+    ],
+)
+def test_iban_masking_round_trips_through_re_validation(iban: str) -> None:
+    """A masked IBAN must itself validate as an already-masked value for
+    every country shape, not just ones whose national check digits happen
+    to be numeric. ES and GB round-trip trivially and would miss a
+    regression here; MT, SC and BR end in letters and are the ones that
+    actually exercise the already-masked pattern's last-four character
+    class."""
+    masked = Account(iban=iban).iban
+    remasked = Account(iban=masked).iban
+    assert remasked == masked
+
+
 # Hostile PAN-shaped inputs: bare, spaced, hyphenated, embedded in prose,
-# before/after the mask marker, separated by non-space whitespace the
-# validator must not silently absorb, and Unicode (Arabic-Indic) digits.
+# before/after the mask marker, separated by whitespace variants (some now
+# recognized separators, some deliberately not -- zero-width space stays
+# rejected), and Unicode (Arabic-Indic) digits, which must never be treated
+# as equivalent to ASCII digits regardless of where they appear.
 _PAN_HOSTILE_INPUTS = [
     "4111111111114417",
     "4111 1111 1111 4417",
@@ -138,17 +187,21 @@ _IBAN_HOSTILE_INPUTS = [
 @pytest.mark.parametrize("value", _PAN_HOSTILE_INPUTS)
 def test_pan_hostile_inputs_never_leak(value: str) -> None:
     """Whichever branch a hostile PAN-shaped input takes, the invariant
-    holds: an accepted value never carries a run of five or more digits and
-    always has exactly four mask bullets; a rejected value never echoes the
-    raw input back. This is the invariant stated once so it survives a
-    rewrite of the branching logic above."""
+    holds exactly, not heuristically: an accepted value is exactly the
+    canonical masked shape (a loose digit-run/bullet-count check would
+    still pass a regression that put a space-grouped PAN behind the
+    marker); a rejected value never echoes the raw input back through any
+    representation of the error, including the structured ones
+    hide_input_in_errors does not touch. This is the invariant stated once
+    so it survives a rewrite of the branching logic above."""
     try:
         out = Card(pan=value).pan
     except ValidationError as exc:
         assert value not in str(exc)
+        assert value not in repr(exc.errors(include_input=False))
+        assert value not in exc.json(include_input=False)
         return
-    assert re.search(r"[0-9]{5,}", out) is None
-    assert out.count("•") in (4, 6)
+    assert _PAN_MASKED_RE.fullmatch(out)
 
 
 @pytest.mark.parametrize("value", _IBAN_HOSTILE_INPUTS)
@@ -158,6 +211,7 @@ def test_iban_hostile_inputs_never_leak(value: str) -> None:
         out = Account(iban=value).iban
     except ValidationError as exc:
         assert value not in str(exc)
+        assert value not in repr(exc.errors(include_input=False))
+        assert value not in exc.json(include_input=False)
         return
-    assert re.search(r"[0-9]{5,}", out) is None
-    assert out.count("•") in (4, 6)
+    assert _IBAN_MASKED_RE.fullmatch(out)
