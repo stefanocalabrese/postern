@@ -6,7 +6,7 @@
 
 **Architecture:** A uv workspace with one shared library (`packages/postern-core`) and two service packages (`services/api`, `services/confirm`). Only `services/api` is built in this plan; `services/confirm` exists as an empty package so the import-linter contract that forbids `services.api` from importing it is live from day one. The MCP server is assembled by a `build_server()` factory taking an injected customer resolver, which is the single choke point for "the token is the identity" and the seam that makes tools testable without an auth round trip.
 
-**Tech Stack:** Python 3.12, uv 0.12.x workspace, fastmcp 4.0.3, pydantic 2.13.x, Starlette ASGI middleware, pytest 8 + pytest-asyncio 1.4 (`asyncio_mode = "auto"`), respx, ruff, mypy strict, import-linter 2.15.
+**Tech Stack:** Python 3.12, uv 0.12.x workspace, fastmcp 4.0.3, pydantic 2.13.x, Starlette ASGI middleware, pytest 8 + pytest-asyncio 1.4 (`asyncio_mode = "auto"`), httpx2 as the façade's HTTP client, ruff, mypy strict, import-linter 2.15.
 
 ---
 
@@ -24,6 +24,8 @@
 | Tier-1 writes (`cards.freeze_card`) | 5 | handoff §10.4 |
 | Payments, tier 2 | 6 | handoff §10.4, §10.10, §10.13, §10.17 |
 | Terraform, PrivateLink, Istio, WAF, RDS | separate repo (handoff §12.3) | |
+
+**Status, 2026-09-12:** Tasks 0 and 1 are complete, committed as "chore: uv workspace skeleton with local CI gates" and "docs: record facade HTTP client decision (httpx2, MockTransport)". Review of that work found defects in this plan's own text, corrected below; see `docs/decisions/0001-facade-http-client.md` for the façade HTTP client decision.
 
 **Naming assumption:** the design docs say `bank-mcp` / `bank_mcp_core`; this plan uses the repo's name, `postern` / `postern_core`. If that flips, it is one rename across this file and the skeleton.
 
@@ -53,7 +55,7 @@ Checked against primary sources on 2026-09-12. Anything not here is design reaso
 - In-process test client: `from fastmcp.client import Client`; `async with Client(transport=mcp) as c`. It accepts **no auth argument**, which is why this plan injects the customer resolver instead.
 - **Dependency is `httpx2>=2.5.0`, not `httpx`.**
 
-**Libraries:** pydantic 2.13.5 (`AfterValidator` preferred over `BeforeValidator`; `Annotated` metadata applies right-to-left), import-linter 2.15 (`lint-imports`, exits 1 on violation), uv 0.12.13, pytest-asyncio 1.4.0 (set both `asyncio_default_fixture_loop_scope` and `asyncio_default_test_loop_scope` or session teardown raises), respx 0.23.1 (requires `httpx>=0.25.0`), testcontainers 4.15.0 (`testcontainers.community.postgres`).
+**Libraries:** pydantic 2.13.5 (`AfterValidator` preferred over `BeforeValidator`; `Annotated` metadata applies right-to-left), import-linter 2.15 (`lint-imports`, exits 1 on violation), uv 0.12.13, pytest-asyncio 1.4.0 (set both `asyncio_default_fixture_loop_scope` and `asyncio_default_test_loop_scope` or session teardown raises), httpx2 2.12.0 (the Task 1 spike found the `httpx`-mocking library cannot mock it; see `docs/decisions/0001-facade-http-client.md`), testcontainers 4.15.0 (`testcontainers.community.postgres`).
 
 ---
 
@@ -67,7 +69,7 @@ Checked against primary sources on 2026-09-12. Anything not here is design reaso
 
 **D4. `cache_scope="private"` is set at server construction**, not per tool. The catalog varies by consent, so no result may be shared across authorization contexts.
 
-**D5. The façade's HTTP client is chosen by the Task 1 spike**, not assumed. `httpx2` is what FastMCP pulls; `respx` only mocks `httpx`. The spike decides and records.
+**D5. The façade's HTTP client is `httpx2`, resolved by the Task 1 spike.** `httpx2` is what FastMCP pulls. The `httpx`-mocking library cannot mock it (`TypeError` at mock-setup time, before any request), so it is dropped from the dev dependency group; backend tests mock at the transport layer instead, via an injected `httpx2.MockTransport(handler)`. See `docs/decisions/0001-facade-http-client.md`.
 
 ---
 
@@ -76,6 +78,7 @@ Checked against primary sources on 2026-09-12. Anything not here is design reaso
 ```
 postern/
 ├── pyproject.toml                      # workspace root + services package
+├── .python-version                     # pins 3.12: mypy, ruff and the Dockerfile all target it
 ├── Makefile                            # make ci runs every gate locally
 ├── .importlinter                       # forbidden contract: api -/-> confirm
 ├── Dockerfile                          # two targets: api, confirm
@@ -83,6 +86,7 @@ postern/
 ├── packages/postern-core/
 │   ├── pyproject.toml
 │   └── src/postern_core/
+│       ├── py.typed                    # PEP 561 marker, needed for mypy across packages
 │       ├── domain/
 │       │   ├── masking.py              # MaskedPan, MaskedIban
 │       │   ├── money.py                # Money
@@ -126,12 +130,20 @@ postern/
 ### Task 0: Repo skeleton and the local gate runner
 
 **Files:**
-- Create: `pyproject.toml`, `Makefile`, `.importlinter`, `.gitignore`
-- Create: `packages/postern-core/pyproject.toml`, `packages/postern-core/src/postern_core/__init__.py`
+- Create: `pyproject.toml`, `Makefile`, `.importlinter`, `.gitignore`, `.python-version`
+- Create: `packages/postern-core/pyproject.toml`, `packages/postern-core/src/postern_core/__init__.py`, `packages/postern-core/src/postern_core/py.typed`
 - Create: `services/__init__.py`, `services/api/__init__.py`, `services/confirm/__init__.py`
 - Create: `tests/__init__.py`
 
-- [ ] **Step 1: Write the root `pyproject.toml`**
+- [ ] **Step 1: Write `.python-version`**
+
+```bash
+echo "3.12" > .python-version
+```
+
+Pins the interpreter `uv` resolves the venv against. Without it, `uv sync` resolved to Python 3.13.13, while mypy targets `python_version = "3.12"` (Step 2 below), ruff targets `py312`, and Task 13's Dockerfile uses `python:3.12-slim`; the gates would then type-check 3.12 semantics on a 3.13 interpreter.
+
+- [ ] **Step 2: Write the root `pyproject.toml`**
 
 ```toml
 [project]
@@ -158,7 +170,6 @@ postern-core = { workspace = true }
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=1.4",
-    "respx>=0.23",
     "ruff>=0.16",
     "mypy>=1.14",
     "import-linter>=2.15",
@@ -180,12 +191,14 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
-ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
 ```
 
-`package = false` makes the root a virtual project: uv installs its dependencies but does not build it, so `services/` is imported from the repo root. Both loop-scope settings are required; omitting `asyncio_default_test_loop_scope` while the fixture scope is `session` raises `RuntimeError: attached to a different loop` at teardown (measured on pytest-asyncio 1.4.0).
+`package = false` makes the root a virtual project: uv installs its dependencies but does not build it, so `services/` is imported from the repo root. Both loop-scope settings are required; omitting `asyncio_default_test_loop_scope` while the fixture scope is `session` raises `RuntimeError: attached to a different loop` at teardown (measured on pytest-asyncio 1.4.0). `S101` (assert) is ignored only under `tests/**`, not globally: a global ignore would let a bare `assert` in production masking or auth code pass silently, and asserts are stripped under `python -O`.
 
-- [ ] **Step 2: Write `packages/postern-core/pyproject.toml`**
+- [ ] **Step 3: Write `packages/postern-core/pyproject.toml`**
 
 ```toml
 [project]
@@ -203,7 +216,7 @@ build-backend = "uv_build"
 
 No workspace keys in a member. The default `src/postern_core/` layout matches the file structure above, so no `module-name` override is needed here.
 
-- [ ] **Step 3: Create the package skeletons**
+- [ ] **Step 4: Create the package skeletons**
 
 ```bash
 mkdir -p packages/postern-core/src/postern_core/domain \
@@ -217,11 +230,21 @@ touch packages/postern-core/src/postern_core/__init__.py \
       tests/__init__.py tests/fixtures/__init__.py
 ```
 
-- [ ] **Step 4: Write `.importlinter`**
+- [ ] **Step 5: Add the `py.typed` marker to `postern-core`**
+
+```bash
+touch packages/postern-core/src/postern_core/py.typed
+```
+
+Empty, per PEP 561. Without it, any mypy invocation that does not pass both `packages` and `services` in the same command degrades to `Skipping analyzing "postern_core": module is installed, but missing library stubs or py.typed marker`. It is included automatically in the wheel built by the `uv_build` backend.
+
+- [ ] **Step 6: Write `.importlinter`**
 
 ```ini
 [importlinter]
-root_package = services
+root_packages =
+    services
+    postern_core
 
 [importlinter:contract:api-not-confirm]
 name = API service must not import the write path
@@ -232,14 +255,14 @@ forbidden_modules =
     services.confirm
 ```
 
-This is the A3 control (handoff §8.2) expressed as a lint rule. `lint-imports` exits 1 on violation.
+This is the A3 control (handoff §8.2) expressed as a lint rule. `lint-imports` exits 1 on violation. `root_packages` must be plural: the contract needs to see the transitive route through the shared library `postern_core`, and with only `services` declared as the root package, import-linter cannot see `postern_core` at all, so the two-hop violation `services.api -> postern_core -> services.confirm` is reported as kept, exit 0.
 
-- [ ] **Step 5: Write the `Makefile`**
+- [ ] **Step 7: Write the `Makefile`**
 
 ```make
-.PHONY: ci lint fmt type imports test
+.PHONY: ci lint fmt fmt-check type imports lock test
 
-ci: lint type imports test
+ci: lint fmt-check type imports lock test
 
 lint:
 	uv run ruff check .
@@ -247,34 +270,44 @@ lint:
 fmt:
 	uv run ruff format .
 
+fmt-check:
+	uv run ruff format --check packages services tests
+
 type:
 	uv run mypy packages services tests
 
 imports:
 	uv run lint-imports
 
+lock:
+	uv lock --check --offline
+
 test:
-	uv run pytest -q
+	@if [ -z "$$(find tests -name 'test_*.py' -print -quit 2>/dev/null)" ]; then \
+		echo "no tests yet, skipping"; \
+	else \
+		uv run pytest -q; \
+	fi
 ```
 
-`make ci` is the gate runner. GitHub Actions minutes are billed on private repos, so the gates run locally first; a workflow file lands in Task 14 but is left disabled for you to enable.
+`make ci` is the gate runner. GitHub Actions minutes are billed on private repos, so the gates run locally first; a workflow file lands in Task 14 but is left disabled for you to enable. `fmt-check` is scoped to `packages services tests`, not `.`, because `ruff format` on `.` also reformats the Python code fences inside the markdown design docs in `docs/`. The `test` recipe checks for test files before invoking pytest rather than masking pytest's exit code 5 (no tests collected); it stops firing on its own once Task 2 adds real tests.
 
-- [ ] **Step 6: Install and verify the workspace resolves**
+- [ ] **Step 8: Install and verify the workspace resolves**
 
 Run: `uv sync`
 Expected: resolves and installs; then `uv run python -c "import postern_core, services.api, services.confirm; print('ok')"` prints `ok`.
 
 If `uv sync` rejects `package = false` alongside `[project].dependencies`, the fallback is to delete `[tool.uv] package = false` and add `[tool.uv.build-backend] module-root = ""` / `module-name = "services"` with a `uv_build` `[build-system]`. Verify with the same import line.
 
-- [ ] **Step 7: Confirm the gates run green on an empty tree**
+- [ ] **Step 9: Confirm the gates run green on an empty tree**
 
 Run: `make ci`
-Expected: ruff passes, mypy passes, `lint-imports` prints `Contracts: 1 kept, 0 broken.`, pytest reports `no tests ran` (exit 5 is acceptable here and disappears in Task 2).
+Expected: `lint` passes, `fmt-check` passes, `type` passes, `imports` prints `Contracts: 1 kept, 0 broken.`, `lock` passes, and `test` prints `no tests yet, skipping` and exits 0 (no test files exist yet; this disappears once Task 2 adds real tests).
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add pyproject.toml Makefile .importlinter .gitignore packages services tests
+git add pyproject.toml Makefile .importlinter .gitignore .python-version packages services tests
 git commit -m "chore: uv workspace skeleton with local CI gates"
 ```
 
@@ -282,52 +315,36 @@ git commit -m "chore: uv workspace skeleton with local CI gates"
 
 ### Task 1: Spike, resolve `httpx2` vs `httpx` for the façade
 
-**Why this is first:** `fastmcp` 4.0.3 depends on `httpx2>=2.5.0` and lists no `httpx`. `respx` 0.23.1 requires `httpx>=0.25.0`. The façade client's library choice determines whether `respx` can mock it, which every backend test in Tasks 8 to 11 depends on. Guessing here invalidates four tasks.
+**Why this is first:** `fastmcp` 4.0.3 depends on `httpx2>=2.5.0` and lists no `httpx`. The façade client's HTTP library, and whether its test-mocking approach actually works against it, determines every backend test in Tasks 8 to 11. Guessing here invalidates four tasks.
 
 **Files:**
 - Create: `docs/decisions/0001-facade-http-client.md`
 
 - [ ] **Step 1: Observe what is actually installed**
 
-Run: `uv run python -c "import httpx2; print(httpx2.__version__)"` and `uv run python -c "import httpx; print(httpx.__version__)"`
-Expected: `httpx2` imports. `httpx` may or may not be present, since `respx` pulls it into the dev group only.
+Run: `uv run python -c "import httpx2; print(httpx2.__version__)"`
+Expected: `httpx2` imports. Verified: `2.12.0`.
 
-- [ ] **Step 2: Test whether respx intercepts httpx2**
+- [ ] **Step 2: Test the two mocking approaches against httpx2**
 
-```python
-# /tmp/spike_respx.py
-import asyncio, httpx2, respx
+First, the library that mocks `httpx` requests: setting up a mock against an `httpx2.Response` raises `TypeError: <Response [200 OK]> is not an instance of httpx.Response` at mock-setup time, before any request is made. It does not recognize `httpx2`'s response type, so it cannot mock this client.
 
-async def main() -> None:
-    with respx.mock(base_url="https://backend.test") as mock:
-        mock.get("/ping").mock(return_value=httpx2.Response(200, json={"ok": True}))
-        async with httpx2.AsyncClient(base_url="https://backend.test") as c:
-            r = await c.get("/ping")
-        print("intercepted:", r.json())
-
-asyncio.run(main())
-```
-
-Run: `uv run python /tmp/spike_respx.py`
-Expected: either `intercepted: {'ok': True}` (respx patches httpx2 transparently), or an exception / real connection attempt (it does not).
+Second, `httpx2.MockTransport(handler)` injected into `BackendClient`'s transport: this works, and the handler observes a custom `Authorization` header set by the client.
 
 - [ ] **Step 3: Record the decision**
 
-Write `docs/decisions/0001-facade-http-client.md` with the observed result and one of these two outcomes:
+Write `docs/decisions/0001-facade-http-client.md` with the observed result: the façade uses `httpx2` (FastMCP's own dependency, one HTTP stack in the image); backend tests mock at the **transport** layer via an injected `httpx2.MockTransport(handler)`; the `httpx`-mocking library is dropped from the dev dependency group, since it cannot mock `httpx2`.
 
-- **If respx intercepts httpx2:** the façade uses `httpx2`, one HTTP stack in the image, `respx` stays the mocking tool. Record the observed output as evidence.
-- **If it does not:** the façade uses `httpx2` anyway (do not ship two HTTP stacks in a bank image), and backend tests mock at the **transport** layer instead, by injecting a `httpx2.MockTransport(handler)` into `BackendClient`. Record that `respx` is then only usable for code that still uses `httpx`, and drop `respx` from the dev group.
-
-The decision record must state: the date, the observed command output, the chosen option, and the consequence for Tasks 8 to 11.
+The decision record must state: the date, the observed command output for both approaches in Step 2, the chosen option, and the consequence for Tasks 8 to 11.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add docs/decisions/0001-facade-http-client.md
-git commit -m "docs: record facade HTTP client decision from respx/httpx2 spike"
+git commit -m "docs: record facade HTTP client decision (httpx2, MockTransport)"
 ```
 
-> **Tasks 8 to 11 below are written for the `MockTransport` form**, because it works under both outcomes. If the spike shows respx intercepts httpx2, the tests may be simplified to respx, but they are not required to be.
+> **Tasks 8 to 11 below are written for the `MockTransport` form.** That is the only form: Step 2 above ruled out the alternative.
 
 ---
 
@@ -2586,18 +2603,20 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --frozen
-      - run: uv run ruff check .
-      - run: uv run mypy packages services tests
-      - run: uv run lint-imports
-      - run: uv run pytest -q
+      - run: make lint
+      - run: make fmt-check
+      - run: make type
+      - run: make imports
+      - run: make lock
+      - run: make test
 ```
 
-`on: workflow_dispatch` only, so nothing fires on push. Actions minutes are billed on private repositories; `make ci` runs the same five gates locally for free. Add `push`/`pull_request` triggers when you decide to spend the minutes.
+`on: workflow_dispatch` only, so nothing fires on push. Actions minutes are billed on private repositories; `make ci` runs the same six gates locally for free. Add `push`/`pull_request` triggers when you decide to spend the minutes.
 
 - [ ] **Step 5: Run the full gate set**
 
 Run: `make ci`
-Expected: ruff clean, mypy clean, `Contracts: 1 kept, 0 broken.`, and pytest green across all test files.
+Expected: `lint` clean, `fmt-check` prints an `N files already formatted` line, `type` clean, `imports` prints `Contracts: 1 kept, 0 broken.`, `lock` prints a `Resolved N packages` line, and `test` green across all test files.
 
 - [ ] **Step 6: Commit**
 
