@@ -738,9 +738,33 @@ correction note above `test_models_reject_unknown_fields`.
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, BeforeValidator, ConfigDict, StringConstraints
 
 CurrencyCode = Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")]
+
+
+def _reject_float(value: object) -> object:
+    """Reject a bare Python `float` outright, before pydantic's own `Decimal`
+    coercion runs.
+
+    A JSON number decoded by `json.loads` becomes a `float`, and IEEE 754
+    binary floats cannot represent most decimal fractions exactly:
+    `0.1 + 0.2 == 0.30000000000000004`. `Decimal`, `str` and `int` are all
+    exact and pass through unchanged to pydantic's own `Decimal` validation;
+    `Field(strict=True)` was measured and rejected, since it also rejects the
+    `str` wire form a backend must use to avoid this exact hazard. A backend
+    sends amounts as a decimal string (or an int for a whole-number amount),
+    never a bare JSON number that a client-side float already corrupted.
+    """
+    if isinstance(value, float):
+        raise ValueError(
+            "amount must not be a float: binary floating point cannot represent "
+            "a decimal amount exactly; send a decimal string or a Decimal"
+        )
+    return value
+
+
+MoneyAmount = Annotated[Decimal, BeforeValidator(_reject_float)]
 
 
 class Money(BaseModel):
@@ -748,9 +772,26 @@ class Money(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    amount: Decimal
+    amount: MoneyAmount
     currency: CurrencyCode
 ```
+
+**Corrected against what execution actually found (2026-09-12, coordinator review):** the
+plan originally typed `amount: Decimal` with no further guard. `Decimal` accepts a `float`
+without complaint, coercing it through `str(float)`; measured on the original code,
+`Money(amount=0.1 + 0.2, currency="EUR").model_dump_json()` produced
+`{"amount":"0.30000000000000004","currency":"EUR"}` — an IEEE 754 binary-float artifact
+serialized as a money amount and handed to a model that reads it out to a bank customer.
+`Field(strict=True)` was measured as an alternative and rejected: it also rejects the
+`str` wire form (`is_instance_of` on `"340.00"`), which is the safe form a backend must
+use to avoid the float hazard in the first place. The `BeforeValidator` above was measured
+to accept `Decimal`, `str` and `int` and reject only `float` (and, as a side effect,
+`bool`, since pydantic's own `Decimal` core schema does not coerce a `bool`).
+`str` is accepted deliberately: a backend that sends JSON and parses it with `json.loads`
+gets a `float` for any bare JSON number, so a decimal string is the only exact wire form.
+`int` is accepted because it is exact by construction. `Money(amount=Decimal("340.00"),
+currency="EUR").model_dump_json()` still produces exactly `{"amount":"340.00","currency":"EUR"}`,
+trailing zeros preserved.
 
 - [ ] **Step 4: Write `identity.py`**
 
@@ -809,7 +850,6 @@ while backends refactor. Counterparty account identifiers are absent by design
 (§6.5): name only, never an account number.
 """
 
-from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, StringConstraints
@@ -860,7 +900,7 @@ class Card(_Strict):
 class ConsentSummary(_Strict):
     domain: Literal["accounts", "transactions", "cards", "payments"]
     granted: bool
-    expires_at: datetime | None
+    expires_at: AwareDatetime | None
 
 
 class SessionInfo(_Strict):
@@ -873,6 +913,15 @@ class SessionInfo(_Strict):
 ```
 
 `Annotated[str, AfterValidator]` runs on validation only. `model_construct` skips validation entirely by design (it exists to build a model from already-trusted data without re-running validators) and no `ConfigDict` option changes that, so it cannot be closed by configuration. It is forbidden by convention in this codebase: no tool or façade function may call `Card.model_construct`, `Account.model_construct`, or the equivalent on any other model in this module. The backstop is the golden masking test (Task 7) on serialized tool output, which catches a `model_construct` misuse the same way it catches any other raw passthrough.
+
+**Corrected against what execution actually found (2026-09-12, coordinator review):** the
+plan originally typed `expires_at: datetime | None`, inconsistent with `Balance.as_of` and
+`Transaction.booked_at`, which both use `AwareDatetime`. This was an oversight, not a
+deliberate exception: a naive expiry compared against an aware "now" raises `TypeError`,
+and a naive timestamp shown to a customer in an unknown zone is exactly the ambiguity
+`AwareDatetime` exists to remove elsewhere in this same module. Changed to
+`AwareDatetime | None`; the unused `from datetime import datetime` import is dropped
+along with it, since nothing else in the module names `datetime` directly.
 
 - [ ] **Step 6: Write the failing test for the `model_copy` bypass**
 
@@ -963,6 +1012,21 @@ is the regression test (written first, observed failing with the raw IBAN surviv
 `session.model_dump_json()`, then closed by the config change). This brings the file to
 12 passed, not 11 — the extra test is the adversarial-pass addition, not one of the 10
 steps' original 11.
+
+**Second addendum (2026-09-12, coordinator review of the adversarial pass):** two items
+reported but not fixed in the first pass were fixed on coordinator instruction. `Money`
+now rejects a bare `float` amount (see the correction above Step 3) and
+`ConsentSummary.expires_at` is now `AwareDatetime | None` (see the correction above Step
+6's failing-test steps). Five more tests were added the same way: written first against
+the pre-fix code, observed failing (`test_money_rejects_a_float_amount` and
+`test_consent_summary_rejects_a_naive_expiry` both failed with `DID NOT RAISE
+ValidationError`), then closed by the two fixes. This brings the file to 17 passed.
+
+Recorded rather than fixed: `Money` still enforces no scale or precision — a value with
+more decimal places than its currency allows (e.g. `Decimal("1.23456789")` for `"EUR"`)
+is accepted and serialized as given. Closing that needs an ISO 4217 minor-unit table
+(JPY is 0 decimal places, most currencies are 2, a few are 3), which is a data commitment
+beyond this task; see "What this plan deliberately does not establish" below.
 
 ---
 
@@ -2925,6 +2989,7 @@ Do not let any of these read as done because the tests are green.
 | Cross-customer enforcement (ZT-2) | The stub backend never checks the subject. **This is the critical path and it is answered by another team, not by this repo** | out of repo |
 | PCI DSS scope | `MaskedPan` masks in this process, so the server does hold a full PAN briefly. Open question §10.17 asks the domain teams for pre-masked projections | out of repo |
 | Base64 sentinel header decoding | Documented deviation from the spec in `docs/decisions/0002` | Plan 4 |
+| `Money` scale/precision enforcement | `Money` rejects a `float` amount (Task 3) but enforces no per-currency decimal-place limit; `Decimal("1.23456789")` for `"EUR"` is accepted and serialized as given. Closing this needs an ISO 4217 minor-unit table (JPY is 0 decimal places, most currencies are 2, a few are 3), a data commitment beyond Task 3 | unscheduled |
 
 ## Self-review
 
