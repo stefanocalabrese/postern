@@ -6,7 +6,6 @@ while backends refactor. Counterparty account identifiers are absent by design
 """
 
 from collections.abc import Mapping
-from datetime import datetime
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, StringConstraints
@@ -65,7 +64,7 @@ class Card(_Strict):
 class ConsentSummary(_Strict):
     domain: Literal["accounts", "transactions", "cards", "payments"]
     granted: bool
-    expires_at: datetime | None
+    expires_at: AwareDatetime | None
 
 
 class SessionInfo(_Strict):

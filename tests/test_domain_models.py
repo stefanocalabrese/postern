@@ -25,6 +25,38 @@ def test_money_rejects_a_non_iso_currency() -> None:
         Money(amount=Decimal("1"), currency="euros")
 
 
+def test_money_rejects_a_float_amount() -> None:
+    """0.1 + 0.2 is the canonical IEEE 754 binary-float artifact
+    (0.30000000000000004), and it must never reach a customer as a money
+    amount. Decimal exists to prevent exactly this; nothing stopped a float
+    from reaching Money.amount and serializing verbatim.
+
+    Constructed via model_validate on a plain dict, not Money(amount=...)
+    directly: Money.amount is statically Decimal (Annotated[Decimal, ...]
+    types as its first argument, with no pydantic.mypy plugin configured to
+    synthesize a broader __init__), so mypy --strict rejects a float/str/int
+    keyword argument here the same way it rejected Account(pan=...) in Task
+    3's review. The point of this test is the runtime rejection."""
+    with pytest.raises(ValidationError):
+        Money.model_validate({"amount": 0.1 + 0.2, "currency": "EUR"})
+
+
+def test_money_accepts_a_decimal_string_amount() -> None:
+    """The safe wire form: a backend that sends JSON must send the amount as
+    a string, not a bare JSON number (json.loads turns a JSON number into a
+    float, which is the hazard test_money_rejects_a_float_amount closes)."""
+    m = Money.model_validate({"amount": "340.00", "currency": "EUR"})
+    assert m.amount == Decimal("340.00")
+    assert m.model_dump_json() == '{"amount":"340.00","currency":"EUR"}'
+
+
+def test_money_accepts_an_int_amount() -> None:
+    """An int is an exact whole-number amount, with no binary-float
+    imprecision possible."""
+    m = Money.model_validate({"amount": 340, "currency": "EUR"})
+    assert m.amount == Decimal("340")
+
+
 def test_balance_carries_account_ref_and_as_of() -> None:
     b = Balance(
         account_ref="acc_7f3a",
@@ -99,6 +131,22 @@ def test_validation_error_never_echoes_the_raw_identifier() -> None:
     with pytest.raises(ValidationError) as exc_info:
         Card(ref="crd_1", label="Debit", pan="my card is 4111111111114417 thanks", status="active")
     assert "4111111111114417" not in str(exc_info.value)
+
+
+def test_consent_summary_rejects_a_naive_expiry() -> None:
+    """expires_at must be aware, exactly like Balance.as_of and
+    Transaction.booked_at: a naive timestamp shown to a customer in an
+    unknown zone is exactly the ambiguity AwareDatetime exists to remove,
+    and a naive expiry compared against an aware "now" raises TypeError."""
+    with pytest.raises(ValidationError):
+        ConsentSummary(domain="accounts", granted=True, expires_at=datetime(2026, 9, 12, 10, 0))
+
+
+def test_consent_summary_aware_expiry_round_trips() -> None:
+    aware = datetime(2026, 9, 12, 10, 0, tzinfo=UTC)
+    cs = ConsentSummary(domain="accounts", granted=True, expires_at=aware)
+    reloaded = ConsentSummary.model_validate_json(cs.model_dump_json())
+    assert reloaded.expires_at == aware
 
 
 def test_nested_model_construct_bypass_is_remasked_on_parent_construction() -> None:
