@@ -1,0 +1,12 @@
+[importlinter]
+root_packages =
+    services
+    postern_core
+
+[importlinter:contract:api-not-confirm]
+name = API service must not import the write path
+type = forbidden
+source_modules =
+    services.api
+forbidden_modules =
+    services.confirm
