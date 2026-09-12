@@ -22,7 +22,6 @@ postern-core = { workspace = true }
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=1.4",
-    "respx>=0.23",
     "ruff>=0.16",
     "mypy>=1.14",
     "import-linter>=2.15",
