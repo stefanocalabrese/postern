@@ -42,6 +42,18 @@ compromised tool handler cannot mint a token the payments service will accept,
 because it does not hold the key. That is an infrastructure property, not a
 code-review promise.
 
+## Flow
+
+The diagram below covers both phases end to end. Phase A is the RFC 8628 device
+grant: the customer scans a rotating QR or opens a universal link, confirms a
+pairing code in their own bank app, and the signed approval becomes a customer
+access token. Phase B is a single tool call: Postern verifies the customer token,
+mints a short-lived internal JWT from a Vault-cached signing key, and Istio
+enforces that internal JWT before a domain service returns rows that Postern
+projects and masks back to the client.
+
+![Sequence diagram of the Postern device-grant authorization flow and a tool call reaching a domain service behind Istio](docs/images/auth-flow.png)
+
 ## Rules that are decisions, not preferences
 
 Read `CLAUDE.md` before changing anything. The load-bearing ones:
