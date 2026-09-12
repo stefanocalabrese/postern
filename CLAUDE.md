@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Docs only. No code, no `pyproject.toml`, no commit history (`git rev-list --count --all` returns 0). Everything below describes a design that has been agreed and not yet built.
+Skeleton. Tasks 0 and 1 of the 15-task plan are done: uv workspace, six-gate `make ci`, import-linter contract, one decision record. No tools, no database, no auth, no backend calls. Everything in "Architecture" and "Hard rules" below describes the target, not what exists.
 
-**Naming is unresolved.** The repo is `postern`; all three design docs call the project `bank-mcp` and name the package `bank_mcp_core`, the services `bank-mcp-api` / `bank-mcp-confirm`, and the PyPI distribution `bank-mcp`. The docs predate the name. Ask before picking one. If Postern wins, the PyPI distribution name must be `postern-mcp` (bare `postern` is taken on PyPI).
+**Naming is settled: `postern`.** The design docs predate the name and still say `bank-mcp` / `bank_mcp_core` / `bank-mcp-api`; the code uses `postern`, `postern_core`, `services/api`, `services/confirm`. Do not rename the docs. The PyPI distribution name must be `postern-mcp`, since bare `postern` is taken.
 
 ## Source documents, in reading order
 
@@ -15,6 +15,8 @@ Docs only. No code, no `pyproject.toml`, no commit history (`git rev-list --coun
 3. `docs/bank-mcp-python-implementation-guide.md` (431 lines): FastMCP specifics, repo layout, code patterns.
 
 Cross-references: `§N.N` points at the handoff, `ZT-N` at the zero-trust plan, `A1..A11` at the attack scenarios in its §3.2.
+
+Also current, and corrected against what execution actually found: `docs/superpowers/plans/postern-foundation-and-read-surface-2026-09-12.md` (the 15-task plan being executed, task by task), `docs/decisions/` (decision records), `README.md`. Where a design doc and the plan disagree, the plan is newer.
 
 ## What this is
 
@@ -33,7 +35,7 @@ Two deployables over one shared library. This is a decision, not a preference (h
 | `services/api` | MCP tools, OAuth/device-grant endpoints, QR page | **read** | backend read endpoints only |
 | `services/confirm` | approval callback, execution | **write** | backend write endpoints |
 
-`packages/bank_mcp_core/` carries `domain/` (masked types), `facade/` (httpx + internal JWT), `store/` (SQLAlchemy + Alembic), `auth/` (Vault key fetch, JWT minting), `risk/` (tier selection).
+`packages/postern-core/src/postern_core/` carries `domain/` (masked types), `facade/` (httpx2 + internal JWT), `store/` (SQLAlchemy + Alembic), `auth/` (Vault key fetch, JWT minting), `risk/` (tier selection).
 
 Two authentication layers that must never be conflated (handoff §7.1):
 - **Agent to MCP server**: OAuth 2.1, CIMD over deprecated DCR, RFC 8628 device grant with a QR flow.
@@ -54,8 +56,8 @@ These are decisions carried over from the design conversation. Do not relitigate
 - **Never write "Face ID" anywhere in this codebase or its docs.** The bank app brands its identity-verification feature that way, but it is server-side selfie matching in the backend cluster, not Apple's on-device feature. Any reader, human or model, will implement the wrong thing. Use "app identity verification"; write "device unlock biometric" when the phone's own biometric is meant.
 - **Masking is a type property, not a function someone remembers to call.** `MaskedPan`, `MaskedIban` via `Annotated` + Pydantic validator, whose only constructor masks. A handler that forgets must fail validation, not leak. Prefer the backend returning pre-masked values so the server never holds a full PAN and stays out of PCI DSS scope.
 - **`payments.create_payment` takes a `payee_ref`, never a raw IBAN.** A new payee's IBAN is typed in the bank app during confirmation and never passes through the agent channel.
-- **`cacheScope` is per-user, never global.** The tool catalog varies by consent state; a shared cache leaks which accounts and permissions a customer has. That is a data leak, not a performance bug.
-- **Validate `Mcp-Method` / `Mcp-Name` headers against the body** in middleware before any handler runs; mismatch returns 400 with JSON-RPC `-32020`. A load balancer routing on a header while the server executes on the body is a request-smuggling shape.
+- **`cacheScope` is `"private"`, never `"public"`.** Those are the only two values the spec allows, and `"private"` means "MUST NOT be shared across authorization contexts". The tool catalog varies by consent state; a shared cache leaks which accounts and permissions a customer has. That is a data leak, not a performance bug. `ttlMs` and `cacheScope` are both required fields on `server/discover`, `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list` and `resources/read`.
+- **Validate `Mcp-Method` / `Mcp-Name` headers against the body** before any handler runs; mismatch returns 400 with JSON-RPC `-32020`. A load balancer routing on a header while the server executes on the body is a request-smuggling shape. **This must be ASGI middleware, not FastMCP middleware**, for the reason in "Version traps" below.
 - **MRTR is for disambiguation only** (which account, which card, which date range). Never for authorizing money movement, because the answer routes back through the model's channel.
 - **Tier 1 is the default for writes, not tier 2.** Tier 2 adds server-side identity verification, which is a GDPR Article 9 special-category processing event on every single use, costs 5 to 15 seconds, and fails a real percentage of the time. Tier 1 already satisfies SCA with two factors.
 - **Declare the verification tier on the tool definition.** Never derive it from the HTTP verb: search endpoints are POST because the body is large, and a five-year transaction export is a GET.
@@ -67,24 +69,27 @@ These are decisions carried over from the design conversation. Do not relitigate
 
 Both of these will produce plausible, wrong code from memory. Verify before relying on either.
 
-- **FastMCP is at v4.0.3 (2026-09-05), under the `PrefectHQ` org, not `jlowin`.** Nearly every FastMCP example in training data and on the web is v2 or v3. In v4, `@mcp.tool` takes no parentheses. Docs are published in llms.txt format at `https://gofastmcp.com/llms.txt`: fetch the index, then the page. The implementation guide's §0.1 lists what was verified on 12 September 2026 and §0.2 lists what was explicitly not (v3 to v4 breaking changes, `httpx` vs `httpx2`, tool annotation syntax, MRTR support, session semantics). Anything outside §0.1 is design reasoning, not a verified framework fact.
+- **FastMCP is at v4.0.3 (2026-09-05), under the `PrefectHQ` org, not `jlowin`.** Nearly every FastMCP example in training data and on the web is v2 or v3. Docs are in llms.txt format at `https://gofastmcp.com/llms.txt`: fetch the index, then the page. The implementation guide's §0.1 lists what was verified on 12 September 2026; anything outside it is design reasoning, not a verified framework fact.
+- **`ToolError` cannot produce an HTTP status.** FastMCP 4 returns it as `CallToolResult(is_error=True)` inside an HTTP **200**, and exposes no documented way to set the status from a tool or a middleware hook. The implementation guide §6.3 shows header/body validation as a FastMCP `Middleware` raising `ToolError`; that is wrong and cannot satisfy the spec's "MUST return 400". Any control that owes an HTTP status belongs in ASGI middleware passed to `http_app(middleware=[...])`. `McpError(code=..., message=...)` sets an arbitrary JSON-RPC code but still not a status.
+- **The HTTP client is `httpx2`, not `httpx`.** `fastmcp` 4.0.3 pulls `fastmcp-slim[client,server]`, which declares `httpx2>=2.5.0` and no `httpx`. `respx` cannot mock it: it type-checks against `httpx.Response` and raises `TypeError` at mock-setup time, before any request. Backend tests inject `httpx2.MockTransport(handler)` instead, which does carry an `Authorization` header through to the handler. `respx` has been removed from the dev group. See `docs/decisions/0001-facade-http-client.md`.
+- **Smaller v4 facts, all verified:** `@mcp.tool` works bare *and* with parentheses. Tool annotations come from `mcp.types.ToolAnnotations`, not from fastmcp. `ctx.set_state` / `get_state` are **async** (`await`). `FastMCP()` accepts `cache_scope` and `cache_ttl` directly. The in-process test `Client(transport=server)` accepts **no auth argument**, which is why tools resolve the customer through an injected `CustomerResolver` rather than reading the token directly.
 - **Package identity:** this project uses `fastmcp` (PrefectHQ, `from fastmcp import FastMCP`), not the official `mcp` SDK (`mcp.server.mcpserver.*`). Mixing imports produces confusing type errors. Pin `fastmcp>=4.0.3,<5`.
-- **MCP protocol `2026-07-28` removed the `initialize`/`initialized` handshake and protocol-level sessions**, including `Mcp-Session-Id`. Every request is self-describing and any request can land on any instance. No in-process session state at all: mint an explicit handle and have the model pass it back as an argument, which is exactly what the challenge ID does. Server-level `instructions` used to live on `InitializeResult`, which no longer exists; confirm where it lives now.
+- **MCP protocol `2026-07-28` removed the `initialize`/`initialized` handshake and protocol-level sessions**, including `Mcp-Session-Id`. Every request is self-describing and any request can land on any instance. No in-process session state at all: mint an explicit handle and have the model pass it back as an argument, which is exactly what the challenge ID does. Server-level `instructions` now lives on the `server/discover` result. There is a third mandatory header, `MCP-Protocol-Version`, alongside `Mcp-Method` and `Mcp-Name`. SSE resumability is gone, so a dropped stream loses the in-flight request and the client re-issues it with a new id: **every handler must be safe to re-run**. MRTR's `requestState` is attacker-controlled and MUST be integrity-protected (HMAC or AEAD) if it influences authorization.
+- **DPoP is not in the spec.** A search of the entire `2026-07-28` tree, security-considerations page included, returns zero hits for DPoP, RFC 9449, sender-constrained tokens or mTLS. The only token-binding mechanism is audience restriction via RFC 8707 resource indicators. This closes ZT-6's first branch: it resolves to a written decision record plus compensating controls, not to implementing DPoP.
 
 ## Commands
 
-None of these run yet, since the repo has no `pyproject.toml`. They are what the implementation guide §1.1 and §8 specify for the skeleton:
-
 ```bash
-uv sync                      # install; uv.lock is committed
-uv run ruff check .
-uv run mypy .                # [tool.mypy] strict = true
-uv run lint-imports          # import-linter, reads .importlinter
-uv run pytest
-uv run pytest tests/test_masking_golden.py::test_name   # single test
+uv sync                                                  # uv.lock is committed
+make ci                                                  # lint fmt-check type imports lock test
+make fmt                                                 # ruff format
+uv run pytest tests/test_masking_golden.py::test_name    # single test
+uv run --with pillow python tools/render_auth_flow.py    # regenerate the README diagram
 ```
 
-`asyncio_mode = "auto"` is set in `[tool.pytest.ini_options]`, so async tests need no marker. Use FastMCP's in-process `Client` against the server object for tool tests (no network), `respx` for the backend, `testcontainers[postgres]` for a real database, and `RSAKeyPair.generate()` + `StaticTokenVerifier` for auth fixtures.
+`make ci` is the gate runner and must exit 0 before any commit. It runs locally rather than in Actions because minutes are billed on private repos; the workflow file arrives in Task 14 with `on: workflow_dispatch` only.
+
+`asyncio_mode = "auto"` is set, so async tests need no marker. Use FastMCP's in-process `Client(transport=server)` for tool tests (no network), `httpx2.MockTransport` for the backend, `testcontainers.community.postgres` for a real database (the old `testcontainers.postgres` path is deprecated), and `RSAKeyPair.generate()` + `StaticTokenVerifier` for auth fixtures.
 
 Images are two targets from one multi-stage Dockerfile:
 
@@ -95,6 +100,15 @@ npx @modelcontextprotocol/inspector    # test before wiring any real client
 ```
 
 Local development needs no VPC: `docker compose` with Postgres and stubbed backends, uvicorn, a fake Vault key from file.
+
+## Toolchain gotchas, each found the hard way
+
+- **`.importlinter` needs `root_packages` (plural) listing both `services` and `postern_core`.** With only `services`, import-linter never graphs the shared library, so `services.api -> postern_core -> services.confirm` reports **KEPT with exit 0**. That two-hop route through the one library both services import is the realistic regression path, so the singular form makes the contract decorative.
+- **`.python-version` pins 3.12.** Without it `requires-python = ">=3.12"` lets uv resolve 3.13 while mypy targets `python_version = "3.12"`, ruff targets `py312`, and the Dockerfile ships `python:3.12-slim`.
+- **`packages/postern-core/src/postern_core/py.typed` is required.** Without the PEP 561 marker, any mypy run that does not pass `packages` and `services` in one invocation degrades to `Skipping analyzing "postern_core"`.
+- **`ruff format --check` is scoped to `packages services tests`, never `.`.** Unscoped it also rewrites the Python code fences inside the markdown design docs.
+- **`S101` is ignored per-file for `tests/**` only.** A global ignore lets a bare `assert` into production masking and auth code, where `python -O` strips it.
+- **Pydantic: prefer `AfterValidator` to `BeforeValidator`** for the masked types; the function is then guaranteed a `str`. `Annotated` metadata applies right-to-left, so a `StringConstraints` placed before the masking validator fires against the unmasked value.
 
 ## CI gates that block the build
 
