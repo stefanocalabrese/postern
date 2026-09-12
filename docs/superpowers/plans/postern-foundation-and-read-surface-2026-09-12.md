@@ -25,7 +25,7 @@
 | Payments, tier 2 | 6 | handoff §10.4, §10.10, §10.13, §10.17 |
 | Terraform, PrivateLink, Istio, WAF, RDS | separate repo (handoff §12.3) | |
 
-**Status, 2026-09-12:** Tasks 0 and 1 are complete, committed as "chore: uv workspace skeleton with local CI gates" and "docs: record facade HTTP client decision (httpx2, MockTransport)". Review of that work found defects in this plan's own text, corrected below; see `docs/decisions/0001-facade-http-client.md` for the façade HTTP client decision.
+**Status, 2026-09-12:** Tasks 0, 1 and 2 are complete, committed as "chore: uv workspace skeleton with local CI gates", "docs: record facade HTTP client decision (httpx2, MockTransport)", and "feat(domain): masked PAN and IBAN types enforced by validator". Security review of Task 2 found defects in this plan's own text, corrected below; see `docs/decisions/0001-facade-http-client.md` for the façade HTTP client decision.
 
 **Naming assumption:** the design docs say `bank-mcp` / `bank_mcp_core`; this plan uses the repo's name, `postern` / `postern_core`. If that flips, it is one rename across this file and the skeleton.
 
@@ -57,6 +57,8 @@ Checked against primary sources on 2026-09-12. Anything not here is design reaso
 
 **Libraries:** pydantic 2.13.5 (`AfterValidator` preferred over `BeforeValidator`; `Annotated` metadata applies right-to-left), import-linter 2.15 (`lint-imports`, exits 1 on violation), uv 0.12.13, pytest-asyncio 1.4.0 (set both `asyncio_default_fixture_loop_scope` and `asyncio_default_test_loop_scope` or session teardown raises), httpx2 2.12.0 (the Task 1 spike found the `httpx`-mocking library cannot mock it; see `docs/decisions/0001-facade-http-client.md`), testcontainers 4.15.0 (`testcontainers.community.postgres`).
 
+**Pydantic 2.13 validation-bypass surface for `Annotated[str, AfterValidator]`**, measured during the Task 2 review against a model with `model_config = ConfigDict(extra="forbid", frozen=True)` and a `MaskedPan` field: `Strict(pan="4111111111114417").model_dump_json()` masks correctly; `Strict.model_construct(pan="4111111111114417").model_dump_json()` returns the raw PAN; `ok.model_copy(update={"pan": "4111111111114417"}).model_dump_json()` also returns the raw PAN, even under `frozen=True`. Plain attribute assignment (`ok.pan = "..."`) is the one idiom `frozen=True` blocks, raising `ValidationError`. No `ConfigDict` option closes `model_construct`; `model_copy(update=...)` is closed only by overriding the method to re-validate. Separately, `ValidationError.__str__` embeds `input_value=...` by default, confirmed by constructing with a raw PAN embedded in a string and finding it in `str(exc)`; `hide_input_in_errors=True` removes it, confirmed the same way.
+
 ---
 
 ## Design decisions this plan locks in
@@ -70,6 +72,10 @@ Checked against primary sources on 2026-09-12. Anything not here is design reaso
 **D4. `cache_scope="private"` is set at server construction**, not per tool. The catalog varies by consent, so no result may be shared across authorization contexts.
 
 **D5. The façade's HTTP client is `httpx2`, resolved by the Task 1 spike.** `httpx2` is what FastMCP pulls. The `httpx`-mocking library cannot mock it (`TypeError` at mock-setup time, before any request), so it is dropped from the dev dependency group; backend tests mock at the transport layer instead, via an injected `httpx2.MockTransport(handler)`. See `docs/decisions/0001-facade-http-client.md`.
+
+**D6. Masked types strict-parse and reject rather than coerce.** A "looks masked" or "scrape any digits" approach coerces arbitrary text into a well-formed mask: the original approach turned `"card 4111111111114417 exp 12/28"` into `'•••• 1228'`, a confident, wrong answer that nothing downstream can catch. Rejecting anything that is not a well-formed PAN or a mod-97-valid IBAN is the only way to keep every accepted mask trustworthy.
+
+**D7. `_Strict` re-validates on `model_copy(update=...)` and hides input in errors; `model_construct` is forbidden by convention.** `model_copy(update=...)` and `model_construct` both bypass `Annotated` validators even under `frozen=True` (see Verified facts above). `model_copy` is closed by overriding it to re-validate through `model_validate`. `model_construct` cannot be closed by configuration, so it is forbidden by convention, backstopped by the Task 7 golden masking test on serialized tool output.
 
 ---
 
@@ -360,17 +366,26 @@ Handoff §6.5: masking is a type property, never a function someone remembers to
 
 ```python
 # tests/test_masking_types.py
-import pytest
-from pydantic import BaseModel, ValidationError
+import re
 
+import pytest
 from postern_core.domain.masking import MaskedIban, MaskedPan
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 
 class Card(BaseModel):
+    # Masking is a type property, but Pydantic's own error formatting still
+    # echoes the raw offending input via `input_value` in every
+    # ValidationError unless the consuming model opts out. Any real model
+    # built on MaskedPan/MaskedIban must set this too (see report).
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     pan: MaskedPan
 
 
 class Account(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     iban: MaskedIban
 
 
@@ -400,8 +415,120 @@ def test_iban_without_country_code_is_rejected() -> None:
         Account(iban="9121000418450200051332")
 
 
+def test_iban_already_masked_is_idempotent() -> None:
+    assert Account(iban="ES•• •••• 1332").iban == "ES•• •••• 1332"
+
+
 def test_masked_pan_serializes_as_a_plain_string() -> None:
     assert Card(pan="4111111111114417").model_dump_json() == '{"pan":"•••• 4417"}'
+
+
+def test_pan_with_mask_prefix_and_appended_full_pan_is_rejected() -> None:
+    """A value that merely starts with the mask marker must not be coerced
+    into a well-formed mask. Strict-parse rejects it outright instead of
+    accepting whatever digits happen to be attached after it."""
+    leaky = "•••• 4417 extra 4111111111114417"
+    with pytest.raises(ValidationError) as exc_info:
+        Card(pan=leaky)
+    assert "4111111111114417" not in str(exc_info.value)
+
+
+def test_iban_with_mask_substring_and_appended_full_iban_is_rejected() -> None:
+    """A value that merely contains the mask marker somewhere must not be
+    coerced into a well-formed mask. Strict-parse rejects it outright."""
+    leaky = "ES•••• 1332 ES9121000418450200051332"
+    with pytest.raises(ValidationError) as exc_info:
+        Account(iban=leaky)
+    assert "9121000418450200051332" not in str(exc_info.value)
+
+
+def test_bogus_and_attacker_controlled_values_are_rejected() -> None:
+    """Well-formed-looking garbage must not be coerced into a confident,
+    wrong last-four. None of these are real card numbers or IBANs."""
+    with pytest.raises(ValidationError):
+        Account(iban="XX0000")
+    with pytest.raises(ValidationError):
+        Account(iban="hello world 1332")
+    with pytest.raises(ValidationError):
+        Card(pan="+34 600 123 456")
+    with pytest.raises(ValidationError):
+        Card(pan="card 4111111111114417 exp 12/28")
+
+
+def test_two_pans_sharing_last_four_render_identically() -> None:
+    """Deliberate under minimization: last-4 masking cannot distinguish two
+    cards that happen to share their last four digits. Do not widen this to
+    more digits to "fix" the collision; the collision is the point."""
+    assert Card(pan="4111111111114417").pan == Card(pan="5500000000004417").pan
+
+
+def test_two_ibans_sharing_last_four_render_identically() -> None:
+    """Same deliberate collision as above, for IBANs. Both values below are
+    real mod-97-valid ES IBANs that happen to share their last four digits."""
+    assert (
+        Account(iban="ES9121000418450200051332").iban
+        == Account(iban="ES8921000418450200091332").iban
+    )
+
+
+# Hostile PAN-shaped inputs: bare, spaced, hyphenated, embedded in prose,
+# before/after the mask marker, separated by non-space whitespace the
+# validator must not silently absorb, and Unicode (Arabic-Indic) digits.
+_PAN_HOSTILE_INPUTS = [
+    "4111111111114417",
+    "4111 1111 1111 4417",
+    "4111-1111-1111-4417",
+    "my card number is 4111111111114417 thanks",
+    "•••• 0000 4111111111114417",
+    "4111111111114417 •••• 0000",
+    "4111\n1111\n1111\n4417",
+    "4111\t1111\t1111\t4417",
+    "4111​1111​1111​4417",
+    "4111\xa01111\xa01111\xa04417",
+    "4111 1111 1111 ٤٤١٧",
+]
+
+# Same shapes, for a full IBAN.
+_IBAN_HOSTILE_INPUTS = [
+    "ES9121000418450200051332",
+    "ES91 2100 0418 4502 0005 1332",
+    "es9121000418450200051332",
+    "IBAN: ES9121000418450200051332 please",
+    "ES•• •••• 1332 ES9121000418450200051332",
+    "ES9121000418450200051332 ES•• •••• 1332",
+    "ES91\n2100\n0418\n4502\n0005\n1332",
+    "ES91\t2100\t0418\t4502\t0005\t1332",
+    "ES91​21000418450200051332",
+    "ES91\xa021000418450200051332",
+]
+
+
+@pytest.mark.parametrize("value", _PAN_HOSTILE_INPUTS)
+def test_pan_hostile_inputs_never_leak(value: str) -> None:
+    """Whichever branch a hostile PAN-shaped input takes, the invariant
+    holds: an accepted value never carries a run of five or more digits and
+    always has exactly four mask bullets; a rejected value never echoes the
+    raw input back. This is the invariant stated once so it survives a
+    rewrite of the branching logic above."""
+    try:
+        out = Card(pan=value).pan
+    except ValidationError as exc:
+        assert value not in str(exc)
+        return
+    assert re.search(r"[0-9]{5,}", out) is None
+    assert out.count("•") in (4, 6)
+
+
+@pytest.mark.parametrize("value", _IBAN_HOSTILE_INPUTS)
+def test_iban_hostile_inputs_never_leak(value: str) -> None:
+    """Same invariant as above, for IBAN-shaped hostile input."""
+    try:
+        out = Account(iban=value).iban
+    except ValidationError as exc:
+        assert value not in str(exc)
+        return
+    assert re.search(r"[0-9]{5,}", out) is None
+    assert out.count("•") in (4, 6)
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -419,32 +546,46 @@ These types exist so that a handler which forgets to mask fails validation
 rather than leaking. Never replace them with a `str` plus a helper function.
 """
 
+import re
 from typing import Annotated
 
 from pydantic import AfterValidator
 
 _MASK = "••••"
+_PAN_MASKED_RE = re.compile(r"•••• [0-9]{4}")
+_IBAN_MASKED_RE = re.compile(r"[A-Z]{2}•• •••• [0-9]{4}")
+_PAN_RE = re.compile(r"[0-9]{12,19}")
+_IBAN_RE = re.compile(r"[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}")
+
+
+def _mod97_ok(compact: str) -> bool:
+    """ISO 7064 mod-97 check (the IBAN checksum algorithm).
+
+    Move the first four characters to the end, map each character to its
+    base-36 value written out as a decimal string, and require the
+    resulting integer mod 97 to equal 1.
+    """
+    rearranged = compact[4:] + compact[:4]
+    digits = "".join(str(int(ch, 36)) for ch in rearranged)
+    return int(digits) % 97 == 1
 
 
 def _mask_pan(value: str) -> str:
-    if value.startswith(_MASK):
+    if _PAN_MASKED_RE.fullmatch(value):
         return value
-    digits = "".join(c for c in value if c.isdigit())
-    if len(digits) < 4:
-        raise ValueError("insufficient digits to mask a PAN")
-    return f"{_MASK} {digits[-4:]}"
+    compact = value.replace(" ", "").replace("-", "")
+    if not _PAN_RE.fullmatch(compact):
+        raise ValueError("not a PAN: expected 12 to 19 digits")
+    return f"{_MASK} {compact[-4:]}"
 
 
 def _mask_iban(value: str) -> str:
-    if _MASK in value:
+    if _IBAN_MASKED_RE.fullmatch(value):
         return value
     compact = "".join(value.split()).upper()
-    if len(compact) < 6 or not compact[:2].isalpha():
-        raise ValueError("not an IBAN: expected a two-letter country code")
-    digits = "".join(c for c in compact if c.isdigit())
-    if len(digits) < 4:
-        raise ValueError("insufficient digits to mask an IBAN")
-    return f"{compact[:2]}•• {_MASK} {digits[-4:]}"
+    if not _IBAN_RE.fullmatch(compact) or not _mod97_ok(compact):
+        raise ValueError("not an IBAN: expected ISO 13616 form")
+    return f"{compact[:2]}•• {_MASK} {compact[-4:]}"
 
 
 MaskedPan = Annotated[str, AfterValidator(_mask_pan)]
@@ -454,12 +595,18 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 """Own IBAN, country code plus last four. Counterparty IBANs are omitted entirely."""
 ```
 
-`AfterValidator`, not `BeforeValidator`: Pydantic's docs state after-validators "run after Pydantic's internal validation" and are "more type safe", and the function is then guaranteed a `str`. If you ever add a `StringConstraints` to these `Annotated` chains, put it **after** the validator in the list, because `Annotated` metadata applies right-to-left.
+This strict-parses rather than coerces, for two measured reasons.
+
+First, the original `value.startswith(_MASK)` and `_MASK in value` checks treated "looks masked" as "is masked". `_mask_pan("•••• 4417 extra 4111111111114417")` returned the string verbatim, full PAN included.
+
+Second, the original approach scraped every digit out of the input and mapped the last four onto a mask, which coerces arbitrary text into a well-formed mask: `_mask_pan("card 4111111111114417 exp 12/28")` returned `'•••• 1228'` (the expiry, not the card), and `_mask_pan("+34 600 123 456")` returned `'•••• 3456'`. Every one of those outputs is well formed, so nothing downstream can distinguish it from a correctly masked value.
+
+`_mask_iban` enforces the ISO 7064 mod-97 checksum on the compact form before masking. `_mask_pan` deliberately does not enforce Luhn: the project's own test fixture `4111111111114417` is not Luhn-valid (checksum digit sum 45, not divisible by 10), and a Luhn gate would refuse to display a card the backend actually sent.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `uv run pytest tests/test_masking_types.py -q`
-Expected: PASS, 7 passed
+Expected: PASS, 34 passed
 
 - [ ] **Step 5: Commit**
 
@@ -622,8 +769,9 @@ while backends refactor. Counterparty account identifiers are absent by design
 (§6.5): name only, never an account number.
 """
 
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, StringConstraints
 
@@ -634,7 +782,18 @@ Ref = Annotated[str, StringConstraints(pattern=r"^[a-z]{3}_[A-Za-z0-9]{1,32}$")]
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        validate_assignment=True,
+        hide_input_in_errors=True,
+    )
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Re-validate on update, so masking cannot be bypassed (see Task 2 review)."""
+        if update:
+            return type(self).model_validate({**self.model_dump(), **update})
+        return super().model_copy(deep=deep)
 
 
 class Account(_Strict):
@@ -681,12 +840,47 @@ class SessionInfo(_Strict):
     confirmation_note: str
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
+`Annotated[str, AfterValidator]` runs on validation only. `model_construct` skips validation entirely by design (it exists to build a model from already-trusted data without re-running validators) and no `ConfigDict` option changes that, so it cannot be closed by configuration. It is forbidden by convention in this codebase: no tool or façade function may call `Card.model_construct`, `Account.model_construct`, or the equivalent on any other model in this module. The backstop is the golden masking test (Task 7) on serialized tool output, which catches a `model_construct` misuse the same way it catches any other raw passthrough.
+
+- [ ] **Step 6: Write the failing test for the `model_copy` bypass**
+
+```python
+# Add to tests/test_domain_models.py
+def test_model_copy_update_remasks_rather_than_storing_raw() -> None:
+    """model_copy(update=...) is the natural idiom for patching one field of
+    a backend-derived model, and it bypasses Annotated validators even under
+    frozen=True. _Strict overrides model_copy to re-validate (Task 2 review)."""
+    card = Card(ref="crd_1", label="Debit", pan="4111111111114417", status="active")
+    patched = card.model_copy(update={"pan": "4111111111114417"})
+    assert patched.pan == "•••• 4417"
+    assert "4111111111114417" not in patched.model_dump_json()
+```
 
 Run: `uv run pytest tests/test_domain_models.py -q`
-Expected: PASS, 9 passed
+Expected: FAIL against a `_Strict` without the `model_copy` override, `AssertionError` on `patched.pan`.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Write the failing test for the hidden-input leak**
+
+```python
+# Add to tests/test_domain_models.py
+def test_validation_error_never_echoes_the_raw_identifier() -> None:
+    """Pydantic's default ValidationError.__str__ embeds `input_value=...`
+    for the field that failed. Without hide_input_in_errors=True on _Strict,
+    the raw string below appears verbatim in str(exc)."""
+    with pytest.raises(ValidationError) as exc_info:
+        Card(ref="crd_1", label="Debit", pan="my card is 4111111111114417 thanks", status="active")
+    assert "4111111111114417" not in str(exc_info.value)
+```
+
+Run: `uv run pytest tests/test_domain_models.py -q`
+Expected: FAIL against a `_Strict` without `hide_input_in_errors=True`, the raw digits are present in `str(exc_info.value)`.
+
+- [ ] **Step 8: Run the full test file to verify it passes**
+
+Run: `uv run pytest tests/test_domain_models.py -q`
+Expected: PASS, 11 passed
+
+- [ ] **Step 9: Commit**
 
 ```bash
 git add packages/postern-core/src/postern_core/domain/money.py \
@@ -1416,7 +1610,7 @@ COUNTERPARTY_IBAN = "DE89370400440532013000"
 ACCOUNTS = {
     "accounts": [
         {"id": "acc_7f3a", "label": "Joint expenses", "iban": FULL_IBAN},
-        {"id": "acc_9b21", "label": "Savings", "iban": "ES9000418450200051119"},
+        {"id": "acc_9b21", "label": "Savings", "iban": "ES2221000418450200051119"},
     ]
 }
 
@@ -1634,7 +1828,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from postern_core.domain.models import Account, Balance
+from postern_core.domain.models import Account, Balance, Ref
 from postern_core.domain.money import Money
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef
@@ -1651,7 +1845,7 @@ async def list_accounts(backend: BackendClient, customer: CustomerRef) -> list[A
 
 
 async def get_balance(
-    backend: BackendClient, customer: CustomerRef, account_ref: str
+    backend: BackendClient, customer: CustomerRef, account_ref: Ref
 ) -> Balance:
     payload: dict[str, Any] = await backend.get_json(
         f"/accounts/{account_ref}/balance", customer=customer, audience=_AUDIENCE
@@ -1672,7 +1866,7 @@ Projection is explicit and field-by-field. Never pass a backend dict through: th
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from postern_core.domain.models import Account, Balance
+from postern_core.domain.models import Account, Balance, Ref
 from postern_core.facade import accounts as facade
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerResolver
@@ -1691,7 +1885,7 @@ def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -
         return await facade.list_accounts(backend, resolver())
 
     @mcp.tool(name="accounts.get_balance", annotations=_READ)
-    async def accounts_get_balance(account_ref: str) -> Balance:
+    async def accounts_get_balance(account_ref: Ref) -> Balance:
         """Current balance for one account, with currency and an `as_of` time.
 
         `account_ref` comes from `accounts.list`. Report the amount and currency
@@ -1888,7 +2082,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from postern_core.domain.masking import scrub_free_text
-from postern_core.domain.models import Transaction
+from postern_core.domain.models import Ref, Transaction
 from postern_core.domain.money import Money
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef
@@ -1898,7 +2092,7 @@ MAX_DAYS = 365
 
 
 async def list_transactions(
-    backend: BackendClient, customer: CustomerRef, account_ref: str, days: int
+    backend: BackendClient, customer: CustomerRef, account_ref: Ref, days: int
 ) -> list[Transaction]:
     payload = await backend.get_json(
         "/transactions",
@@ -1934,7 +2128,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from postern_core.domain.models import Transaction
+from postern_core.domain.models import Ref, Transaction
 from postern_core.facade import transactions as facade
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerResolver
@@ -1945,7 +2139,7 @@ _READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -> None:
     @mcp.tool(name="transactions.list", annotations=_READ)
     async def transactions_list(
-        account_ref: str,
+        account_ref: Ref,
         days: Annotated[int, Field(ge=1, le=facade.MAX_DAYS)] = 30,
     ) -> list[Transaction]:
         """Transactions for one account, newest first, last 30 days by default.
@@ -2279,11 +2473,13 @@ no write capability exists in the tool surface at all.
 """
 
 import inspect
+import typing
 
 import httpx2
 import pytest
 from fastmcp.client import Client
 
+from postern_core.domain.masking import MaskedIban, MaskedPan
 from postern_core.facade import accounts, cards, transactions
 from postern_core.facade.client import BackendClient, StubTokenMinter
 from services.api.server import build_server
@@ -2332,7 +2528,22 @@ def test_the_api_service_does_not_import_the_confirm_service() -> None:
 
     source = inspect.getsource(inspect.getmodule(api_server))
     assert "services.confirm" not in source
+
+
+async def test_no_tool_parameter_accepts_a_masked_type(server) -> None:
+    """A parameter typed MaskedPan or MaskedIban would accept an
+    already-masked value as an input identifier, which handoff §6.5
+    forbids. Return annotations may use these types; parameters may not."""
+    for tool in await server.list_tools():
+        hints = typing.get_type_hints(tool.fn, include_extras=True)
+        for param_name, hint in hints.items():
+            if param_name == "return":
+                continue
+            assert hint != MaskedPan, f"{tool.name}.{param_name} accepts MaskedPan"
+            assert hint != MaskedIban, f"{tool.name}.{param_name} accepts MaskedIban"
 ```
+
+This turns the output-only rule from Task 2 into something a passing test suite enforces, not something a reviewer has to remember to check.
 
 ```python
 # tests/test_asgi_app.py
@@ -2397,7 +2608,7 @@ app = create_app()
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_no_write_from_api.py tests/test_asgi_app.py -q`
-Expected: PASS, 7 passed
+Expected: PASS, 8 passed
 
 - [ ] **Step 5: Prove the import-linter contract actually bites**
 
