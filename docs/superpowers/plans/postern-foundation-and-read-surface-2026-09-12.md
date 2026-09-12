@@ -625,6 +625,12 @@ git commit -m "feat(domain): masked PAN and IBAN types enforced by validator"
 - Create: `packages/postern-core/src/postern_core/domain/models.py`
 - Test: `tests/test_domain_models.py`
 
+**Files added in the second security-review round (see the third addendum after Step
+10):** `packages/postern-core/src/postern_core/domain/base.py` (the `_Strict` base, moved
+out of `models.py` so `money.py` can derive `Money` from it too); `FreeText` added to the
+existing `packages/postern-core/src/postern_core/domain/masking.py`; tests added to
+`tests/test_masking_types.py`.
+
 Handoff §6.5: amounts are structured with explicit currency and an `as_of` timestamp, with the account identifier alongside every balance, because we control none of the rendering. Handoff §8.4: these models are the MCP-facing contract, deliberately distinct from whatever the backends return.
 
 - [ ] **Step 1: Write the failing test**
@@ -1022,11 +1028,109 @@ the pre-fix code, observed failing (`test_money_rejects_a_float_amount` and
 `test_consent_summary_rejects_a_naive_expiry` both failed with `DID NOT RAISE
 ValidationError`), then closed by the two fixes. This brings the file to 17 passed.
 
-Recorded rather than fixed: `Money` still enforces no scale or precision — a value with
-more decimal places than its currency allows (e.g. `Decimal("1.23456789")` for `"EUR"`)
-is accepted and serialized as given. Closing that needs an ISO 4217 minor-unit table
-(JPY is 0 decimal places, most currencies are 2, a few are 3), which is a data commitment
-beyond this task; see "What this plan deliberately does not establish" below.
+Recorded rather than fixed at the time: `Money` still enforced no scale or precision — a
+value with more decimal places than its currency allows (e.g. `Decimal("1.23456789")` for
+`"EUR"`) was accepted and serialized as given. Superseded by the third addendum below,
+which closes the float-artifact shape of this gap (more than 4 decimal places) without
+needing the ISO 4217 minor-unit table; true per-currency precision (rejecting 3 decimal
+places for `"EUR"` specifically, which only allows 2) still needs that table and is still
+not established — see "What this plan deliberately does not establish" below.
+
+**Third addendum (2026-09-12, coordinator security review — two Criticals, both
+reproduced):**
+
+*Critical 1 — `Money` derived from `BaseModel`, not `_Strict`, so none of the Step 8 fixes
+reached it.* Measured before this fix: `Money(amount=Decimal(str(0.1 + 0.2)),
+currency="EUR")` (the `Decimal(str(x))` idiom a façade might write to "safely" convert a
+number) produced `{"amount":"0.30000000000000004",...}`; `Money(...).model_copy(update=
+{"amount": 0.1 + 0.2})` produced a **bare JSON float**, `{"amount":0.30000000000000004,...}`;
+and embedding that bad `Money` in a `Balance` carried it through untouched, because
+`revalidate_instances` is read from the *nested field's own class* (`Money`), not the
+parent's — `Balance` setting `revalidate_instances="always"` on itself never mattered.
+
+Fix: `_Strict` moved out of `models.py` into a new module,
+`packages/postern-core/src/postern_core/domain/base.py`, so `money.py` can import it
+without a cycle (`models.py` already imports `money.py`). `Money` now derives from
+`_Strict`, not `BaseModel`. `models.py` imports `_Strict` from `.base` instead of defining
+it. `_Strict.model_copy` also gained two corrections while it was being read closely for
+this fix: the truthiness check `if update:` is now `if update is not None:` (a caller
+passing `update={}` must still take the re-validating path, not silently fall through to
+the raw `super().model_copy()` just because an empty dict is falsy), and the unvalidated
+copy is now produced via `super().model_copy(update=dict(update), deep=deep)` first — so
+`deep` is honoured exactly as pydantic's own `model_copy` honours it — before being
+re-validated via `model_validate(unvalidated.model_dump())`, rather than manually
+re-merging `self.model_dump()` with `update` (behaviourally equivalent for the existing
+tests, but no longer silently discarding `deep`).
+
+`money.py` gained `_reject_imprecise_decimal`, an `AfterValidator` that rejects a
+`Decimal` whose exponent implies more than 4 decimal places, run after pydantic's own
+`Decimal` coercion (`_reject_float`'s `BeforeValidator` runs before it, `Field(
+allow_inf_nan=False)` sits between the two). 4 decimal places is above every real ISO
+4217 minor unit and below every float artifact measured (`0.1 + 0.2`'s repr has 17;
+`Decimal(0.1)`'s exact binary value has 55), so it closes `Decimal(str(0.1 + 0.2))` and
+`Decimal(0.1)` without needing the currency table. `Field(allow_inf_nan=False)` pins the
+`NaN`/`Infinity` rejection explicitly; it was previously an unstated side effect of
+pydantic-core's own default for `Decimal`, not something this module's code or tests said.
+
+The reviewer's own regression test almost passes as written, with one correction found
+by running it: `bad = Money(amount=Decimal("1.00"), currency="EUR").model_copy(update=
+{"amount": 0.1 + 0.2})` now raises immediately, one line earlier than the test originally
+assumed, because `Money` inheriting `_Strict`'s `model_copy` closes the bypass at its
+source rather than only at the point of embedding it in `Balance`. Both statements are
+wrapped in the same `pytest.raises` in `tests/test_domain_models.py::
+test_bad_money_cannot_reach_a_parent_models_serialized_output` so the test passes
+regardless of which of the two now closes it.
+
+*Critical 2 — free-text fields were unguarded, and remittance text is exactly where IBANs
+live.* Measured, plain constructor, no bypass: `Transaction(..., description="SEPA CT
+ES9121000418450200051332 CARD 4111111111114417").model_dump_json()` contained both the
+raw IBAN and the raw PAN. Unstructured remittance information is where counterparty IBANs
+and card references appear in ISO 20022 traffic, and this lands in a vendor chat history
+unrecallable — the primary threat in `CLAUDE.md`.
+
+Fix: `FreeText` added to `packages/postern-core/src/postern_core/domain/masking.py`
+(a Task 2 file; this addition happened during Task 3's security review, not Task 2
+itself). Unlike `MaskedPan`/`MaskedIban`, which validate that a whole value *is* a PAN or
+IBAN, `FreeText` scans for PAN- and IBAN-*shaped substrings* inside a larger string and
+redacts them in place, reusing `_MASK` and `_mod97_ok` from the same module. The IBAN scan
+runs first, deliberately: an IBAN's digit run (e.g. 22 digits) would otherwise be
+partially chewed by the 12-19-digit PAN scan before the IBAN scan ever saw it. An
+IBAN-shaped substring that fails the mod-97 checksum is left unchanged (not a real IBAN,
+e.g. a merchant reference that happens to look like one); there is no equivalent checksum
+for a PAN-shaped digit run, so any 12-19-digit run is masked regardless of context —
+over-redaction by design, consistent with this module's existing preference for a false
+positive over a leak. No separator handling (no grouped `"4111 1111 1111 4417"` detection
+inside free text): `MaskedPan`/`MaskedIban` own that job for a value that IS a PAN/IBAN;
+this only has to stop a contiguous run reaching a client.
+
+Applied to `Transaction.description`, `Transaction.counterparty_name`, `Account.label`,
+`Card.label` and `SessionInfo.confirmation_note` in `models.py`. Task 9's `scrub_free_text`
+is dropped in favour of this — see the correction note at the top of Task 9 below.
+
+*Two small fixes, both in `identity.py`:* `CustomerRef.model_config` gained
+`hide_input_in_errors=True`. Measured before the fix: `CustomerRef(value=
+"ES9121000418450200051332")` leaked the raw value in `str()`, `repr()`, `errors()` *and*
+`.json()`; for every other `_Strict` model in this codebase, `str()`/`repr()` are already
+clean and only `errors()`/`.json()` need `include_input=False`, so the codebase-wide
+assumption "only `errors()` leaks" was false specifically for `CustomerRef`, and `str(exc)`
+is what `logger.exception` writes. And the module comment explaining `_OPAQUE` was
+corrected: it no longer calls the `cust:`/`cust_` prefix "the actual guarantee" (overstated);
+it is a provenance convention the token issuer is trusted to follow, not a proof of opacity.
+
+*Recorded, not fixed:* `CustomerRef`'s `^cust[:_][A-Za-z0-9]{1,60}$` still accepts
+`cust_ES9121000418450200051332` (an IBAN), `cust_12345678Z` (a Spanish DNI shape) and
+`cust_4111111111114417` (a PAN) as the suffix after the namespace prefix. Tightening the
+suffix to the issuer's actual minted-token shape needs the platform team to say what that
+shape is. Added as an open item next to ZT-2 below, worded as a requirement on the token
+issuer (the `sub` claim must not be a national id, account number or PAN), not as a defect
+in this code to fix unilaterally.
+
+Test count: `tests/test_domain_models.py` gained 9 tests (the `Money` NaN/Infinity/exponent-
+boundary/`Decimal(str(float))`/`Decimal(float)` cases, the `Transaction.description`
+integration test, and the reviewer's regression test) and `tests/test_masking_types.py`
+gained 3 (`FreeText` redacts an embedded IBAN and PAN, leaves ordinary merchant text
+unchanged, leaves an IBAN-shaped-but-invalid-checksum string unchanged). Full suite: 70
+passed.
 
 ---
 
@@ -2086,13 +2190,28 @@ git commit -m "feat(tools): accounts.list and accounts.get_balance over the stub
 ### Task 9: `transactions.list` with a bounded window and scrubbed free text
 
 **Files:**
-- Modify: `packages/postern-core/src/postern_core/domain/masking.py` (add `scrub_free_text`)
 - Create: `packages/postern-core/src/postern_core/facade/transactions.py`
 - Create: `services/api/tools/transactions.py`
 - Modify: `services/api/server.py`, `tests/test_masking_golden.py`
 - Test: `tests/test_tools_transactions.py`
 
-Two controls meet here. Handoff §6.5: "Bound result sets hard. Transactions default to 30 days, explicit widening required. One unbounded call persists five years of history permanently, somewhere we cannot reach." And: counterparty account numbers are omitted entirely, name only. The fixture's `description` embeds a full PAN and IBAN in free text, which no type protects, so free text is scrubbed.
+**Corrected against what execution actually found (2026-09-12, security review of Task 3,
+second round):** the plan originally had this task add a `scrub_free_text` function to
+`masking.py` and call it by hand in the façade projection
+(`description=scrub_free_text(row["description"])`). That is "a function someone
+remembers to call," which this module's own premise forbids (masking is a type property,
+not a function someone remembers to call). `FreeText` — added to `masking.py` in Task 3's
+second security-review round, not here — closes the same gap at the type level:
+`Transaction.description` and `Transaction.counterparty_name` are already `FreeText`, so
+the redaction happens on validation regardless of whether the façade author remembers to
+call anything. This task no longer modifies `masking.py`, adds no `scrub_free_text`, and
+the façade projection below passes `row["description"]` straight through. What survives
+from the original plan is the *test* that redaction actually happens end-to-end through
+this tool — see Step 1's `test_free_text_description_is_scrubbed`, updated to match
+`FreeText`'s masked form (`•••• last4` / `XX•• •••• last4`, the same shape as
+`MaskedPan`/`MaskedIban`) rather than the literal string `"[redacted]"`.
+
+Two controls meet here. Handoff §6.5: "Bound result sets hard. Transactions default to 30 days, explicit widening required. One unbounded call persists five years of history permanently, somewhere we cannot reach." And: counterparty account numbers are omitted entirely, name only. The fixture's `description` embeds a full PAN and IBAN in free text; `Transaction.description: FreeText` closes that at the model boundary rather than in this task's façade code.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2154,12 +2273,18 @@ async def test_counterparty_account_is_absent_from_the_result(server) -> None:
 
 
 async def test_free_text_description_is_scrubbed(server) -> None:
+    """`Transaction.description` is `FreeText` (Task 3, second security-review
+    round): the redaction happens on model validation inside `Transaction(...)`,
+    not because this façade remembers to call a scrub function. Asserts the
+    masked *form* (same shape as `MaskedPan`/`MaskedIban`), not the literal
+    string "[redacted]" the original plan expected from a since-dropped
+    `scrub_free_text`."""
     async with Client(transport=server) as client:
         result = await client.call_tool("transactions.list", {"account_ref": "acc_7f3a"})
     description = result.structured_content["result"][0]["description"]
     assert fx.FULL_PAN not in description
     assert fx.COUNTERPARTY_IBAN not in description
-    assert "[redacted]" in description
+    assert "•••• " in description
 
 
 async def test_direction_is_derived_from_the_sign(server) -> None:
@@ -2168,58 +2293,18 @@ async def test_direction_is_derived_from_the_sign(server) -> None:
     assert result.structured_content["result"][0]["direction"] == "debit"
 ```
 
-Also add to `tests/test_masking_types.py`:
-
-```python
-def test_scrub_free_text_redacts_pans_and_ibans() -> None:
-    from postern_core.domain.masking import scrub_free_text
-
-    text = "Card 4111111111114417 purchase, ref ES9121000418450200051332"
-    scrubbed = scrub_free_text(text)
-    assert "4111111111114417" not in scrubbed
-    assert "ES9121000418450200051332" not in scrubbed
-    assert scrubbed == "Card [redacted] purchase, ref [redacted]"
-
-
-def test_scrub_free_text_leaves_ordinary_text_alone() -> None:
-    from postern_core.domain.masking import scrub_free_text
-
-    assert scrub_free_text("Groceries at Acme Ltd") == "Groceries at Acme Ltd"
-```
-
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/test_tools_transactions.py tests/test_masking_types.py -q`
-Expected: FAIL, `ImportError: cannot import name 'scrub_free_text'`
+Run: `uv run pytest tests/test_tools_transactions.py -q`
+Expected: FAIL, `ModuleNotFoundError: No module named 'postern_core.facade.transactions'`
 
-- [ ] **Step 3: Add `scrub_free_text` to `masking.py`**
-
-```python
-import re
-
-_PAN_IN_TEXT = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
-_IBAN_IN_TEXT = re.compile(r"(?<![A-Z0-9])[A-Z]{2}\d{2}[A-Z0-9]{10,30}(?![A-Z0-9])")
-
-REDACTED = "[redacted]"
-
-
-def scrub_free_text(value: str) -> str:
-    """Redact card- and account-shaped substrings from backend free text.
-
-    Types protect structured fields. Free text is where a PAN actually leaks:
-    a merchant string or memo the backend never treated as an identifier.
-    """
-    return _IBAN_IN_TEXT.sub(REDACTED, _PAN_IN_TEXT.sub(REDACTED, value))
-```
-
-- [ ] **Step 4: Write the façade projection**
+- [ ] **Step 3: Write the façade projection**
 
 ```python
 # packages/postern-core/src/postern_core/facade/transactions.py
 from datetime import datetime
 from decimal import Decimal
 
-from postern_core.domain.masking import scrub_free_text
 from postern_core.domain.models import Ref, Transaction
 from postern_core.domain.money import Money
 from postern_core.facade.client import BackendClient
@@ -2250,13 +2335,19 @@ def _project(row: dict) -> Transaction:
         amount=Money(amount=abs(amount), currency=row["currency"]),
         direction="debit" if amount < 0 else "credit",
         counterparty_name=row["counterparty_name"],
-        description=scrub_free_text(row["description"]),
+        description=row["description"],
     )
 ```
 
+`description=row["description"]` is passed straight through, not
+`scrub_free_text(row["description"])`: `Transaction.description` is `FreeText`, so
+construction itself redacts any embedded PAN or IBAN. A façade author who forgets
+something here cannot reproduce the original leak, which is the point — the type carries
+the control, not this function's discipline.
+
 `counterparty_iban` is read from the backend row and never carried forward. The `Transaction` model has no field for it, so a future contributor who tries gets a validation error from `extra="forbid"`.
 
-- [ ] **Step 5: Write the tool**
+- [ ] **Step 4: Write the tool**
 
 ```python
 # services/api/tools/transactions.py
@@ -2291,7 +2382,7 @@ def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -
 
 The cap is enforced by the schema, so an out-of-range `days` is rejected before any backend call.
 
-- [ ] **Step 6: Register and add the golden case**
+- [ ] **Step 5: Register and add the golden case**
 
 In `server.py`, inside the `if backend is not None:` block: `transactions_tools.register(server, resolver, backend)` with the matching import. In `tests/test_masking_golden.py`, add to `CASES`:
 
@@ -2299,19 +2390,20 @@ In `server.py`, inside the `if backend is not None:` block: `transactions_tools.
     "transactions.list": {"account_ref": "acc_7f3a"},
 ```
 
-- [ ] **Step 7: Run the tests**
+- [ ] **Step 6: Run the tests**
 
-Run: `uv run pytest tests/test_tools_transactions.py tests/test_masking_types.py tests/test_masking_golden.py -q`
-Expected: PASS. The 6 tests in tests/test_tools_transactions.py pass, the 2 new tests in tests/test_masking_types.py pass, and the previously green tests/test_masking_golden.py stays green.
+Run: `uv run pytest tests/test_tools_transactions.py tests/test_masking_golden.py -q`
+Expected: PASS. The 6 tests in `tests/test_tools_transactions.py` pass (including
+`test_free_text_description_is_scrubbed`, proving `FreeText` redacts through this tool
+end-to-end), and the previously green `tests/test_masking_golden.py` stays green.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add packages/postern-core/src/postern_core/domain/masking.py \
-        packages/postern-core/src/postern_core/facade/transactions.py \
+git add packages/postern-core/src/postern_core/facade/transactions.py \
         services/api/tools/transactions.py services/api/server.py \
-        tests/test_tools_transactions.py tests/test_masking_types.py tests/test_masking_golden.py
-git commit -m "feat(tools): transactions.list with bounded window and scrubbed free text"
+        tests/test_tools_transactions.py tests/test_masking_golden.py
+git commit -m "feat(tools): transactions.list with a bounded window"
 ```
 
 ---
@@ -2987,9 +3079,10 @@ Do not let any of these read as done because the tests are green.
 | Consent | `banking_start_session` reports hardcoded consent; the tool catalog is not yet filtered by it, so §3.4's leak scenario is not yet testable | Plan 2 |
 | Audit chain | No `audit_log`. The evidence a regulator asks for (handoff §9) does not exist | Plan 2 |
 | Cross-customer enforcement (ZT-2) | The stub backend never checks the subject. **This is the critical path and it is answered by another team, not by this repo** | out of repo |
+| Token issuer must never mint a `sub` shaped like a national id, account number or PAN (alongside ZT-2) | `CustomerRef`'s `^cust[:_][A-Za-z0-9]{1,60}$` still accepts `cust_ES9121000418450200051332` (an IBAN), `cust_12345678Z` (a Spanish DNI shape) and `cust_4111111111114417` (a PAN) as the suffix. This code can only check the namespace prefix; it cannot prove what the issuer mints. Tightening the suffix to the issuer's real minted-token shape is a question for the platform team, worded here as a requirement on them, not a defect in this code | out of repo |
 | PCI DSS scope | `MaskedPan` masks in this process, so the server does hold a full PAN briefly. Open question §10.17 asks the domain teams for pre-masked projections | out of repo |
 | Base64 sentinel header decoding | Documented deviation from the spec in `docs/decisions/0002` | Plan 4 |
-| `Money` scale/precision enforcement | `Money` rejects a `float` amount (Task 3) but enforces no per-currency decimal-place limit; `Decimal("1.23456789")` for `"EUR"` is accepted and serialized as given. Closing this needs an ISO 4217 minor-unit table (JPY is 0 decimal places, most currencies are 2, a few are 3), a data commitment beyond Task 3 | unscheduled |
+| `Money` per-currency scale/precision enforcement | `Money` rejects more than 4 decimal places (Task 3, second security-review round), which closes every float-artifact shape measured, but not true per-currency precision: `Decimal("1.234")` (3 decimal places) for `"EUR"` (which allows only 2) is still accepted and serialized as given. Closing that needs an ISO 4217 minor-unit table (JPY is 0 decimal places, most currencies are 2, a few are 3), a data commitment beyond Task 3 | unscheduled |
 
 ## Self-review
 
