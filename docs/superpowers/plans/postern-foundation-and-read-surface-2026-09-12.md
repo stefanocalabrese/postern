@@ -1933,7 +1933,7 @@ CASES: dict[str, dict] = {
 - [ ] **Step 7: Run the tests**
 
 Run: `uv run pytest tests/test_tools_accounts.py tests/test_masking_golden.py -q`
-Expected: PASS, 8 passed
+Expected: PASS. The 5 tests in tests/test_tools_accounts.py pass, and the previously green tests/test_masking_golden.py stays green.
 
 - [ ] **Step 8: Commit**
 
@@ -2164,7 +2164,7 @@ In `server.py`, inside the `if backend is not None:` block: `transactions_tools.
 - [ ] **Step 7: Run the tests**
 
 Run: `uv run pytest tests/test_tools_transactions.py tests/test_masking_types.py tests/test_masking_golden.py -q`
-Expected: PASS, 17 passed
+Expected: PASS. The 6 tests in tests/test_tools_transactions.py pass, the 2 new tests in tests/test_masking_types.py pass, and the previously green tests/test_masking_golden.py stays green.
 
 - [ ] **Step 8: Commit**
 
@@ -2295,7 +2295,7 @@ def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -
 - [ ] **Step 6: Run the tests**
 
 Run: `uv run pytest tests/test_tools_cards.py tests/test_masking_golden.py -q`
-Expected: PASS, 6 passed
+Expected: PASS. The 3 tests in tests/test_tools_cards.py pass, and the previously green tests/test_masking_golden.py stays green.
 
 - [ ] **Step 7: Commit**
 
@@ -2442,7 +2442,7 @@ def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -
 - [ ] **Step 5: Run the tests**
 
 Run: `uv run pytest tests/test_bootstrap.py tests/test_masking_golden.py -q`
-Expected: PASS, 8 passed
+Expected: PASS. The 5 tests in tests/test_bootstrap.py pass, and the previously green tests/test_masking_golden.py stays green.
 
 - [ ] **Step 6: Commit**
 
@@ -2608,7 +2608,7 @@ app = create_app()
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_no_write_from_api.py tests/test_asgi_app.py -q`
-Expected: PASS, 8 passed
+Expected: PASS. The 5 tests in tests/test_no_write_from_api.py and the 3 tests in tests/test_asgi_app.py pass.
 
 - [ ] **Step 5: Prove the import-linter contract actually bites**
 
