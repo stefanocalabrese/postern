@@ -1716,6 +1716,55 @@ git add services/api/asgi/header_validation.py tests/test_header_body_mismatch.p
 git commit -m "feat(api): reject Mcp-Method/Mcp-Name body mismatch with 400 and -32020"
 ```
 
+**Addendum (2026-09-12, adversarial pass before commit):** the above steps'
+code, as written, passed all 10 of its own tests but had two real bugs and one
+unaddressed operational gap, found by attacking the implementation rather
+than by extending its tests. Full detail, including the findings recorded but
+deliberately not fixed, is in `docs/decisions/0002-header-validation.md`;
+summary of what changed in the code actually committed:
+
+- **Duplicate `Mcp-Method`/`Mcp-Name` headers.** `scope["headers"]` is a list;
+  `_headers` above builds a `dict`, which keeps the last of a repeated
+  header. Reproduced: `Mcp-Method: tools/list` followed by
+  `Mcp-Method: tools/call`, body method `"tools/call"`, passed as a match
+  (`assert 200 == 400` failed) because the surviving value happened to agree
+  with the body — the exact case where an upstream load balancer routing on
+  the *first* occurrence would have executed a different method than this
+  middleware validated. Fixed: `_headers` now returns
+  `dict[str, list[str]]`, keeping every occurrence per lower-cased name; a
+  new `_single` helper returns `(value, is_duplicate)`, and either header
+  being duplicated is rejected outright with `-32020`, independent of
+  whether any individual value would have matched.
+- **A header value with an invalid UTF-8 byte crashed the middleware.**
+  `_headers` decoded with the UTF-8 default; `scope["headers"]` values carry
+  no encoding guarantee (Starlette's own `Headers` datastructure decodes as
+  latin-1 for this reason). `b"\xff\xfe".decode()` raises
+  `UnicodeDecodeError`; the same bytes decode cleanly under latin-1. Fixed:
+  both header names and values now decode as latin-1.
+- **Unbounded buffering.** Nothing upstream (uvicorn, Starlette, FastMCP)
+  bounds request body size, and the drain buffers the whole body before any
+  check runs — a real denial-of-service surface, not fixed with a guessed
+  number since this project has no basis for choosing one on a deployment's
+  behalf. Added `max_body_bytes: int | None = None` to
+  `HeaderBodyValidation.__init__`; `_drain` now takes the same parameter and
+  raises `_BodyTooLarge` as soon as the running total crosses it, without
+  finishing the buffer first; `__call__` responds `413` in that case. Default
+  is unbounded, unchanged from the code above; a deployment that needs the
+  cap must set it explicitly.
+- **Ten findings were reported without changing the code**, including a
+  parallel duplicate-key ambiguity inside the JSON body itself (Python's
+  `json.loads` keeps the last of a repeated top-level key; RFC 8259 §4 calls
+  the behaviour unpredictable across implementations) and the header/body
+  case-sensitivity, whitespace, and leak-surface checks. All are detailed in
+  `docs/decisions/0002-header-validation.md`.
+
+`tests/test_header_body_mismatch.py` grew from the 10 tests above to 30: the
+20 added tests cover every finding, including a real end-to-end request
+through `build_server` + `mcp.http_app(middleware=[Middleware(
+HeaderBodyValidation, ...)])` driven with `httpx2.ASGITransport` (`httpx` is
+not installed in this project — `docs/decisions/0001-facade-http-client.md`).
+`uv run pytest tests/test_header_body_mismatch.py -q` → `30 passed`.
+
 ---
 
 ### Task 6: Backend façade client
