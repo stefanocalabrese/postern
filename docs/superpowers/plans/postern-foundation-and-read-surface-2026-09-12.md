@@ -677,7 +677,8 @@ def test_account_masks_its_iban() -> None:
 
 
 def test_card_masks_its_pan() -> None:
-    assert Card(ref="crd_1", label="Debit", pan="4111111111114417").pan == "•••• 4417"
+    card = Card(ref="crd_1", label="Debit", pan="4111111111114417", status="active")
+    assert card.pan == "•••• 4417"
 
 
 def test_transaction_has_no_counterparty_account_field() -> None:
@@ -686,8 +687,21 @@ def test_transaction_has_no_counterparty_account_field() -> None:
 
 
 def test_models_reject_unknown_fields() -> None:
+    # `pan` is not a field on Account. Constructed via model_validate on a plain
+    # dict, not Account(pan=...) directly: the latter is a field name mypy
+    # --strict statically rejects (pydantic v2's BaseModel is a PEP 681
+    # dataclass_transform, so a keyword mypy cannot see on the model is a
+    # call-arg error, not just a runtime one), and the point of this test is
+    # the runtime extra="forbid" behaviour, not a static-typing violation.
     with pytest.raises(ValidationError):
-        Account(ref="acc_1", label="X", iban="ES9121000418450200051332", pan="4111111111114417")
+        Account.model_validate(
+            {
+                "ref": "acc_1",
+                "label": "X",
+                "iban": "ES9121000418450200051332",
+                "pan": "4111111111114417",
+            }
+        )
 
 
 def test_customer_ref_is_opaque() -> None:
@@ -699,6 +713,23 @@ def test_customer_ref_is_opaque() -> None:
 
 Run: `uv run pytest tests/test_domain_models.py -q`
 Expected: FAIL, `ModuleNotFoundError: No module named 'postern_core.domain.money'`
+
+**Corrected against what execution actually found (2026-09-12):** the plan originally
+had `test_card_masks_its_pan` call `Card(ref="crd_1", label="Debit", pan="4111111111114417")`
+with no `status`. Once `models.py` (Step 5) exists, that call fails with `status: Field
+required` rather than exercising masking, and the test file never reaches the "11 passed"
+state Step 9 claims. See the correction note above `test_card_masks_its_pan`.
+
+**Second correction (2026-09-12):** the plan originally had `test_models_reject_unknown_fields`
+call `Account(ref="acc_1", label="X", iban="ES9121000418450200051332", pan="4111111111114417")`
+directly. `mypy --strict` fails this line with `Unexpected keyword argument "pan" for
+"Account"  [call-arg]`: pydantic v2's `BaseModel` is a PEP 681 `dataclass_transform`, so
+mypy statically checks constructor keywords against declared fields even with no
+`pydantic.mypy` plugin configured (this repo configures none). The test's own point is
+the *runtime* `extra="forbid"` behaviour, which `Account.model_validate({...})` on a
+plain dict exercises identically (confirmed: both raise `ValidationError` with
+`type == "extra_forbidden"`) without a keyword mypy can see statically. See the
+correction note above `test_models_reject_unknown_fields`.
 
 - [ ] **Step 3: Write `money.py`**
 
@@ -735,7 +766,16 @@ from typing import Annotated, Protocol
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
-_OPAQUE = r"^[A-Za-z0-9_:-]{4,64}$"
+# `cust` is the only namespace this codebase mints (handoff §7.2's example
+# claim is `"sub": "cust:7f3a..."`; test fixtures across this repo use the
+# underscore form `cust_7f3a`, so both separators are accepted). Anchoring on
+# a literal namespace prefix is what actually rejects an IBAN, PAN, bare
+# account number or national id: all of those are also short alphanumeric
+# strings, so a bare `[A-Za-z0-9_:-]{4,64}` character-class guard accepts an
+# IBAN outright (24 alphanumeric characters sits inside 4..64) and proves
+# nothing about opacity. The namespace prefix is the actual guarantee; the
+# token issuer is the one place trusted to hand out `cust:`/`cust_` values.
+_OPAQUE = r"^cust[:_][A-Za-z0-9]{1,60}$"
 
 
 class CustomerRef(BaseModel):
@@ -756,7 +796,7 @@ class CustomerResolver(Protocol):
     def __call__(self) -> CustomerRef: ...
 ```
 
-The `_OPAQUE` pattern rejects an IBAN because IBANs exceed the character class only by length; note it accepts alphanumerics, so treat it as a shape guard, not proof of opacity. The real guarantee is that the value comes from the token's `sub`, which handoff §7.2 requires to be an opaque customer reference.
+**Corrected against what execution actually found (2026-09-12):** the plan originally specified `_OPAQUE = r"^[A-Za-z0-9_:-]{4,64}$"` with the justifying prose "IBANs exceed the character class only by length." That prose is wrong: an IBAN is entirely alphanumeric and typically 15-34 characters, so it sits *inside* that class, not outside it — `CustomerRef(value="ES9121000418450200051332")` (24 alphanumeric characters) validates successfully against it, and `test_customer_ref_is_opaque` does not fail as claimed below. A character-class guard alone cannot distinguish an opaque token from an IBAN, a PAN, a bare account number or an email address, because all of those are also short strings drawn from a similar alphabet. The fix anchors on the literal `cust:`/`cust_` namespace prefix from handoff §7.2's example claim (`"sub": "cust:7f3a..."`) and this repo's own fixtures (`cust_7f3a`), which is what actually makes the value's provenance — "minted only by the token issuer" — a checkable property rather than an assertion.
 
 - [ ] **Step 5: Write `models.py`**
 
@@ -910,6 +950,19 @@ git add packages/postern-core/src/postern_core/domain/money.py \
         tests/test_domain_models.py
 git commit -m "feat(domain): MCP-facing models, Money, and opaque customer identity"
 ```
+
+**Addendum from the Task 3 adversarial pass (2026-09-12), beyond the 10 steps above:**
+`_Strict.model_copy`'s re-validation (Step 8) closes the bypass for a nested *dict*
+update, but Pydantic's default `revalidate_instances="never"` means a field typed
+`list[Account]` accepts an already-`Account`-typed instance as-is, skipping its
+validators — including one built via the forbidden `Account.model_construct()`. This
+is reachable through a plain `SessionInfo(accounts=[bad_account], ...)` call, with no
+`model_copy` involved at all. `_Strict.model_config` adds `revalidate_instances="always"`
+to close it; `tests/test_domain_models.py::test_nested_model_construct_bypass_is_remasked_on_parent_construction`
+is the regression test (written first, observed failing with the raw IBAN surviving into
+`session.model_dump_json()`, then closed by the config change). This brings the file to
+12 passed, not 11 — the extra test is the adversarial-pass addition, not one of the 10
+steps' original 11.
 
 ---
 
