@@ -1,6 +1,18 @@
 import pytest
-from postern_core.domain.masking import _IBAN_MASKED_RE, _PAN_MASKED_RE, MaskedIban, MaskedPan
+from postern_core.domain.masking import (
+    _IBAN_MASKED_RE,
+    _PAN_MASKED_RE,
+    FreeText,
+    MaskedIban,
+    MaskedPan,
+)
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+class Memo(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    text: FreeText
 
 
 class Card(BaseModel):
@@ -233,3 +245,31 @@ def test_iban_hostile_inputs_never_leak(value: str) -> None:
         assert value not in exc.json(include_input=False)
         return
     assert _IBAN_MASKED_RE.fullmatch(out)
+
+
+def test_free_text_redacts_an_embedded_iban_and_pan() -> None:
+    """Unstructured remittance information is exactly where a counterparty
+    IBAN or a card reference appears in ISO 20022 traffic (security review,
+    Task 3, second round)."""
+    memo = Memo(text="SEPA CT ES9121000418450200051332 CARD 4111111111114417")
+    assert memo.text == "SEPA CT ES•• •••• 1332 CARD •••• 4417"
+    assert "ES9121000418450200051332" not in memo.text
+    assert "4111111111114417" not in memo.text
+
+
+def test_free_text_leaves_ordinary_merchant_text_unchanged() -> None:
+    memo = Memo(text="Coffee at Blue Bottle, Barcelona")
+    assert memo.text == "Coffee at Blue Bottle, Barcelona"
+
+
+def test_free_text_leaves_an_iban_shaped_but_invalid_checksum_string_unchanged() -> None:
+    """IBAN-shaped (two letters, two digits, alnum) but failing the mod-97
+    checksum: not a real IBAN, so a merchant reference that happens to look
+    like one is not corrupted on a false positive. Its digits are broken up
+    by letters ("XY99ABCD123456"), so the separate PAN scan does not catch
+    it either -- a pure 12+ digit run embedded in an IBAN-shaped-but-invalid
+    string (no letters breaking it up) would still get masked as PAN-shaped
+    on its own merits, which is over-redaction by design, not a bug; this
+    test is about the string genuinely surviving both passes untouched."""
+    memo = Memo(text="Reference XY99ABCD123456 for invoice")
+    assert memo.text == "Reference XY99ABCD123456 for invoice"

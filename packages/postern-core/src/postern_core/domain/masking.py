@@ -71,3 +71,46 @@ MaskedPan = Annotated[str, AfterValidator(_mask_pan)]
 
 MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 """Own IBAN, country code plus last four. Counterparty IBANs are omitted entirely."""
+
+# Substring scan, not the fullmatch `_PAN_RE`/`_IBAN_RE` above: free text is a
+# sentence with a PAN or IBAN embedded in it (unstructured remittance
+# information is exactly where a counterparty IBAN or a card reference
+# appears in ISO 20022 traffic), not a value that is entirely a PAN or IBAN.
+# No separator handling here (no grouped "4111 1111 1111 4417" detection):
+# `MaskedPan`/`MaskedIban` own that job for a value that IS a PAN/IBAN; this
+# only has to stop a contiguous run reaching a client, which is what a
+# memo/description field actually carries in practice.
+_PAN_IN_TEXT_RE = re.compile(r"\d{12,19}")
+_IBAN_IN_TEXT_RE = re.compile(r"\b[A-Za-z]{2}[0-9]{2}[A-Za-z0-9]{10,30}\b")
+
+
+def _redact_iban_match(match: re.Match[str]) -> str:
+    candidate = match.group(0)
+    compact = candidate.upper()
+    if _mod97_ok(compact):
+        return f"{compact[:2]}•• {_MASK} {compact[-4:]}"
+    # IBAN-shaped but fails the checksum: not a real IBAN (e.g. a merchant
+    # reference that happens to look like one). Leave it as written rather
+    # than mangling ordinary text on a false positive.
+    return candidate
+
+
+def _redact_pan_match(match: re.Match[str]) -> str:
+    candidate = match.group(0)
+    return f"{_MASK} {candidate[-4:]}"
+
+
+def _redact_free_text(value: str) -> str:
+    # IBAN pass first: an IBAN's digits (e.g. "9121000418450200051332", 22
+    # digits) would otherwise be greedily chewed by the 12-19-digit PAN scan
+    # first, masking part of the IBAN's numeric run without leaving anything
+    # for `_redact_iban_match` to recognize as IBAN-shaped afterwards.
+    text = _IBAN_IN_TEXT_RE.sub(_redact_iban_match, value)
+    return _PAN_IN_TEXT_RE.sub(_redact_pan_match, text)
+
+
+FreeText = Annotated[str, AfterValidator(_redact_free_text)]
+"""Free text (transaction memos, payee names, labels): redacts any IBAN- or
+PAN-shaped substring on validation, rather than requiring every caller to
+remember to scrub it (handoff §3.4's leak scenario, security review of
+Task 3). Ordinary text passes through unchanged."""

@@ -57,6 +57,50 @@ def test_money_accepts_an_int_amount() -> None:
     assert m.amount == Decimal("340")
 
 
+def test_money_rejects_decimal_str_of_float_repr() -> None:
+    """`Decimal(str(0.1 + 0.2))` is the idiom a façade might write to
+    "safely" convert a number: the value is already a Decimal by the time
+    Money sees it, so _reject_float's isinstance check never fires. Its
+    exponent (-17, from the 17-digit float repr) is what catches it
+    (security review, Task 3, second round)."""
+    with pytest.raises(ValidationError):
+        Money(amount=Decimal(str(0.1 + 0.2)), currency="EUR")
+
+
+def test_money_rejects_decimal_constructed_directly_from_a_float() -> None:
+    """`Decimal(0.1)` (no str() in between) carries the exact binary value of
+    the float, not its short decimal repr: 55 digits after the point."""
+    with pytest.raises(ValidationError):
+        Money(amount=Decimal(0.1), currency="EUR")
+
+
+def test_money_accepts_decimal_with_up_to_four_decimal_places() -> None:
+    """4 decimal places is above every real ISO 4217 minor unit (JPY is 0,
+    most currencies are 2, a few are 3), so this is the accepted boundary,
+    not just the rejected one."""
+    m = Money(amount=Decimal("1.2345"), currency="EUR")
+    assert m.amount == Decimal("1.2345")
+
+
+def test_money_rejects_decimal_with_more_than_four_decimal_places() -> None:
+    with pytest.raises(ValidationError):
+        Money(amount=Decimal("1.23456"), currency="EUR")
+
+
+def test_money_rejects_nan_amount() -> None:
+    """Pinned explicitly with Field(allow_inf_nan=False): pydantic-core
+    happens to default to rejecting NaN/Infinity for Decimal, but nothing in
+    this module said so before, and nothing tested it (security review,
+    Task 3, second round)."""
+    with pytest.raises(ValidationError):
+        Money(amount=Decimal("NaN"), currency="EUR")
+
+
+def test_money_rejects_infinite_amount() -> None:
+    with pytest.raises(ValidationError):
+        Money(amount=Decimal("Infinity"), currency="EUR")
+
+
 def test_balance_carries_account_ref_and_as_of() -> None:
     b = Balance(
         account_ref="acc_7f3a",
@@ -89,6 +133,25 @@ def test_card_masks_its_pan() -> None:
 def test_transaction_has_no_counterparty_account_field() -> None:
     assert "counterparty_iban" not in Transaction.model_fields
     assert "counterparty_account" not in Transaction.model_fields
+
+
+def test_transaction_description_redacts_an_embedded_iban_and_pan() -> None:
+    """Unstructured remittance information is exactly where a counterparty
+    IBAN or a card reference appears in ISO 20022 traffic (security review,
+    Task 3, second round): measured, plain constructor, no bypass."""
+    t = Transaction(
+        ref="txn_1",
+        account_ref="acc_1",
+        booked_at=datetime(2026, 9, 12, tzinfo=UTC),
+        amount=Money(amount=Decimal("10.00"), currency="EUR"),
+        direction="debit",
+        counterparty_name="Merchant",
+        description="SEPA CT ES9121000418450200051332 CARD 4111111111114417",
+    )
+    dumped = t.model_dump_json()
+    assert "ES9121000418450200051332" not in dumped
+    assert "4111111111114417" not in dumped
+    assert t.description == "SEPA CT ES•• •••• 1332 CARD •••• 4417"
 
 
 def test_models_reject_unknown_fields() -> None:
@@ -169,3 +232,25 @@ def test_nested_model_construct_bypass_is_remasked_on_parent_construction() -> N
     )
     assert session.accounts[0].iban == "ES•• •••• 1332"
     assert "9121000418450200051332" not in session.model_dump_json()
+
+
+def test_bad_money_cannot_reach_a_parent_models_serialized_output() -> None:
+    """Money derived from plain BaseModel (pre-fix): `model_copy(update=...)`
+    stored the raw float unvalidated, and Balance's own
+    revalidate_instances="always" never caught it embedding a nested Money,
+    because that setting is read from the *nested field's own class*
+    (Money), not the parent's -- so a bad Money reached
+    Balance.model_dump_json() as a bare JSON float untouched (security
+    review, Task 3, second round).
+
+    Measured after the fix: Money now derives from _Strict too, so
+    `model_copy(update={"amount": 0.1 + 0.2})` on the Money instance itself
+    already raises -- one line earlier than this test originally assumed,
+    because the fix closes the bypass at its source rather than only at the
+    point of embedding. Both statements are wrapped in the same
+    pytest.raises so this test passes regardless of which of the two closes
+    it, while still proving a bad amount can never reach a Balance's
+    serialized output by this route."""
+    with pytest.raises(ValidationError):
+        bad = Money(amount=Decimal("1.00"), currency="EUR").model_copy(update={"amount": 0.1 + 0.2})
+        Balance(account_ref="acc_1", amount=bad, as_of=datetime(2026, 9, 12, tzinfo=UTC))

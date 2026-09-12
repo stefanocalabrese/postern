@@ -5,36 +5,20 @@ while backends refactor. Counterparty account identifiers are absent by design
 (§6.5): name only, never an account number.
 """
 
-from collections.abc import Mapping
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, StringConstraints
+from pydantic import AwareDatetime, StringConstraints
 
-from postern_core.domain.masking import MaskedIban, MaskedPan
+from postern_core.domain.base import _Strict
+from postern_core.domain.masking import FreeText, MaskedIban, MaskedPan
 from postern_core.domain.money import Money
 
 Ref = Annotated[str, StringConstraints(pattern=r"^[a-z]{3}_[A-Za-z0-9]{1,32}$")]
 
 
-class _Strict(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        validate_assignment=True,
-        hide_input_in_errors=True,
-        revalidate_instances="always",
-    )
-
-    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
-        """Re-validate on update, so masking cannot be bypassed (see Task 2 review)."""
-        if update:
-            return type(self).model_validate({**self.model_dump(), **update})
-        return super().model_copy(deep=deep)
-
-
 class Account(_Strict):
     ref: Ref
-    label: str
+    label: FreeText
     iban: MaskedIban
 
 
@@ -50,13 +34,13 @@ class Transaction(_Strict):
     booked_at: AwareDatetime
     amount: Money
     direction: Literal["debit", "credit"]
-    counterparty_name: str
-    description: str
+    counterparty_name: FreeText
+    description: FreeText
 
 
 class Card(_Strict):
     ref: Ref
-    label: str
+    label: FreeText
     pan: MaskedPan
     status: Literal["active", "frozen", "cancelled"]
 
@@ -73,4 +57,4 @@ class SessionInfo(_Strict):
     accounts: list[Account]
     consents: list[ConsentSummary]
     write_enabled: list[str]
-    confirmation_note: str
+    confirmation_note: FreeText
