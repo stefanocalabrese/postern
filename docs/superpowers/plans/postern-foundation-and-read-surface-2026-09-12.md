@@ -2133,17 +2133,30 @@ this test, which is the point: the check must not be something you can forget.
 
 import json
 import re
+from typing import Any
 
 import httpx2
 import pytest
+from fastmcp import FastMCP
 from fastmcp.client import Client
-
+from fastmcp.client.client import CallToolResult  # not re-exported by fastmcp.client.__init__
+from fastmcp.exceptions import ToolError
 from postern_core.facade.client import BackendClient, StubTokenMinter
+
 from services.api.server import build_server
 from services.api.settings import Settings
 from tests.conftest import TEST_CUSTOMER
 from tests.fixtures import backend_responses as fx
 
+# Deliberately not `postern_core.domain.masking._PAN_RE` / `_IBAN_RE`. Those
+# are private, fullmatch-oriented patterns for validating a single
+# already-separator-stripped field; they have no tolerance for a
+# space/hyphen-grouped run still embedded in a larger serialized blob, so
+# reusing them here would make this harness WEAKER at exactly the free-text
+# case (a card number typed with spaces into a memo) the module's own
+# `_redact_free_text` docstring names as the realistic leak shape. A golden
+# test's job is to search loosely and over-flag; masking.py's job is to
+# fullmatch narrowly and validate. Same underlying facts, different purpose.
 PAN_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
 IBAN_RE = re.compile(r"(?<![A-Z0-9])[A-Z]{2}\d{2}[A-Z0-9]{10,30}(?![A-Z0-9])")
 
@@ -2154,7 +2167,7 @@ ROUTES = {
     "/cards": fx.CARDS,
 }
 
-CASES: dict[str, dict] = {}
+CASES: dict[str, dict[str, Any]] = {}
 """tool name -> arguments. Extended by Tasks 8, 9, 10 and 11."""
 
 
@@ -2166,27 +2179,60 @@ def _handler(request: httpx2.Request) -> httpx2.Response:
 
 
 @pytest.fixture
-def server():
+def server() -> FastMCP:
     backend = BackendClient(
         "https://backend.test", StubTokenMinter(), transport=httpx2.MockTransport(_handler)
     )
     return build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 
 
-async def test_every_registered_tool_has_a_masking_case(server) -> None:
+def _render_result(result: CallToolResult) -> str:
+    """Everything a client could actually receive from this call, not just
+    the structured half. `structured_content`/`data` are both `None` on an
+    error result (fastmcp 4.0.3's `_on_call_tool` puts `str(exc)` straight
+    into a `TextContent` block on the error path and sets neither of the
+    other two), so a scan of `structured_content or data` alone is blind to
+    a leak that reaches the client only through an error message. `content`
+    blocks are Pydantic models (`mcp_types.ContentBlock`), dumped through
+    `model_dump(mode="json")` so they serialize the same way
+    `structured_content` already does.
+    """
+    payload = {
+        "content": [block.model_dump(mode="json") for block in result.content],
+        "structured_content": result.structured_content,
+        "data": result.data,
+    }
+    return json.dumps(payload, default=str)
+
+
+async def _assert_every_registered_tool_has_a_case(
+    server: FastMCP, cases: dict[str, dict[str, Any]]
+) -> None:
     async with Client(transport=server) as client:
         registered = {tool.name for tool in await client.list_tools()}
-    missing = registered - CASES.keys()
+    missing = registered - cases.keys()
     assert not missing, f"tools with no golden masking case: {sorted(missing)}"
 
 
-async def test_no_tool_output_contains_a_pan_or_iban(server) -> None:
+async def _assert_no_tool_output_leaks_a_pan_or_iban(
+    server: FastMCP, cases: dict[str, dict[str, Any]]
+) -> None:
     async with Client(transport=server) as client:
-        for name, arguments in CASES.items():
-            result = await client.call_tool(name, arguments)
-            rendered = json.dumps(result.structured_content or result.data, default=str)
+        for name, arguments in cases.items():
+            # raise_on_error=False: an erroring tool must be a case this scan
+            # inspects, not a ToolError this loop lets escape uncaught.
+            result = await client.call_tool(name, arguments, raise_on_error=False)
+            rendered = _render_result(result)
             assert not PAN_RE.search(rendered), f"{name} leaked a PAN: {rendered[:400]}"
             assert not IBAN_RE.search(rendered), f"{name} leaked an IBAN: {rendered[:400]}"
+
+
+async def test_every_registered_tool_has_a_masking_case(server: FastMCP) -> None:
+    await _assert_every_registered_tool_has_a_case(server, CASES)
+
+
+async def test_no_tool_output_contains_a_pan_or_iban(server: FastMCP) -> None:
+    await _assert_no_tool_output_leaks_a_pan_or_iban(server, CASES)
 
 
 def test_the_regexes_actually_catch_the_fixtures() -> None:
@@ -2196,14 +2242,73 @@ def test_the_regexes_actually_catch_the_fixtures() -> None:
     assert IBAN_RE.search(fx.COUNTERPARTY_IBAN)
     assert not PAN_RE.search("•••• 4417")
     assert not IBAN_RE.search("ES•• •••• 1332")
+    # Grouped forms are just as much a leak as the bare one.
+    assert PAN_RE.search("4111 1111 1111 4417")
+    assert PAN_RE.search("4111-1111-1111-4417")
+
+
+# --- Self-check: proof the harness above is a control, not a decoration. ---
+# Each test below builds a deliberately leaky server in-process and asserts
+# the SAME helpers the production tests call (`_assert_every_registered_
+# tool_has_a_case`, `_assert_no_tool_output_leaks_a_pan_or_iban`) raise
+# against it, so a future change that defangs the real check makes these
+# report "DID NOT RAISE" instead of the whole file staying quietly green.
+
+
+def _leaky_accounts_server() -> FastMCP:
+    leaky = FastMCP(name="leaky-proof-raw-dict")
+
+    @leaky.tool
+    def leaky_accounts() -> dict[str, Any]:
+        return fx.ACCOUNTS  # raw backend dict: full IBANs, no domain model at all
+
+    return leaky
+
+
+def _leaky_error_server() -> FastMCP:
+    leaky = FastMCP(name="leaky-proof-error-message")
+
+    @leaky.tool
+    def leaky_error() -> dict[str, Any]:
+        raise ToolError(f"backend said: account not found for {fx.FULL_IBAN}")
+
+    return leaky
+
+
+async def test_self_check_harness_catches_a_raw_passthrough_leak() -> None:
+    leaky = _leaky_accounts_server()
+    with pytest.raises(AssertionError, match="leaked an IBAN"):
+        await _assert_no_tool_output_leaks_a_pan_or_iban(leaky, {"leaky_accounts": {}})
+
+
+async def test_self_check_harness_catches_an_unregistered_tool() -> None:
+    leaky = _leaky_accounts_server()
+    with pytest.raises(AssertionError, match="no golden masking case"):
+        await _assert_every_registered_tool_has_a_case(leaky, cases={})
+
+
+async def test_self_check_harness_catches_a_leak_in_an_error_message() -> None:
+    leaky = _leaky_error_server()
+    with pytest.raises(AssertionError, match="leaked an IBAN"):
+        await _assert_no_tool_output_leaks_a_pan_or_iban(leaky, {"leaky_error": {}})
 ```
 
 `test_the_regexes_actually_catch_the_fixtures` is not ceremony: a golden test whose pattern never matches passes forever while leaking everything.
 
+**Corrected against what execution actually found (2026-09-13):** the plan's original harness code differs from the above in five ways, all found while proving by experiment that a golden test which has never failed is not distinguishable from one that cannot fail (see the addendum after Step 4):
+
+1. **The coverage and leak assertions are extracted into `_assert_every_registered_tool_has_a_case` / `_assert_no_tool_output_leaks_a_pan_or_iban`**, called by both the production tests and the `test_self_check_*` tests below, so the self-checks exercise the exact code path that guards CI rather than a hand-rolled copy that could drift from it.
+2. **`_render_result` replaces the plan's `json.dumps(result.structured_content or result.data, default=str)`.** Verified against fastmcp 4.0.3's own source (`fastmcp/server/mixins/mcp_operations.py`, `_on_call_tool`'s `except FastMCPError as e` branch): an error result gets `content=[TextContent(text=str(e))]` with `structured_content` and `data` both left `None`, so the plan's expression is blind to a leak that reaches the client only through an error message. Reproduced experimentally: a tool raising `ToolError(f"... {FULL_IBAN}")` leaves `result.structured_content or result.data` rendering as the literal string `"null"` while `result.content[0].text` carries the full IBAN. `_render_result` scans `content`, `structured_content`, and `data` together; on a successful result this duplicates `structured_content` (FastMCP derives `content` from the same value for any handler that doesn't hand-build a `ToolResult`) rather than missing anything.
+3. **`_assert_no_tool_output_leaks_a_pan_or_iban` calls `client.call_tool(name, arguments, raise_on_error=False)`.** The `fastmcp.client.Client.call_tool` default is `raise_on_error=True`, under which an erroring tool makes the *client* raise `ToolError` with the raw message, which would abort the `for` loop (skipping every later case) and print the raw value into the pytest traceback/CI log rather than a clean, redacted-length assertion message.
+4. **`test_the_regexes_actually_catch_the_fixtures` gained two assertions** for a space-grouped and a hyphen-grouped PAN (`"4111 1111 1111 4417"`, `"4111-1111-1111-4417"`), confirming `PAN_RE`'s `(?:\d[ -]?){13,19}` tolerates the grouping a real leak would carry (a card number typed with spaces into a memo). Checked separately and *not* fixed here, out of this task's scope: `IBAN_RE` has no equivalent grouping tolerance, so a space-grouped IBAN (`"ES91 2100 0418 4502 0005 1332"`) is currently only caught by `PAN_RE` coincidentally matching its digit run, which would not hold for an IBAN whose digits are broken up by letters (e.g. a UK-style `GBkk BBBB SSSS SSCC CCCC CC` grouping).
+5. **Type annotations throughout** (`CASES: dict[str, dict[str, Any]]`, the `server` fixture, `_render_result`'s parameter, every test's `server` argument) needed for `mypy --strict`, which the plan's own snippet did not satisfy as written.
+
+Three permanent `test_self_check_*` tests were added (not a throwaway experiment deleted after use): each builds a deliberately leaky server in-process — a raw-dict passthrough, a tool absent from `CASES`, and a tool that leaks through an error message — and asserts the production helpers raise against it. Verified by deliberately reintroducing each defect in turn (an `IBAN_RE` that matches nothing; a `_render_result` reverted to the plan's original expression) and confirming the corresponding self-check, and only that one, reports "DID NOT RAISE".
+
 - [ ] **Step 3: Run the tests**
 
 Run: `uv run pytest tests/test_masking_golden.py -q`
-Expected: PASS, 3 passed. With `CASES` empty and no tools registered, the first two pass trivially. That is the correct starting state (implementation guide milestone 2).
+Expected: PASS, 6 passed, not 3. With `CASES` empty and no tools registered, `test_every_registered_tool_has_a_masking_case` and `test_no_tool_output_contains_a_pan_or_iban` still pass trivially — that half of the plan's claim holds. The three `test_self_check_*` tests are new (see the correction above) and pass because the leaky servers they build are deliberately caught, not because anything is trivial.
 
 - [ ] **Step 4: Commit**
 
