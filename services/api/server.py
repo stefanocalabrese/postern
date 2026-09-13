@@ -18,6 +18,7 @@ from postern_core.identity import CustomerRef, CustomerResolver
 from pydantic import ValidationError
 
 from services.api.settings import Settings
+from services.api.tools import accounts as accounts_tools
 
 SERVER_INSTRUCTIONS = """\
 Postern exposes read access to the customer's own bank accounts, cards and
@@ -89,10 +90,13 @@ def build_server(
             required_scopes=None,
         )
 
-    return FastMCP(
+    server = FastMCP(
         name="postern",
         instructions=SERVER_INSTRUCTIONS,
         auth=auth,
         cache_scope="private",
         cache_ttl=settings.cache_ttl_seconds,
     )
+    if backend is not None:
+        accounts_tools.register(server, resolver, backend)
+    return server

@@ -2328,6 +2328,15 @@ git commit -m "test: golden masking harness that fails on any unregistered tool"
 - Modify: `tests/test_masking_golden.py` (add two cases)
 - Test: `tests/test_tools_accounts.py`
 
+**Corrected against what execution actually found (2026-09-13):**
+
+1. **The `result.structured_content["result"]` assumption was unverified when this plan was written; it has now been measured directly against fastmcp 4.0.3** (a throwaway in-process probe registering `list[Item]`, a single `Item`, and `list[str]` tools and printing `result.structured_content` for each). The plan's guess was correct and needed no fix: a tool returning `list[Model]` wraps the list under a `"result"` key (`{"result": [...]}`), while a tool returning a single `Model` is not wrapped at all — `structured_content` is that model's own fields directly, with no `"result"` key. The test file below exercises both shapes as written in the original plan.
+2. **`def client_and_server():` is untyped**, which `mypy --strict` rejects (the same defect Tasks 4 and 7 already hit). Fixed to `def client_and_server() -> FastMCP:`.
+3. **`ToolAnnotations(readOnlyHint=True, openWorldHint=False)` uses the deprecated camelCase kwargs.** `mcp.types.ToolAnnotations`'s actual field names are `read_only_hint` and `open_world_hint`; the camelCase spellings are accepted at runtime only via a deprecated compatibility alias (a `DeprecationWarning` fires on both construction and attribute access), and `mypy --strict` rejects them outright: `Unexpected keyword argument "readOnlyHint" for "ToolAnnotations"; did you mean "read_only_hint"?`. Fixed to the snake_case field names in both the tool registration and the test assertions (`.read_only_hint`, and `.input_schema` in place of the equally-deprecated `.inputSchema`).
+4. **`facade/accounts.py`'s `list_accounts`/`get_balance` were typed against the concrete `BackendClient`, which `services/api/server.py` never holds.** `build_server` (Task 4) types its parameter `backend: BackendReader | None` specifically so it does not have to import Task 6's concrete client; the value it passes to `accounts_tools.register` after the `backend is not None` narrowing is a `BackendReader`, not a `BackendClient`. Typing the façade functions and `register`'s `backend` parameter against the concrete class made `mypy --strict` reject the call site. Fixed by typing all three (`list_accounts`, `get_balance`, `register`) against `postern_core.facade.protocol.BackendReader` instead — the same seam `build_server` already uses, and consistent with `BackendClient` satisfying it structurally without either module importing the other.
+
+None of the four required a design change, only the fixes described. `Ref` (imported from `postern_core.domain.models`, not redefined) is already used for every `account_ref` parameter in the code below; this was verified, not assumed, by confirming `mypy --strict` passes and that a masked value is rejected before any backend request is issued (see the task report's adversarial pass).
+
 - [ ] **Step 1: Write the failing test**
 
 ```python
@@ -2351,52 +2360,61 @@ def _handler(request: httpx2.Request) -> httpx2.Response:
 
 
 @pytest.fixture
-def client_and_server():
+def client_and_server() -> FastMCP:
     backend = BackendClient(
         "https://backend.test", StubTokenMinter(), transport=httpx2.MockTransport(_handler)
     )
     return build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 
 
-async def test_accounts_list_returns_masked_ibans(client_and_server) -> None:
+async def test_accounts_list_returns_masked_ibans(client_and_server: FastMCP) -> None:
     async with Client(transport=client_and_server) as client:
         result = await client.call_tool("accounts.list", {})
+    assert result.structured_content is not None
     ibans = [a["iban"] for a in result.structured_content["result"]]
     assert ibans == ["ES•• •••• 1332", "ES•• •••• 1119"]
 
 
-async def test_accounts_list_returns_refs_not_backend_ids(client_and_server) -> None:
+async def test_accounts_list_returns_refs_not_backend_ids(client_and_server: FastMCP) -> None:
     async with Client(transport=client_and_server) as client:
         result = await client.call_tool("accounts.list", {})
+    assert result.structured_content is not None
     assert [a["ref"] for a in result.structured_content["result"]] == ["acc_7f3a", "acc_9b21"]
 
 
-async def test_get_balance_carries_currency_and_as_of(client_and_server) -> None:
+async def test_get_balance_carries_currency_and_as_of(client_and_server: FastMCP) -> None:
     async with Client(transport=client_and_server) as client:
         result = await client.call_tool("accounts.get_balance", {"account_ref": "acc_7f3a"})
     balance = result.structured_content
+    assert balance is not None
     assert balance["amount"] == {"amount": "1200.50", "currency": "EUR"}
     assert balance["as_of"].startswith("2026-09-12T10:00:00")
     assert balance["account_ref"] == "acc_7f3a"
 
 
-async def test_tools_take_no_customer_argument(client_and_server) -> None:
+async def test_tools_take_no_customer_argument(client_and_server: FastMCP) -> None:
     """The token is the identity (handoff §6.2)."""
     async with Client(transport=client_and_server) as client:
         tools = {t.name: t for t in await client.list_tools()}
     for name in ("accounts.list", "accounts.get_balance"):
-        properties = tools[name].inputSchema.get("properties", {})
+        properties = tools[name].input_schema.get("properties", {})
         assert "user_id" not in properties
         assert "customer_id" not in properties
         assert "customer_ref" not in properties
 
 
-async def test_read_tools_are_annotated_read_only(client_and_server) -> None:
+async def test_read_tools_are_annotated_read_only(client_and_server: FastMCP) -> None:
     async with Client(transport=client_and_server) as client:
         tools = {t.name: t for t in await client.list_tools()}
-    assert tools["accounts.list"].annotations.readOnlyHint is True
-    assert tools["accounts.get_balance"].annotations.readOnlyHint is True
+    assert tools["accounts.list"].annotations is not None
+    assert tools["accounts.list"].annotations.read_only_hint is True
+    assert tools["accounts.get_balance"].annotations is not None
+    assert tools["accounts.get_balance"].annotations.read_only_hint is True
 ```
+
+`.inputSchema`/`.readOnlyHint` in the original draft are deprecated camelCase aliases (see the correction above); fixed to `.input_schema`/`.read_only_hint` above.
+
+The executed version of `tests/test_tools_accounts.py` adds one more test beyond the five above, `test_get_balance_rejects_a_masked_value_as_the_ref`, covering the adversarial-pass finding that `Ref`'s pattern rejects a masked value before any backend request is built. See the file itself; not reproduced here to avoid drift between two copies of the same tests.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -2415,13 +2433,13 @@ from typing import Any
 
 from postern_core.domain.models import Account, Balance, Ref
 from postern_core.domain.money import Money
-from postern_core.facade.client import BackendClient
+from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef
 
 _AUDIENCE = "accounts.svc"
 
 
-async def list_accounts(backend: BackendClient, customer: CustomerRef) -> list[Account]:
+async def list_accounts(backend: BackendReader, customer: CustomerRef) -> list[Account]:
     payload = await backend.get_json("/accounts", customer=customer, audience=_AUDIENCE)
     return [
         Account(ref=row["id"], label=row["label"], iban=row["iban"])
@@ -2429,9 +2447,7 @@ async def list_accounts(backend: BackendClient, customer: CustomerRef) -> list[A
     ]
 
 
-async def get_balance(
-    backend: BackendClient, customer: CustomerRef, account_ref: Ref
-) -> Balance:
+async def get_balance(backend: BackendReader, customer: CustomerRef, account_ref: Ref) -> Balance:
     payload: dict[str, Any] = await backend.get_json(
         f"/accounts/{account_ref}/balance", customer=customer, audience=_AUDIENCE
     )
@@ -2441,6 +2457,8 @@ async def get_balance(
         as_of=datetime.fromisoformat(payload["as_of"]),
     )
 ```
+
+`BackendReader` (Task 4's minimal `Protocol`), not the concrete `BackendClient`: see correction 4 above. `Ref` is imported, not redefined; it is already the pattern-constrained type from `postern_core.domain.models`, so `get_balance`'s `account_ref` parameter cannot accept a masked value — verified in the adversarial pass (a masked IBAN string as `account_ref` is rejected as an input-schema validation error before any backend request is issued, and the mock transport records zero calls).
 
 Projection is explicit and field-by-field. Never pass a backend dict through: that is exactly how the `description` field in the fixtures leaks a PAN.
 
@@ -2453,13 +2471,13 @@ from mcp.types import ToolAnnotations
 
 from postern_core.domain.models import Account, Balance, Ref
 from postern_core.facade import accounts as facade
-from postern_core.facade.client import BackendClient
+from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerResolver
 
-_READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
-def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -> None:
+def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader) -> None:
     @mcp.tool(name="accounts.list", annotations=_READ)
     async def accounts_list() -> list[Account]:
         """List the customer's accounts with their refs, labels and masked IBANs.
@@ -2479,7 +2497,9 @@ def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -
         return await facade.get_balance(backend, resolver(), account_ref)
 ```
 
-Descriptions stay inside the ~500 character budget (handoff §4.3); cross-cutting workflow guidance lives in the bootstrap tool result, not repeated per tool.
+`ToolAnnotations(readOnlyHint=..., openWorldHint=...)` in the original draft used deprecated camelCase kwargs that `mypy --strict` rejects; fixed to `read_only_hint`/`open_world_hint` above (correction 3). `backend: BackendClient` in `register`'s signature is likewise fixed to `BackendReader` (correction 4) to match what `services/api/server.py` actually passes in.
+
+Descriptions stay inside the ~500 character budget (handoff §4.3); measured at 213 and 212 characters for `accounts_list` and `accounts_get_balance` respectively. Cross-cutting workflow guidance lives in the bootstrap tool result, not repeated per tool.
 
 - [ ] **Step 5: Register them in `server.py`**
 
@@ -2495,12 +2515,14 @@ from services.api.tools import accounts as accounts_tools
         instructions=SERVER_INSTRUCTIONS,
         auth=auth,
         cache_scope="private",
-        cache_ttl=settings.cache_ttl_ms,
+        cache_ttl=settings.cache_ttl_seconds,
     )
     if backend is not None:
         accounts_tools.register(server, resolver, backend)
     return server
 ```
+
+`settings.cache_ttl_ms` in the original draft is stale: Task 4's correction 2 renamed this field to `cache_ttl_seconds` before Task 8 was ever executed, but this snippet had not been updated to match. Fixed above.
 
 Replace the bare `return FastMCP(...)` from Task 4 with this form. The `backend is not None` guard keeps Task 4's assembly tests valid.
 
@@ -2518,7 +2540,7 @@ CASES: dict[str, dict] = {
 - [ ] **Step 7: Run the tests**
 
 Run: `uv run pytest tests/test_tools_accounts.py tests/test_masking_golden.py -q`
-Expected: PASS. The 5 tests in tests/test_tools_accounts.py pass, and the previously green tests/test_masking_golden.py stays green.
+Expected: PASS. The 6 tests in tests/test_tools_accounts.py pass (5 from the original draft plus the masked-ref-rejection test from the adversarial pass), and the previously green tests/test_masking_golden.py stays green (12 tests total across both files).
 
 - [ ] **Step 8: Commit**
 
