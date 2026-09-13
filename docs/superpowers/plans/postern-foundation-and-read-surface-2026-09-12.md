@@ -2911,6 +2911,24 @@ git commit -m "feat(tools): transactions.list with a bounded window and a hard r
 
 **Use `build_model` (Task 8, correction 5) for every `Card` construction in `facade/cards.py`**, not a direct `Card(...)` call — same reasoning as Task 9's note: a `pydantic.ValidationError` escaping to FastMCP's dispatcher logs the raw value via `logger.warning(..., e.errors(include_url=False))`, regardless of `hide_input_in_errors`. See `packages/postern-core/src/postern_core/facade/projection.py`.
 
+**Also corrected: the draft's own Step 3 code below contradicts that same directive** — its `list_cards` calls `Card(...)` directly, the identical bug Task 9's Step 3 draft had for `Transaction`. Fixed in the executed façade: `_project_card` wraps the `Card(...)` call in a `build_model(lambda: ..., resource="card")` call, matching `facade/accounts.py`'s `_project_account` pattern.
+
+**Also corrected: the draft's Step 3 and Step 4 code type `backend` as the concrete `BackendClient`.** Matches Task 8 and 9's correction to the same plan section: `services/api/server.py` only ever holds a `BackendReader | None`, so a parameter typed `BackendClient` here would make `mypy --strict` reject the call sites in both the façade and `services/api/tools/cards.py`. The executed files use `BackendReader` throughout.
+
+**Also corrected: the draft's Step 4 code and Step 1 test use camelCase `ToolAnnotations(readOnlyHint=..., openWorldHint=...)` / `.readOnlyHint`.** `mcp.types.ToolAnnotations` takes snake_case kwargs (`read_only_hint`, `open_world_hint`); the camelCase forms are deprecated aliases and `mypy --strict` rejects them as unexpected keyword arguments (confirmed against the same `ToolAnnotations` Tasks 8 and 9 already use with snake_case). The executed tool and test use `read_only_hint`/`open_world_hint`.
+
+**A decision this task's own draft did not make: whether `cards.list` needs the same row cap Task 9 added to `transactions.list`.** Considered and rejected, not silently matched or silently skipped:
+
+Handoff §6.5's "Bound result sets hard" motivated `transactions.list`'s `MAX_ROWS`/`TransactionPage.truncated` because that tool's result size is a product of two things this repo cannot bound by schema alone: a widenable time window (`days`, up to 365) and an active account's transaction frequency, which handoff §6.5's own "not 200 records" framing already treats as routinely exceeding a few hundred rows on a wide window. `cards.list` has neither factor — it takes no arguments at all, so there is no parameter for a model to widen or be talked into widening by adversarial content, and a card row is created by the bank's own card-issuance process (a discrete, ops-gated action), not logged once per event the way a transaction is. That is a materially different risk shape from transactions, not the same shape assumed safe twice — and it is also the shape `accounts.list` (Task 8) already has, which this plan did not cap either, so a cap here would be inconsistent with the nearer precedent (accounts), not with the more distant one (transactions).
+
+This does **not** mean "a customer has few cards" is verified — it is not, and that exact class of assumption about a backend this repo does not contain has been wrong before in this project (`facade/transactions.py`'s own truncation-order and direction-from-sign notes, both recorded as open items rather than fixed). The reason not to cap here is narrower and more specific: `facade/transactions.py`'s `MAX_ROWS = 100` is deliberately anchored below a number the design handoff itself names ("not 200 records" — handoff §6.5's own example of too much for a customer question). Nothing in the handoff or this repo names an equivalent figure for cards, so a `CARD_MAX_ROWS` constant invented for this task would be a bare guess with no source, not a control grounded in anything the handoff says — the same kind of unverified external claim this project's standards reject elsewhere. **What would change this:** evidence of a real backend contract under which one customer can hold many cards — a corporate/business multi-card program, virtual-card-per-subscription or virtual-card-per-merchant issuance, or any other pattern this repo has no visibility into. If that turns up, `list_cards` needs the same `MAX_ROWS`/`truncated` treatment `list_transactions` already has, sized against whatever number that contract actually supports — recorded as an open item next to the existing ones (truncation order, direction-from-sign, full pagination), not built speculatively here.
+
+**Adversarial pass findings, recorded:**
+- The stub backend was made to return `expiry`, `cvv`, `full_pan` and `cardholder_name` alongside the four valid fields (`tests/test_tools_cards.py::test_cards_list_drops_expiry_cvv_full_pan_and_cardholder_name`). None reach any client-visible channel: `_project_card` reads named fields off the row one at a time, never `Card(**row)`, so an unnamed field is simply never read, not rejected by `extra="forbid"` after the fact.
+- `Card.status` outside its `Literal["active", "frozen", "cancelled"]` (e.g. `"blocked"`) raises `pydantic.ValidationError` on `Card(...)` construction, caught by `build_model` the same way a bad IBAN is for `accounts.list` (Task 8). Confirmed by temporarily reverting `facade/cards.py` to construct `Card(...)` directly: the raw `'blocked'` value then reaches FastMCP's own `logger.warning` on the `fastmcp` logger (`tests/test_tools_cards.py::test_cards_list_unrecognized_status_does_not_leak_via_build_model`'s docstring carries the captured failure). Restored, the value reaches neither the client-visible result nor the log.
+- Two of the customer's own cards can share a masked `pan` last-four (handoff §6.5: last four only, never first-6-plus-last-4 — Task 2's review flagged this collision as deliberate). `ref` and `label` do distinguish them in this tool's real output (`tests/test_tools_cards.py::test_two_cards_sharing_a_last_four_are_distinguishable_by_ref_and_label`); `pan` alone does not, and the tool's own docstring says so.
+- The golden masking harness was proven to catch a real leak from this tool specifically, not just from the fixture-only cases already in `CASES`: `services/api/tools/cards.py`'s `cards_list` was temporarily changed to bypass the façade entirely and return `payload["cards"]` (the raw backend rows) directly. `tests/test_masking_golden.py::test_no_tool_output_contains_a_pan_or_iban` failed with `cards.list leaked a PAN: ...4111111111114417...`. Reverted; the full suite is green again.
+
 - [ ] **Step 1: Write the failing test**
 
 ```python
@@ -2954,7 +2972,7 @@ async def test_cards_list_never_returns_expiry_or_cvv(server) -> None:
 async def test_cards_list_is_annotated_read_only(server) -> None:
     async with Client(transport=server) as client:
         tools = {t.name: t for t in await client.list_tools()}
-    assert tools["cards.list"].annotations.readOnlyHint is True
+    assert tools["cards.list"].annotations.read_only_hint is True
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -2966,22 +2984,29 @@ Expected: FAIL, tool `cards.list` is not registered.
 
 ```python
 # packages/postern-core/src/postern_core/facade/cards.py
+from typing import Any
+
 from postern_core.domain.models import Card
-from postern_core.facade.client import BackendClient
+from postern_core.facade.projection import build_model
+from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef
 
 _AUDIENCE = "cards.svc"
 
 
-async def list_cards(backend: BackendClient, customer: CustomerRef) -> list[Card]:
+def _project_card(row: dict[str, Any]) -> Card:
+    return build_model(
+        lambda: Card(ref=row["id"], label=row["label"], pan=row["pan"], status=row["status"]),
+        resource="card",
+    )
+
+
+async def list_cards(backend: BackendReader, customer: CustomerRef) -> list[Card]:
     payload = await backend.get_json("/cards", customer=customer, audience=_AUDIENCE)
-    return [
-        Card(ref=row["id"], label=row["label"], pan=row["pan"], status=row["status"])
-        for row in payload["cards"]
-    ]
+    return [_project_card(row) for row in payload["cards"]]
 ```
 
-Handoff §6.5 prefers the backend returning pre-masked values so this server never holds a full PAN and stays out of PCI DSS scope. That is open question §10.17. Until it is answered, `MaskedPan` masks on construction here and the full PAN exists in this process only for the duration of one projection.
+Handoff §6.5 prefers the backend returning pre-masked values so this server never holds a full PAN and stays out of PCI DSS scope. That is open question §10.17. Until it is answered, `MaskedPan` masks on construction here and the full PAN exists in this process only for the duration of one projection. No row cap: see the decision note above this task's Step 1.
 
 - [ ] **Step 4: Write the tool**
 
@@ -2992,19 +3017,21 @@ from mcp.types import ToolAnnotations
 
 from postern_core.domain.models import Card
 from postern_core.facade import cards as facade
-from postern_core.facade.client import BackendClient
+from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerResolver
 
-_READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
-def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -> None:
+def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader) -> None:
     @mcp.tool(name="cards.list", annotations=_READ)
     async def cards_list() -> list[Card]:
-        """List the customer's cards with their refs, labels and last four digits.
+        """List the customer's cards with their refs, labels, last-four digits and status.
 
         Card numbers are shown as the last four digits only and cannot be used
-        to transact. Expiry dates and security codes are never available here.
+        to transact; expiry dates and security codes are never available here.
+        Two cards can share the same last four digits -- use `ref` (or `label`)
+        to tell them apart, never `pan` alone.
         """
         return await facade.list_cards(backend, resolver())
 ```
@@ -3020,15 +3047,18 @@ def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -
 - [ ] **Step 6: Run the tests**
 
 Run: `uv run pytest tests/test_tools_cards.py tests/test_masking_golden.py -q`
-Expected: PASS. The 3 tests in tests/test_tools_cards.py pass, and the previously green tests/test_masking_golden.py stays green.
+Expected: PASS. Executed with a wider adversarial test file than the draft above (7 tests, not 3: extra backend fields, the PAN-last-four collision, and the `build_model` status-leak proof, in addition to the draft's three), plus the previously green `tests/test_masking_golden.py` — 13 tests total, all green.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add packages/postern-core/src/postern_core/facade/cards.py services/api/tools/cards.py \
-        services/api/server.py tests/test_tools_cards.py tests/test_masking_golden.py
+        services/api/server.py tests/test_tools_cards.py tests/test_masking_golden.py \
+        docs/superpowers/plans/postern-foundation-and-read-surface-2026-09-12.md
 git commit -m "feat(tools): cards.list with last-four masking"
 ```
+
+No `packages/postern-core/src/postern_core/domain/models.py` change, unlike Task 9's commit: `Card` (and its `Literal["active", "frozen", "cancelled"]` status) was already added to that module in Task 2/3, and this task's "no row cap" decision means no new page-wrapper model (a `CardsPage` analogous to `TransactionPage`) is needed either.
 
 ---
 

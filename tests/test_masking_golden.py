@@ -56,6 +56,7 @@ CASES: dict[str, dict[str, Any]] = {
     "accounts.list": {},
     "accounts.get_balance": {"account_ref": "acc_7f3a"},
     "transactions.list": {"account_ref": "acc_7f3a"},
+    "cards.list": {},
 }
 """tool name -> arguments. Extended by Tasks 8, 9, 10 and 11."""
 
