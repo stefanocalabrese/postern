@@ -2323,6 +2323,7 @@ git commit -m "test: golden masking harness that fails on any unregistered tool"
 
 **Files:**
 - Create: `packages/postern-core/src/postern_core/facade/accounts.py`
+- Create: `packages/postern-core/src/postern_core/facade/projection.py` (`build_model`, added by correction 5 below — Tasks 9, 10 and 11 reuse it)
 - Create: `services/api/tools/accounts.py`
 - Modify: `services/api/server.py` (register the tools)
 - Modify: `tests/test_masking_golden.py` (add two cases)
@@ -2334,8 +2335,9 @@ git commit -m "test: golden masking harness that fails on any unregistered tool"
 2. **`def client_and_server():` is untyped**, which `mypy --strict` rejects (the same defect Tasks 4 and 7 already hit). Fixed to `def client_and_server() -> FastMCP:`.
 3. **`ToolAnnotations(readOnlyHint=True, openWorldHint=False)` uses the deprecated camelCase kwargs.** `mcp.types.ToolAnnotations`'s actual field names are `read_only_hint` and `open_world_hint`; the camelCase spellings are accepted at runtime only via a deprecated compatibility alias (a `DeprecationWarning` fires on both construction and attribute access), and `mypy --strict` rejects them outright: `Unexpected keyword argument "readOnlyHint" for "ToolAnnotations"; did you mean "read_only_hint"?`. Fixed to the snake_case field names in both the tool registration and the test assertions (`.read_only_hint`, and `.input_schema` in place of the equally-deprecated `.inputSchema`).
 4. **`facade/accounts.py`'s `list_accounts`/`get_balance` were typed against the concrete `BackendClient`, which `services/api/server.py` never holds.** `build_server` (Task 4) types its parameter `backend: BackendReader | None` specifically so it does not have to import Task 6's concrete client; the value it passes to `accounts_tools.register` after the `backend is not None` narrowing is a `BackendReader`, not a `BackendClient`. Typing the façade functions and `register`'s `backend` parameter against the concrete class made `mypy --strict` reject the call site. Fixed by typing all three (`list_accounts`, `get_balance`, `register`) against `postern_core.facade.protocol.BackendReader` instead — the same seam `build_server` already uses, and consistent with `BackendClient` satisfying it structurally without either module importing the other.
+5. **A backend-supplied value that fails `MaskedIban`/`MaskedPan`'s own validator (or a `null`/missing field) raises a bare `pydantic.ValidationError` while `Account`/`Balance` is constructed, and that escapes to FastMCP's own dispatcher, which logs it via `logger.warning(..., e.errors(include_url=False))`.** `.errors()`, not `.str()`, so `hide_input_in_errors` does not cover it, and the raw value reaches the server's own logs — which in a bank typically ship to a SIEM, often a third party. This is the same channel Task 2 documented as a caller obligation and Task 4 closed for `token_customer_resolver`; it reappeared here on the return-value side because nothing in the original draft catches it. Fixed by adding `packages/postern-core/src/postern_core/facade/projection.py` (`build_model`, a small generic helper) and routing every model construction in `facade/accounts.py` through it: it catches `pydantic.ValidationError`, reads only `error["loc"]` (the field name, never the value) from `exc.errors(include_input=False)`, and raises `BackendError(...) from None`. **Tasks 9, 10 and 11 project transactions, cards and the session bootstrap through the same models and must call `build_model` too — see the notes added to each.**
 
-None of the four required a design change, only the fixes described. `Ref` (imported from `postern_core.domain.models`, not redefined) is already used for every `account_ref` parameter in the code below; this was verified, not assumed, by confirming `mypy --strict` passes and that a masked value is rejected before any backend request is issued (see the task report's adversarial pass).
+None of the five required a design change beyond adding the one helper, only the fixes described. `Ref` (imported from `postern_core.domain.models`, not redefined) is already used for every `account_ref` parameter in the code below; this was verified, not assumed, by confirming `mypy --strict` passes and that a masked value is rejected before any backend request is issued (see the task report's adversarial pass).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2414,7 +2416,7 @@ async def test_read_tools_are_annotated_read_only(client_and_server: FastMCP) ->
 
 `.inputSchema`/`.readOnlyHint` in the original draft are deprecated camelCase aliases (see the correction above); fixed to `.input_schema`/`.read_only_hint` above.
 
-The executed version of `tests/test_tools_accounts.py` adds one more test beyond the five above, `test_get_balance_rejects_a_masked_value_as_the_ref`, covering the adversarial-pass finding that `Ref`'s pattern rejects a masked value before any backend request is built. See the file itself; not reproduced here to avoid drift between two copies of the same tests.
+The executed version of `tests/test_tools_accounts.py` adds two more tests beyond the five above: `test_get_balance_rejects_a_masked_value_as_the_ref` (the adversarial-pass finding that `Ref`'s pattern rejects a masked value before any backend request is built) and `test_accounts_list_validation_error_does_not_leak_the_raw_iban` (correction 5: a `caplog`-driven proof, at DEBUG on the `fastmcp` logger specifically, that a backend IBAN failing validation reaches neither the client-visible result nor the server log). See the file itself; not reproduced here to avoid drift between two copies of the same tests.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -2422,6 +2424,32 @@ Run: `uv run pytest tests/test_tools_accounts.py -q`
 Expected: FAIL, the client raises because tool `accounts.list` is not registered.
 
 - [ ] **Step 3: Write the façade projection**
+
+```python
+# packages/postern-core/src/postern_core/facade/projection.py
+"""Safe construction of an MCP-facing domain model from backend data."""
+
+from collections.abc import Callable
+
+from pydantic import ValidationError
+
+from postern_core.facade.client import BackendError
+
+
+def build_model[Model](factory: Callable[[], Model], *, resource: str) -> Model:
+    """Call `factory` and turn any `pydantic.ValidationError` it raises into
+    a `BackendError` naming only the failing field(s), never the value.
+    """
+    try:
+        return factory()
+    except ValidationError as exc:
+        fields = ", ".join(str(error["loc"][-1]) for error in exc.errors(include_input=False))
+        raise BackendError(
+            502,
+            f"backend response for {resource!r} failed validation on field(s): {fields}",
+            "The bank returned data in an unexpected shape. Tell the customer and retry later.",
+        ) from None
+```
 
 ```python
 # packages/postern-core/src/postern_core/facade/accounts.py
@@ -2433,32 +2461,42 @@ from typing import Any
 
 from postern_core.domain.models import Account, Balance, Ref
 from postern_core.domain.money import Money
+from postern_core.facade.projection import build_model
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef
 
 _AUDIENCE = "accounts.svc"
 
 
+def _project_account(row: dict[str, Any]) -> Account:
+    return build_model(
+        lambda: Account(ref=row["id"], label=row["label"], iban=row["iban"]),
+        resource="account",
+    )
+
+
 async def list_accounts(backend: BackendReader, customer: CustomerRef) -> list[Account]:
     payload = await backend.get_json("/accounts", customer=customer, audience=_AUDIENCE)
-    return [
-        Account(ref=row["id"], label=row["label"], iban=row["iban"])
-        for row in payload["accounts"]
-    ]
+    return [_project_account(row) for row in payload["accounts"]]
 
 
 async def get_balance(backend: BackendReader, customer: CustomerRef, account_ref: Ref) -> Balance:
     payload: dict[str, Any] = await backend.get_json(
         f"/accounts/{account_ref}/balance", customer=customer, audience=_AUDIENCE
     )
-    return Balance(
-        account_ref=payload["account_id"],
-        amount=Money(amount=Decimal(payload["amount"]), currency=payload["currency"]),
-        as_of=datetime.fromisoformat(payload["as_of"]),
+    return build_model(
+        lambda: Balance(
+            account_ref=payload["account_id"],
+            amount=Money(amount=Decimal(payload["amount"]), currency=payload["currency"]),
+            as_of=datetime.fromisoformat(payload["as_of"]),
+        ),
+        resource="balance",
     )
 ```
 
 `BackendReader` (Task 4's minimal `Protocol`), not the concrete `BackendClient`: see correction 4 above. `Ref` is imported, not redefined; it is already the pattern-constrained type from `postern_core.domain.models`, so `get_balance`'s `account_ref` parameter cannot accept a masked value — verified in the adversarial pass (a masked IBAN string as `account_ref` is rejected as an input-schema validation error before any backend request is issued, and the mock transport records zero calls).
+
+Every model construction goes through `build_model` (correction 5 above), not a direct `Account(...)`/`Balance(...)` call: a bare `pydantic.ValidationError` escaping to FastMCP's own dispatcher gets logged with the raw offending value via `logger.warning(..., e.errors(include_url=False))`, a real egress channel distinct from the model-facing one the golden harness scans. `list_accounts`'s per-row construction is a named function (`_project_account`), not a lambda inline in the comprehension: a lambda closing over the comprehension's own loop variable needs a `row=row`-style default binding to satisfy ruff's B023, and `mypy --strict` cannot infer that lambda's parameter type through a generic function call; a named function taking `row` as its own parameter avoids both.
 
 Projection is explicit and field-by-field. Never pass a backend dict through: that is exactly how the `description` field in the fixtures leaks a PAN.
 
@@ -2540,12 +2578,14 @@ CASES: dict[str, dict] = {
 - [ ] **Step 7: Run the tests**
 
 Run: `uv run pytest tests/test_tools_accounts.py tests/test_masking_golden.py -q`
-Expected: PASS. The 6 tests in tests/test_tools_accounts.py pass (5 from the original draft plus the masked-ref-rejection test from the adversarial pass), and the previously green tests/test_masking_golden.py stays green (12 tests total across both files).
+Expected: PASS. The 7 tests in tests/test_tools_accounts.py pass (5 from the original draft, plus the masked-ref-rejection test and the `build_model`/`caplog` leak test from the adversarial pass — correction 5), and the previously green tests/test_masking_golden.py stays green (13 tests total across both files).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add packages/postern-core/src/postern_core/facade/accounts.py services/api/tools/accounts.py \
+git add packages/postern-core/src/postern_core/facade/accounts.py \
+        packages/postern-core/src/postern_core/facade/projection.py \
+        services/api/tools/accounts.py \
         services/api/server.py tests/test_tools_accounts.py tests/test_masking_golden.py
 git commit -m "feat(tools): accounts.list and accounts.get_balance over the stubbed backend"
 ```
@@ -2577,6 +2617,8 @@ this tool — see Step 1's `test_free_text_description_is_scrubbed`, updated to 
 `MaskedPan`/`MaskedIban`) rather than the literal string `"[redacted]"`.
 
 Two controls meet here. Handoff §6.5: "Bound result sets hard. Transactions default to 30 days, explicit widening required. One unbounded call persists five years of history permanently, somewhere we cannot reach." And: counterparty account numbers are omitted entirely, name only. The fixture's `description` embeds a full PAN and IBAN in free text; `Transaction.description: FreeText` closes that at the model boundary rather than in this task's façade code.
+
+**Use `build_model` (Task 8, correction 5) for every `Transaction` construction in this task's façade projection**, not a direct `Transaction(...)` call: a backend row that fails validation (a malformed `booked_at`, a `counterparty_name`/`description` that somehow reaches `FreeText`'s validator with a non-string, or any other future field) raises `pydantic.ValidationError`, and left uncaught that leaks the raw value into the server log the same way Task 8's adversarial pass found for `accounts.list` — see `packages/postern-core/src/postern_core/facade/projection.py`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2781,6 +2823,8 @@ git commit -m "feat(tools): transactions.list with a bounded window"
 - Modify: `services/api/server.py`, `tests/test_masking_golden.py`
 - Test: `tests/test_tools_cards.py`
 
+**Use `build_model` (Task 8, correction 5) for every `Card` construction in `facade/cards.py`**, not a direct `Card(...)` call — same reasoning as Task 9's note: a `pydantic.ValidationError` escaping to FastMCP's dispatcher logs the raw value via `logger.warning(..., e.errors(include_url=False))`, regardless of `hide_input_in_errors`. See `packages/postern-core/src/postern_core/facade/projection.py`.
+
 - [ ] **Step 1: Write the failing test**
 
 ```python
@@ -2910,6 +2954,8 @@ git commit -m "feat(tools): cards.list with last-four masking"
 - Test: `tests/test_bootstrap.py`
 
 Handoff §4.2, marked "required, do not skip": client support for server `instructions` is inconsistent, so the bootstrap tool is the only context-delivery mechanism that works everywhere, because it arrives as a tool result. Consent state is hardcoded to "granted" here and becomes real in Plan 2.
+
+This task has no dedicated `facade/` module — it reuses `accounts_facade.list_accounts` (already routed through `build_model`, Task 8 correction 5) and constructs `SessionInfo`/`ConsentSummary` in `services/api/tools/bootstrap.py` directly. Today's `consents`/`write_enabled` values are hardcoded literals, not backend-derived, so the `ValidationError` risk `build_model` closes does not currently apply to that construction — but if a later task makes any field of `SessionInfo`/`ConsentSummary` backend-derived rather than a literal, construct it through `build_model` too, for the same reason as Tasks 9 and 10.
 
 - [ ] **Step 1: Write the failing test**
 
