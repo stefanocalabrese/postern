@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from services.api.settings import Settings
 from services.api.tools import accounts as accounts_tools
+from services.api.tools import bootstrap as bootstrap_tools
 from services.api.tools import cards as cards_tools
 from services.api.tools import transactions as transactions_tools
 
@@ -28,9 +29,10 @@ transactions. Call `banking_start_session` first: it returns the accounts you
 may reference, which domains are consented, and the rules for this session.
 
 Reference accounts and cards by their `ref` values, never by IBAN or card
-number. Amounts are always structured with an explicit currency and an `as_of`
-timestamp; report them as given and do not restate them in another currency.
-Transaction history defaults to the last 30 days and must be widened explicitly.
+number. Amounts always carry an explicit currency; report them as given and
+do not restate them in another currency. A balance carries an `as_of` time;
+a transaction carries `booked_at` instead. Transaction history defaults to
+the last 30 days and must be widened explicitly.
 """
 
 
@@ -100,6 +102,7 @@ def build_server(
         cache_ttl=settings.cache_ttl_seconds,
     )
     if backend is not None:
+        bootstrap_tools.register(server, resolver, backend)
         accounts_tools.register(server, resolver, backend)
         transactions_tools.register(server, resolver, backend)
         cards_tools.register(server, resolver, backend)
