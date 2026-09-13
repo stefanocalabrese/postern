@@ -9,6 +9,7 @@ from postern_core.domain.models import (
     ConsentSummary,
     SessionInfo,
     Transaction,
+    TransactionPage,
 )
 from postern_core.domain.money import Money
 from postern_core.identity import CustomerRef
@@ -232,6 +233,32 @@ def test_nested_model_construct_bypass_is_remasked_on_parent_construction() -> N
     )
     assert session.accounts[0].iban == "ES•• •••• 1332"
     assert "9121000418450200051332" not in session.model_dump_json()
+
+
+def test_transaction_model_construct_bypass_is_remasked_by_transactionpage() -> None:
+    """Same defense as the `Account`/`SessionInfo` case above, exercised for
+    Task 9's `TransactionPage`: `Transaction.model_construct(...)` bypasses
+    `description`'s `FreeText` redaction (the adversarial pass for this task
+    found this is the only way to actually leak a raw row through this
+    tool -- plain `TransactionPage(items=[...])` construction re-masks a
+    bypassed `Transaction` because revalidation is read from `Transaction`'s
+    own `_Strict` config, not the parent's).
+    """
+    bad_transaction = Transaction.model_construct(
+        ref="txn_1",
+        account_ref="acc_1",
+        booked_at=datetime(2026, 9, 12, tzinfo=UTC),
+        amount=Money(amount=Decimal("10.00"), currency="EUR"),
+        direction="debit",
+        counterparty_name="Merchant",
+        description="Card 4111111111114417 purchase, ref ES9121000418450200051332",
+    )
+    assert "4111111111114417" in bad_transaction.description  # forbidden call, unmasked by design
+
+    page = TransactionPage(items=[bad_transaction], truncated=False)
+    assert page.items[0].description == "Card •••• 4417 purchase, ref ES•• •••• 1332"
+    assert "4111111111114417" not in page.model_dump_json()
+    assert "9121000418450200051332" not in page.model_dump_json()
 
 
 def test_bad_money_cannot_reach_a_parent_models_serialized_output() -> None:

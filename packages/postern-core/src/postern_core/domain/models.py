@@ -38,6 +38,22 @@ class Transaction(_Strict):
     description: FreeText
 
 
+class TransactionPage(_Strict):
+    """Result of `transactions.list` (Task 9, handoff §6.5's row-bound gap).
+
+    `postern_core.facade.transactions.MAX_ROWS` caps `items` in that façade,
+    in this process, regardless of what the backend sends or which query
+    parameters it honors. `truncated` is the only signal a model has that
+    `items` is not the complete window: a raw list with rows silently
+    dropped would let "how much did I spend on groceries" compute a
+    confidently wrong total from a partial page. See
+    `facade/transactions.py`'s module docstring for the full design note.
+    """
+
+    items: list[Transaction]
+    truncated: bool
+
+
 class Card(_Strict):
     ref: Ref
     label: FreeText

@@ -2616,6 +2616,22 @@ this tool — see Step 1's `test_free_text_description_is_scrubbed`, updated to 
 `FreeText`'s masked form (`•••• last4` / `XX•• •••• last4`, the same shape as
 `MaskedPan`/`MaskedIban`) rather than the literal string `"[redacted]"`.
 
+**Corrected against what execution actually found (Task 9, 2026-09-13, handoff §6.5/§6.6 gap in the handoff review that assigned this task):** the plan as drafted below bounds only the *time window* (`days`, 1..365, default 30). It does not bound the *row count*. Handoff §6.5's own sentence motivating the day bound — "One unbounded call persists five years of history permanently, somewhere we cannot reach" — is not satisfied by a day bound alone: a 365-day window on an active current account is plausibly several thousand rows, all in one call, none of them recallable from a vendor's chat history. Handoff §6.6 separately requires "Pagination on every list-returning tool," which neither this task nor Task 8 built.
+
+Fixed by adding a second, independent bound, enforced in `packages/postern-core/src/postern_core/facade/transactions.py`, not requested of the backend: `MAX_ROWS = 100`. `list_transactions` slices the backend response to `MAX_ROWS` rows and returns a new wrapper model, `TransactionPage` (`items: list[Transaction]`, `truncated: bool`), instead of the bare `list[Transaction]` the original draft below returns. `truncated` is `True` whenever the backend sent more than `MAX_ROWS` rows, regardless of `days` — this is what makes the bound hold even against a backend that ignores every query parameter this façade sends, which is the realistic failure mode since the backend is not in this repository and this façade sends no `limit`/`page_size` parameter for it to ignore in the first place.
+
+Three shapes were weighed (a hard cap with a truncation flag; a `limit` argument with a low default and a hard maximum; opaque-cursor pagination) and the hard cap was chosen. A `limit` argument still needs the same server-side hard cap as a backstop (the model can set it too high, omit it, or be talked into raising it by adversarial content in a transaction description), so it adds a parameter the model can get wrong without removing the need for the cap this task adds anyway. Cursor pagination solves genuine completeness (fetching all rows across calls) but that is exactly the "building an aggregation tool" and full-pagination surface the task handoff marks out of scope for this task and unclaimed by any task in this 15-task plan (Task 10's `cards.list` returns a small, unbounded-in-practice collection; Task 11 is the bootstrap tool) — recorded as an open item below rather than built speculatively. A hard cap plus a visible flag needs no cooperation from the model to be safe, fails closed against a misbehaving or indifferent backend, and gives the model exactly the one bit of information handoff §6.5's own "not 200 records" framing cares about: whether what it just received is the whole answer or not. `MAX_ROWS = 100` is deliberately below that "200 records" example.
+
+This changes the tool's return type from `list[Transaction]` to `TransactionPage` throughout Steps 1, 3 and 4 below, which also changes the FastMCP structured-content shape measured in Task 8: a tool returning a single `Model` (here, `TransactionPage`) is not wrapped under a `"result"` key the way a bare `list[Model]` is, so `result.structured_content["items"][...]` replaces the draft's `result.structured_content["result"][...]` in every test below. Also carried over from Task 8's correction 1: the façade and tool below are typed against `postern_core.facade.protocol.BackendReader`, not `BackendClient` — `services/api/server.py` only ever holds the narrower `BackendReader | None`, so typing either function's `backend` parameter as the concrete `BackendClient` makes `mypy --strict` reject the call site, exactly as Task 8 found for `accounts.py`. The draft code blocks below (Steps 3 and 4) predate this correction and still show `BackendClient`; the executed files use `BackendReader`.
+
+**Also corrected: the draft's own Step 3 code contradicts the `build_model` directive stated two paragraphs below** (the one starting "Use `build_model`...") — the draft's `_project` calls `Transaction(...)` directly. Fixed in the executed façade: `_project` wraps the whole construction (including `Decimal(row["amount"])`, so a malformed amount and a masking-validator failure are both inside the same factory) in a nested `factory()` passed to `build_model`, matching `facade/accounts.py`'s `_project_account` pattern.
+
+**Adversarial pass findings, recorded rather than fixed (each needs a real backend contract to resolve, which does not exist in this repo):**
+- *Truncation order.* `list_transactions` truncates to the first `MAX_ROWS` rows in whatever order the backend returned them. The tool's own docstring says "newest first," but that is a claim about the backend's behavior, not something this façade verifies or enforces by sorting. If a real backend ever returns oldest-first or unsorted, truncation would silently keep the wrong end of the window rather than the most recent transactions. Needs a real backend integration test to confirm the ordering assumption before this is safe to rely on for anything time-sensitive.
+- *Direction-from-sign convention.* `direction` is derived from the sign of `row["amount"]` (negative → debit, non-negative → credit), and the reported `amount` is its absolute value, per the original design. Verified safe for the values a signed-decimal-string backend would send, including a zero amount and an explicit negative zero (`Decimal("-0.00") < 0` is `False` in Python, so both land on `"credit"`, the same arbitrary-but-deterministic side — there is no "correct" direction for zero). Not verified, and not verifiable from this repo: a backend that instead sends an always-positive `amount` and signals direction through a separate field would have every transaction reported `"credit"`, silently, with nothing in this façade able to detect the mismatch from the row shape alone. `tests/test_tools_transactions.py::test_direction_from_sign_is_wrong_if_the_backend_signals_direction_separately` pins today's (plan-specified) behavior for this case so a regression is visible even though a fix is not possible without the real contract.
+- *Missing/null `amount`.* `row["amount"]` missing raises a bare `KeyError` (already the accepted pattern for this codebase per `facade/projection.py`'s docstring: safe, because `KeyError.__str__` names only the literal key, never a value). `row["amount"] = None` raises `TypeError: conversion from NoneType to Decimal is not supported` from the bare stdlib `Decimal(None)` call; a non-numeric string raises `decimal.InvalidOperation`. Both confirmed, directly against the stdlib, to never embed the offending value in their message (`tests/test_tools_transactions.py::test_decimal_error_messages_never_embed_the_offending_value`), so neither is a leak — merely a less friendly error than `build_model`'s `BackendError` gives for an actual `pydantic.ValidationError`. Left as-is rather than wrapping in a broader catch, since widening what this façade swallows was not asked for here and risks hiding a real bug behind a generic message.
+- *Full pagination (handoff §6.6).* Still not built by this task or any other task in this 15-task plan. `MAX_ROWS` bounds a single call; it does not let a model retrieve the rest of a truncated window. That gap is intentional for this task (the task explicitly scopes out building an aggregation tool and full pagination) but is not closed anywhere yet — flagged here as an open item for whichever future task claims handoff §6.6, alongside the existing open items next to ZT-2.
+
 Two controls meet here. Handoff §6.5: "Bound result sets hard. Transactions default to 30 days, explicit widening required. One unbounded call persists five years of history permanently, somewhere we cannot reach." And: counterparty account numbers are omitted entirely, name only. The fixture's `description` embeds a full PAN and IBAN in free text; `Transaction.description: FreeText` closes that at the model boundary rather than in this task's façade code.
 
 **Use `build_model` (Task 8, correction 5) for every `Transaction` construction in this task's façade projection**, not a direct `Transaction(...)` call: a backend row that fails validation (a malformed `booked_at`, a `counterparty_name`/`description` that somehow reaches `FreeText`'s validator with a non-string, or any other future field) raises `pydantic.ValidationError`, and left uncaught that leaks the raw value into the server log the same way Task 8's adversarial pass found for `accounts.list` — see `packages/postern-core/src/postern_core/facade/projection.py`.
@@ -2669,12 +2685,15 @@ async def test_window_is_capped(server) -> None:
             "transactions.list", {"account_ref": "acc_7f3a", "days": 4000}, raise_on_error=False
         )
     assert result.is_error
+    assert SEEN == []  # rejected by the schema, before any backend call -- see correction above
 
 
 async def test_counterparty_account_is_absent_from_the_result(server) -> None:
     async with Client(transport=server) as client:
         result = await client.call_tool("transactions.list", {"account_ref": "acc_7f3a"})
-    row = result.structured_content["result"][0]
+    # NOT result.structured_content["result"][0]: the tool returns a single
+    # TransactionPage model now, not a bare list -- see correction above.
+    row = result.structured_content["items"][0]
     assert row["counterparty_name"] == "Acme Ltd"
     assert "counterparty_iban" not in row
 
@@ -2688,7 +2707,7 @@ async def test_free_text_description_is_scrubbed(server) -> None:
     `scrub_free_text`."""
     async with Client(transport=server) as client:
         result = await client.call_tool("transactions.list", {"account_ref": "acc_7f3a"})
-    description = result.structured_content["result"][0]["description"]
+    description = result.structured_content["items"][0]["description"]
     assert fx.FULL_PAN not in description
     assert fx.COUNTERPARTY_IBAN not in description
     assert "•••• " in description
@@ -2697,8 +2716,22 @@ async def test_free_text_description_is_scrubbed(server) -> None:
 async def test_direction_is_derived_from_the_sign(server) -> None:
     async with Client(transport=server) as client:
         result = await client.call_tool("transactions.list", {"account_ref": "acc_7f3a"})
-    assert result.structured_content["result"][0]["direction"] == "debit"
+    assert result.structured_content["items"][0]["direction"] == "debit"
+
+
+async def test_row_count_is_capped_when_the_backend_sends_more_than_the_cap() -> None:
+    """The row-bound correction above: the stub ignores `days` entirely and
+    always returns MAX_ROWS + 50 rows, proving the cap holds even when the
+    backend does not cooperate."""
+    rows = [dict(fx.TRANSACTIONS["transactions"][0], id=f"txn_{i}") for i in range(facade.MAX_ROWS + 50)]
+    server = _server_with_rows(rows)
+    async with Client(transport=server) as client:
+        result = await client.call_tool("transactions.list", {"account_ref": "acc_7f3a"})
+    assert len(result.structured_content["items"]) == facade.MAX_ROWS
+    assert result.structured_content["truncated"] is True
 ```
+
+`tests/test_tools_transactions.py` as executed also adds row-bound tests beyond this excerpt (an under-the-cap case asserting `truncated` is `False`, an exactly-at-the-cap boundary case), the adversarial-pass tests named in the correction above, and a `content`-plus-`structured_content` PAN/IBAN scan mirroring `test_accounts_list_validation_error_does_not_leak_the_raw_iban`'s scan scope. See the file itself rather than a second copy reproduced here.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -2707,43 +2740,58 @@ Expected: FAIL, `ModuleNotFoundError: No module named 'postern_core.facade.trans
 
 - [ ] **Step 3: Write the façade projection**
 
+**Superseded by the row-bound correction above.** The draft below is kept for the
+`days`/`FreeText`/`build_model` shape it originally proposed; the executed file adds
+`MAX_ROWS`, returns `TransactionPage` instead of `list[Transaction]`, wraps the whole
+`Transaction(...)` construction (including the `Decimal(row["amount"])` parse) in a
+`build_model`-wrapped factory, and types `backend` as `BackendReader`, not `BackendClient`:
+
 ```python
-# packages/postern-core/src/postern_core/facade/transactions.py
+# packages/postern-core/src/postern_core/facade/transactions.py -- AS EXECUTED
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
-from postern_core.domain.models import Ref, Transaction
+from postern_core.domain.models import Ref, Transaction, TransactionPage
 from postern_core.domain.money import Money
-from postern_core.facade.client import BackendClient
+from postern_core.facade.projection import build_model
+from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef
 
 _AUDIENCE = "transactions.svc"
 MAX_DAYS = 365
+MAX_ROWS = 100
+
+
+def _project(row: dict[str, Any]) -> Transaction:
+    def factory() -> Transaction:
+        amount = Decimal(row["amount"])
+        return Transaction(
+            ref=row["id"],
+            account_ref=row["account_id"],
+            booked_at=datetime.fromisoformat(row["booked_at"]),
+            amount=Money(amount=abs(amount), currency=row["currency"]),
+            direction="debit" if amount < 0 else "credit",
+            counterparty_name=row["counterparty_name"],
+            description=row["description"],
+        )
+
+    return build_model(factory, resource="transaction")
 
 
 async def list_transactions(
-    backend: BackendClient, customer: CustomerRef, account_ref: Ref, days: int
-) -> list[Transaction]:
+    backend: BackendReader, customer: CustomerRef, account_ref: Ref, days: int
+) -> TransactionPage:
     payload = await backend.get_json(
         "/transactions",
         customer=customer,
         audience=_AUDIENCE,
         params={"account_id": account_ref, "days": days},
     )
-    return [_project(row) for row in payload["transactions"]]
-
-
-def _project(row: dict) -> Transaction:
-    amount = Decimal(row["amount"])
-    return Transaction(
-        ref=row["id"],
-        account_ref=row["account_id"],
-        booked_at=datetime.fromisoformat(row["booked_at"]),
-        amount=Money(amount=abs(amount), currency=row["currency"]),
-        direction="debit" if amount < 0 else "credit",
-        counterparty_name=row["counterparty_name"],
-        description=row["description"],
-    )
+    rows = payload["transactions"]
+    truncated = len(rows) > MAX_ROWS
+    items = [_project(row) for row in rows[:MAX_ROWS]]
+    return TransactionPage(items=items, truncated=truncated)
 ```
 
 `description=row["description"]` is passed straight through, not
@@ -2752,42 +2800,54 @@ construction itself redacts any embedded PAN or IBAN. A façade author who forge
 something here cannot reproduce the original leak, which is the point — the type carries
 the control, not this function's discipline.
 
-`counterparty_iban` is read from the backend row and never carried forward. The `Transaction` model has no field for it, so a future contributor who tries gets a validation error from `extra="forbid"`.
+`counterparty_iban` is read from the backend row and never carried forward. The `Transaction` model has no field for it, so a future contributor who tries gets a validation error from `extra="forbid"` — caught by `build_model`, not leaked, if anyone ever tries.
+
+`TransactionPage` is defined in `postern_core/domain/models.py`, next to `Transaction`:
+`items: list[Transaction]`, `truncated: bool`.
 
 - [ ] **Step 4: Write the tool**
 
+**Also superseded by the row-bound correction:** return type is `TransactionPage`, `backend` is typed `BackendReader`.
+
 ```python
-# services/api/tools/transactions.py
+# services/api/tools/transactions.py -- AS EXECUTED
 from typing import Annotated
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from postern_core.domain.models import Ref, TransactionPage
+from postern_core.facade import transactions as facade
+from postern_core.facade.protocol import BackendReader
+from postern_core.identity import CustomerResolver
 from pydantic import Field
 
-from postern_core.domain.models import Ref, Transaction
-from postern_core.facade import transactions as facade
-from postern_core.facade.client import BackendClient
-from postern_core.identity import CustomerResolver
-
-_READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
-def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendClient) -> None:
+def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader) -> None:
     @mcp.tool(name="transactions.list", annotations=_READ)
     async def transactions_list(
         account_ref: Ref,
         days: Annotated[int, Field(ge=1, le=facade.MAX_DAYS)] = 30,
-    ) -> list[Transaction]:
-        """Transactions for one account, newest first, last 30 days by default.
+    ) -> TransactionPage:
+        """Transactions for one account, last 30 days by default.
 
-        Widen with `days` only when the customer asked for an older period.
-        Counterparty account numbers are not available through this channel;
-        the counterparty name is. Amounts are positive with a `direction`.
+        Widen with `days` (1 to 365) only when the customer asked for an
+        older period. Counterparty account numbers are not available
+        through this channel; the counterparty name is. Amounts are
+        positive with a separate `direction`.
+
+        `items` may not be the complete window: this call never returns more
+        than a fixed number of rows in one response, no matter how wide
+        `days` is or how many the bank's backend holds. Check `truncated`
+        before reporting a total or a count to the customer -- if it is
+        `true`, narrow `days` (or ask the customer to narrow the period)
+        rather than presenting `items` as the whole history for the window.
         """
         return await facade.list_transactions(backend, resolver(), account_ref, days)
 ```
 
-The cap is enforced by the schema, so an out-of-range `days` is rejected before any backend call.
+The day cap is enforced by the schema, so an out-of-range `days` is rejected before any backend call — confirmed with `SEEN == []` in the executed test. The row cap is enforced in the façade after the backend responds, so it holds even against a backend that ignores `days` entirely (see the correction above).
 
 - [ ] **Step 5: Register and add the golden case**
 
@@ -2800,17 +2860,43 @@ In `server.py`, inside the `if backend is not None:` block: `transactions_tools.
 - [ ] **Step 6: Run the tests**
 
 Run: `uv run pytest tests/test_tools_transactions.py tests/test_masking_golden.py -q`
-Expected: PASS. The 6 tests in `tests/test_tools_transactions.py` pass (including
-`test_free_text_description_is_scrubbed`, proving `FreeText` redacts through this tool
-end-to-end), and the previously green `tests/test_masking_golden.py` stays green.
+Expected: PASS. As executed: 19 tests in `tests/test_tools_transactions.py` (the 6 from the
+original draft, adapted to the `TransactionPage`/`items`/`truncated` shape, plus the
+row-bound and adversarial-pass tests from the correction above), and `tests/test_masking_golden.py`
+stays green at 6 (one more `CASES` entry than Task 8 left it at, same test count in that file).
+Full suite after this task: 162 passed (`uv run pytest -q`), `make ci` exits 0.
+
+Golden-harness leak proof (adversarial pass, reverted immediately after capturing this):
+temporarily changing `_project`'s `Transaction(...)` call to `Transaction.model_construct(...)`
+(skips `FreeText` validation) did NOT fail `tests/test_masking_golden.py` on its own --
+`TransactionPage`'s own `_Strict.revalidate_instances="always"` re-masks a bypassed nested
+`Transaction` on construction (same defense `test_nested_model_construct_bypass_is_remasked_
+on_parent_construction` already proved for `Account`/`SessionInfo`). Also changing
+`list_transactions`'s return to `TransactionPage.model_construct(items=items, truncated=...)`
+(skipping the parent's own revalidation too) did fail it:
+
+```
+FAILED tests/test_masking_golden.py::test_no_tool_output_contains_a_pan_or_iban
+AssertionError: transactions.list leaked a PAN: {"content": [{"type": "text", "text":
+"{\"items\":[{...,\"description\":\"Card 4111111111114417 purchase, ref
+DE89370400440532013000\"}],\"truncated\":false}", ...
+```
+
+Both edits reverted before committing; `git diff` on `facade/transactions.py` was empty
+afterward and the full suite was rerun green. Added as a permanent regression test in
+`tests/test_domain_models.py` (`test_transaction_model_construct_bypass_is_remasked_by_
+transactionpage`), since it pins a real defense-in-depth property of `TransactionPage`
+rather than a one-off manual check.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add packages/postern-core/src/postern_core/facade/transactions.py \
+        packages/postern-core/src/postern_core/domain/models.py \
         services/api/tools/transactions.py services/api/server.py \
-        tests/test_tools_transactions.py tests/test_masking_golden.py
-git commit -m "feat(tools): transactions.list with a bounded window"
+        tests/test_tools_transactions.py tests/test_masking_golden.py \
+        tests/test_domain_models.py
+git commit -m "feat(tools): transactions.list with a bounded window and a hard row cap"
 ```
 
 ---
