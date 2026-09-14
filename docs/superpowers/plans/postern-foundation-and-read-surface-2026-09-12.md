@@ -3641,7 +3641,7 @@ Do not let any of these read as done because the tests are green.
 
 | Not established | Why it matters | Lands in |
 |---|---|---|
-| Any real authentication | `auth=None` locally; `JWTVerifier` is wired but never exercised against a real issuer | Plan 4 |
+| Any real authentication | Stale as of Task 13/14: `docker-compose.yml` no longer runs with `auth=None`, and `JWTVerifier` has now been exercised end to end over real HTTP (`docs/decisions/0004-base-images.md`, `docs/verification/2026-09-14-stack-run.md`) -- but only against `stub/backend.py`'s own disposable local JWKS/token-issuer routes, generated fresh on every container start. No genuine customer-facing OAuth 2.1 / RFC 8628 device-grant flow, no real bank-issued identity, and no production JWKS/issuer exist | Plan 4 |
 | The Vault read/write key split | `StubTokenMinter` returns a fake bearer string. The structural argument in handoff §6.2 is currently a lint rule plus tests, not an infrastructure property | Plan 3 |
 | Consent | `banking_start_session` reports hardcoded consent; the tool catalog is not yet filtered by it, so §3.4's leak scenario is not yet testable | Plan 2 |
 | Audit chain | No `audit_log`. The evidence a regulator asks for (handoff §9) does not exist | Plan 2 |

@@ -1,0 +1,24 @@
+name: ci
+
+# workflow_dispatch ONLY. Do not add `push` or `pull_request` triggers:
+# Actions minutes are billed on this private repository and the owner has
+# none to spend. `make ci` runs these same six gates locally for free and
+# is the actual gate that must pass before any commit (see CLAUDE.md).
+on:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: make lint
+      - run: make fmt-check
+      - run: make type
+      - run: make imports
+      - run: make lock
+      - run: make test
