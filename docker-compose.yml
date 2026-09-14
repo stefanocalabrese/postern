@@ -42,6 +42,19 @@
 # stack binds to localhost, the backend is `backend-stub`, and the JWKS
 # keypair is generated fresh on every container start.
 services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postern
+      POSTGRES_PASSWORD: postern
+      POSTGRES_DB: postern
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postern"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   backend-stub:
     image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
     working_dir: /app
@@ -65,6 +78,7 @@ services:
       target: api
     environment:
       POSTERN_BACKEND_BASE_URL: http://backend-stub:8081
+      POSTERN_DATABASE_URL: postgresql+asyncpg://postern:postern@db:5432/postern
       POSTERN_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
       POSTERN_TOKEN_ISSUER: "https://postern-local-dev.invalid"
       POSTERN_AUDIENCE: "postern"
@@ -72,4 +86,7 @@ services:
       POSTERN_STRICT_HEADERS: "0"
     ports: ["8080:8080"]
     depends_on:
-      - backend-stub
+      backend-stub:
+        condition: service_started
+      db:
+        condition: service_healthy

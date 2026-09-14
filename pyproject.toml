@@ -7,6 +7,9 @@ dependencies = [
     "fastmcp>=4.0.3,<5",
     "uvicorn[standard]>=0.34",
     "structlog>=25.1",
+    "sqlalchemy[asyncio]>=2.0.52,<3",
+    "asyncpg>=0.31",
+    "alembic>=1.20,<2",
 ]
 
 [tool.uv]
@@ -25,6 +28,7 @@ dev = [
     "ruff>=0.16",
     "mypy>=1.14",
     "import-linter>=2.15",
+    "testcontainers[postgres]>=4.15",
 ]
 
 [tool.pytest.ini_options]

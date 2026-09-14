@@ -1,5 +1,7 @@
 """Server assembly with an injected customer resolver (Task 4)."""
 
+import dataclasses
+
 import pytest
 from fastmcp import FastMCP
 from fastmcp.client import Client
@@ -153,3 +155,17 @@ def test_token_customer_resolver_rejects_a_malformed_subject_without_leaking_it(
         token_customer_resolver()
     assert raw_pan not in str(excinfo.value)
     assert not isinstance(excinfo.value.__cause__, ValidationError)
+
+
+def test_settings_reads_the_database_url_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POSTERN_BACKEND_BASE_URL", "https://backend.test")
+    monkeypatch.setenv("POSTERN_DATABASE_URL", "postgresql+asyncpg://u:p@db:5432/postern")
+    monkeypatch.delenv("POSTERN_JWKS_URI", raising=False)
+    monkeypatch.delenv("POSTERN_TOKEN_ISSUER", raising=False)
+    assert Settings.from_env().database_url == "postgresql+asyncpg://u:p@db:5432/postern"
+
+
+def test_settings_database_url_is_required() -> None:
+    assert "database_url" in {f.name for f in dataclasses.fields(Settings)}

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Settings:
     backend_base_url: str
+    database_url: str = "postgresql+asyncpg://postern:postern@localhost:5432/postern"
     customer_jwks_uri: str | None = None
     customer_token_issuer: str | None = None
     audience: str = "postern"
@@ -78,6 +79,10 @@ class Settings:
         """
         return cls(
             backend_base_url=os.environ["POSTERN_BACKEND_BASE_URL"],
+            database_url=os.environ.get(
+                "POSTERN_DATABASE_URL",
+                "postgresql+asyncpg://postern:postern@localhost:5432/postern",
+            ),
             customer_jwks_uri=os.environ.get("POSTERN_JWKS_URI") or None,
             customer_token_issuer=os.environ.get("POSTERN_TOKEN_ISSUER") or None,
             audience=os.environ.get("POSTERN_AUDIENCE", "postern"),
