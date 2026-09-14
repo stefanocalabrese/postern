@@ -3564,7 +3564,7 @@ git commit -m "build: two-target image, pinned bases, and a local stub backend"
 
 **Files:**
 - Create: `.github/workflows/ci.yml`
-- Create: `docs/verification/2026-09-12-inspector-run.md`
+- Create: `docs/verification/2026-09-14-stack-run.md`
 
 - [ ] **Step 1: Run the stack**
 
@@ -3574,7 +3574,7 @@ Expected: `api` listens on 8080, `backend-stub` on 8081.
 - [ ] **Step 2: Drive it with MCP Inspector**
 
 Run: `npx @modelcontextprotocol/inspector`
-Connect to `http://localhost:8080/mcp` over Streamable HTTP. Confirm each of these and record the output in `docs/verification/2026-09-12-inspector-run.md`:
+Connect to `http://localhost:8080/mcp` over Streamable HTTP. Confirm each of these and record the output in `docs/verification/2026-09-14-stack-run.md`:
 
 1. Five tools are listed: `banking_start_session`, `accounts.list`, `accounts.get_balance`, `transactions.list`, `cards.list`.
 2. `banking_start_session` returns one account with `iban` `ES•• •••• 1332`.
@@ -3629,7 +3629,7 @@ Expected: `lint` clean, `fmt-check` prints an `N files already formatted` line, 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add .github/workflows/ci.yml docs/verification/2026-09-12-inspector-run.md
+git add .github/workflows/ci.yml docs/verification/2026-09-14-stack-run.md
 git commit -m "ci: local gate runner plus a manually-triggered workflow"
 ```
 
