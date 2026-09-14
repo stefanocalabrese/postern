@@ -1,0 +1,75 @@
+# Local development stack (handoff §8.7): Postgres is not wired yet (no
+# database exists in this plan), so this is the `api` image plus a stub of
+# the bank's backend. No VPC, no Vault, no real customer.
+#
+# `POSTERN_JWKS_URI`/`POSTERN_TOKEN_ISSUER` point at `backend-stub`'s own
+# disposable local IdP (`stub/backend.py`'s `/.well-known/jwks.json` and
+# `/mint-token` routes), not left empty as the plan originally drafted this
+# file. Two Task 13 findings, both against the current `services/api/*`
+# code, drove that:
+#
+# 1. `Settings.from_env()` used to read `POSTERN_JWKS_URI`/`POSTERN_TOKEN_ISSUER`
+#    via a required `os.environ[...]`, which can only ever produce a `str`
+#    (even `""`) or a startup `KeyError` -- never `None`. `services/api/
+#    server.py::build_server` and `services/api/main.py::
+#    _refuse_stub_minter_in_production` both branch on `is None` to reach
+#    the documented no-auth path, so setting both to `""` (this file's
+#    original plan) reached neither: it produced two non-`None` empty
+#    strings, which `build_server` tried to build a `JWTVerifier` from and
+#    `_refuse_stub_minter_in_production` treated as "production-shaped",
+#    refusing to start `StubTokenMinter` outright. Fixed in
+#    `services/api/settings.py`: `from_env()` now normalizes an absent or
+#    empty value to `None` for both.
+# 2. Even with that fixed, a *genuinely* auth-less stack (both left `""`,
+#    reaching `auth=None`) can start and answer `tools/list`, but can never
+#    complete a single tool call: every tool's customer resolver is
+#    `services/api/server.py::token_customer_resolver` in production, which
+#    unconditionally calls `fastmcp.server.dependencies.get_access_token()`
+#    -- and that returns `None` on every request when no auth provider is
+#    configured at all, so every call fails closed with "request carries no
+#    validated access token" (proven manually: see
+#    docs/decisions/0004-base-images.md). Proving a real masked `tools/call`
+#    response therefore needs genuine, if throwaway, customer JWT auth, not
+#    the empty-string shape the plan assumed would still be "no auth".
+#
+# `POSTERN_ALLOW_STUB_TOKEN_MINTER=1` is required as a consequence of point
+# 2: real `customer_jwks_uri`/`customer_token_issuer` values make this
+# configuration "production-shaped" by `_refuse_stub_minter_in_production`'s
+# own definition, which refuses `StubTokenMinter` by default. This is
+# exactly the scenario `Settings.allow_stub_token_minter`'s own docstring
+# names as the deliberate override for ("real customer auth already live,
+# backend still a controlled sandbox") -- acceptable only because this
+# stack binds to localhost, the backend is `backend-stub`, and the JWKS
+# keypair is generated fresh on every container start.
+services:
+  backend-stub:
+    image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
+    working_dir: /app
+    volumes:
+      - ./:/app
+      # Anonymous volume over `.venv`: without it, a `.venv` created on the
+      # host (a different OS/ABI than this Linux container) would be bind-
+      # mounted straight over the container's own, and `uv run` would try to
+      # execute host-built binary extensions (pydantic-core, uvloop, ...)
+      # under the wrong platform.
+      - /app/.venv
+    environment:
+      POSTERN_TOKEN_ISSUER: "https://postern-local-dev.invalid"
+      POSTERN_AUDIENCE: "postern"
+    command: uv run uvicorn stub.backend:app --host 0.0.0.0 --port 8081
+    ports: ["8081:8081"]
+
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      POSTERN_BACKEND_BASE_URL: http://backend-stub:8081
+      POSTERN_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
+      POSTERN_TOKEN_ISSUER: "https://postern-local-dev.invalid"
+      POSTERN_AUDIENCE: "postern"
+      POSTERN_ALLOW_STUB_TOKEN_MINTER: "1"
+      POSTERN_STRICT_HEADERS: "0"
+    ports: ["8080:8080"]
+    depends_on:
+      - backend-stub

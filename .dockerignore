@@ -1,0 +1,51 @@
+# Never let secrets, VCS metadata or test material into the build context;
+# both the `api` and `confirm` targets do `COPY . .` in the builder stage,
+# so anything not excluded here is a candidate for landing in the image.
+.git
+.gitignore
+.dockerignore
+
+# Local environments and caches -- never shipped, and `.env*` may hold
+# real secrets on a developer machine even though none is committed.
+.venv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.import_linter_cache/
+.env
+.env.*
+.DS_Store
+dist/
+build/
+*.egg-info/
+
+# Test material and design docs: neither the API nor confirm runtime needs
+# them, and the adversarial requirement is that they never reach the image,
+# not merely that they are undocumented in it.
+tests/
+docs/
+tools/
+
+# The stub backend runs from the host source tree via a bind mount in
+# docker-compose.yml (`backend-stub` uses the builder base image directly,
+# not the `api`/`confirm` targets), so it never needs to be baked into
+# either shipped image.
+stub/
+
+# Editor/agent metadata, never relevant to a production image.
+.claude/
+
+# Repo-management and internal-design files: no runtime value, and
+# CLAUDE.md/README.md carry more of this project's internal security
+# reasoning than a shipped container image should hold, even though none of
+# it is a credential. `pyproject.toml` and `uv.lock` are excluded from this
+# list on purpose -- `uv sync` inside the image needs both.
+CLAUDE.md
+README.md
+Makefile
+Dockerfile
+docker-compose.yml
+.importlinter
+.python-version

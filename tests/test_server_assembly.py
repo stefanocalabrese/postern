@@ -82,6 +82,41 @@ def test_build_server_stays_unauthenticated_when_neither_is_set() -> None:
     assert server.auth is None
 
 
+def test_settings_from_env_treats_missing_jwks_and_issuer_as_no_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`os.environ[...]` can never produce `None`, only a `KeyError` or a
+    `str` -- reading these two that way made `build_server`'s documented
+    no-auth path (the one the previous test exercises) unreachable through
+    `from_env()`, which is what the local docker-compose stack actually
+    calls (Task 13 finding).
+    """
+    monkeypatch.setenv("POSTERN_BACKEND_BASE_URL", "https://backend.test")
+    monkeypatch.delenv("POSTERN_JWKS_URI", raising=False)
+    monkeypatch.delenv("POSTERN_TOKEN_ISSUER", raising=False)
+    settings = Settings.from_env()
+    assert settings.customer_jwks_uri is None
+    assert settings.customer_token_issuer is None
+    server = build_server(settings, resolver=lambda: _REF, backend=None)
+    assert server.auth is None
+
+
+def test_settings_from_env_treats_empty_string_jwks_and_issuer_as_no_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compose convention this repo's plan used (`POSTERN_JWKS_URI: ""`)
+    must reach the same `None` normalization as leaving the variable unset,
+    since docker-compose setting a key to `""` still makes the environment
+    variable present (not absent) in the container.
+    """
+    monkeypatch.setenv("POSTERN_BACKEND_BASE_URL", "https://backend.test")
+    monkeypatch.setenv("POSTERN_JWKS_URI", "")
+    monkeypatch.setenv("POSTERN_TOKEN_ISSUER", "")
+    settings = Settings.from_env()
+    assert settings.customer_jwks_uri is None
+    assert settings.customer_token_issuer is None
+
+
 def test_token_customer_resolver_with_no_access_token_raises_permission_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

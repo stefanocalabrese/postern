@@ -53,14 +53,33 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        """`os.environ[...]` for the three with no safe default, so a missing
-        one fails at startup with a `KeyError` naming it, rather than at the
-        first customer request.
+        """`os.environ["POSTERN_BACKEND_BASE_URL"]` has no safe default, so a
+        missing value fails at startup with a `KeyError` naming it, rather
+        than at the first customer request.
+
+        `POSTERN_JWKS_URI` and `POSTERN_TOKEN_ISSUER` are optional (Task 13
+        finding): `services/api/server.py::build_server` and
+        `services/api/main.py::_refuse_stub_minter_in_production` both branch
+        on `customer_jwks_uri is None` / `customer_token_issuer is None` to
+        reach the documented no-auth path that `Settings.for_testing()` and
+        the local docker-compose stack rely on
+        (`test_build_server_stays_unauthenticated_when_neither_is_set`'s own
+        docstring says so) -- but `os.environ[...]` can never produce `None`,
+        only a `KeyError` or a `str`, even an empty one. Reading these two
+        with a required `os.environ[...]` therefore made that no-auth path
+        unreachable through `from_env()` at all: unset raised `KeyError`
+        before startup got anywhere, and setting either to `""` (the compose
+        convention for "off") produced a non-`None` string, which
+        `build_server` treats as configured and `_refuse_stub_minter_in_production`
+        treats as "production-shaped", refusing to start with `StubTokenMinter`.
+        `os.environ.get(...) or None` collapses both "absent" and `""` to
+        `None`, matching what the rest of the codebase already assumes this
+        method can produce.
         """
         return cls(
             backend_base_url=os.environ["POSTERN_BACKEND_BASE_URL"],
-            customer_jwks_uri=os.environ["POSTERN_JWKS_URI"],
-            customer_token_issuer=os.environ["POSTERN_TOKEN_ISSUER"],
+            customer_jwks_uri=os.environ.get("POSTERN_JWKS_URI") or None,
+            customer_token_issuer=os.environ.get("POSTERN_TOKEN_ISSUER") or None,
             audience=os.environ.get("POSTERN_AUDIENCE", "postern"),
             strict_headers=os.environ.get("POSTERN_STRICT_HEADERS") == "1",
             cache_ttl_seconds=int(os.environ.get("POSTERN_CACHE_TTL_SECONDS", "60")),
