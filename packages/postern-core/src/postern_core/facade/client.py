@@ -128,8 +128,17 @@ class BackendClient:
         minter: TokenMinter,
         *,
         transport: httpx2.AsyncBaseTransport | None = None,
-        timeout: float = 10.0,
+        timeout: float | httpx2.Timeout = 10.0,
     ) -> None:
+        # `timeout` widened from a bare `float` to also accept `httpx2.Timeout`
+        # (Task 12 finding): a single float here applies independently to
+        # httpx2's connect, read, write and pool phases, not once total, so
+        # this constructor's own default of `10.0` was a worst case of up to
+        # 40 seconds, not 10. `services/api/main.py` now always passes an
+        # explicit `httpx2.Timeout` built from four `Settings` fields with a
+        # stated combined worst case; this widening is only a type-hint
+        # correction, `httpx2.AsyncClient(timeout=...)` already accepted a
+        # `Timeout` instance.
         self._minter = minter
         self._client = httpx2.AsyncClient(
             base_url=base_url,
