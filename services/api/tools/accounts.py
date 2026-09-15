@@ -10,6 +10,7 @@ result being fed back in as a lookup identifier.
 """
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthCheck
 from mcp.types import ToolAnnotations
 from postern_core.domain.models import Account, Balance, Ref
 from postern_core.facade import accounts as facade
@@ -19,8 +20,10 @@ from postern_core.identity import CustomerResolver
 _READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
-def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader) -> None:
-    @mcp.tool(name="accounts.list", annotations=_READ)
+def register(
+    mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader, check: AuthCheck
+) -> None:
+    @mcp.tool(name="accounts.list", annotations=_READ, auth=check)
     async def accounts_list() -> list[Account]:
         """List the customer's accounts with their refs, labels and masked IBANs.
 
@@ -29,7 +32,7 @@ def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader) -
         """
         return await facade.list_accounts(backend, resolver())
 
-    @mcp.tool(name="accounts.get_balance", annotations=_READ)
+    @mcp.tool(name="accounts.get_balance", annotations=_READ, auth=check)
     async def accounts_get_balance(account_ref: Ref) -> Balance:
         """Current balance for one account, with currency and an `as_of` time.
 

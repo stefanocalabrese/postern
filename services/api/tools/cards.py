@@ -8,6 +8,7 @@ for why this tool does not carry the `MAX_ROWS`/`truncated` treatment
 """
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthCheck
 from mcp.types import ToolAnnotations
 from postern_core.domain.models import Card
 from postern_core.facade import cards as facade
@@ -17,8 +18,10 @@ from postern_core.identity import CustomerResolver
 _READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
-def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader) -> None:
-    @mcp.tool(name="cards.list", annotations=_READ)
+def register(
+    mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader, check: AuthCheck
+) -> None:
+    @mcp.tool(name="cards.list", annotations=_READ, auth=check)
     async def cards_list() -> list[Card]:
         """List the customer's cards with their refs, labels, last-four
         digits and status.

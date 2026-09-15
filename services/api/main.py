@@ -21,9 +21,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx2
+from fastmcp.server.auth import AuthProvider
 from fastmcp.server.http import StarletteWithLifespan
 from postern_core.facade.client import BackendClient, StubTokenMinter
 from postern_core.identity import CustomerResolver
+from postern_core.store.engine import Database
 from starlette.middleware import Middleware
 
 from services.api.asgi.header_validation import HeaderBodyValidation
@@ -124,16 +126,20 @@ def create_app(
     *,
     resolver: CustomerResolver | None = None,
     transport: httpx2.AsyncBaseTransport | None = None,
+    auth_override: AuthProvider | None = None,
 ) -> StarletteWithLifespan:
     """Assemble the read-path ASGI app.
 
-    `resolver` and `transport` are keyword-only test seams: production
-    (the module-level `app` attribute below, built by `__getattr__`) always
-    resolves the customer from the validated access token and always
-    reaches the backend over the real network. Tests inject a fixed
-    customer and an `httpx2.MockTransport` the same way every other task in
-    this plan already mocks the backend, because there is no live customer
-    token or real bank to call against in CI.
+    `resolver`, `transport` and `auth_override` are keyword-only test seams:
+    production (the module-level `app` attribute below, built by
+    `__getattr__`) always resolves the customer from the validated access
+    token, always reaches the backend over the real network, and always
+    builds its `JWTVerifier` from `Settings`. Tests inject a fixed customer,
+    an `httpx2.MockTransport`, and (Task 4) a `JWTVerifier` built from a
+    generated key pair so a consent-enforcement test can mint its own
+    tokens, the same way every other task in this plan already mocks its
+    external dependencies because there is no live customer token, real
+    bank or real identity provider to call against in CI.
     """
     settings = settings or Settings.from_env()
     _refuse_stub_minter_in_production(settings)
@@ -144,7 +150,29 @@ def create_app(
         transport=transport,
         timeout=_backend_timeout(settings),
     )
-    server = build_server(settings, resolver or token_customer_resolver, backend)
+    # Consent is enforced against `AuthContext.token`, which only exists when
+    # real customer authentication is configured. `has_real_customer_auth`
+    # reuses the exact signal `_refuse_stub_minter_in_production` already
+    # uses for "is this production-shaped": both jwks_uri and issuer set, or
+    # (Task 4) a test-injected `auth_override`. Wiring a `Database` in
+    # regardless would deny every consent-gated call in the documented
+    # no-auth path (`Settings.for_testing()`, the local docker-compose
+    # stack) -- there is no validated token there for `services.api.consent`
+    # to read a subject from -- which would silently break that path's own
+    # stated purpose the moment this feature landed. Measured: every
+    # `tests/test_asgi_app.py` end-to-end call regressed to `Unknown tool`
+    # until this was scoped to real customer auth only.
+    has_real_customer_auth = (
+        settings.customer_jwks_uri is not None and settings.customer_token_issuer is not None
+    ) or auth_override is not None
+    db = Database(settings.database_url) if has_real_customer_auth else None
+    server = build_server(
+        settings,
+        resolver or token_customer_resolver,
+        backend,
+        db=db,
+        auth_override=auth_override,
+    )
     app = server.http_app(
         path="/mcp",
         stateless_http=True,

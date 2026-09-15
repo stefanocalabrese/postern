@@ -11,6 +11,7 @@ argument or cursor pagination.
 from typing import Annotated
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthCheck
 from mcp.types import ToolAnnotations
 from postern_core.domain.models import Ref, TransactionPage
 from postern_core.facade import transactions as facade
@@ -21,8 +22,10 @@ from pydantic import Field
 _READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 
-def register(mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader) -> None:
-    @mcp.tool(name="transactions.list", annotations=_READ)
+def register(
+    mcp: FastMCP, resolver: CustomerResolver, backend: BackendReader, check: AuthCheck
+) -> None:
+    @mcp.tool(name="transactions.list", annotations=_READ, auth=check)
     async def transactions_list(
         account_ref: Ref,
         days: Annotated[int, Field(ge=1, le=facade.MAX_DAYS)] = 30,

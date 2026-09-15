@@ -12,11 +12,14 @@ backend itself, only passes it through to tools registered in later tasks.
 """
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthContext, AuthProvider
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef, CustomerResolver
+from postern_core.store.engine import Database
 from pydantic import ValidationError
 
+from services.api.consent import consent_for
 from services.api.settings import Settings
 from services.api.tools import accounts as accounts_tools
 from services.api.tools import bootstrap as bootstrap_tools
@@ -63,10 +66,21 @@ def token_customer_resolver() -> CustomerRef:
         ) from None
 
 
+async def _no_consent_required(ctx: AuthContext) -> bool:
+    """The `db is None` stand-in: every existing test builds a server without
+    a database and must keep working unchanged, so only the consent tests
+    (which always pass a real `Database`) exercise the real check.
+    """
+    return True
+
+
 def build_server(
     settings: Settings,
     resolver: CustomerResolver,
     backend: BackendReader | None,
+    *,
+    db: Database | None = None,
+    auth_override: AuthProvider | None = None,
 ) -> FastMCP:
     has_jwks_uri = settings.customer_jwks_uri is not None
     has_issuer = settings.customer_token_issuer is not None
@@ -85,7 +99,7 @@ def build_server(
             f"{settings.customer_token_issuer!r})"
         )
 
-    auth = None
+    auth: AuthProvider | None = None
     if has_jwks_uri and has_issuer:
         auth = JWTVerifier(
             jwks_uri=settings.customer_jwks_uri,
@@ -93,6 +107,8 @@ def build_server(
             audience=settings.audience,
             required_scopes=None,
         )
+    if auth_override is not None:
+        auth = auth_override
 
     server = FastMCP(
         name="postern",
@@ -103,7 +119,12 @@ def build_server(
     )
     if backend is not None:
         bootstrap_tools.register(server, resolver, backend)
-        accounts_tools.register(server, resolver, backend)
-        transactions_tools.register(server, resolver, backend)
-        cards_tools.register(server, resolver, backend)
+        accounts_check = consent_for("accounts", db) if db is not None else _no_consent_required
+        transactions_check = (
+            consent_for("transactions", db) if db is not None else _no_consent_required
+        )
+        cards_check = consent_for("cards", db) if db is not None else _no_consent_required
+        accounts_tools.register(server, resolver, backend, accounts_check)
+        transactions_tools.register(server, resolver, backend, transactions_check)
+        cards_tools.register(server, resolver, backend, cards_check)
     return server
