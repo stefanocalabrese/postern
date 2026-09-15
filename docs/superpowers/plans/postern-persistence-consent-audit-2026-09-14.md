@@ -69,7 +69,13 @@ Measured on 2026-09-14 against the installed packages and a real Postgres contai
 
 **D5. Audit arguments are scrubbed through the existing `FreeText` machinery before persisting.** The raw client dict can carry a PAN or IBAN, and an audit table is a long-lived store.
 
-**D6 (revised in Task 2, see Step 8 below). `alembic check` is a standalone `make migrations` target, not a `make ci` gate.** The original plan made it a seventh `make ci` gate; that was overridden during execution because it would have required a running Postgres for `make ci` to pass, which conflicts with `make ci` running fully offline in under a second, the property that lets it run locally for free instead of billed Actions minutes. The same check runs instead as an explicit step in `.github/workflows/ci.yml` against a free Postgres service container, and must be run by hand before committing a model change.
+**D6 (revised in Task 2, see Step 8 below). `alembic check` is a standalone `make migrations` target, not a `make ci` gate.** The original plan made it a seventh `make ci` gate; that was overridden during execution because it would have required a running Postgres for `make ci` to pass, which conflicts with `make ci` running fully offline in under a second, the property that lets it run locally for free instead of billed Actions minutes. The same check runs instead as an explicit step in `.github/workflows/ci.yml` against a free Postgres service container, and must be run by hand before committing a model change. This was true through Task 2; **D7 below is where Task 3 changes it.**
+
+**D7 (Task 3). Container-backed tests run in the default `make ci`, not behind a marker, degrading to an explicit skip when Docker is unreachable.** `tests/test_store_consents.py` needs a real Postgres, and unlike `alembic check` (D6), the `session` fixture's Postgres is a disposable container the tests own and tear down themselves, not a fixed URL an operator supplies. That difference is why D6's reasoning does not transfer: D6 keeps `alembic check` out of `make ci` because it needs a database *someone else* stands up; a `testcontainers` fixture needs nothing but a running Docker daemon and starts its own.
+
+Measured on this machine, `postgres:17-alpine` already pulled, three consecutive runs: `make ci` was ~1.49s wall / 0.91s pytest before Task 3, ~3.3-3.8s wall / 2.4-2.6s pytest after, all as one `pytest` session because the container fixture is session-scoped (paid once per run, not per test). An addition of ~2s to a local pre-commit gate is not the kind of cost that justifies excluding the tests: Task 4 adds the actual consent-enforcement tests, the security control this whole plan exists to build, and a default `make ci` that skips them via a marker nobody remembers to pass would gate nothing that matters while still exiting 0.
+
+Docker unreachable degrades to an explicit `pytest.skip("Docker is not reachable, skipping database-backed tests: ...")` raised from `pg_url` after a `docker.from_env().ping()` check, rather than the raw 15-frame `docker.errors.DockerException` traceback `PostgresContainer.__init__` produces on its own (measured, both ways, with `DOCKER_HOST` pointed at a socket that does not exist: the un-guarded fixture fails 7 times, once per dependent test, each with the full traceback; the guarded fixture skips 7 times in 0.01s total with one specific reason line each). `make test`'s pytest invocation also gained `-rs`, so every skip's reason prints in the summary `make ci` output, not just its count — a developer running `make ci` without Docker sees exactly why 7 tests didn't run, every time, rather than a "212 passed" that looks identical whether or not the consent tests executed. The CI workflow's `gates` job already has a Postgres service container (Task 2) and unconditionally runs `make test`, so there is one gate, dispatched manually, where these tests cannot be silently skipped.
 
 ## File structure
 
@@ -538,7 +544,7 @@ git commit -m "feat(store): consents and audit_log tables with an alembic drift 
 - Create: `packages/postern-core/src/postern_core/store/consents.py`
 - Test: `tests/test_store_consents.py`
 
-- [ ] **Step 1: Add the database fixtures to `tests/conftest.py`**
+- [x] **Step 1: Add the database fixtures to `tests/conftest.py`**
 
 ```python
 import os
@@ -590,7 +596,9 @@ async def session(database: Database) -> AsyncSession:
 
 `driver="asyncpg"` must be passed explicitly: `PostgresContainer` defaults to `psycopg2` and would hand back a sync URL. `null_pool=True` guards against a future test carrying its own `loop_scope` marker, which otherwise raises `RuntimeError: Event loop is closed` on a pooled asyncpg connection.
 
-- [ ] **Step 2: Write the failing test**
+**Revised beyond this snippet, per D7 above:** `pg_url` opens with a `docker.from_env().ping()` guarded by `except DockerException: pytest.skip(...)`, before constructing `PostgresContainer` at all. Without it, a machine with no Docker running gets a 15-frame `docker.errors.DockerException` traceback, once per test that depends on `session` (measured: 7 traceback blocks, `DOCKER_HOST` pointed at a nonexistent socket). With it, the same run produces 7 clean skips in 0.01s, each carrying its own reason. This needed `types-docker` added to the dev dependency group for `mypy --strict` to accept the `docker` import (`tests/conftest.py`, `pyproject.toml`, `uv.lock`).
+
+- [x] **Step 2: Write the failing test**
 
 ```python
 # tests/test_store_consents.py
@@ -649,12 +657,24 @@ async def test_a_customer_with_no_rows_has_no_consent(session) -> None:
     assert await consents.granted_domains(session, CUST) == set()
 ```
 
-- [ ] **Step 3: Run it to verify it fails**
+**Extended beyond this snippet:** a seventh test, `test_rollback_isolation_row_from_other_test_is_not_visible`, asserting `CUST` has no granted domains — the direct proof that the `session` fixture's rollback isolates tests from each other, run alongside the row-inserting test above in both collection orders (both pass; see Task 3's completion note after Step 6).
+
+- [x] **Step 3: Run it to verify it fails**
 
 Run: `uv run pytest tests/test_store_consents.py -q`
 Expected: FAIL, `ModuleNotFoundError: No module named 'postern_core.store.consents'`. Docker must be running; the fixture starts a real Postgres 17 container.
 
-- [ ] **Step 4: Write `consents.py`**
+Actual, verified:
+
+```
+ImportError while importing test module '.../tests/test_store_consents.py'.
+tests/test_store_consents.py:13: in <module>
+    from postern_core.store import consents
+E   ImportError: cannot import name 'consents' from 'postern_core.store'
+1 error in 0.05s
+```
+
+- [x] **Step 4: Write `consents.py`**
 
 ```python
 # packages/postern-core/src/postern_core/store/consents.py
@@ -686,17 +706,27 @@ async def granted_domains(session: AsyncSession, customer: CustomerRef) -> set[s
     return set(rows.scalars().all())
 ```
 
-- [ ] **Step 5: Run it to verify it passes**
+- [x] **Step 5: Run it to verify it passes**
 
 Run: `uv run pytest tests/test_store_consents.py -q`
-Expected: PASS, 6 passed
+Expected: PASS, 6 passed. Actual: **7 passed** in 1.62-1.75s (the seventh is the rollback-isolation test added above); confirmed stable across three consecutive runs and in reverse collection order.
 
-- [ ] **Step 6: Commit**
+Each of the three filters in `granted_domains` (customer, `granted is True`, expiry) was broken one at a time and confirmed to fail a specific test, not a vague one:
+
+- Dropping `ConsentRecord.customer_ref == customer.value` made `test_granted_domains_returns_only_this_customers_rows` fail with `{'accounts', 'payments'} == {'accounts'}` — `OTHER`'s `payments` grant leaked into `CUST`'s result.
+- Dropping `ConsentRecord.granted.is_(True)` made `test_an_ungranted_row_is_not_returned` fail with `{'payments'} == set()` — a revoked row was returned as granted.
+- Dropping the expiry clause made `test_an_expired_row_is_treated_as_absent` fail with `{'cards'} == set()` — a row expired a day ago was returned as current.
+
+Each break was reverted before moving to the next; the final implementation is byte-for-byte the code block in Step 4.
+
+- [x] **Step 6: Commit**
 
 ```bash
-git add tests/conftest.py tests/test_store_consents.py packages/postern-core/src/postern_core/store/consents.py
+git add tests/conftest.py tests/test_store_consents.py packages/postern-core/src/postern_core/store/consents.py Makefile .github/workflows/ci.yml pyproject.toml uv.lock docs/superpowers/plans/postern-persistence-consent-audit-2026-09-14.md
 git commit -m "feat(store): read consent, treating an expired row as absent"
 ```
+
+`Makefile` and `.github/workflows/ci.yml` are included because D7 above changes what `make ci` and the workflow's comments claim about `make ci` being fully offline. `pyproject.toml` and `uv.lock` are included for the `types-docker` dev dependency the Docker-reachability skip guard needs to pass `mypy --strict`. The plan file is included because Step 1, Step 2, Step 3, Step 5 and the decision log were corrected to match what was actually built (D7).
 
 ---
 

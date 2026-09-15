@@ -2,12 +2,16 @@ name: ci
 
 # workflow_dispatch ONLY. Do not add `push` or `pull_request` triggers:
 # Actions minutes are billed on this private repository and the owner has
-# none to spend. `make ci` runs the same six offline gates below locally for
-# free and is the actual gate that must pass before any commit (see
-# CLAUDE.md). The `alembic check` step is the one gate `make ci` does not
-# run, because it needs a reachable Postgres that this manually dispatched
-# workflow gets for free via a service container and a local `make ci` does
-# not have by default.
+# none to spend. `make ci` runs the same six gates below locally for free and
+# is the actual gate that must pass before any commit (see CLAUDE.md). Since
+# Task 3, `test` starts its own disposable `testcontainers` Postgres for the
+# consent-repository tests (measured ~2s added, session-scoped so paid once),
+# so `make ci` is no longer fully offline; it degrades to an explicit skip,
+# not a crash, when a local machine has no Docker running (see `pg_url` in
+# tests/conftest.py). The `alembic check` step is still the one gate `make
+# ci` does not run, because it needs a fixed, externally reachable Postgres
+# URL rather than a container it owns and tears down itself; this manually
+# dispatched workflow gets one for free via the service container below.
 on:
   workflow_dispatch:
 
@@ -15,10 +19,13 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     # `alembic check` (the `migrations` target) is not one of `make ci`'s six
-    # local gates: it needs a reachable Postgres, and keeping `make ci` fully
-    # offline is what lets it run locally for free. Here, a Postgres service
-    # container costs nothing on a manually dispatched run, so the drift
-    # check runs as an extra step instead.
+    # local gates: it needs a database URL fixed in advance, which is a
+    # different requirement from `test`'s own disposable `testcontainers`
+    # Postgres (Task 3). Here, a Postgres service container costs nothing on
+    # a manually dispatched run, so the drift check runs as an extra step
+    # instead; `make test` also runs against a second, independent container
+    # that `testcontainers` starts and tears down itself, which this service
+    # container does not replace.
     services:
       postgres:
         image: postgres:17-alpine

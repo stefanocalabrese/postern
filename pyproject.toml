@@ -29,6 +29,7 @@ dev = [
     "mypy>=1.14",
     "import-linter>=2.15",
     "testcontainers[postgres]>=4.15",
+    "types-docker>=7.2.0.20260827",
 ]
 
 [tool.pytest.ini_options]

@@ -1457,6 +1457,7 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
     { name = "testcontainers" },
+    { name = "types-docker" },
 ]
 
 [package.metadata]
@@ -1478,6 +1479,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.4" },
     { name = "ruff", specifier = ">=0.16" },
     { name = "testcontainers", extras = ["postgres"], specifier = ">=4.15" },
+    { name = "types-docker", specifier = ">=7.2.0.20260827" },
 ]
 
 [[package]]
@@ -2074,6 +2076,31 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/53/a3/1585216310e344e8102c22482f6060c7a6ea0322b63e026372e6dcefcfd6/truststore-0.10.4.tar.gz", hash = "sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301", size = 26169, upload-time = "2025-08-12T18:49:02.73Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/19/97/56608b2249fe206a67cd573bc93cd9896e1efb9e98bce9c163bcdc704b88/truststore-0.10.4-py3-none-any.whl", hash = "sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981", size = 18660, upload-time = "2025-08-12T18:49:01.46Z" },
+]
+
+[[package]]
+name = "types-docker"
+version = "7.2.0.20260827"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "types-requests" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/66/92/ebed321b5e0d5f6b2efc2fee34e99961d1425600d3b1629f0684176bc204/types_docker-7.2.0.20260827.tar.gz", hash = "sha256:6e1674ec12dd4d09d6437f735dcf6b3c61e730c330623aacf92b492e1444094f", size = 36929, upload-time = "2026-08-27T12:07:36.723Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0e/62/40a2b11c2be94d7288d7c0c5ca673d2b9d11f2930f58ec9d5d98380092ba/types_docker-7.2.0.20260827-py3-none-any.whl", hash = "sha256:ecc2b403ec086552a298232b92b662fb195d0e749f155c0b707e59fdedb5bfdf", size = 51269, upload-time = "2026-08-27T12:07:35.671Z" },
+]
+
+[[package]]
+name = "types-requests"
+version = "2.33.0.20260906"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c0/18/4c2c0290953f8b3b9612adfcb07b57f144ade3ad32a76764fca42b77c5f3/types_requests-2.33.0.20260906.tar.gz", hash = "sha256:76ab8a0fb736744a0c3deee7aa57b2927e301f078d9e61f5391b3e92002416b9", size = 25263, upload-time = "2026-09-06T06:35:47.707Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/4c/51ec821d22a45b4162fa3f3e9e94ea4c0f8c49e82363b10955baa5438391/types_requests-2.33.0.20260906-py3-none-any.whl", hash = "sha256:9f53622652bd921ead7a54d665be1b8d518165c8b51cc9d68d944cd6b6bfa8fb", size = 21461, upload-time = "2026-09-06T06:35:45.856Z" },
 ]
 
 [[package]]
