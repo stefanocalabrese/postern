@@ -1,6 +1,9 @@
+import re
+
 import pytest
 from postern_core.domain.masking import (
     _IBAN_MASKED_RE,
+    _MASK,
     _PAN_MASKED_RE,
     FreeText,
     MaskedIban,
@@ -273,3 +276,162 @@ def test_free_text_leaves_an_iban_shaped_but_invalid_checksum_string_unchanged()
     test is about the string genuinely surviving both passes untouched."""
     memo = Memo(text="Reference XY99ABCD123456 for invoice")
     assert memo.text == "Reference XY99ABCD123456 for invoice"
+
+
+# --- Free-text digit runs longer than a PAN (leak found by security review) ---
+
+_DIGIT_RUN_RE = re.compile(r"[0-9]+")
+
+# Two sources for contiguous digit runs, sliced to each length under test.
+# "ascending" is structure-only filler. "amex-repeated" repeats a complete,
+# Luhn-valid 15-digit American Express number, so that a redaction which
+# emits a last-four and leaves an unconsumed remainder of the same run
+# concatenates the two back into a real card number -- which is exactly the
+# reported leak at length 30.
+_DIGIT_RUN_SOURCES = {
+    "ascending": "1234567890" * 5,
+    "amex-repeated": "378282246310005" * 4,
+}
+
+
+def _luhn_ok(digits: str) -> bool:
+    """Luhn check (ISO/IEC 7812-1 Annex B), the card-number check digit."""
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = int(char)
+        if index % 2:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def _long_digit_runs(text: str) -> list[str]:
+    """Digit runs of 13 or more, i.e. long enough to be most real PANs."""
+    return [run for run in _DIGIT_RUN_RE.findall(text) if len(run) >= 13]
+
+
+def _luhn_valid_pan_substrings(text: str) -> list[str]:
+    """Every 13-to-19-digit substring of `text` that passes Luhn.
+
+    This is the assertion that actually encodes "a real card number
+    survived the redaction". A length check alone would pass a 15-digit run
+    of arbitrary digits; this one only fires on something a payment network
+    would accept as a PAN.
+    """
+    found: list[str] = []
+    for run in _DIGIT_RUN_RE.findall(text):
+        for length in range(13, 20):
+            for start in range(len(run) - length + 1):
+                candidate = run[start : start + length]
+                if _luhn_ok(candidate):
+                    found.append(candidate)
+    return found
+
+
+def test_luhn_helper_agrees_with_known_card_numbers() -> None:
+    """The leak assertions below are only as good as this helper."""
+    assert _luhn_ok("378282246310005")  # AmEx, the number in the reported leak
+    assert _luhn_ok("4111111111111111")  # the canonical Visa test number
+    assert not _luhn_ok("378282246310006")
+    assert not _luhn_ok("1234567890123")
+
+
+def test_free_text_bare_thirty_digit_run_does_not_reconstitute_a_pan() -> None:
+    """Measured leak: a 30-digit run was matched as 19 digits, replaced by
+    the mask plus THAT RUN's last four, and the unconsumed 11-digit
+    remainder left immediately after it -- so the mask's own last four
+    concatenated with the residue into 378282246310005, a complete valid
+    AmEx number. The redaction was helping reconstitute the card."""
+    out = Memo(text="378282246310005378282246310005").text
+    assert "378282246310005" not in out
+    assert _long_digit_runs(out) == []
+    assert _luhn_valid_pan_substrings(out) == []
+
+
+def test_free_text_embedded_thirty_digit_run_does_not_reconstitute_a_pan() -> None:
+    out = Memo(text="paid 378282246310005378282246310005 today").text
+    assert "378282246310005" not in out
+    assert _long_digit_runs(out) == []
+    assert _luhn_valid_pan_substrings(out) == []
+
+
+@pytest.mark.parametrize("source", sorted(_DIGIT_RUN_SOURCES))
+@pytest.mark.parametrize("length", range(12, 41))
+def test_free_text_digit_run_of_any_length_never_leaves_a_pan(length: int, source: str) -> None:
+    """Property over every contiguous digit-run length from 12 (shortest
+    PAN) to 40 (well past the longest), bare and embedded in prose.
+
+    The invariant is stated on the OUTPUT, not on the matching strategy, so
+    it survives any rewrite of the regex: whatever the redaction emits, no
+    accepted output may contain a 13+ digit run, and none may contain a
+    Luhn-valid 13-to-19-digit run. A run of 12 or more must also actually
+    be redacted -- an output that simply left it alone would satisfy a
+    "no long run" check at length 12 while leaking."""
+    run = _DIGIT_RUN_SOURCES[source][:length]
+    assert len(run) == length
+    for text in (run, f"paid {run} today"):
+        out = Memo(text=text).text
+        assert _MASK in out, f"{text!r} -> {out!r} was not redacted at all"
+        assert run not in out, f"{text!r} -> {out!r} carries the run verbatim"
+        assert _long_digit_runs(out) == [], f"{text!r} -> {out!r}"
+        assert _luhn_valid_pan_substrings(out) == [], f"{text!r} -> {out!r}"
+
+
+_WORD_CHAR_RE = re.compile(r"\w")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ES9121000418450200051332",
+        "SEPA CT ES9121000418450200051332 thanks",
+        "ref-ES9121000418450200051332-ok",
+        "ES9121000418450200051332XXXXXXXXXX",  # 34 chars, the pattern's ceiling
+        "ES9121000418450200051332XXXXXXXXXXX",  # 35, one past it
+        "MT84MALT011000012345MTLCAST001S",
+        "MT84MALT011000012345MTLCAST001SREF9",
+        "ES9121000418450200051332_tail",
+        "xES9121000418450200051332",
+    ],
+)
+def test_iban_redaction_is_never_adjacent_to_a_word_character(text: str) -> None:
+    """The PAN leak's mechanism has no IBAN analogue, and this is why.
+
+    The PAN scan could match a PAN-length WINDOW of a longer digit run and
+    leave the rest of that run touching the mask, so the mask's own last
+    four concatenated with the residue. `_IBAN_IN_TEXT_RE` cannot do that:
+    it is `\\b`-anchored at both ends and every character it can match is a
+    word character, so a match is always a whole word-character token, never
+    a proper substring of a longer one. A token past the pattern's 34-char
+    ceiling therefore does not match a 34-char prefix of itself -- the
+    trailing `\\b` fails and every backtrack fails with it, so the pattern
+    matches nothing at all there rather than matching part of it.
+
+    Asserted on the output: no redaction the IBAN pass emits may have a
+    word character against either side of it, which is the precondition the
+    reconstitution needs and cannot get. This is the guard to re-run if
+    anyone widens `{10,30}` or drops a `\\b`.
+    """
+    out = Memo(text=text).text
+    for match in re.finditer(r"[A-Z]{2}•• •••• [A-Za-z0-9]{4}", out):
+        before = out[match.start() - 1 : match.start()]
+        after = out[match.end() : match.end() + 1]
+        assert not _WORD_CHAR_RE.fullmatch(before or " "), f"{text!r} -> {out!r}"
+        assert not _WORD_CHAR_RE.fullmatch(after or " "), f"{text!r} -> {out!r}"
+
+
+def test_free_text_still_scans_iban_before_pan() -> None:
+    """The IBAN pass must keep running first: the PAN scan consuming an
+    IBAN's numeric run would leave nothing IBAN-shaped for the IBAN pass to
+    recognize, costing the country code the IBAN mask is supposed to keep.
+    An input carrying both an IBAN and an over-long digit run must redact
+    both, each in its own shape."""
+    text = "SEPA ES9121000418450200051332 ref 378282246310005378282246310005"
+    out = Memo(text=text).text
+    assert out == "SEPA ES•• •••• 1332 ref ••••"
+    assert "ES9121000418450200051332" not in out
+    assert "378282246310005" not in out
+    assert _long_digit_runs(out) == []
+    assert _luhn_valid_pan_substrings(out) == []

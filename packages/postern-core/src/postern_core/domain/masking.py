@@ -80,8 +80,22 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 # `MaskedPan`/`MaskedIban` own that job for a value that IS a PAN/IBAN; this
 # only has to stop a contiguous run reaching a client, which is what a
 # memo/description field actually carries in practice.
-_PAN_IN_TEXT_RE = re.compile(r"\d{12,19}")
+#
+# The run pattern is deliberately UNBOUNDED above (`{12,}`, not `{12,19}`).
+# An upper bound here is not a harmless approximation, it reconstitutes
+# cards: against the 30-digit run "378282246310005378282246310005" the
+# bounded form matched only the first 19 digits, emitted THAT window's last
+# four ("3782"), and left the unconsumed 11-digit remainder
+# ("82246310005") immediately after the mask -- so the output read
+# "•••• 378282246310005", a complete valid 15-digit AmEx number that the
+# redaction itself had helped assemble out of its own mask. Consuming the
+# whole run first and deciding what to emit afterwards is the only shape
+# that cannot leave a residue for the mask to concatenate with.
+_PAN_IN_TEXT_RE = re.compile(r"\d{12,}")
 _IBAN_IN_TEXT_RE = re.compile(r"\b[A-Za-z]{2}[0-9]{2}[A-Za-z0-9]{10,30}\b")
+
+# ISO/IEC 7812-1 caps a PAN at 19 digits; no scheme issues a longer one.
+_PAN_MAX_DIGITS = 19
 
 
 def _redact_iban_match(match: re.Match[str]) -> str:
@@ -97,14 +111,31 @@ def _redact_iban_match(match: re.Match[str]) -> str:
 
 def _redact_pan_match(match: re.Match[str]) -> str:
     candidate = match.group(0)
+    if len(candidate) > _PAN_MAX_DIGITS:
+        # Longer than any PAN, so this run is not a card and its last four
+        # digits are not a card's last four. `MaskedPan`'s last-four IS the
+        # deliberate, policy-approved disclosure for a genuine card, and
+        # that approval does not transfer to arbitrary digits: copying the
+        # shape here would publish four attacker-chosen digits into a
+        # vendor's chat history and the audit table for no benefit, while
+        # asserting a confident, wrong "card ending NNNN" to whatever reads
+        # the text next -- the same failure `MaskedPan` refuses when it
+        # rejects well-formed-looking garbage instead of guessing a
+        # last-four for it. Emit the marker and nothing else.
+        return _MASK
     return f"{_MASK} {candidate[-4:]}"
 
 
 def _redact_free_text(value: str) -> str:
     # IBAN pass first: an IBAN's digits (e.g. "9121000418450200051332", 22
-    # digits) would otherwise be greedily chewed by the 12-19-digit PAN scan
-    # first, masking part of the IBAN's numeric run without leaving anything
-    # for `_redact_iban_match` to recognize as IBAN-shaped afterwards.
+    # digits) would otherwise be greedily chewed by the PAN scan first,
+    # consuming the IBAN's whole numeric run without leaving anything for
+    # `_redact_iban_match` to recognize as IBAN-shaped afterwards -- which
+    # costs the country code that `MaskedIban` exists to keep. The
+    # unbounded PAN run pattern makes this ordering matter more, not less.
+    # The IBAN replacement cannot feed the PAN pass either: it is
+    # `\b`-anchored at both ends, so no digit can sit against the "1332" it
+    # emits, and the bullets in it are not digits.
     text = _IBAN_IN_TEXT_RE.sub(_redact_iban_match, value)
     return _PAN_IN_TEXT_RE.sub(_redact_pan_match, text)
 
