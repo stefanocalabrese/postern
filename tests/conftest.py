@@ -7,10 +7,15 @@ import pytest_asyncio
 from alembic import command
 from alembic.config import Config
 from docker.errors import DockerException
+from fastmcp import FastMCP
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
+from postern_core.store.models import AuditEntry
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from testcontainers.community.postgres import PostgresContainer
+
+from services.api.middleware.audit import AuditMiddleware
 
 TEST_CUSTOMER = CustomerRef(value="cust_7f3a")
 
@@ -63,3 +68,59 @@ async def session(database: Database) -> AsyncIterator[AsyncSession]:
         async with maker() as s:
             yield s
         await trans.rollback()
+
+
+async def _clear_audit_log(database: Database) -> None:
+    async with database.sessionmaker() as s:
+        await s.execute(delete(AuditEntry))
+        await s.commit()
+
+
+@pytest_asyncio.fixture
+async def audit_server(database: Database) -> AsyncIterator[FastMCP]:
+    """Fresh `audit_log` state per test, before AND after.
+
+    `AuditMiddleware` commits through `database.sessionmaker()` -- a session
+    bound directly to the engine, not to this file's `session` fixture and
+    its already-open, rolled-back transaction. That is deliberate in the
+    middleware (an audit row for a failed call must survive regardless of
+    what the rest of the request rolls back), but it also means the
+    middleware's writes are real, independently committed rows in the
+    session-scoped Postgres container that the `session` fixture's rollback
+    cannot undo. Measured directly: without the pre-test clear, the second
+    test in this file onward sees every prior test's rows too, and
+    `rows(session)[0]` silently reads an *earlier* test's row instead of
+    erroring. The post-`yield` clear matters separately: without it, the
+    *last* test to run leaves its rows sitting in the session-scoped
+    container for whatever runs against `audit_log` next, in this file or
+    another. Clearing here, both ends, keeps that persistence behaviour
+    intact in the middleware/production code and fixes isolation only at the
+    test boundary.
+    """
+    await _clear_audit_log(database)
+
+    # `strict_input_validation=True`: FastMCP defaults to lax coercion (its
+    # own doc string: "providing the string '10' to an integer field will be
+    # coerced to 10"), so `leaky_tool`'s digit-only PAN string is silently
+    # coerced to an `int` and the call *succeeds* without this -- measured
+    # directly, the intended `ValidationError` never fires on a default
+    # server. This is what actually makes the coercion produce the
+    # `ValidationError` the test below asserts on.
+    mcp = FastMCP(name="audit-test", strict_input_validation=True)
+    mcp.add_middleware(AuditMiddleware(database))
+
+    @mcp.tool
+    async def ok_tool(amount: int, memo: str = "") -> str:
+        return f"ok {amount}"
+
+    @mcp.tool
+    async def boom_tool() -> str:
+        raise ValueError("internal detail")
+
+    @mcp.tool
+    async def leaky_tool(pan: int) -> str:
+        return "unreachable"
+
+    yield mcp
+
+    await _clear_audit_log(database)
