@@ -2,14 +2,38 @@ name: ci
 
 # workflow_dispatch ONLY. Do not add `push` or `pull_request` triggers:
 # Actions minutes are billed on this private repository and the owner has
-# none to spend. `make ci` runs these same six gates locally for free and
-# is the actual gate that must pass before any commit (see CLAUDE.md).
+# none to spend. `make ci` runs the same six offline gates below locally for
+# free and is the actual gate that must pass before any commit (see
+# CLAUDE.md). The `alembic check` step is the one gate `make ci` does not
+# run, because it needs a reachable Postgres that this manually dispatched
+# workflow gets for free via a service container and a local `make ci` does
+# not have by default.
 on:
   workflow_dispatch:
 
 jobs:
   gates:
     runs-on: ubuntu-latest
+    # `alembic check` (the `migrations` target) is not one of `make ci`'s six
+    # local gates: it needs a reachable Postgres, and keeping `make ci` fully
+    # offline is what lets it run locally for free. Here, a Postgres service
+    # container costs nothing on a manually dispatched run, so the drift
+    # check runs as an extra step instead.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postern
+          POSTGRES_PASSWORD: postern
+          POSTGRES_DB: postern
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postern"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      POSTERN_DATABASE_URL: postgresql+asyncpg://postern:postern@localhost:5432/postern
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -22,3 +46,5 @@ jobs:
       - run: make imports
       - run: make lock
       - run: make test
+      - run: uv run alembic upgrade head
+      - run: make migrations

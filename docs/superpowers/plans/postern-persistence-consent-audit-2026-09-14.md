@@ -69,7 +69,7 @@ Measured on 2026-09-14 against the installed packages and a real Postgres contai
 
 **D5. Audit arguments are scrubbed through the existing `FreeText` machinery before persisting.** The raw client dict can carry a PAN or IBAN, and an audit table is a long-lived store.
 
-**D6. `alembic check` becomes a seventh `make ci` gate**, so a model change without a migration fails the build rather than the deploy.
+**D6 (revised in Task 2, see Step 8 below). `alembic check` is a standalone `make migrations` target, not a `make ci` gate.** The original plan made it a seventh `make ci` gate; that was overridden during execution because it would have required a running Postgres for `make ci` to pass, which conflicts with `make ci` running fully offline in under a second, the property that lets it run locally for free instead of billed Actions minutes. The same check runs instead as an explicit step in `.github/workflows/ci.yml` against a free Postgres service container, and must be run by hand before committing a model change.
 
 ## File structure
 
@@ -354,7 +354,7 @@ git commit -m "feat(store): async engine and session factory"
 - Modify: `Makefile`
 - Test: `tests/test_store_models.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_store_models.py
@@ -383,12 +383,12 @@ def test_audit_arguments_column_is_jsonb() -> None:
     assert isinstance(AuditEntry.__table__.c.arguments.type, JSONB)
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `uv run pytest tests/test_store_models.py -q`
 Expected: FAIL, `ModuleNotFoundError: No module named 'postern_core.store.models'`
 
-- [ ] **Step 3: Write `models.py`**
+- [x] **Step 3: Write `models.py`**
 
 ```python
 # packages/postern-core/src/postern_core/store/models.py
@@ -440,17 +440,17 @@ class AuditEntry(Base):
 
 `outcome` is `"returned"` or `"raised"`, read from whether `call_next` raised, never from an `is_error` flag, for the reason in the verified facts.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Run: `uv run pytest tests/test_store_models.py -q`
 Expected: PASS, 4 passed
 
-- [ ] **Step 5: Initialise Alembic**
+- [x] **Step 5: Initialise Alembic**
 
 Run: `uv run alembic init --template async migrations`
 Expected: creates `migrations/` and `alembic.ini` at the repo root.
 
-- [ ] **Step 6: Make the three edits to `migrations/env.py`**
+- [x] **Step 6: Make the three edits to `migrations/env.py`**
 
 Replace `target_metadata = None` with:
 
@@ -479,7 +479,7 @@ if config.config_file_name is not None and os.path.exists(config.config_file_nam
 
 **That third edit is not optional.** The generated template guards only on `is not None`, but `config_file_name` is the literal string `"alembic.ini"` even when that file is absent, so any configuration that does not keep an `alembic.ini` dies with `FileNotFoundError: alembic.ini doesn't exist`. Measured.
 
-- [ ] **Step 7: Generate and apply the migration against a real database**
+- [x] **Step 7: Generate and apply the migration against a real database**
 
 ```bash
 docker compose up -d db
@@ -493,32 +493,41 @@ Expected: the revision names both tables (`Detected added table 'consents'`, `De
 
 Read the generated migration before committing it. Autogenerate is a draft, not an authority: confirm both tables, the unique constraint and both indexes are present and that nothing unexpected was added.
 
-- [ ] **Step 8: Add the drift gate to `make ci`**
+- [x] **Step 8 (revised): Add the drift gate as a standalone target, not a `make ci` prerequisite**
 
-In the `Makefile`, add a target and put it in the `ci` chain immediately after `lock`:
+**Not implemented as originally written.** D6 above ("`alembic check` becomes a seventh `make ci` gate") was overridden during execution: `make ci` running fully offline in well under a second is the property that lets it run locally for free instead of against billed GitHub Actions minutes (see `CLAUDE.md`, `.github/workflows/ci.yml`'s own header comment). Adding `migrations` to the `ci` chain would make that gate require a running Postgres on every commit on every machine, which trades a real, load-bearing property (offline, sub-second, runs anywhere) for a gate that already runs for free somewhere else.
+
+Instead:
+
+In the `Makefile`, add a target that is **not** in the `ci` prerequisite list:
 
 ```make
 migrations:
 	POSTERN_DATABASE_URL=$${POSTERN_DATABASE_URL:-postgresql+asyncpg://postern:postern@localhost:5432/postern} uv run alembic check
 ```
 
-and change the `ci` line to:
+documented inline as needing a reachable database and required before committing any change to `packages/postern-core/src/postern_core/store/models.py`.
 
-```make
-ci: lint fmt-check type imports lock migrations test
+The same check runs in `.github/workflows/ci.yml`, which stays `workflow_dispatch`-only, as an extra step after `make test` against a `postgres:17-alpine` service container (free on a manually dispatched run):
+
+```yaml
+      - run: uv run alembic upgrade head
+      - run: make migrations
 ```
 
-`alembic check` exits 1 when a model has changed without a migration, which is the failure mode that otherwise surfaces at deploy time. Note it needs a reachable database: if that is a problem for a machine without Docker running, say so in the commit message rather than silently making the gate optional.
+`alembic check` exits 1 (measured: 255 from the `alembic` CLI wrapper) when a model has changed without a migration, naming the exact drifted column, and exits 0 again once the migration or the model change is reconciled. Both directions verified against a real container as part of Task 2. `make ci` was confirmed to still exit 0, in ~0.9-1.5s, with the database container stopped.
 
-- [ ] **Step 9: Run the gates and commit**
+- [x] **Step 9: Run the gates and commit**
 
 Run: `make ci`
 Expected: exit 0.
 
 ```bash
-git add packages/postern-core/src/postern_core/store/models.py alembic.ini migrations Makefile tests/test_store_models.py
+git add packages/postern-core/src/postern_core/store/models.py alembic.ini migrations Makefile .github/workflows/ci.yml tests/test_store_models.py docs/superpowers/plans/postern-persistence-consent-audit-2026-09-14.md
 git commit -m "feat(store): consents and audit_log tables with an alembic drift gate"
 ```
+
+`.github/workflows/ci.yml` is included because Step 8 was revised to add the drift check there instead of to `make ci`; the plan file itself is included because Step 8 and D6 above were corrected to match.
 
 ---
 
