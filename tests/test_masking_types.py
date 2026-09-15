@@ -382,6 +382,20 @@ def test_free_text_digit_run_of_any_length_never_leaves_a_pan(length: int, sourc
 _WORD_CHAR_RE = re.compile(r"\w")
 
 
+def _assert_iban_mask_is_token_aligned(text: str, out: str) -> None:
+    """No IBAN mask in `out` may have a word character against either side.
+
+    That adjacency is the precondition the PAN leak needed: a mask emitting
+    its own last four directly against unconsumed characters of the same
+    token. Checked wherever an IBAN redaction is produced.
+    """
+    for match in _IBAN_MASKED_RE.finditer(out):
+        before = out[match.start() - 1 : match.start()]
+        after = out[match.end() : match.end() + 1]
+        assert not _WORD_CHAR_RE.fullmatch(before or " "), f"{text!r} -> {out!r}"
+        assert not _WORD_CHAR_RE.fullmatch(after or " "), f"{text!r} -> {out!r}"
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -404,22 +418,17 @@ def test_iban_redaction_is_never_adjacent_to_a_word_character(text: str) -> None
     four concatenated with the residue. `_IBAN_IN_TEXT_RE` cannot do that:
     it is `\\b`-anchored at both ends and every character it can match is a
     word character, so a match is always a whole word-character token, never
-    a proper substring of a longer one. A token past the pattern's 34-char
-    ceiling therefore does not match a 34-char prefix of itself -- the
-    trailing `\\b` fails and every backtrack fails with it, so the pattern
-    matches nothing at all there rather than matching part of it.
+    a proper substring of a longer one. The IBAN pass then replaces that
+    whole token, tail included, so there is never an unconsumed remainder
+    of it left against the emitted mask.
 
     Asserted on the output: no redaction the IBAN pass emits may have a
     word character against either side of it, which is the precondition the
     reconstitution needs and cannot get. This is the guard to re-run if
-    anyone widens `{10,30}` or drops a `\\b`.
+    anyone re-bounds the candidate pattern or drops a `\\b`, and it is the
+    reason the tail of a token cannot be preserved beside the mask.
     """
-    out = Memo(text=text).text
-    for match in re.finditer(r"[A-Z]{2}•• •••• [A-Za-z0-9]{4}", out):
-        before = out[match.start() - 1 : match.start()]
-        after = out[match.end() : match.end() + 1]
-        assert not _WORD_CHAR_RE.fullmatch(before or " "), f"{text!r} -> {out!r}"
-        assert not _WORD_CHAR_RE.fullmatch(after or " "), f"{text!r} -> {out!r}"
+    _assert_iban_mask_is_token_aligned(text, Memo(text=text).text)
 
 
 def test_free_text_still_scans_iban_before_pan() -> None:
@@ -435,3 +444,83 @@ def test_free_text_still_scans_iban_before_pan() -> None:
     assert "378282246310005" not in out
     assert _long_digit_runs(out) == []
     assert _luhn_valid_pan_substrings(out) == []
+
+
+# --- An IBAN with a tail glued to it (second hole, same lesson) --------------
+#
+# Every value below is mod-97 valid. These are the country shapes whose BBAN
+# carries letters, so their digit runs are short and the PAN pass does not
+# incidentally destroy what the IBAN pass missed. "MT-synth" is the worst
+# case and the one that leaked completely: a real-format MT IBAN
+# (MT 2!n 4!a 5!n 18!c) whose longest digit run is 5, so once a tail
+# defeated the IBAN scan, NOTHING in either pass touched it.
+_TAILED_IBANS = {
+    "MT-synth": ("MT92MALT01100ABCDEFGH1234IJKL56", "MT•• •••• KL56"),
+    "MT-real": ("MT84MALT011000012345MTLCAST001S", "MT•• •••• 001S"),
+    "SC": ("SC18SSCB11010000000000001497USD", "SC•• •••• 7USD"),
+    "BR": ("BR9700360305000010009795493P1", "BR•• •••• 93P1"),
+}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "MT92MALT01100ABCDEFGH1234IJKL56",
+        "MT92MALT01100ABCDEFGH1234IJKL56REF9",
+        "MT92MALT01100ABCDEFGH1234IJKL56REF99",
+    ],
+)
+def test_free_text_redacts_an_iban_whatever_is_glued_after_it(text: str) -> None:
+    """Measured leak: appending word characters to a valid IBAN made the
+    whole-token checksum fail, and the IBAN pass then gave up on the token
+    entirely instead of looking at the IBAN inside it -- so a complete,
+    mod-97-valid Maltese IBAN reached the output verbatim. The redaction
+    must not be defeatable by concatenation."""
+    assert Memo(text=text).text == "MT•• •••• KL56"
+
+
+def test_free_text_redacts_an_iban_with_one_character_glued_after_it() -> None:
+    """The sharpest form of the same leak, and the reason it is not just a
+    ceiling problem: ONE appended letter takes the token to 32 characters,
+    comfortably inside the old pattern's 34-character range, so the pattern
+    matched the whole token, the checksum failed on it, and the IBAN was
+    returned untouched. No length bound was involved at all."""
+    assert Memo(text="MT92MALT01100ABCDEFGH1234IJKL56R").text == "MT•• •••• KL56"
+
+
+@pytest.mark.parametrize("name", sorted(_TAILED_IBANS))
+def test_free_text_drops_an_iban_tail_rather_than_leaving_it_beside_the_mask(
+    name: str,
+) -> None:
+    """The emit decision, locked in: a token that contains a valid IBAN is
+    replaced whole, so the output is the same with or without a tail.
+
+    Preserving the tail is the one option that must not be taken. It would
+    put the mask's own last four directly against unconsumed,
+    attacker-influenced characters of the same token ("KL56" + "REF9"),
+    which is precisely the shape of the PAN leak this branch already fixed,
+    and it would break the token-alignment invariant above."""
+    iban, expected = _TAILED_IBANS[name]
+    assert Memo(text=iban).text == expected
+    assert Memo(text=iban + "R").text == expected
+
+
+@pytest.mark.parametrize("name", sorted(_TAILED_IBANS))
+@pytest.mark.parametrize("tail_len", range(0, 11))
+def test_free_text_iban_never_survives_a_tail_of_any_length(name: str, tail_len: int) -> None:
+    """Property over appended-tail lengths 0 to 10, bare and in prose,
+    across the country shapes whose BBAN contains letters.
+
+    Stated on the output rather than on the matching strategy: whatever the
+    IBAN pass emits, neither the IBAN nor the token it sits in may reach
+    the output, something must have been redacted in IBAN shape, and the
+    mask must stay token-aligned."""
+    iban, _ = _TAILED_IBANS[name]
+    tail = "REF9A7X2QZ"[:tail_len]
+    token = iban + tail
+    for text in (token, f"SEPA CT {token} ok"):
+        out = Memo(text=text).text
+        assert iban not in out, f"{text!r} -> {out!r} carries the IBAN verbatim"
+        assert token not in out, f"{text!r} -> {out!r} carries the token verbatim"
+        assert _IBAN_MASKED_RE.search(out), f"{text!r} -> {out!r} was not redacted"
+        _assert_iban_mask_is_token_aligned(text, out)

@@ -92,21 +92,72 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 # whole run first and deciding what to emit afterwards is the only shape
 # that cannot leave a residue for the mask to concatenate with.
 _PAN_IN_TEXT_RE = re.compile(r"\d{12,}")
-_IBAN_IN_TEXT_RE = re.compile(r"\b[A-Za-z]{2}[0-9]{2}[A-Za-z0-9]{10,30}\b")
+
+# Same lesson, IBAN side: the candidate pattern is unbounded above too, and
+# for a sharper reason than the ceiling. `[A-Za-z0-9]{10,30}` matched a whole
+# token only up to 34 characters, and `_redact_iban_match` then checksummed
+# THAT WHOLE TOKEN and gave up when it failed -- so one word character glued
+# to a valid IBAN was enough to defeat the scan entirely:
+# "MT92MALT01100ABCDEFGH1234IJKL56R" is 32 characters, well inside the old
+# range, and the complete mod-97-valid IBAN reached the output verbatim. Past
+# 34 the same input failed differently and just as badly: the trailing `\b`
+# rejected the greedy 30-character attempt and every backtrack with it, so
+# the pattern matched nothing at all. Neither failure is a length problem.
+# Match the maximal token, then look for an IBAN inside it.
+_IBAN_IN_TEXT_RE = re.compile(r"\b[A-Za-z]{2}[0-9]{2}[A-Za-z0-9]{10,}\b")
 
 # ISO/IEC 7812-1 caps a PAN at 19 digits; no scheme issues a longer one.
 _PAN_MAX_DIGITS = 19
 
+# ISO 13616 caps an IBAN at 34 characters. 14 is this module's own historical
+# lower bound (the old `2 + 2 + {10,30}`), kept rather than tightened to the
+# registry's true 15-character minimum so that this change only ever adds
+# redaction and never removes any.
+_IBAN_MIN_LEN = 14
+_IBAN_MAX_LEN = 34
+
+
+def _longest_iban_prefix(token: str) -> str | None:
+    """The longest leading slice of `token` that checksums as an IBAN.
+
+    Longest first, not shortest: a genuine IBAN's own length is the answer
+    wanted, and shorter slices of it can checksum by coincidence -- the
+    registry example "SC18SSCB11010000000000001497USD" has a mod-97-valid
+    18-character prefix, and returning that would emit a last-four taken
+    from the middle of the real account number instead of its end.
+
+    At most 21 checks per token however long the token is, because nothing
+    longer than 34 characters can be an IBAN. Scanning every WINDOW of the
+    token rather than its prefixes would cost O(len(token)) checks and hand
+    an attacker a CPU-burn primitive through a field they write; the price
+    of the cheap version is that an IBAN with junk glued to its FRONT is
+    not found (documented limitation, see `_redact_free_text`).
+    """
+    for end in range(min(len(token), _IBAN_MAX_LEN), _IBAN_MIN_LEN - 1, -1):
+        prefix = token[:end]
+        if _mod97_ok(prefix):
+            return prefix
+    return None
+
 
 def _redact_iban_match(match: re.Match[str]) -> str:
     candidate = match.group(0)
-    compact = candidate.upper()
-    if _mod97_ok(compact):
-        return f"{compact[:2]}•• {_MASK} {compact[-4:]}"
-    # IBAN-shaped but fails the checksum: not a real IBAN (e.g. a merchant
-    # reference that happens to look like one). Leave it as written rather
-    # than mangling ordinary text on a false positive.
-    return candidate
+    compact = _longest_iban_prefix(candidate.upper())
+    if compact is None:
+        # IBAN-shaped but nothing in it checksums: not a real IBAN (e.g. a
+        # merchant reference that happens to look like one). Leave it as
+        # written rather than mangling ordinary text on a false positive.
+        return candidate
+    # The WHOLE token is replaced, tail included, not just the IBAN prefix.
+    # Keeping the tail would set the mask's own last four directly against
+    # unconsumed, attacker-influenced characters of the same token
+    # ("KL56" + "REF9"), which is exactly the shape that let the PAN scan
+    # reassemble a card out of its own mask. Country code plus last four is
+    # kept, and only that: the checksum has positively identified a genuine
+    # IBAN here, and that is precisely the disclosure `MaskedIban` is
+    # approved to make about one -- unlike an over-long digit run, which is
+    # definitionally not a card and so has no approved last-four at all.
+    return f"{compact[:2]}•• {_MASK} {compact[-4:]}"
 
 
 def _redact_pan_match(match: re.Match[str]) -> str:
@@ -136,6 +187,14 @@ def _redact_free_text(value: str) -> str:
     # The IBAN replacement cannot feed the PAN pass either: it is
     # `\b`-anchored at both ends, so no digit can sit against the "1332" it
     # emits, and the bullets in it are not digits.
+    #
+    # Known limitation, deliberate: `_longest_iban_prefix` checks prefixes,
+    # so an IBAN with junk glued to its FRONT ("REF9MT92MALT...") is not
+    # found -- that token does not even match the candidate pattern, whose
+    # `[A-Za-z]{2}[0-9]{2}` opener has to land at the token start. Closing
+    # it means scanning every window of every token, which is O(len(token))
+    # checksum checks on attacker-written text. Worth doing behind an input
+    # length cap; not worth doing unbounded.
     text = _IBAN_IN_TEXT_RE.sub(_redact_iban_match, value)
     return _PAN_IN_TEXT_RE.sub(_redact_pan_match, text)
 
