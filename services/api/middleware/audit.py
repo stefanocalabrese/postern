@@ -115,7 +115,6 @@ class AuditMiddleware(Middleware):
         context: MiddlewareContext[CallToolRequestParams],
         call_next: CallNext[CallToolRequestParams, ToolResult],
     ) -> ToolResult:
-        name = context.message.name[:_MAX_TOOL_NAME]
         # One allowance for the WHOLE tree, not one per string `_scrub`
         # happens to visit: without this, `FreeText` gives every string it
         # validates its own fresh checksum budget (masking.py's
@@ -132,7 +131,89 @@ class AuditMiddleware(Middleware):
         # oversight: that data is not agent-controlled the way tool
         # arguments are, so splitting it into many strings is not an
         # attacker's lever the way it is here.
+        #
+        # The NAME is scrubbed here too now, through the same `_scrub` path
+        # as `arguments`, in this SAME scope -- not a second
+        # `redaction_budget()` block of its own. `context.message.name` is
+        # exactly as agent-chosen as any argument value: `_MAX_TOOL_NAME`
+        # (64) leaves room for a 16-digit PAN or a 31-character IBAN, and an
+        # agent that wants one in the bank's audit table does not need an
+        # argument at all, it names a tool after one. A separate scope for
+        # the name alone would quietly reintroduce a per-string allowance
+        # for exactly the value this fix exists to close, defeating the one
+        # allowance-per-call invariant the shared scope holds.
+        #
+        # Scrubbed BEFORE the arguments, deliberately: the name is bounded
+        # (clamped to `_MAX_TOOL_NAME` first, so the scan itself is bounded
+        # too) while the arguments are not, and a bounded value can only
+        # spend a small, fixed amount of the shared allowance -- measured
+        # directly against this module's own worst-case shape (a
+        # letter-letter-digit-digit opener repeated across the full 64
+        # characters, the maximum density `_find_iban_in_token` allows,
+        # confirmed by exhaustive derivation over every start position): 223
+        # checksums against the 100,000-checksum default, 0.223% of one
+        # call's allowance. That percentage is the durable number -- a
+        # count of names needed to exhaust the budget outright would be a
+        # ratio pinned to `_IBAN_SCAN_BUDGET`'s current value, which has
+        # already moved once in this module's history and is fixed by no
+        # test, so it is left out rather than stated as if it were stable.
+        # An ordinary name (`ok_tool`, `transactions.list`, ...) costs zero
+        # checksums -- it never reaches a letter-letter-digit-digit opener
+        # at all. Scrubbing this first therefore cannot meaningfully starve
+        # the arguments that follow.
+        #
+        # The converse does not hold for an IBAN-shaped name: scrubbing the
+        # name LAST would let an agent that pads its own arguments to
+        # exhaust the shared budget get its own IBAN-shaped tool name
+        # bare-masked to `••••` as a side effect of that exhaustion
+        # (`_redact_iban_match`'s `budget.exhausted` branch) -- verified
+        # live, by swapping the order -- destroying the one field an
+        # investigator uses to know WHAT was called. A PAN-shaped name is
+        # immune to that specific failure: `_redact_pan_match` spends no
+        # budget at all, so a PAN-shaped name resolves identically
+        # regardless of exhaustion or ordering (also verified live, e.g.
+        # `"tool_4111111111114417"` still comes back
+        # `"tool_•••• 4417"` even against an already-exhausted budget). The
+        # IBAN case alone is enough to require scrubbing the name first;
+        # getting it right for both shapes, rather than relying on one
+        # shape's accident, is the point. Losing argument detail degrades a
+        # row; losing the name degrades the row's identity.
         with redaction_budget() as scope:
+            name = _scrub(context.message.name[:_MAX_TOOL_NAME])
+            # `_scrub`'s two substitutions never lengthen a match: the
+            # shortest possible PAN run (12 digits) becomes `"•••• " +` its
+            # last four (9 characters), and the shortest possible IBAN match
+            # (14 characters) becomes a fixed 14-character mask; anything
+            # longer than either minimum only shrinks further, or (an
+            # over-length run, or an ambiguous IBAN token) collapses to the
+            # 4-character bare marker. `_strip_invisible` only ever removes
+            # characters. Confirmed by direct measurement (see
+            # `tests/test_audit_middleware.py`), fuzzed across shapes up to
+            # 64 characters plus every real PAN/IBAN in this module's own
+            # fixtures at every padding offset: growth was never observed.
+            #
+            # That guarantee is in CHARACTERS, not bytes, and the distinction
+            # is not academic: `_MASK` ("••••") is U+2022 BULLET, 3 bytes
+            # each in UTF-8, so masking can grow a string's BYTE length even
+            # while shrinking or holding its CHARACTER length -- verified
+            # live, four 15-character IBANs joined by "." (63 characters)
+            # scrub to 59 characters but 107 UTF-8 bytes. This is safe here
+            # only because `audit_log.tool_name` is Postgres `VARCHAR(64)`
+            # (models.py), and `VARCHAR`'s length argument is a character
+            # count, not a byte count. A byte-counted column (e.g. a
+            # `bytea`, or a `VARBINARY` on another database) would need a
+            # bound on `len(name.encode())`, not on `len(name)`, and this
+            # comment's "never lengthens" claim would not transfer to it
+            # unchanged.
+            #
+            # `tool_name` is the same column the un-scrubbed clamp above
+            # already exists to protect (see `_MAX_TOOL_NAME`'s own
+            # docstring), so this second clamp is kept as a cheap fail-safe
+            # against a future change to `_scrub`'s substitution lengths --
+            # or to the column's own type -- not because today's masking
+            # can trigger it.
+            if len(name) > _MAX_TOOL_NAME:
+                name = name[:_MAX_TOOL_NAME]
             arguments = _scrub(dict(context.message.arguments or {}))
         token = get_access_token()
         subject = token.claims.get("sub") if token is not None else None

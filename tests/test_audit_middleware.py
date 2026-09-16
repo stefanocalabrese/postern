@@ -1,3 +1,6 @@
+import random
+import string
+
 import pytest
 from fastmcp import FastMCP
 from fastmcp.client import Client
@@ -7,7 +10,7 @@ from postern_core.store.models import AuditEntry
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from services.api.middleware.audit import _scrub
+from services.api.middleware.audit import _MAX_TOOL_NAME, _scrub
 
 
 async def rows(session: AsyncSession) -> list[AuditEntry]:
@@ -342,3 +345,161 @@ async def test_an_ordinary_call_records_the_budget_as_not_exhausted_on_the_raise
     entry = (await rows(session))[0]
     assert entry.outcome == "raised"
     assert entry.redaction_budget_exhausted is False
+
+
+# -- The tool NAME is scrubbed the same way `arguments` is, before it reaches
+# `audit_log.tool_name` -----------------------------------------------------
+#
+# `context.message.name` is entirely agent-chosen -- `_MAX_TOOL_NAME` (64)
+# leaves ample room for a 16-digit PAN or a 31-character IBAN -- and a
+# tool-lookup failure for an unregistered name still reaches `on_call_tool`'s
+# "raised" write with the name intact. See the ordering comment on
+# `AuditMiddleware.on_call_tool` (`services/api/middleware/audit.py`) for
+# the threat this closes and why the name is scrubbed before the arguments.
+
+
+def test_scrub_never_lengthens_a_string_up_to_the_tool_name_clamp() -> None:
+    """Pins the measurement behind `on_call_tool`'s second, defensive clamp:
+    every substitution `_scrub`'s string branch can make
+    (`_redact_pan_match`, `_redact_iban_match`, `_strip_invisible`) replaces
+    a match with something the same length or shorter, so scrubbing an
+    already-clamped 64-character name can never overflow `audit_log
+    .tool_name`'s `String(64)` column. Seeded random sampling across a fixed
+    alphabet, not one hand-picked example, plus every real PAN/IBAN this
+    file already exercises, at every padding offset up to the clamp. The
+    alphabet includes a handful of `_strip_invisible`-stripped characters
+    (U+200B ZERO WIDTH SPACE, U+3164 HANGUL FILLER, U+0001, U+E0002) so this
+    test actually exercises that leg of the never-lengthens claim -- a
+    plain ASCII/digit/punctuation alphabet never calls `_strip_invisible`'s
+    character-removal path at all."""
+    alphabet = string.ascii_uppercase + string.digits + "_.- " + "​ㅤ\U000e0002"
+    rng = random.Random(0)  # noqa: S311 -- test fuzz, not cryptographic use
+    for _ in range(20_000):
+        length = rng.randint(0, _MAX_TOOL_NAME)
+        candidate = "".join(rng.choice(alphabet) for _ in range(length))
+        assert len(_scrub(candidate)) <= len(candidate)
+
+    real_values = (
+        "4111111111114417",
+        "411111111111",
+        "4111111111111111111",
+        "ES9121000418450200051332",
+        "MT84MALT011000012345MTLCAST001S",
+        "GB29NWBK60161331926819",
+    )
+    for value in real_values:
+        for pad in range(0, _MAX_TOOL_NAME - len(value) + 1):
+            candidate = (("A" * pad) + value)[:_MAX_TOOL_NAME]
+            assert len(_scrub(candidate)) <= len(candidate)
+
+
+async def test_a_pan_shaped_tool_name_is_masked_in_the_audit_row(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    pan_name = "4111111111114417"
+    async with Client(transport=audit_server) as c:
+        await c.call_tool(pan_name, {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert pan_name not in entry.tool_name
+    assert entry.tool_name == "•••• 4417"
+
+
+async def test_an_iban_shaped_tool_name_is_masked_in_the_audit_row(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    iban_name = "ES9121000418450200051332"
+    async with Client(transport=audit_server) as c:
+        await c.call_tool(iban_name, {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert iban_name not in entry.tool_name
+    assert entry.tool_name == "ES•• •••• 1332"
+
+
+async def test_an_ordinary_tool_name_is_recorded_unchanged(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """The regression guard: a name with no PAN/IBAN-shaped substring must
+    reach `audit_log.tool_name` exactly as sent, not run through masking
+    that mangles every ordinary row."""
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("transactions.list", {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert entry.tool_name == "transactions.list"
+
+
+async def test_a_call_with_a_scrubbed_name_records_exactly_one_row_on_the_returned_path(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """`call_next` still receives the untouched name -- resolution happens on
+    `context.message.name`, never on the value this middleware records --
+    so a tool registered under a PAN/IBAN-shaped name still resolves and
+    succeeds; only the audit row's copy of the name is masked."""
+    iban_name = "ES9121000418450200051332"
+
+    async def iban_named_tool(amount: int) -> str:
+        return f"ok {amount}"
+
+    audit_server.tool(name=iban_name)(iban_named_tool)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool(iban_name, {"amount": 1})
+    entries = await rows(session)
+    assert len(entries) == 1
+    assert entries[0].outcome == "returned"
+    assert entries[0].tool_name == "ES•• •••• 1332"
+
+
+async def test_a_call_with_a_scrubbed_name_records_exactly_one_row_on_the_raised_path(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    pan_name = "4111111111114417"
+    async with Client(transport=audit_server) as c:
+        await c.call_tool(pan_name, {}, raise_on_error=False)
+    entries = await rows(session)
+    assert len(entries) == 1
+    assert entries[0].outcome == "raised"
+    assert entries[0].tool_name == "•••• 4417"
+
+
+async def test_an_oversized_tool_name_still_produces_exactly_one_audit_row_after_scrubbing(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """Companion to the pre-existing oversized-name test: an oversized name
+    with no PAN/IBAN-shaped substring is unaffected by scrubbing, clamped
+    exactly as before."""
+    long_name = "y" * 200
+    async with Client(transport=audit_server) as c:
+        result = await c.call_tool(long_name, {}, raise_on_error=False)
+    assert result.is_error is True
+    entries = await rows(session)
+    assert len(entries) == 1
+    assert entries[0].tool_name == long_name[:64]
+    assert entries[0].outcome == "raised"
+
+
+async def test_the_name_is_scrubbed_before_the_arguments_so_their_exhaustion_does_not_bare_mask_it(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """Pins the ordering decision in `on_call_tool`: the name is scrubbed
+    BEFORE the arguments, in the same shared `redaction_budget` scope. The
+    memo below (`_EXHAUSTING_MEMO`, already proven elsewhere in this file to
+    exhaust the whole call's checksum allowance on its own) is scrubbed
+    SECOND. If the order were reversed, that exhaustion would already be in
+    effect by the time the name is scanned, and `_redact_iban_match`'s
+    `budget.exhausted` branch would bare-mask the name's IBAN to `••••`
+    instead of resolving it -- losing the one field an investigator uses to
+    know WHAT was called. Scrubbing the bounded name first means its own
+    (measured, see `services/api/middleware/audit.py`) worst case of 223
+    checksums out of a 100,000 allowance can never be meaningfully dented by
+    a single real IBAN, so it always resolves correctly regardless of how
+    much the arguments go on to spend."""
+    iban_name = "ES9121000418450200051332"
+
+    async def iban_named_tool(amount: int, memo: str = "") -> str:
+        return f"ok {amount}"
+
+    audit_server.tool(name=iban_name)(iban_named_tool)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool(iban_name, {"amount": 1, "memo": _EXHAUSTING_MEMO})
+    entry = (await rows(session))[0]
+    assert entry.tool_name == "ES•• •••• 1332"
+    assert entry.redaction_budget_exhausted is True
