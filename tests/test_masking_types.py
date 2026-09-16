@@ -13,6 +13,7 @@ from postern_core.domain.masking import (
     FreeText,
     MaskedIban,
     MaskedPan,
+    RedactionScope,
     _current_budget,
     _has_qualifying_start,
     redaction_budget,
@@ -1003,6 +1004,112 @@ def test_redaction_budget_is_shared_across_separate_free_text_validations() -> N
         out = Memo(text=f"{junk} {real_iban}").text
     assert real_iban not in out
     assert out.endswith(_MASK)
+
+
+# --- The scope object `redaction_budget` yields: `exhausted`, and nothing
+# else public ----------------------------------------------------------------
+#
+# `services/api/middleware/audit.py` needs to know, from OUTSIDE this module,
+# whether a call's redaction degraded, without gaining a route to
+# `_ScanBudget` itself: `spend()` and `remaining` stay private on purpose --
+# `remaining`'s meaning has already changed shape three times (per-token
+# bound, call-wide budget, qualifying-start narrowing), and anything built
+# against it would pin every caller to today's scan strategy.
+# `redaction_budget` yields a scope object instead, exposing exactly one
+# public property.
+
+
+def test_redaction_scope_exhausted_is_false_on_a_fresh_budget() -> None:
+    with redaction_budget(10) as scope:
+        assert scope.exhausted is False
+
+
+def test_redaction_scope_exhausted_is_true_once_the_budget_is_spent() -> None:
+    """A small, explicit budget, not a megabyte of junk: one 128-character
+    junk token spends 559 checksum operations (measured elsewhere in this
+    file against `_find_iban_in_token`), comfortably more than a budget of
+    1."""
+    with redaction_budget(1) as scope:
+        Memo(text="AB12" * 32)  # a single junk token; spends the one checksum
+        assert scope.exhausted is True
+
+
+def test_redaction_scope_exhausted_is_readable_after_the_block_exits() -> None:
+    """Live delegation, not a snapshot taken at `yield` time: reading
+    `scope.exhausted` after the block has exited must still report what
+    happened DURING the block, because the scope holds a reference to the
+    same `_ScanBudget` the block spent from rather than copying a bool at
+    yield time."""
+    with redaction_budget(1) as scope:
+        assert scope.exhausted is False
+        Memo(text="AB12" * 32)
+    assert scope.exhausted is True
+
+
+def test_redaction_scope_exhausted_is_true_after_an_exception_inside_the_block() -> None:
+    """The audit middleware's `raised` path writes its row AFTER an
+    exception has propagated out of the block, so the flag must still be
+    readable, and correct, from the `except` handler. The `ContextVar` is
+    reset in `redaction_budget`'s `finally` on the way out, so this only
+    holds if `scope.exhausted` reads its own stored `_ScanBudget` reference
+    rather than looking the current budget up from the (by then reset)
+    `ContextVar`."""
+    scope_from_block: RedactionScope | None = None
+    try:
+        with redaction_budget(1) as scope:
+            scope_from_block = scope
+            Memo(text="AB12" * 32)
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert scope_from_block is not None
+    assert scope_from_block.exhausted is True
+    assert _current_budget.get() is None
+
+
+def test_redaction_scope_exhausted_is_false_after_an_exception_with_the_budget_untouched() -> None:
+    """Same exception path, but nothing inside the block ever spent the
+    budget: `exhausted` must read False, not True, and not raise."""
+    scope_from_block: RedactionScope | None = None
+    try:
+        with redaction_budget(500) as scope:
+            scope_from_block = scope
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert scope_from_block is not None
+    assert scope_from_block.exhausted is False
+    assert _current_budget.get() is None
+
+
+def test_bare_redaction_budget_without_as_still_works() -> None:
+    """Every existing call site uses `with redaction_budget():`, with no
+    `as` clause -- the changed return type must not break any of them."""
+    with redaction_budget(10):
+        assert _current_budget.get() is not None
+
+
+def test_redaction_scope_nesting_reports_its_own_budgets_exhaustion() -> None:
+    """An inner scope reports its OWN budget's exhaustion, not the outer
+    one's -- and exiting the inner block restores the outer budget exactly
+    as `test_redaction_budget_restores_a_nested_callers_own_budget` above
+    already proves at the `ContextVar` level."""
+    with redaction_budget(500) as outer:
+        with redaction_budget(1) as inner:
+            Memo(text="AB12" * 32)
+            assert inner.exhausted is True
+            assert outer.exhausted is False
+        assert outer.exhausted is False
+
+
+def test_redaction_scope_does_not_expose_spend_or_remaining() -> None:
+    """The scope's only public member is `exhausted`. Asserted with
+    `hasattr` rather than by inspecting the scope class's own source, so a
+    future passthrough (a `__getattr__`, say) would be caught the same way
+    a caller reaching through it would be."""
+    with redaction_budget(10) as scope:
+        assert not hasattr(scope, "spend")
+        assert not hasattr(scope, "remaining")
 
 
 # --- Default_Ignorable_Code_Point: unassigned codepoints that still render

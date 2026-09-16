@@ -224,8 +224,55 @@ _current_budget: contextvars.ContextVar[_ScanBudget | None] = contextvars.Contex
 )
 
 
+class RedactionScope:
+    """Read-only view onto the `_ScanBudget` active for one `redaction_budget`
+    block, yielded by that context manager so a caller outside this module
+    can learn whether the block's redaction degraded, without ever gaining a
+    route to `_ScanBudget` itself.
+
+    `spend()` and `remaining` stay unreachable through this on purpose: this
+    class holds a `_ScanBudget` but does not subclass it, forward attribute
+    access to it, or expose it, so `exhausted` is the only thing a caller can
+    read. `remaining` is a checksum count whose meaning has already changed
+    three times (a per-token bound, then a call-wide budget, then a
+    qualifying-start narrowing of what exhaustion masks) -- anything built
+    against it, from outside this module, would pin every future revision of
+    the scan strategy to today's one.
+
+    `exhausted` delegates LIVE to the underlying `_ScanBudget` on every read,
+    rather than copying a bool at construction time: `services/api/
+    middleware/audit.py` reads it once the whole `_scrub` walk has finished
+    (or, on the exception path, once it has propagated past the `with`
+    block), by which point `redaction_budget` has already reset the
+    `ContextVar` back to whatever it held before -- so a `RedactionScope`
+    keeps its own direct reference to the one `_ScanBudget` it was built
+    with, rather than reading `_current_budget` at property-access time. The
+    two are the same object as long as the block's own budget was never
+    superseded by a nested `redaction_budget`, which is exactly the
+    condition nesting keeps true: see `redaction_budget`'s docstring for how
+    a nested block restores the outer `ContextVar` value on exit, and this
+    class's own tests in `tests/test_masking_types.py` for the nested and
+    exception-inside-the-block cases checked directly.
+    """
+
+    __slots__ = ("_budget",)
+
+    def __init__(self, budget: _ScanBudget) -> None:
+        self._budget = budget
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the underlying `_ScanBudget` had spent its whole
+        allowance, as of the moment this is read. True means at least one
+        `FreeText` value validated inside the originating `redaction_budget`
+        block was scanned with a degraded, bare-marker fallback (see
+        `_redact_iban_match`'s `budget.exhausted` branch) rather than the
+        full scan; it says nothing about which value, or how many."""
+        return self._budget.exhausted
+
+
 @contextmanager
-def redaction_budget(checksums: int = _IBAN_SCAN_BUDGET) -> Iterator[None]:
+def redaction_budget(checksums: int = _IBAN_SCAN_BUDGET) -> Iterator[RedactionScope]:
     """Make one checksum-operation allowance ambient for every `FreeText`
     validation performed inside this `with` block, across as many separate
     strings as it validates.
@@ -269,11 +316,19 @@ def redaction_budget(checksums: int = _IBAN_SCAN_BUDGET) -> Iterator[None]:
     boundary is ever crossed while the budget is ambient, and there is
     nothing for a concurrently-scheduled coroutine on the same task to
     observe even if `ContextVar` did not already isolate it by task.
+
+    Yields a `RedactionScope`, not the `_ScanBudget` itself: a caller
+    outside this module -- `services/api/middleware/audit.py`'s audit-log
+    write, specifically -- needs to know whether this block's redaction
+    degraded, but must never gain a route to `_ScanBudget.spend()` or
+    `.remaining`. See `RedactionScope` for why that view is read-only, one
+    property wide, and safe to read after this block has already exited and
+    reset the `ContextVar` above.
     """
     budget = _ScanBudget(checksums)
     token = _current_budget.set(budget)
     try:
-        yield
+        yield RedactionScope(budget)
     finally:
         _current_budget.reset(token)
 
