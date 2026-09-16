@@ -15,7 +15,7 @@ toward a client MUST call `errors(include_input=False)` or
 import contextvars
 import re
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Annotated
 
@@ -95,6 +95,25 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 # redaction itself had helped assemble out of its own mask. Consuming the
 # whole run first and deciding what to emit afterwards is the only shape
 # that cannot leave a residue for the mask to concatenate with.
+#
+# `\d`, not `[0-9]` -- deliberately different from `_PAN_RE` above, and not
+# a bug to reconcile. Python's `\d` is Unicode-aware, so this pattern
+# already matches a PAN written in Arabic-Indic (`٠١٢٣٤٥٦٧٨٩`) or Eastern
+# Arabic-Indic (`۰۱۲۳۴۵۶۷۸۹`) digits -- verified directly, not assumed:
+# `_redact_free_text("pay ٤٤١٧٤٤١٧٤٤١٧")` masks it, last four preserved IN
+# THE ORIGINAL SCRIPT ("pay •••• ٤٤١٧"). `_PAN_RE` (`_mask_pan`'s own
+# fullmatch check, for `MaskedPan`) stays `[0-9]{12,19}`, ASCII-only, and
+# would REJECT that same digit run outright ("not a PAN: expected 12 to 19
+# digits") rather than mask it. This divergence is intentional and safe in
+# the direction it goes: `FreeText` (this pattern) fails closed by matching
+# MORE digit scripts than it strictly needs to, `MaskedPan` fails closed by
+# accepting FEWER; neither can be talked into leaking a PAN by the other's
+# choice. It is also unreachable in practice, which is why it has never
+# needed resolving: ISO/IEC 7812 specifies ASCII digits for a PAN (ISO
+# 13616 likewise for an IBAN), so no real backend sends either in
+# Arabic-Indic numerals. Do not "fix" this by making the two patterns
+# agree -- that is exactly the kind of asymmetry a later reader tidies into
+# a bug without knowing why it existed.
 _PAN_IN_TEXT_RE = re.compile(r"\d{12,}")
 
 # ISO/IEC 7812-1 caps a PAN at 19 digits; no scheme issues a longer one.
@@ -863,11 +882,503 @@ def _strip_invisible(value: str) -> str:
     return "".join(ch for ch in value if not _is_stripped(ch))
 
 
+_LOOKALIKE_DIGIT_WORDS = {
+    "ZERO": "0",
+    "ONE": "1",
+    "TWO": "2",
+    "THREE": "3",
+    "FOUR": "4",
+    "FIVE": "5",
+    "SIX": "6",
+    "SEVEN": "7",
+    "EIGHT": "8",
+    "NINE": "9",
+}
+_MATH_ALPHANUMERIC_LETTER_RE = re.compile(r"^MATHEMATICAL [A-Z][A-Z -]* (CAPITAL|SMALL) ([A-Z])$")
+_MATH_ALPHANUMERIC_DIGIT_RE = re.compile(
+    r"^MATHEMATICAL [A-Z][A-Z -]* DIGIT (" + "|".join(_LOOKALIKE_DIGIT_WORDS) + ")$"
+)
+_ENCLOSED_ALPHANUMERIC_LETTER_RE = re.compile(
+    r"^CIRCLED (LATIN CAPITAL|LATIN SMALL) LETTER ([A-Z])$"
+)
+_ENCLOSED_ALPHANUMERIC_DIGIT_RE = re.compile(
+    r"^CIRCLED DIGIT (" + "|".join(_LOOKALIKE_DIGIT_WORDS) + ")$"
+)
+
+
+def _build_fullwidth_lookalikes() -> dict[str, str]:
+    """Fullwidth Latin letters and digits (U+FF01-U+FF5E block): a fixed
+    +0xFEE0 offset from ASCII ('Ａ' - 'A' == '１' - '1' == 0xFEE0),
+    verified directly against the running interpreter, not assumed from the
+    block's name. A formula, not a lookup table: nothing here can drift
+    across a Unicode version bump, because the block's own definition is the
+    offset -- there is no name-parsing step for this source to get out of
+    sync with anything."""
+    table: dict[str, str] = {}
+    for cp in range(0xFF21, 0xFF3B):  # fullwidth A-Z
+        table[chr(cp)] = chr(cp - 0xFEE0)
+    for cp in range(0xFF41, 0xFF5B):  # fullwidth a-z
+        table[chr(cp)] = chr(cp - 0xFEE0)
+    for cp in range(0xFF10, 0xFF1A):  # fullwidth 0-9
+        table[chr(cp)] = chr(cp - 0xFEE0)
+    return table
+
+
+def _build_math_alphanumeric_lookalikes() -> dict[str, str]:
+    """Mathematical Alphanumeric Symbols (U+1D400-U+1D7FF), derived by
+    parsing `unicodedata.name()` rather than hand-listing ~700 codepoints.
+    Deliberately restricted to names ending in '(CAPITAL|SMALL) <letter>' or
+    'DIGIT <word>': the math-styled GREEK letters sharing this same block
+    (e.g. MATHEMATICAL BOLD CAPITAL ALPHA) are excluded by the same regex,
+    on purpose -- a math-styled Greek alpha is not a Latin look-alike the
+    way a math-styled Latin A is, and this table's job is Latin/digit
+    look-alikes only. This block is complete and closed in Unicode (every
+    math-alphabet style ISO 13616/7812 could plausibly encounter was
+    assigned when the block was created); a future Unicode version is not
+    expected to add new members here the way it can to Cyrillic or Greek."""
+    table: dict[str, str] = {}
+    for cp in range(0x1D400, 0x1D800):
+        try:
+            name = unicodedata.name(chr(cp))
+        except ValueError:
+            continue
+        m = _MATH_ALPHANUMERIC_LETTER_RE.match(name)
+        if m:
+            case, letter = m.groups()
+            table[chr(cp)] = letter.lower() if case == "SMALL" else letter
+            continue
+        m = _MATH_ALPHANUMERIC_DIGIT_RE.match(name)
+        if m:
+            table[chr(cp)] = _LOOKALIKE_DIGIT_WORDS[m.group(1)]
+    return table
+
+
+def _build_enclosed_alphanumeric_lookalikes() -> dict[str, str]:
+    """Enclosed Alphanumerics (U+2460-U+24FF) only -- not the Enclosed
+    Alphanumeric Supplement (U+1F100-U+1F1FF, "negative circled"/"squared"
+    forms), a different, much larger, and visually distinct block. Two-digit
+    forms ("CIRCLED NUMBER TEN".."TWENTY") are skipped on purpose: mapping
+    one codepoint to a two-character string would break the 1:1 codepoint
+    correspondence every other entry in this table keeps, which
+    `_delookalike` (below) relies on to stay a single `str.translate` pass."""
+    table: dict[str, str] = {}
+    for cp in range(0x2460, 0x2500):
+        try:
+            name = unicodedata.name(chr(cp))
+        except ValueError:
+            continue
+        m = _ENCLOSED_ALPHANUMERIC_LETTER_RE.match(name)
+        if m:
+            case, letter = m.groups()
+            table[chr(cp)] = letter.lower() if "SMALL" in case else letter
+            continue
+        m = _ENCLOSED_ALPHANUMERIC_DIGIT_RE.match(name)
+        if m:
+            table[chr(cp)] = _LOOKALIKE_DIGIT_WORDS[m.group(1)]
+    return table
+
+
+# Hand-enumerated: Cyrillic and Greek letters visually identical -- not
+# merely similar -- to a Latin letter, both cases, plus dotless i. This is
+# the ONLY source in `_LOOKALIKE_TABLE` with no mechanical derivation and no
+# formal Unicode property backing it ("confusable with a specific other
+# letter" is not itself an enumerable Unicode property the way
+# Default_Ignorable_Code_Point is on `_DEFAULT_IGNORABLE_UNASSIGNED` above);
+# it is a closed, manually curated list, and
+# `test_bundled_unicode_version_matches_the_version_the_lookalike_table_was_derived_against`
+# (tests/test_masking_types.py) exists specifically because nothing else in
+# this file can detect a future Unicode version assigning a new
+# Cyrillic/Greek character with a Latin look-alike -- see that test's own
+# failure message for what a human must do about it, and do not treat
+# passing it as evidence this list is complete.
+#
+# Both cases were added in the same change that discovered the gap:
+# uppercase-only was this table's first shape, on the reasoning that ISO
+# 13616 IBANs are conventionally rendered uppercase -- true, but irrelevant,
+# because `_delookalike` runs on the WHOLE free-text value, not on an
+# isolated IBAN candidate, and an attacker is not obliged to render the rest
+# of their homoglyph in the same case as the real IBAN. Measured directly: a
+# single lowercase Cyrillic а (U+0430) substituted into an otherwise-
+# uppercase IBAN reached `_redact_free_text`'s output completely unchanged
+# under the uppercase-only table -- not merely "degraded", but byte-for-byte
+# identical to the input -- because the uppercase-only table left it
+# non-ASCII and `_IBAN_IN_TEXT_RE` split the token on it exactly as it would
+# on any other non-ASCII codepoint. See
+# `test_lowercase_cyrillic_homoglyph_is_now_properly_masked` (tests/
+# test_masking_confusables.py) for that case, now closed.
+#
+# Every precomposed accented Latin letter (a-with-acute, n-with-tilde,
+# c-with-cedilla, ...) is excluded BY CONSTRUCTION: none of the four sources
+# in `_LOOKALIKE_TABLE` touches the Latin-1 Supplement or Latin Extended-A
+# blocks at all, so there is no code path through which "ñ", "ç", "à" could
+# ever enter this table by accident. Verified against 53 realistic Spanish
+# and Catalan merchant descriptors and payee names with zero alterations
+# (`test_false_positive_corpus_is_untouched_through_the_public_api`, same
+# test file, and `test_false_positives_on_legitimate_text` in tests/
+# test_masking_homoglyph_measurement.py).
+_HAND_CYRILLIC_LOOKALIKES = {
+    "А": "A",
+    "В": "B",
+    "Е": "E",
+    "К": "K",
+    "М": "M",
+    "Н": "H",
+    "О": "O",
+    "Р": "P",
+    "С": "C",
+    "Т": "T",
+    "У": "Y",
+    "Х": "X",
+    "Ѕ": "S",
+    "Ј": "J",
+    "а": "a",
+    "в": "b",
+    "е": "e",
+    "к": "k",
+    "м": "m",
+    "н": "h",
+    "о": "o",
+    "р": "p",
+    "с": "c",
+    "т": "t",
+    "у": "y",
+    "х": "x",
+    "ѕ": "s",
+    "ј": "j",
+}
+_HAND_GREEK_LOOKALIKES = {
+    "Α": "A",
+    "Β": "B",
+    "Ε": "E",
+    "Ζ": "Z",
+    "Η": "H",
+    "Ι": "I",
+    "Κ": "K",
+    "Μ": "M",
+    "Ν": "N",
+    "Ο": "O",
+    "Ρ": "P",
+    "Τ": "T",
+    "Υ": "Y",
+    "Χ": "X",
+    "α": "a",
+    "β": "b",
+    "ε": "e",
+    "ζ": "z",
+    "η": "h",
+    "ι": "i",
+    "κ": "k",
+    "μ": "m",
+    "ν": "n",
+    "ο": "o",
+    "ρ": "p",
+    "τ": "t",
+    "υ": "y",
+    "χ": "x",
+}
+_HAND_MISC_LOOKALIKES = {
+    "ı": "i",  # LATIN SMALL LETTER DOTLESS I
+}
+
+_LOOKALIKE_TABLE: dict[str, str] = {
+    **_build_fullwidth_lookalikes(),
+    **_build_math_alphanumeric_lookalikes(),
+    **_build_enclosed_alphanumeric_lookalikes(),
+    **_HAND_CYRILLIC_LOOKALIKES,
+    **_HAND_GREEK_LOOKALIKES,
+    **_HAND_MISC_LOOKALIKES,
+}
+
+# `_redact_free_text`'s position-preserving splice (`_sub_preserving_original`
+# below) depends on `_delookalike` never changing a value's LENGTH: it finds
+# match spans in a transliterated skeleton and slices the ORIGINAL string at
+# those same offsets, which is only correct if the skeleton and the original
+# stay index-aligned, character for character. That alignment holds only if
+# every entry in this table maps to EXACTLY one character -- true today by
+# construction (see `_build_enclosed_alphanumeric_lookalikes`'s own
+# docstring for the one source that had to be deliberately narrowed to keep
+# it true), but "true today" is a fact about data, not about code, and nothing
+# else in this file would notice if a future edit added a multi-character
+# target. A `str.maketrans` mapping ALLOWS multi-character replacement
+# values -- `_delookalike` itself would keep working, silently producing a
+# LONGER string with no error -- so this cannot be left as a remembered
+# invariant: checked here, unconditionally, at import time, raising rather
+# than asserting, because `assert` is stripped under `python -O` and this is
+# exactly the kind of check `_STRIPPED_CATEGORIES`'s own module docstring
+# warns a stripped assert would silently fail to protect. A future edit that
+# violates this must fail the moment the module is imported, not
+# desynchronise a splice offset and cut a mask into the wrong place months
+# later. See `test_lookalike_table_values_are_single_characters`
+# (tests/test_masking_confusables.py) for the same property checked as a
+# test too, and `test_delookalike_preserves_string_length` for the
+# consequence this guards, exercised directly.
+_MULTI_CHARACTER_LOOKALIKE_TARGETS = {k: v for k, v in _LOOKALIKE_TABLE.items() if len(v) != 1}
+if _MULTI_CHARACTER_LOOKALIKE_TARGETS:
+    raise ValueError(
+        "_LOOKALIKE_TABLE must map every codepoint to exactly one ASCII "
+        "character -- _redact_free_text's position-preserving splice relies "
+        "on the skeleton and the original string staying the same length "
+        "and index-aligned. Found multi-character (or empty) targets: "
+        f"{_MULTI_CHARACTER_LOOKALIKE_TARGETS!r}"
+    )
+
+_LOOKALIKE_TRANS = str.maketrans(_LOOKALIKE_TABLE)
+
+
+def _delookalike(value: str) -> str:
+    """Map every codepoint in `_LOOKALIKE_TABLE` to the ASCII letter or digit
+    it visually renders as, before either `_IBAN_IN_TEXT_RE` or
+    `_PAN_IN_TEXT_RE` ever runs. Same ordering principle as
+    `_strip_invisible` immediately above it, for the mirror-image reason:
+    that function strips a codepoint that renders as NOTHING so a reader
+    sees one continuous token while the codepoint stream is split below the
+    scan's length floor; this one neutralizes a codepoint that renders as an
+    ASCII LOOK-ALIKE for the identical structural reason --
+    `_IBAN_IN_TEXT_RE`/`_PAN_IN_TEXT_RE` are `[A-Za-z0-9]`-only, so a single
+    Cyrillic А inside an otherwise-ASCII IBAN splits the token exactly the
+    way a zero-width space does, and the checksum pass never runs. Found
+    live on main: `'MT92MАLT01100ABCDEFGH1234IJKL56'` (one Cyrillic А,
+    U+0410) reached `_redact_free_text`'s output completely unchanged.
+
+    This function itself only builds the SKELETON -- the ASCII-mapped copy
+    used to find matches. It does not decide what reaches the output; see
+    `_sub_preserving_original` and `_redact_free_text` below for the splice
+    that applies a match found here back onto the UNTRANSLITERATED original,
+    leaving every character outside a matched span exactly as written.
+
+    That position-preserving design was not the first one shipped, and the
+    reversal is worth recording rather than quietly overwriting: the first
+    version of this function transliterated the whole value and let
+    `_redact_free_text` scan and mask that transliterated copy directly, on
+    the reasoning that this deployment's realistic `FreeText` input
+    distribution is Spanish/Catalan and would not contain genuine Cyrillic
+    or Greek script. That premise was wrong -- `FreeText` covers SEPA
+    remittance information and counterparty names, and SEPA includes
+    Greece, Cyprus and Bulgaria, so a Greek payee or a Bulgarian
+    counterparty name is ordinary traffic, not an exotic case. Measured on
+    the whole-value version before it was replaced: `'ΜΑΡΙΑ ΠΑΠΑΔΟΠΟΥΛΟΥ'`
+    (a Greek name, no IBAN or PAN anywhere in it) came out
+    `'MAPIA ΠAΠAΔOΠOYΛOY'`, and `'payment to МОСКВА office'` came out
+    `'payment to MOCKBA office'` -- half-transliterated gibberish in a field
+    a customer and a model both read, which is corruption, not the
+    over-redaction this module's other trade-offs accept. Over-redaction
+    means masking MORE than necessary; it does not mean silently rewriting
+    unrelated, unmasked characters into a different script. Every mapping
+    in `_LOOKALIKE_TABLE` being 1:1 (see `_build_enclosed_alphanumeric_
+    lookalikes`'s own docstring for the one source deliberately narrowed to
+    keep this true, and the module-level check immediately above
+    `_LOOKALIKE_TRANS` that fails the import if it ever stops being true) is
+    exactly what makes the position-preserving splice tractable: the
+    skeleton this function returns is always the same length, and
+    index-aligned, with whatever string was passed in.
+
+    Cost, stated plainly rather than left for a reader to discover under
+    load: this runs unconditionally, before `_ScanBudget` is even
+    constructed, so it is spent whether or not the value contains anything
+    resembling an IBAN or PAN -- `_IBAN_SCAN_BUDGET` bounds CHECKSUM
+    operations only, and a `str.translate` call is not one. On its own this
+    is a single O(length) pass, and the `value.isascii()` fast path below
+    (identical in shape to `_strip_invisible`'s own) means an ordinary ASCII
+    memo -- the overwhelming majority of real traffic -- pays only the cost
+    of that one C-level check, not a translation pass at all.
+    Two numbers, for two different strings, because they are not the same
+    claim: a genuinely ALL-ASCII 67-character memo
+    ("TRANSFER SALARY PAYMENT REF 2024-09-15 SABADELL BRANCH ACCOUNT 4471")
+    measured 2.0-2.1 microseconds end to end (`_redact_free_text` as a
+    whole, this function called twice, once per pass -- see
+    `_redact_free_text` itself), min of 5 trials of 20,000 reps each, five
+    repeated runs, all landing in that band -- independently corroborated
+    at 2.51 microseconds on a different 73-character all-ASCII memo, same
+    method, by a reviewer of this change; the two numbers are close enough
+    (both "a few microseconds") to support the same conclusion without
+    either being asserted as the one true figure. A 61-character memo WITH
+    accented Latin characters ("Transferència nòmina mensual Josep Martí
+    ref 2024-09 Sabadell", the realistic Catalan memo this module's own
+    test suite uses for false-positive testing) measured 7.6-7.8
+    microseconds instead, same method -- NOT the isascii() fast path this
+    paragraph is about, because that string genuinely is not ASCII; it is
+    the general per-character path taken by both this function and
+    `_strip_invisible` finding nothing to change, still cheap, just not the
+    same claim as the all-ASCII number above. Earlier revisions of this
+    docstring conflated the two and cited "7-9 microseconds" as the
+    ASCII-fast-path figure; that was the accented-memo number mislabelled,
+    corrected here after a reviewer measured the true ASCII case and found
+    the citation roughly 3x too high. Both numbers are, either way,
+    indistinguishable in practice from this function not existing.
+    The cost that matters is what this does to the module's OWN documented
+    worst case, and it makes it worse, not neutral: `masking.py`'s adversarial
+    shape is space-separated 128-character tokens built to maximize
+    qualifying-start checksum attempts (see `_IBAN_SCAN_BUDGET`'s own
+    derivation above). Measured on a 1 MiB payload of that shape with every
+    'A' opener replaced by a Cyrillic А (U+0410) -- a payload an attacker
+    controls as freely as the plain-ASCII version -- this function
+    RE-ASSEMBLES the exact expensive shape the unfixed scan could not even
+    see: under the unfixed ASCII-only scan (no `_delookalike` at all) the
+    substitution splits each 128-character token into 3-character fragments
+    (below `_IBAN_MIN_LEN`), so the checksum pass finds nothing to do
+    (measured: 81ms, cheaper than the plain-ASCII adversarial case, because
+    the unfixed scan is doing structurally less work). With `_delookalike`
+    in place, the SAME payload measures 265-272ms across repeated runs --
+    noticeably above the 165-175ms the plain-ASCII adversarial shape itself
+    costs on identical, unmodified `_redact_free_text` -- because the full
+    128-character token is reassembled before the scan runs and pays the
+    scan's own known worst case in full, on top of this function's own
+    translate pass over non-ASCII input (which does not get the isascii()
+    fast path), paid roughly TWICE for this shape specifically: once to
+    build the IBAN pass's skeleton, and again to build the PAN pass's,
+    because this payload's own budget-exhaustion bare-masking (see
+    `_redact_iban_match`'s `budget.exhausted` branch) touches nearly the
+    whole string, which defeats the one optimization `_redact_free_text`
+    has for skipping that second call (see its own comment, immediately
+    below the two calls to this function, for exactly when that skip does
+    and does not help -- this adversarial shape is the "does not" case,
+    by design: it is built to spend the budget, and spending the budget is
+    what makes the skip unable to fire). `_ScanBudget` does not see any of
+    this: every microsecond here is spent before `budget` is read for the
+    first time, so this is, by construction, an UNBOUNDED cost with respect
+    to that budget -- bounded only by this being at most two O(length)
+    passes over one value, the same KIND of bound `_strip_invisible`
+    already carries and this module already accepts elsewhere, just paid
+    twice instead of once in the worst case. This module has a documented
+    history of a per-token bound being defeated by attacker-controlled
+    tokenization (`_IBAN_SCAN_MAX_TOKEN`), then a per-string bound being
+    defeated by attacker-controlled string-splitting (`_IBAN_SCAN_BUDGET`
+    vs `redaction_budget`); an unbudgeted preprocessing pass whose cost
+    SCALES WITH how much of the adversarial shape it manages to reassemble,
+    and can be paid MORE THAN ONCE per call, is the obvious next place to
+    look for the same pattern, and it has not been closed here -- only
+    measured and stated.
+
+    This is a real cost increase from the position-preserving splice
+    (`_sub_preserving_original`) this function's skeleton feeds, not from
+    this function itself changing -- the whole-value version that shipped
+    first measured 193-197ms on the identical payload, because it needed
+    only one transliteration pass, scanned and masked that single
+    transliterated copy directly, and never needed a second, freshly
+    rebuilt skeleton for a second pass. That version was replaced because it
+    corrupted legitimate non-Latin text outside any match (see this
+    function's own "position-preserving, not whole-value" section above);
+    the ~70-100ms difference on this specific adversarial shape is the
+    measured price of that correctness fix, not an oversight in it.
+
+    Residual gap, stated for an auditor rather than left implicit: this
+    function closes the leak for exactly the codepoints in
+    `_LOOKALIKE_TABLE` -- fullwidth Latin, Mathematical Alphanumeric Latin,
+    Enclosed Alphanumeric Latin, and the hand-enumerated Cyrillic/Greek
+    look-alikes (both cases) plus dotless i. Any OTHER non-ASCII codepoint
+    that splits a token the same way -- a Cyrillic letter with no Latin
+    look-alike (Ж, none attempted), an Armenian, Georgian or CJK character,
+    or a future Unicode-assigned Cyrillic/Greek look-alike not yet added to
+    the hand-enumerated slice -- is NOT covered and still reaches
+    `_redact_free_text`'s output as a full, unmasked leak, identically to
+    main before this change. See
+    `test_residual_gap_an_uncatalogued_cyrillic_letter_still_leaks` (tests/
+    test_masking_confusables.py) for that gap demonstrated directly, not
+    asserted from reading this comment. Heuristic look-alike redaction
+    cannot, by its nature, enumerate every codepoint that could ever render
+    like an ASCII character; closing this class of leak completely belongs
+    upstream, in a backend that returns pre-masked projections rather than
+    free text a homoglyph can hide inside at all (handoff §10.17).
+    """
+    if value.isascii():
+        return value
+    return value.translate(_LOOKALIKE_TRANS)
+
+
+def _sub_preserving_original(
+    pattern: re.Pattern[str],
+    replace: Callable[[re.Match[str]], str],
+    skeleton: str,
+    original: str,
+) -> str:
+    """`pattern.sub(replace, skeleton)`, except every character OUTSIDE a
+    matched span is taken from `original`, not from `skeleton` -- the
+    position-preserving splice `_redact_free_text` uses instead of masking
+    the transliterated copy directly.
+
+    Matching happens against `skeleton` (built by `_delookalike`, so a
+    Cyrillic А reads as "A" and a fullwidth "１" reads as "1" for the
+    purpose of finding a span at all): `_IBAN_IN_TEXT_RE`/`_PAN_IN_TEXT_RE`
+    are `[A-Za-z0-9]`-only and would not see the match otherwise. What
+    happens to that span in the OUTPUT is decided by `replace`, exactly as
+    it already was before this function existed (`_redact_iban_match` /
+    `_redact_pan_match`, unchanged) -- this function only decides where
+    each piece of the result comes from:
+
+    - A span `replace` decided NOT to mask (`_redact_iban_match`'s two
+      "nothing checksums" branches, which return `match.group(0)`
+      unmodified) is spliced back in FROM `original`, not from `skeleton`
+      -- so a coincidentally IBAN-shaped span that never checksums comes out
+      exactly as the caller wrote it, look-alikes and all, rather than
+      silently rewritten to its ASCII skeleton form. Detected generically,
+      by comparing `replace(match)` against `match.group(0)`, not by
+      special-casing which branch of `_redact_iban_match`/
+      `_redact_pan_match` produced it: every masking branch in both of
+      those functions returns something containing a `_MASK` bullet, which
+      can never equal an alphanumeric `match.group(0)`, so this comparison
+      cannot mistake a real mask for a no-op in either direction.
+    - A span `replace` DID mask is inserted as `replace` returned it
+      (`_MASK`, or the `XX•• •••• YYYY` form) -- these are synthetic,
+      ASCII-and-bullets strings built from the checksum-verified compact
+      form, not copied from either `original` or `skeleton`, so there is no
+      "which copy" question for a masked span.
+    - Everything BETWEEN matches is copied from `original` verbatim,
+      including any look-alike codepoint nowhere near a match -- a Greek
+      word elsewhere in the same value is untouched, character for
+      character, because this function never looks at `skeleton` for
+      anything except locating spans.
+
+    Relies on `skeleton` and `original` being the same length and
+    index-aligned, which holds because `_delookalike` only ever produces
+    `skeleton` from `original` via a 1:1 translation table (enforced at
+    import time immediately above `_LOOKALIKE_TRANS`) -- every offset
+    `pattern.finditer(skeleton)` reports is therefore valid, and means the
+    same thing, in `original` too.
+    """
+    pieces: list[str] = []
+    last_end = 0
+    for match in pattern.finditer(skeleton):
+        pieces.append(original[last_end : match.start()])
+        replacement = replace(match)
+        if replacement == match.group(0):
+            # `replace` decided this span is not sensitive after all --
+            # preserve exactly what the caller wrote, look-alikes included,
+            # rather than the ASCII skeleton form `match.group(0)` itself
+            # holds.
+            pieces.append(original[match.start() : match.end()])
+        else:
+            pieces.append(replacement)
+        last_end = match.end()
+    pieces.append(original[last_end:])
+    return "".join(pieces)
+
+
 def _redact_free_text(value: str) -> str:
-    # Strip invisible/format and combining-mark characters before either
-    # pass below runs. See `_strip_invisible` for why this has to happen
-    # first rather than last, and `_STRIPPED_CATEGORIES` for exactly which
-    # characters and why.
+    # Strip invisible/format and combining-mark characters FIRST, from the
+    # untransliterated value. See `_strip_invisible` for why this has to
+    # happen before either scan runs, and `_STRIPPED_CATEGORIES` for exactly
+    # which characters and why. `value` from this point on is this
+    # function's SPLICE TARGET -- the string every non-matched character in
+    # the final output is copied from, look-alikes included -- so it must
+    # never be built from a transliterated copy.
+    #
+    # An earlier version of this function ran `_delookalike` BEFORE this
+    # strip, on `value` directly, for a real, measured ~30% cost saving:
+    # `_strip_invisible` has its own `value.isascii()` fast path, and
+    # feeding it an already-ASCII (post-`_delookalike`) string let it take
+    # that fast path instead of its general per-character one. That
+    # optimization does NOT carry over to this shape, and reintroducing it
+    # would reopen the bug this rewrite exists to close: `_strip_invisible`
+    # ran on the transliterated copy would strip the SAME positions either
+    # way (Cf/Mn/Cc and `_LOOKALIKE_TABLE`'s Lu/Ll/Nd/No keys are disjoint
+    # categories, confirmed by `test_preprocessing_order_does_not_affect_
+    # output`, tests/test_masking_confusables.py), but its OUTPUT would then
+    # be the transliterated text, not the original -- and that output is
+    # exactly what this variable would carry forward as the splice target,
+    # silently reintroducing whole-value transliteration through the back
+    # door. See `_delookalike`'s own docstring for why whole-value
+    # transliteration was replaced, and this function's own cost comment
+    # below for the number this costs now that the trick is gone.
     value = _strip_invisible(value)
 
     # IBAN pass first: an IBAN's digits (e.g. "9121000418450200051332", 22
@@ -1162,8 +1673,68 @@ def _redact_free_text(value: str) -> str:
     def _redact_iban(m: re.Match[str]) -> str:
         return _redact_iban_match(m, budget)
 
-    text = _IBAN_IN_TEXT_RE.sub(_redact_iban, value)
-    return _PAN_IN_TEXT_RE.sub(_redact_pan_match, text)
+    # Build a fresh ASCII-mapped SKELETON of the current `value` for each
+    # pass, rather than transliterating once up front: `_sub_preserving_
+    # original` only ever reads `skeleton` to locate spans, never to supply
+    # output characters (see its own docstring), so `value` itself never
+    # holds transliterated text at any point in this function. In principle
+    # a second skeleton is needed for the PAN pass, built from the IBAN
+    # pass's OWN output rather than reusing the first one: whatever the IBAN
+    # pass left untouched may still contain look-alike codepoints the PAN
+    # scan needs to see as digits (a card number written with fullwidth or
+    # circled digits, unrelated to any IBAN match), and the first skeleton
+    # no longer corresponds -- character for character -- to `value` once
+    # the IBAN pass has spliced any mask into it.
+    #
+    # But if the IBAN pass spliced NOTHING -- every match it found was a
+    # "leave as written" no-op, or it found no match at all -- `value` is
+    # byte-identical to what it was before that pass ran, and `iban_skeleton`
+    # is therefore still exactly correct for the PAN pass too; recomputing
+    # it would be a second full `_delookalike` translate pass over the same
+    # non-ASCII content for no benefit.
+    #
+    # Measured honestly rather than assumed, on two different shapes, because
+    # the first shape tried (this module's own 1 MiB adversarial payload,
+    # injected with look-alikes throughout -- see `_delookalike`'s own
+    # docstring) showed NO measurable benefit: 265-272ms either way, with or
+    # without this skip. That payload is built to maximise checksum
+    # attempts, which exhausts `_IBAN_SCAN_BUDGET` well before the scan
+    # finishes (see that budget's own derivation above) -- and once
+    # exhausted, `_redact_iban_match`'s budget-exhausted branch bare-masks
+    # every remaining qualifying-start token, which touches nearly the whole
+    # payload and defeats the "nothing changed" condition this skip checks
+    # for almost immediately. This skip is NOT a fix for that cost; the
+    # honest number for that shape is the one on `_redact_free_text`'s own
+    # cost comment (265-272ms), unchanged by this skip existing.
+    #
+    # Where this skip DOES measurably help is the realistic case this
+    # change was made FOR: legitimate non-Latin text with no IBAN or PAN
+    # anywhere in it (a Greek, Bulgarian, Serbian or Turkish name or
+    # sentence -- see the false-positive corpus in tests/test_masking_
+    # homoglyph_measurement.py). There, `_IBAN_IN_TEXT_RE` may still match a
+    # 14+-character word as a CANDIDATE (its skeleton is 14+ ASCII
+    # characters), but with no digit anywhere in it `_has_qualifying_start`
+    # is false at every position, so `_redact_iban_match` returns the
+    # candidate unchanged, `_sub_preserving_original` splices back the
+    # original, and `value` ends up byte-identical to what it was --
+    # exactly the condition this skip checks for. Measured on a realistic
+    # ~90-character Greek memo ("Πληρωμή προς Ιωάννη Παπαδόπουλο για
+    # υπηρεσίες συμβουλευτικής Σεπτέμβριος 2026 Θεσσαλονίκη"), min of
+    # several trials: with this skip, ~11-12 microseconds per call;
+    # recomputing unconditionally, ~13-14 microseconds -- a real, repeatable
+    # ~15-20% reduction, though at an absolute scale ordinary traffic
+    # was already nowhere near noticing. Byte-identical output confirmed
+    # both ways, on both shapes, not assumed.
+    #
+    # Net honest statement: this skip is a correctness-neutral, modest win
+    # for realistic non-Latin legitimate text, and no win at all -- not a
+    # regression, just inert -- for the module's own documented adversarial
+    # worst case, where the budget-exhaustion behaviour it depends on
+    # (nothing changing) essentially never holds.
+    iban_skeleton = _delookalike(value)
+    after_iban = _sub_preserving_original(_IBAN_IN_TEXT_RE, _redact_iban, iban_skeleton, value)
+    pan_skeleton = iban_skeleton if after_iban == value else _delookalike(after_iban)
+    return _sub_preserving_original(_PAN_IN_TEXT_RE, _redact_pan_match, pan_skeleton, after_iban)
 
 
 FreeText = Annotated[str, AfterValidator(_redact_free_text)]

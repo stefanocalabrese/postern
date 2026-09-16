@@ -1,25 +1,48 @@
-"""Measurement harness for three candidate mitigations of the homoglyph leak
-in `_redact_free_text` (masking.py) -- **not** a fix, and not a recommendation.
+"""Originally a measurement harness comparing three candidate mitigations of
+the homoglyph leak in `_redact_free_text` (masking.py). **Capo has since
+decided: approach B (a confusables skeleton) shipped into production --
+first as whole-value transliteration, then, after capo's own measurement
+found that version corrupting legitimate Greek and Cyrillic text
+('ΜΑΡΙΑ ΠΑΠΑΔΟΠΟΥΛΟΥ' -> 'MAPIA ΠAΠAΔOΠOYΛOY'), as a position-preserving
+splice.** This file now serves two purposes:
+
+1. Historical record of the measurement that led to that decision -- A and
+   C are kept, unchanged in shape, as the rejected alternatives.
+2. The regression suite for the shipped fix: the leak-closure corpus below
+   must stay fully closed, and the false-positive corpus (widened to seven
+   scripts after the Spanish/Catalan-only version was found unable to
+   express the failure mode that matters -- see that corpus's own comment)
+   must stay at zero.
 
 The leak: `_IBAN_IN_TEXT_RE` / `_PAN_IN_TEXT_RE` are ASCII-only
 (`[A-Za-z0-9]`), so a single non-ASCII codepoint inside an otherwise-ASCII
 IBAN or PAN splits the token below the scan's own length floor and the
-checksum pass never runs. `masking.py` is UNCHANGED by this file: every
-approach below is a thin preprocessing wrapper that calls straight through
-to the real `_redact_free_text`, `_MASK`, `_IBAN_MASKED_RE` and friends,
-never a reimplementation of the scan or the mask shape.
+checksum pass never runs. `masking.py` now DOES do something about this --
+`_redact_free_text` calls `_delookalike` internally to build a skeleton for
+matching, then splices any resulting mask back onto the untransliterated
+original (`_sub_preserving_original`) -- so `baseline` below
+(`_redact_free_text` with no wrapper at all) is now the shipped, fixed
+behaviour, not the historical unfixed one. `approach_b`'s own explicit
+pre-transliteration is NOT redundant with shipped code the way it briefly
+was when the whole-value version shipped: see `approach_b`'s own docstring
+for why it now serves as a regression canary instead. `A` and `C` remain
+genuinely independent, self-contained implementations that do NOT touch
+masking.py, so they remain meaningful points of comparison against what
+shipped.
 
 Run to see the tables (they are printed, not just asserted):
 
     uv run pytest tests/test_masking_homoglyph_measurement.py -s -q
 
 Vocabulary used throughout the printed tables, chosen deliberately to avoid
-the trap the task that produced this file was built to avoid -- "a `••••`
+the trap the original measurement task was built to avoid -- "a `••••`
 appeared" is NOT evidence of masking, only `_IBAN_MASKED_RE` matching the
 EXACT expected country code and last four is:
 
   properly_masked -- output contains the real `XX•• •••• YYYY` shape for
-                     THIS case's own true IBAN. The intended outcome.
+                     THIS case's own true IBAN. The intended outcome, and
+                     now what `baseline` (shipped code) must produce for
+                     every case in the scored corpus.
   degraded        -- the raw IBAN is NOT recoverable from the output (see
                      `_leaks` below), but not via the proper IBAN mask
                      either -- e.g. a bare `_MASK` marker, or the digit-run
@@ -30,8 +53,8 @@ EXACT expected country code and last four is:
                      it, see `_leaks`) is recoverable from the output.
 
 "closed" in the fraction reported for measurement 1 means NOT leaked, i.e.
-`properly_masked + degraded`, per the task's explicit instruction: assert
-absence of the raw IBAN, never that a mask appeared.
+`properly_masked + degraded`, per the original task's explicit instruction:
+assert absence of the raw IBAN, never that a mask appeared.
 """
 
 from __future__ import annotations
@@ -43,10 +66,36 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from postern_core.domain.masking import (
+    _HAND_CYRILLIC_LOOKALIKES,
+    _HAND_GREEK_LOOKALIKES,
+    _HAND_MISC_LOOKALIKES,
     _IBAN_MASKED_RE,
+    _LOOKALIKE_TABLE,
     _MASK,
+    _build_enclosed_alphanumeric_lookalikes,
+    _build_fullwidth_lookalikes,
+    _build_math_alphanumeric_lookalikes,
+    _delookalike,
     _redact_free_text,
 )
+
+# Aliases onto the REAL, shipped tables -- this file used to build its own
+# copies of these (three algorithmic builder functions plus two hand
+# tables) to keep the measurement's "calls through the real pipeline, never
+# a reimplementation" rule honest for approach B specifically. Now that B
+# IS the real pipeline, importing masking.py's own tables directly is what
+# that same rule requires: a hand-copied duplicate here could silently
+# drift from what actually shipped, which is exactly the kind of gap
+# `test_baseline_and_shipped_approach_b_now_agree` below exists to make
+# impossible.
+_FULLWIDTH_TABLE = _build_fullwidth_lookalikes()
+_MATH_ALNUM_TABLE = _build_math_alphanumeric_lookalikes()
+_ENCLOSED_TABLE = _build_enclosed_alphanumeric_lookalikes()
+_HAND_CYRILLIC = _HAND_CYRILLIC_LOOKALIKES
+_HAND_GREEK = _HAND_GREEK_LOOKALIKES
+_HAND_MISC = _HAND_MISC_LOOKALIKES
+_HAND_TABLE: dict[str, str] = {**_HAND_CYRILLIC, **_HAND_GREEK, **_HAND_MISC}
+_CONFUSABLES_TABLE: dict[str, str] = _LOOKALIKE_TABLE
 
 # ---------------------------------------------------------------------------
 # Ground-truth IBAN fixtures (real ISO 13616 examples, mod-97 verified below)
@@ -90,176 +139,35 @@ def approach_a(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Approach B: a small, hand-plus-derived UTS #39-style confusables skeleton
+# Approach B: shipped. `_redact_free_text` now does this internally.
 # ---------------------------------------------------------------------------
-
-_DIGIT_WORDS = {
-    "ZERO": "0",
-    "ONE": "1",
-    "TWO": "2",
-    "THREE": "3",
-    "FOUR": "4",
-    "FIVE": "5",
-    "SIX": "6",
-    "SEVEN": "7",
-    "EIGHT": "8",
-    "NINE": "9",
-}
-_MATH_ALNUM_LETTER_RE = re.compile(r"^MATHEMATICAL [A-Z][A-Z -]* (CAPITAL|SMALL) ([A-Z])$")
-_MATH_ALNUM_DIGIT_RE = re.compile(
-    r"^MATHEMATICAL [A-Z][A-Z -]* DIGIT (" + "|".join(_DIGIT_WORDS) + ")$"
-)
-_CIRCLED_LETTER_RE = re.compile(r"^CIRCLED (LATIN CAPITAL|LATIN SMALL) LETTER ([A-Z])$")
-_CIRCLED_DIGIT_RE = re.compile(r"^CIRCLED DIGIT (" + "|".join(_DIGIT_WORDS) + ")$")
-
-
-def _build_fullwidth_table() -> dict[str, str]:
-    """Fullwidth Latin letters and digits: a fixed +0xFEE0 offset from ASCII
-    ('Ａ' - 'A' == '１' - '1' == 0xFEE0), verified directly, not
-    assumed. No name-parsing needed for this block."""
-    table: dict[str, str] = {}
-    for cp in range(0xFF21, 0xFF3B):  # fullwidth A-Z
-        table[chr(cp)] = chr(cp - 0xFEE0)
-    for cp in range(0xFF41, 0xFF5B):  # fullwidth a-z
-        table[chr(cp)] = chr(cp - 0xFEE0)
-    for cp in range(0xFF10, 0xFF1A):  # fullwidth 0-9
-        table[chr(cp)] = chr(cp - 0xFEE0)
-    return table
-
-
-def _build_math_alphanumeric_table() -> dict[str, str]:
-    """Mathematical Alphanumeric Symbols (U+1D400-U+1D7FF), derived by
-    parsing `unicodedata.name()` rather than hand-listing ~700 codepoints.
-    Deliberately restricted to names ending in '(CAPITAL|SMALL) <letter>' or
-    'DIGIT <word>' -- the math-styled GREEK letters in the same block
-    (MATHEMATICAL BOLD CAPITAL ALPHA, etc.) are excluded by the same regex,
-    on purpose: they are not ASCII look-alikes in the way a math-bold LATIN
-    letter is, and folding them in would be scope creep on a block this
-    table only needs for its Latin/digit members."""
-    table: dict[str, str] = {}
-    for cp in range(0x1D400, 0x1D800):
-        try:
-            name = unicodedata.name(chr(cp))
-        except ValueError:
-            continue
-        m = _MATH_ALNUM_LETTER_RE.match(name)
-        if m:
-            case, letter = m.groups()
-            table[chr(cp)] = letter.lower() if case == "SMALL" else letter
-            continue
-        m = _MATH_ALNUM_DIGIT_RE.match(name)
-        if m:
-            table[chr(cp)] = _DIGIT_WORDS[m.group(1)]
-    return table
-
-
-def _build_enclosed_alphanumeric_table() -> dict[str, str]:
-    """Enclosed Alphanumerics (U+2460-U+24FF) only -- not the Enclosed
-    Alphanumeric Supplement (U+1F100-U+1F1FF, "negative circled"/"squared"
-    forms), which is a different, much larger block and a materially
-    different visual shape. Two-digit forms ("CIRCLED NUMBER TEN"..
-    "TWENTY") are skipped: mapping one codepoint to a two-character string
-    breaks the 1:1 codepoint correspondence every other entry in this table
-    keeps, for a handful of characters no realistic IBAN/PAN substitution
-    needs."""
-    table: dict[str, str] = {}
-    for cp in range(0x2460, 0x2500):
-        try:
-            name = unicodedata.name(chr(cp))
-        except ValueError:
-            continue
-        m = _CIRCLED_LETTER_RE.match(name)
-        if m:
-            case, letter = m.groups()
-            table[chr(cp)] = letter.lower() if "SMALL" in case else letter
-            continue
-        m = _CIRCLED_DIGIT_RE.match(name)
-        if m:
-            table[chr(cp)] = _DIGIT_WORDS[m.group(1)]
-    return table
-
-
-# Hand-enumerated: UPPERCASE Cyrillic and Greek letters visually identical
-# (not merely similar) to a Latin capital, plus dotless i. Uppercase-only by
-# construction -- ISO 13616 IBANs are conventionally rendered uppercase, and
-# this keeps the hand-maintained boundary a simple, statable rule ("only the
-# capitals") rather than a cherry-picked list. This is also this table's
-# most honest limitation: a LOWERCASE Cyrillic homoglyph glued into an
-# otherwise-uppercase IBAN is NOT covered (see the dedicated corpus case
-# below), even though it splits the ASCII scan exactly the same way.
-#
-# Every precomposed accented Latin letter (a-with-acute, n-with-tilde,
-# c-with-cedilla, ...) is excluded BY CONSTRUCTION: none of the three tables
-# above touches the Latin-1 Supplement or Latin Extended-A blocks at all, so
-# there is no code path through which "ñ", "ç", "à" could ever enter this
-# table by accident.
-_HAND_CYRILLIC = {
-    "А": "A",
-    "В": "B",
-    "Е": "E",
-    "К": "K",
-    "М": "M",
-    "Н": "H",
-    "О": "O",
-    "Р": "P",
-    "С": "C",
-    "Т": "T",
-    "У": "Y",
-    "Х": "X",
-    "Ѕ": "S",
-    "Ј": "J",
-}
-_HAND_GREEK = {
-    "Α": "A",
-    "Β": "B",
-    "Ε": "E",
-    "Ζ": "Z",
-    "Η": "H",
-    "Ι": "I",
-    "Κ": "K",
-    "Μ": "M",
-    "Ν": "N",
-    "Ο": "O",
-    "Ρ": "P",
-    "Τ": "T",
-    "Υ": "Y",
-    "Χ": "X",
-}
-_HAND_MISC = {
-    "ı": "i",  # LATIN SMALL LETTER DOTLESS I
-}
-
-
-def _build_hand_table() -> dict[str, str]:
-    table: dict[str, str] = {}
-    table.update(_HAND_CYRILLIC)
-    table.update(_HAND_GREEK)
-    table.update(_HAND_MISC)
-    return table
-
-
-_FULLWIDTH_TABLE = _build_fullwidth_table()
-_MATH_ALNUM_TABLE = _build_math_alphanumeric_table()
-_ENCLOSED_TABLE = _build_enclosed_alphanumeric_table()
-_HAND_TABLE = _build_hand_table()
-
-_CONFUSABLES_TABLE: dict[str, str] = {
-    **_FULLWIDTH_TABLE,
-    **_MATH_ALNUM_TABLE,
-    **_ENCLOSED_TABLE,
-    **_HAND_TABLE,
-}
-_CONFUSABLES_TRANS = str.maketrans(_CONFUSABLES_TABLE)
-
-
-def _skeleton(value: str) -> str:
-    if value.isascii():
-        return value
-    return value.translate(_CONFUSABLES_TRANS)
 
 
 def approach_b(value: str) -> str:
-    return _redact_free_text(_skeleton(value))
+    """B shipped into `masking.py` itself, TWICE: first as a whole-value
+    transliteration (`_redact_free_text` ran `_delookalike` once, up front,
+    and scanned/masked the transliterated copy directly), then -- after
+    capo's own measurement found that version corrupting legitimate Greek
+    and Cyrillic text ('ΜΑΡΙΑ ΠΑΠΑΔΟΠΟΥΛΟΥ' -> 'MAPIA ΠAΠAΔOΠOYΛOY') -- as a
+    position-preserving splice (`_sub_preserving_original`), which is what
+    ships today. See `_delookalike`'s docstring in masking.py for the full
+    account of that reversal, the cost it changed, and the residual gap.
+
+    This wrapper's own explicit pre-transliteration (`_delookalike(value)`,
+    BEFORE `_redact_free_text` ever sees the value) is NOT redundant with
+    shipped code the way it was when the whole-value version shipped: it
+    destroys the very thing the position-preserving splice exists to
+    preserve, by transliterating confusable characters OUTSIDE any IBAN/PAN
+    match before `_redact_free_text`'s own splice logic ever gets a chance
+    to leave them alone. `test_baseline_and_approach_b_agree_on_the_iban_
+    only_corpus` below confirms the two still agree on the narrow corpus
+    that has no confusable text outside the disguised IBAN itself;
+    `test_approach_b_wrapper_reintroduces_whole_value_corruption` confirms,
+    just as directly, that they no longer agree in general -- kept
+    specifically as a regression canary for "did this module accidentally
+    go back to whole-value transliteration", not as a claim that this
+    wrapper is safe to use."""
+    return _redact_free_text(_delookalike(value))
 
 
 # ---------------------------------------------------------------------------
@@ -474,53 +382,31 @@ def _compact(iban: str) -> str:
     return iban.replace(" ", "").upper()
 
 
-# Checker-only, deliberately BROADER than approach B's own table: lowercase
-# counterparts of the same 14+14 Cyrillic/Greek letters. Approach B excludes
-# these (uppercase-only, see `_HAND_TABLE`'s docstring) -- reusing that same
-# narrower table here would let a lowercase homoglyph hide from the leak
-# check the exact way the task warned about, since the very thing under
-# test would also be the tool measuring it. First measured wrong: a
-# lowercase Cyrillic а substituted into MT_IBAN's account body reached
-# baseline's output completely unchanged (a full, unambiguous leak: no
-# character of the true IBAN was even touched), and without this table
-# `_visual_canon` still classified it as merely "degraded", because it
-# shared approach B's own blind spot. See `test_leak_closure`'s per-case
-# table for the "lowercase cyrillic" row this fixed.
-_CHECKER_ONLY_LOWERCASE_CYRILLIC = {k.lower(): v.lower() for k, v in _HAND_CYRILLIC.items()}
-_CHECKER_ONLY_LOWERCASE_GREEK = {
-    "α": "a",
-    "β": "b",
-    "ε": "e",
-    "ζ": "z",
-    "η": "h",
-    "ι": "i",
-    "κ": "k",
-    "μ": "m",
-    "ν": "n",
-    "ο": "o",
-    "ρ": "p",
-    "τ": "t",
-    "υ": "y",
-    "χ": "x",
-}
-_STRICT_CANON_TABLE: dict[str, str] = {
-    **_CONFUSABLES_TABLE,
-    **_CHECKER_ONLY_LOWERCASE_CYRILLIC,
-    **_CHECKER_ONLY_LOWERCASE_GREEK,
-}
-_STRICT_CANON_TRANS = str.maketrans(_STRICT_CANON_TABLE)
+# This USED to be its own table, deliberately BROADER than approach B's own
+# (which was uppercase-Cyrillic/Greek-only): a checker sharing the exact
+# table of the thing it checks can hide a leak the same way the leak itself
+# hides from an ASCII-chunk comparison, and that is exactly what happened
+# here before it was fixed -- a lowercase Cyrillic а substituted into
+# MT_IBAN's account body reached baseline's output completely unchanged (a
+# full, unambiguous leak), and `_visual_canon` still called it merely
+# "degraded" because it shared approach B's own uppercase-only blind spot.
+# `_LOOKALIKE_TABLE` now includes both cases (that gap is what this file's
+# extension closed -- see `_HAND_CYRILLIC_LOOKALIKES`'s docstring in
+# masking.py), so reusing the real, shipped table here is no longer
+# narrower than what it is checking; `_CONFUSABLES_TABLE` (imported at the
+# top of this file) IS `_LOOKALIKE_TABLE`.
+_STRICT_CANON_TRANS = str.maketrans(_CONFUSABLES_TABLE)
 
 
 def _visual_canon(s: str) -> str:
     """The strongest canonicalisation this file has available, applied only
     to OUTPUT for leak detection -- never used by any of the three
-    approaches themselves. Union of NFKC and a confusables table BROADER
-    than approach B's own (see `_STRICT_CANON_TABLE`), so a check built on
-    this cannot be fooled by exactly the trap the task warned about:
-    comparing ASCII chunks of the original against output that still
-    contains the substituted character, letting the substitution hide the
-    leak from the checker the same way it caused the leak in the first
-    place."""
+    approaches themselves. Union of NFKC and the shipped lookalike table, so
+    a check built on this cannot be fooled by exactly the trap the original
+    task warned about: comparing ASCII chunks of the original against
+    output that still contains the substituted character, letting the
+    substitution hide the leak from the checker the same way it caused the
+    leak in the first place."""
     if s.isascii():
         canon = s
     else:
@@ -580,39 +466,88 @@ def test_leak_closure() -> None:
             f"{outcomes['B (confusables)']:<12}{outcomes['C (mixed-script)']:<12}"
         )
 
-    # Self-check, deliberately weaker than "baseline always fully leaks":
-    # one corpus case (AT/fully-non-ascii) has baseline landing on
-    # "degraded" rather than "leaked", NOT because the leak is closed but
-    # because `\d` is itself Unicode-aware and happens to match the
-    # fullwidth digit run incidentally (trap #1 from the task, reproduced
-    # directly -- see `test_gb_digit_run_trap_illustration` for the same
-    # mechanism on a different shape) -- confirmed directly, not assumed:
-    # baseline's own output for that case is
-    # 'Payment reference АТ•••• ２３４５ thanks', a `_PAN_IN_TEXT_RE` hit,
-    # not an IBAN-aware one. What baseline must NEVER do, on any case in
-    # this corpus, is produce the actual correct `XX•• •••• YYYY` mask --
-    # that would mean the open leak this file measures does not exist.
-    baseline_properly_masked = [
-        label for label, outcomes in per_case.items() if outcomes["baseline"] == "properly_masked"
+    # THE regression gate: B has shipped, so `baseline` (unmodified
+    # `_redact_free_text`, no wrapper) must now produce the actual correct
+    # `XX•• •••• YYYY` mask for EVERY case in this corpus, including --
+    # explicitly, by name -- the lowercase-Cyrillic case that was still
+    # `leaked` on shipped code before this file's hand table grew a
+    # lowercase half. This inverts the pre-fix self-check on purpose: before
+    # B shipped, this test asserted baseline was NEVER `properly_masked`
+    # (that was the leak); now it asserts baseline is ALWAYS `properly_masked`
+    # (that is the fix). If this ever regresses, the leak this module was
+    # built to close is open again.
+    baseline_not_properly_masked = [
+        label for label, outcomes in per_case.items() if outcomes["baseline"] != "properly_masked"
     ]
-    assert baseline_properly_masked == [], (
-        "unmodified main correctly masked a homoglyph-substituted IBAN -- "
-        f"the leak this file measures may already be closed: {baseline_properly_masked}"
+    assert baseline_not_properly_masked == [], (
+        f"shipped code failed to properly mask: {baseline_not_properly_masked}"
+    )
+
+    lowercase_label = next(label for label in per_case if "lowercase cyrillic" in label)
+    assert per_case[lowercase_label]["baseline"] == "properly_masked", (
+        "the lowercase-Cyrillic gap this table's lowercase extension was "
+        "supposed to close is still open on shipped code"
+    )
+
+
+def test_baseline_and_approach_b_agree_on_the_iban_only_corpus() -> None:
+    """The scored 40-case corpus has no confusable character anywhere
+    outside the disguised IBAN itself (every case is "Payment reference
+    {iban} thanks"), so `approach_b`'s own whole-value pre-transliteration
+    has nothing to corrupt: it turns the disguised IBAN into a clean ASCII
+    one before `_redact_free_text` ever runs, `_redact_free_text` then finds
+    and masks that same IBAN via its own splice, and the two land on
+    identical output. NOT a general claim -- see `approach_b`'s own
+    docstring and `test_approach_b_wrapper_reintroduces_whole_value_
+    corruption` immediately below for why this does not extend past this
+    specific corpus shape."""
+    corpus = _build_single_substitution_corpus() + _build_multi_substitution_corpus()
+    mismatches = [case.label for case in corpus if baseline(case.text) != approach_b(case.text)]
+    assert mismatches == [], f"baseline and approach_b diverged on: {mismatches}"
+
+
+def test_approach_b_wrapper_reintroduces_whole_value_corruption() -> None:
+    """The regression canary `approach_b`'s docstring promises: text with a
+    confusable character OUTSIDE any IBAN/PAN match is exactly where
+    `approach_b`'s own pre-transliteration and shipped `baseline` diverge.
+    `baseline` (position-preserving, shipped) must leave it untouched;
+    `approach_b` (whole-value pre-transliteration, the wrapper only) must
+    NOT -- if this assertion ever starts failing because `approach_b` stops
+    corrupting it, check whether shipped `_redact_free_text` quietly went
+    back to whole-value transliteration, because that would make this
+    canary fire for the wrong reason.
+    """
+    text = "ΜΑΡΙΑ ΠΑΠΑΔΟΠΟΥΛΟΥ"
+    assert baseline(text) == text, "shipped code must preserve legitimate Greek text untouched"
+    assert approach_b(text) != text, (
+        "approach_b's own whole-value pre-transliteration was expected to "
+        "corrupt this -- if it no longer does, re-check what changed"
     )
 
 
 def test_gb_digit_run_trap_illustration() -> None:
     """Illustrative only -- NOT part of the scored NL/MT corpus above, and
     deliberately excluded from its "fraction closed" arithmetic. Demonstrates
-    trap #2 from the task: a single Cyrillic substitution in a GB IBAN whose
-    longest digit run (14) already qualifies for `_PAN_IN_TEXT_RE`'s
-    incidental `\\d{12,}` match, so baseline's OWN output contains a `••••`
-    -- from the unrelated PAN scan, not from any IBAN-aware masking -- while
-    the country code and bank sort code identifying the account holder's
-    bank stay fully legible via the substituted glyph.
+    trap #2 from the original task: a single-character substitution in a GB
+    IBAN whose longest digit run (14) already qualifies for
+    `_PAN_IN_TEXT_RE`'s incidental `\\d{12,}` match, so baseline's OWN
+    output can contain a `••••` from the unrelated PAN scan, not from any
+    IBAN-aware masking, while identifying information stays legible.
+
+    The substituted character here is Cyrillic Н (U+041D), which is a
+    look-alike for Latin "H", not "N" -- so this specific case does not
+    represent a genuine disguised GB IBAN even after `_delookalike` runs
+    (it delookalikes to "GB29HWBK...", which does not checksum against the
+    real "GB29NWBK..." at all, since the bank code was never actually
+    preserved). Kept exactly as originally measured, illustrating the trap
+    on a corrupted-but-still-not-properly-masked string; a SECOND case
+    below substitutes a genuine look-alike (Cyrillic В for Latin B, which
+    this table does cover) to confirm the shipped fix also closes this
+    shape when the disguise is a real one.
     """
-    substituted = GB_IBAN[:4] + "Н" + GB_IBAN[5:]  # cyrillic Н in place of ASCII N
-    text = f"Payment reference {substituted} thanks"
+    # cyrillic Н looks like "H", not "N": not a genuine disguise
+    corrupted = GB_IBAN[:4] + "Н" + GB_IBAN[5:]
+    text = f"Payment reference {corrupted} thanks"
     print("\n=== GB digit-run trap illustration (not scored) ===")
     for name, fn in APPROACHES.items():
         output = fn(text)
@@ -625,16 +560,68 @@ def test_gb_digit_run_trap_illustration() -> None:
     )
     assert _classify(baseline_output, GB_IBAN) != "properly_masked"
 
+    # A genuine disguise of the same GB IBAN, using a covered look-alike:
+    # Cyrillic В (U+0412) for Latin "B", the third letter of "NWBK".
+    disguised = GB_IBAN[:6] + "В" + GB_IBAN[7:]
+    disguised_text = f"Payment reference {disguised} thanks"
+    disguised_output = baseline(disguised_text)
+    print(f"genuine disguise    properly_masked {disguised_output!r}")
+    assert _classify(disguised_output, GB_IBAN) == "properly_masked", (
+        "a genuinely disguised GB IBAN (covered look-alike) must be properly "
+        f"masked by shipped code: {disguised_output!r}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Measurement 2: false positives on legitimate Spanish/Catalan text
 # ---------------------------------------------------------------------------
 
-# 45 realistic merchant descriptors, payee names and payment references, all
-# either accented Latin (legitimate, must NOT be touched by construction) or
-# plain ASCII. Included in full per the task's instruction, so the numbers
-# below can be audited against the actual strings.
-FALSE_POSITIVE_CORPUS: list[str] = [
+# Widened after a real gap was found in review: a corpus of Spanish and
+# Catalan text alone is structurally incapable of showing the failure mode
+# that matters here, for the same reason an ES/GB-only IBAN corpus could not
+# show the digit-run trap earlier in this file's own history -- Spanish and
+# Catalan are Latin script with diacritics and are NEVER mixed-script, so
+# any rule built around "non-ASCII is suspicious" scores near-zero on it BY
+# CONSTRUCTION, regardless of whether that rule is actually safe. A corpus
+# that cannot express the failure mode returns a clean number, and the
+# clean number is worthless. Below is the original 53-entry Spanish/Catalan
+# corpus, unchanged (it is real coverage for this deployment's home
+# market and the diacritic path specifically), PLUS six more scripts this
+# deployment's `FreeText` fields genuinely see traffic in -- SEPA remittance
+# information and counterparty names are not confined to Spain -- chosen
+# specifically to stress what the confusables table treats as hostile:
+#
+#   Greek     -- Α Β Ε Ζ Η Ι Κ Μ Ν Ο Ρ Τ Υ Χ are the exact codepoints
+#                _HAND_GREEK_LOOKALIKES maps to a Latin letter; a Greek
+#                name or merchant descriptor is made almost entirely of them.
+#   Bulgarian -- standard Cyrillic, wall-to-wall confusables
+#                (_HAND_CYRILLIC_LOOKALIKES) while being single-script, not
+#                mixed-script.
+#   Serbian   -- a DIFFERENT Cyrillic alphabet from Bulgarian's, including
+#                Ј (U+0408), which this table maps to Latin "J" -- Serbian
+#                names routinely contain it (Јован, Ђорђе).
+#   Turkish   -- dotless ı (U+0131) is simultaneously the tenth confirmed
+#                attack character in this table AND a mandatory letter of
+#                the Turkish alphabet ("Işık", "Yıldırım", "Kadıköy"). If
+#                any rule in this codebase ever treated that codepoint as
+#                inherently hostile rather than "hostile only inside a span
+#                that actually checksums", this corpus is what would show it.
+#   CJK       -- no space-delimited tokens the way every script above has;
+#                exercises a script `_LOOKALIKE_TABLE` does not cover at all.
+#   Arabic    -- right-to-left text direction, contextual letter forms, a
+#                script `_LOOKALIKE_TABLE` does not cover at all. Letters
+#                and prose only, deliberately -- an Arabic-Indic PAN
+#                (`٤٤١٧...`) already masks via `_PAN_IN_TEXT_RE`'s
+#                Unicode-aware `\d` for a reason that has nothing to do with
+#                this table (see that pattern's own comment in masking.py),
+#                so digit-shaped Arabic text would not test what this
+#                corpus exists to test.
+#
+# Reported PER-SCRIPT below, not as one aggregate: an aggregate is exactly
+# the kind of number that would hide false-positive cost landing unevenly
+# across scripts, which is its own question this file states but does not
+# resolve (see `test_false_positives_on_legitimate_text`'s own comment).
+SPANISH_CATALAN_CORPUS: list[str] = [
     "CAFÈ DE L'ÒPERA BCN",
     "FARMÀCIA GÜELL",
     "JOSÉ MUÑOZ SÁNCHEZ",
@@ -694,45 +681,213 @@ FALSE_POSITIVE_CORPUS: list[str] = [
     "REFERÈNCIA20240912BCN",
 ]
 
+# Α Β Ε Ζ Η Ι Κ Μ Ν Ο Ρ Τ Υ Χ -- every one of these is a key in
+# _HAND_GREEK_LOOKALIKES. Realistic merchant descriptors, payee names and
+# bank/branch references, not cherry-picked to dodge those letters.
+GREEK_CORPUS: list[str] = [
+    "ΤΑΒΕΡΝΑ ΑΘΗΝΑ",
+    "ΚΑΦΕ ΜΠΑΡ ΒΟΛΟΣ",
+    "ΙΩΑΝΝΗΣ ΠΑΠΑΔΟΠΟΥΛΟΣ",
+    "ΤΡΑΠΕΖΑ ΠΕΙΡΑΙΩΣ ΘΕΣΣΑΛΟΝΙΚΗ",
+    "ΟΠΤΙΚΑ ΑΘΗΝΩΝ ΚΕΝΤΡΟ",
+    "ΦΑΡΜΑΚΕΙΟ ΝΙΚΗ ΠΑΤΡΑ",
+    "ΕΣΤΙΑΤΟΡΙΟ ΜΥΚΟΝΟΣ",
+    "ΞΕΝΟΔΟΧΕΙΟ ΚΡΗΤΗ ΗΡΑΚΛΕΙΟ",
+    "ΕΛΕΝΗ ΚΩΝΣΤΑΝΤΙΝΟΥ",
+    "ΖΑΧΑΡΟΠΛΑΣΤΕΙΟ ΑΘΗΝΑ",
+]
+
+# Standard (Bulgarian) Cyrillic -- single-script, zero Latin characters,
+# wall-to-wall confusables (_HAND_CYRILLIC_LOOKALIKES covers roughly half of
+# any given word here) while being ordinary legitimate text throughout.
+BULGARIAN_CYRILLIC_CORPUS: list[str] = [
+    "ИВАН ПЕТРОВ",
+    "СОФИЯ БЪЛГАРИЯ",
+    "ПЛОВДИВ ЦЕНТЪР",
+    "МАГАЗИН ЕВРОПА",
+    "ХРИСТО СТОЯНОВ",
+    "РЕСТОРАНТ ВАРНА",
+    "АПТЕКА ЗДРАВЕ БУРГАС",
+    "ВЕЛИКО ТЪРНОВО ПАЗАР",
+]
+
+# Serbian Cyrillic -- a DIFFERENT alphabet from Bulgarian's, not the same
+# text relabelled: Ј, Ђ, Ћ are Serbian-specific letters absent from Russian
+# and Bulgarian orthography. Ј (U+0408) is itself a _HAND_CYRILLIC_
+# LOOKALIKES key (-> Latin "J"), so this script hits the table from a
+# second, distinct direction from Bulgarian.
+SERBIAN_CYRILLIC_CORPUS: list[str] = [
+    "БЕОГРАД ЦЕНТАР",
+    "НОВИ САД ПИЈАЦА",
+    "ЈОВАН ЈОВАНОВИЋ",
+    "ПЕКАРА ДУШАН",
+    "ЂОРЂЕ ПЕТРОВИЋ",
+    "НИШ РЕСТОРАН",
+    "МИЛОШ ЈОВИЋ",
+    "КРАГУЈЕВАЦ ПИЈАЦА",
+]
+
+# Turkish -- dotless ı (U+0131) is simultaneously this table's tenth
+# confirmed attack character and a mandatory letter of the Turkish
+# alphabet. Genuine dotless ı survives into a word only outside an
+# ALL-CAPS, word-initial position: Turkish uppercases dotless ı to plain
+# ASCII "I" (and dotted i to İ, U+0130, a different letter entirely), so
+# "IŞIK" in full caps contains no dotless ı at all, while "Işık" in Title
+# Case does (its THIRD character). Both shapes are included below,
+# deliberately, because both are realistic (merchant descriptors skew
+# ALL-CAPS, personal payee names skew Title Case) and they behave
+# differently at the codepoint level for the exact reason this table cares
+# about.
+TURKISH_CORPUS: list[str] = [
+    "Ayşe Işık",
+    "Mehmet Yıldırım",
+    "Kadıköy Çarşısı İstanbul",
+    "Çınar Eczanesi Ankara",
+    "IŞIKLAR MARKET ANKARA",  # ALL-CAPS: no genuine dotless ı survives here
+    "Fatma Çelik Bursa",
+    "Kırşehir Un Fabrikası",
+    "Diyarbakır Pazarı",
+]
+
+# No script here shares a single codepoint with _LOOKALIKE_TABLE -- included
+# to cover a script class the table does not touch at all, not to stress
+# any specific mapping. No spaces the way every script above has some.
+CJK_CORPUS: list[str] = [
+    "北京烤鸭店",
+    "上海贸易有限公司",
+    "東京レストラン",
+    "深圳科技公司",
+    "大阪商店街",
+    "广州茶餐厅",
+]
+
+# Arabic -- right-to-left text direction and contextual letter forms (a
+# given Arabic letter changes glyph shape depending on its position in a
+# word), another script _LOOKALIKE_TABLE does not cover. Letters and prose
+# only, deliberately no digits: an Arabic-Indic PAN already masks via
+# `_PAN_IN_TEXT_RE`'s own Unicode-aware `\d` (see that pattern's comment in
+# masking.py) for a reason that has nothing to do with this table, so a
+# digit-shaped entry here would not test what this corpus exists to test.
+ARABIC_CORPUS: list[str] = [
+    "مطعم دمشق",
+    "صيدلية النور",
+    "محمد أحمد الشامي",
+    "شركة الأمل للتجارة",
+    "سوق الحميدية دمشق",
+    "مقهى القاهرة",
+    "بنك القاهرة فرع الزمالك",
+    "مكتبة الفرقان",
+]
+
+FALSE_POSITIVE_CORPUS_BY_SCRIPT: dict[str, list[str]] = {
+    "Spanish/Catalan": SPANISH_CATALAN_CORPUS,
+    "Greek": GREEK_CORPUS,
+    "Bulgarian Cyrillic": BULGARIAN_CYRILLIC_CORPUS,
+    "Serbian Cyrillic": SERBIAN_CYRILLIC_CORPUS,
+    "Turkish": TURKISH_CORPUS,
+    "CJK": CJK_CORPUS,
+    "Arabic": ARABIC_CORPUS,
+}
+FALSE_POSITIVE_CORPUS: list[str] = [
+    text for corpus in FALSE_POSITIVE_CORPUS_BY_SCRIPT.values() for text in corpus
+]
+
 
 def test_false_positive_corpus_has_at_least_40_entries() -> None:
     assert len(FALSE_POSITIVE_CORPUS) >= 40
 
 
+def test_false_positive_corpus_covers_at_least_seven_scripts() -> None:
+    """The 40+ entry count alone would still pass on a Spanish/Catalan-only
+    corpus -- this is the assertion that actually guards against
+    re-narrowing back to a single script, which is the exact gap review
+    found in this corpus after the first version shipped."""
+    assert len(FALSE_POSITIVE_CORPUS_BY_SCRIPT) >= 7
+    for script, corpus in FALSE_POSITIVE_CORPUS_BY_SCRIPT.items():
+        assert len(corpus) >= 6, f"{script} corpus too small to be meaningful: {len(corpus)}"
+
+
 def test_false_positives_on_legitimate_text() -> None:
-    n = len(FALSE_POSITIVE_CORPUS)
-    print(f"\n=== Measurement 2: false positives on {n} legitimate Spanish/Catalan strings ===")
-    header = f"{'approach':<20}{'altered':>10}{'fraction':>12}"
-    print(header)
+    """Reported PER SCRIPT, not as one aggregate across all 101 entries --
+    an aggregate is exactly the kind of number that would hide false-positive
+    cost landing unevenly across scripts (see the fairness note in this
+    file's own module docstring and in the report this test's numbers feed).
+    A single "false positives: 0.0%" line across a corpus dominated by
+    Spanish/Catalan entries would still read as "safe for everyone" even if
+    every single Greek or Arabic entry were altered; per-script rows cannot
+    hide that the way one combined percentage could.
+    """
+    print(
+        f"\n=== Measurement 2: false positives, {len(FALSE_POSITIVE_CORPUS)} entries, by script ==="
+    )
 
-    per_approach_altered: dict[str, list[str]] = {name: [] for name in APPROACHES}
+    # {approach: {script: [altered entries]}}
+    per_approach_per_script: dict[str, dict[str, list[str]]] = {
+        name: {script: [] for script in FALSE_POSITIVE_CORPUS_BY_SCRIPT} for name in APPROACHES
+    }
     for name, fn in APPROACHES.items():
-        for text in FALSE_POSITIVE_CORPUS:
-            output = fn(text)
-            if output != text:
-                per_approach_altered[name].append(text)
+        for script, corpus in FALSE_POSITIVE_CORPUS_BY_SCRIPT.items():
+            for text in corpus:
+                if fn(text) != text:
+                    per_approach_per_script[name][script].append(text)
 
     for name in APPROACHES:
-        altered = per_approach_altered[name]
-        print(f"{name:<20}{len(altered):>10}{len(altered) / len(FALSE_POSITIVE_CORPUS):>12.1%}")
+        print(f"\n{name}:")
+        print(f"  {'script':<20}{'altered':>10}{'total':>8}{'fraction':>12}")
+        for script, corpus in FALSE_POSITIVE_CORPUS_BY_SCRIPT.items():
+            altered = per_approach_per_script[name][script]
+            fraction = len(altered) / len(corpus)
+            print(f"  {script:<20}{len(altered):>10}{len(corpus):>8}{fraction:>12.1%}")
 
-    print("\n--- entries altered, per approach ---")
+    print("\n--- entries altered, per approach, per script ---")
     for name in APPROACHES:
-        altered = per_approach_altered[name]
-        if not altered:
+        any_altered = False
+        for script in FALSE_POSITIVE_CORPUS_BY_SCRIPT:
+            altered = per_approach_per_script[name][script]
+            if not altered:
+                continue
+            any_altered = True
+            print(f"{name} / {script}:")
+            for text in altered:
+                print(f"    {text!r} -> {APPROACHES[name](text)!r}")
+        if not any_altered:
             print(f"{name}: none")
-            continue
-        print(f"{name}:")
-        for text in altered:
-            print(f"    {text!r} -> {APPROACHES[name](text)!r}")
 
-    # B must not touch this corpus AT ALL: every entry is either plain ASCII
-    # or precomposed accented Latin, and accented Latin is excluded from the
-    # confusables table by construction (`test_confusables_table_excludes_
-    # accented_latin_by_construction` above). If this fails, that
-    # construction claim is false and this measurement's B numbers
-    # throughout the file need re-deriving.
-    assert per_approach_altered["B (confusables)"] == [], per_approach_altered["B (confusables)"]
+    # THE regression gate: shipped code (`baseline`, no wrapper) must not
+    # touch this corpus AT ALL, in ANY script. Every entry is either plain
+    # ASCII, precomposed accented Latin (excluded from the lookalike table
+    # by construction), or a script `_LOOKALIKE_TABLE` DOES cover
+    # (Greek/Cyrillic) where position preservation means a non-matching
+    # span is never rewritten -- see `_sub_preserving_original`. Confirms,
+    # at full corpus scale rather than the single-string spot-check
+    # elsewhere in this file, exactly the property capo's own measurement
+    # asked to see: a Greek, Bulgarian, Serbian or Turkish name does not
+    # checksum as an IBAN or PAN, so no span matches and nothing is
+    # spliced. If this ever fails on a NON-Spanish/Catalan script
+    # specifically, that is the uneven-cost finding this widened corpus
+    # exists to catch, and it must be reported, not fixed quietly.
+    for script in FALSE_POSITIVE_CORPUS_BY_SCRIPT:
+        altered = per_approach_per_script["baseline"][script]
+        assert altered == [], f"shipped code altered legitimate {script} text: {altered}"
+
+    # B's own wrapper is the OPPOSITE assertion, on purpose: it is expected,
+    # not merely tolerated, to corrupt every non-Latin script here except
+    # CJK and Arabic (which `_LOOKALIKE_TABLE` never touches at all,
+    # regardless of whole-value vs position-preserving). This is the
+    # regression canary from `approach_b`'s own docstring, run against the
+    # full widened corpus rather than one hand-picked string: if B's
+    # wrapper ever STOPS corrupting these, something about `_delookalike`'s
+    # own scope changed and needs re-checking, because this wrapper's
+    # pre-transliteration step has no position-preserving logic of its own.
+    for script in ("Greek", "Bulgarian Cyrillic", "Serbian Cyrillic", "Turkish"):
+        altered = per_approach_per_script["B (confusables)"][script]
+        assert altered, (
+            f"expected approach_b's whole-value pre-transliteration to corrupt "
+            f"{script} text as a known canary -- it did not, re-check what changed"
+        )
+    for script in ("CJK", "Arabic"):
+        altered = per_approach_per_script["B (confusables)"][script]
+        assert altered == [], f"unexpected: B's wrapper altered {script} text: {altered}"
 
     # A is NOT asserted to be empty, on purpose -- it found a real false
     # positive this file did not go looking for: 'Nº445210' loses its 'º'
@@ -740,18 +895,29 @@ def test_false_positives_on_legitimate_text() -> None:
     # COMPATIBILITY normalisation and º has a compatibility decomposition to
     # plain "o" (verified: `unicodedata.normalize("NFKC", "º") == "o"`).
     # Accented Latin itself (á, ñ, ç, è, ü, ò, ...) is confirmed untouched --
-    # every remaining entry in the corpus round-trips through A unchanged --
-    # but "Nº", "1º", "2ª" (floor/ordinal abbreviations genuinely common in
-    # Spanish/Catalan addresses and invoice line items) are a false-positive
-    # SURFACE this file did not design for and NFKC does not exempt. This is
-    # reported, not hidden: see the printed "entries altered" list above and
-    # the report this test's numbers feed.
+    # every remaining Spanish/Catalan entry round-trips through A unchanged
+    # -- but "Nº", "1º", "2ª" (floor/ordinal abbreviations genuinely common
+    # in Spanish/Catalan addresses and invoice line items) are a
+    # false-positive SURFACE this file did not design for and NFKC does not
+    # exempt. This is reported, not hidden: see the printed "entries
+    # altered" list above and the report this test's numbers feed. NFKC is
+    # confirmed to leave every OTHER script in this corpus untouched too
+    # (Greek/Cyrillic/Turkish/CJK/Arabic have no compatibility
+    # decomposition in play here), asserted below alongside the Spanish/
+    # Catalan-specific exemption.
+    for script in FALSE_POSITIVE_CORPUS_BY_SCRIPT:
+        if script == "Spanish/Catalan":
+            continue
+        altered = per_approach_per_script["A (NFKC)"][script]
+        assert altered == [], f"NFKC altered legitimate {script} text unexpectedly: {altered}"
     accented_only_altered = [
-        text for text in per_approach_altered["A (NFKC)"] if "º" not in text and "ª" not in text
+        text
+        for text in per_approach_per_script["A (NFKC)"]["Spanish/Catalan"]
+        if "º" not in text and "ª" not in text
     ]
     assert accented_only_altered == [], (
-        "NFKC altered something in the corpus other than an ordinal indicator "
-        f"(º/ª) -- re-check the false-positive analysis above: {accented_only_altered}"
+        "NFKC altered something in the Spanish/Catalan corpus other than an "
+        f"ordinal indicator (º/ª): {accented_only_altered}"
     )
 
 
@@ -813,48 +979,46 @@ def test_cost() -> None:
 
 
 def test_table_sizes_and_maintenance_notes() -> None:
-    print("\n=== Measurement 4: approach B table size and provenance ===")
+    print("\n=== Measurement 4: shipped lookalike table size and provenance ===")
     print(f"{'source':<45}{'entries':>10}")
     print(f"{'fullwidth (formula, +0xFEE0 offset)':<45}{len(_FULLWIDTH_TABLE):>10}")
     print(f"{'math alphanumeric (derived via unicodedata.name)':<45}{len(_MATH_ALNUM_TABLE):>10}")
     print(f"{'enclosed alphanumeric (derived via unicodedata.name)':<45}{len(_ENCLOSED_TABLE):>10}")
-    print(f"{'hand-enumerated Cyrillic':<45}{len(_HAND_CYRILLIC):>10}")
-    print(f"{'hand-enumerated Greek':<45}{len(_HAND_GREEK):>10}")
+    print(f"{'hand-enumerated Cyrillic (14 upper + 14 lower)':<45}{len(_HAND_CYRILLIC):>10}")
+    print(f"{'hand-enumerated Greek (14 upper + 14 lower)':<45}{len(_HAND_GREEK):>10}")
     print(f"{'hand-enumerated misc (dotless i)':<45}{len(_HAND_MISC):>10}")
     print(f"{'TOTAL hand-maintained (cyrillic+greek+misc)':<45}{len(_HAND_TABLE):>10}")
     print(f"{'TOTAL table (all four sources, deduplicated)':<45}{len(_CONFUSABLES_TABLE):>10}")
     print(f"\nunicodedata.unidata_version in this interpreter: {unicodedata.unidata_version}")
-    assert len(_HAND_TABLE) == 29, "hand-maintained table drifted from the count this report cites"
+    assert len(_HAND_TABLE) == 57, "hand-maintained table drifted from the count this report cites"
 
 
-def test_existing_drift_gate_does_not_cover_the_confusables_table() -> None:
-    """Verifies, rather than assumes, that
-    `test_bundled_unicode_version_matches_the_version_the_ranges_were_derived_against`
-    (tests/test_masking_types.py) is scoped to
-    `_DEFAULT_IGNORABLE_UNASSIGNED_RANGES` (the invisible-character strip)
-    and has no knowledge of a confusables table -- because none exists on
-    main today. A hand-maintained confusables table shipped as approach B
-    would need its OWN version-pinned drift test, of the same shape, not a
-    free ride on the existing one: a future Unicode version could reassign
-    or add a Cyrillic/Greek character with a new Latin-confusable mapping,
-    and nothing in the current test suite would notice.
-    """
+def test_second_drift_gate_now_covers_the_lookalike_table() -> None:
+    """This USED to assert the opposite: that no test covered the
+    confusables table, because it did not exist on main. It does now --
+    `test_bundled_unicode_version_matches_the_version_the_lookalike_table_
+    was_derived_against` (tests/test_masking_types.py) is its own,
+    separately-scoped version-pin gate, not a free ride on the
+    Default_Ignorable one. This just confirms it exists and is scoped to
+    the right names, so this file does not silently go stale the next time
+    someone reads its own claim about test coverage."""
     import inspect
 
     from tests import test_masking_types as existing_tests
 
-    source = inspect.getsource(
-        existing_tests.test_bundled_unicode_version_matches_the_version_the_ranges_were_derived_against
+    gate_source = inspect.getsource(
+        existing_tests.test_bundled_unicode_version_matches_the_version_the_lookalike_table_was_derived_against
     )
-    assert "confusable" not in source.lower()
-    assert (
-        "_DEFAULT_IGNORABLE_UNASSIGNED_RANGES" in source
-        or "_RANGES_DERIVED_AGAINST_UNICODE_VERSION" in source
-    )
+    assert "_HAND_CYRILLIC_LOOKALIKES" in gate_source
+    assert "_HAND_GREEK_LOOKALIKES" in gate_source
+    assert "_HAND_LOOKALIKE_TABLE_DERIVED_AGAINST_UNICODE_VERSION" in gate_source
+    # And it says so, rather than proving it: this gate cannot mechanically
+    # verify completeness (see the gate's own docstring for why not), so its
+    # failure message must say that plainly rather than imply otherwise.
+    assert "not a completeness check" in gate_source.lower()
     print(
-        "\n=== Measurement 4: existing drift gate scope ===\n"
-        "test_bundled_unicode_version_matches_the_version_the_ranges_were_derived_against "
-        "is scoped to _DEFAULT_IGNORABLE_UNASSIGNED_RANGES only. It does not, and cannot, "
-        "cover a hand-maintained confusables table -- that data does not exist on main. "
-        "Shipping approach B would need a second, differently-scoped version-pin test."
+        "\n=== Measurement 4: drift gate scope ===\n"
+        "test_bundled_unicode_version_matches_the_version_the_lookalike_table_was_derived_against "
+        "(tests/test_masking_types.py) is scoped to _HAND_CYRILLIC_LOOKALIKES/"
+        "_HAND_GREEK_LOOKALIKES, separately from the pre-existing Default_Ignorable gate."
     )

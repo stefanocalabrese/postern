@@ -5,6 +5,9 @@ import unicodedata
 import pytest
 from postern_core.domain.masking import (
     _DEFAULT_IGNORABLE_UNASSIGNED_RANGES,
+    _HAND_CYRILLIC_LOOKALIKES,
+    _HAND_GREEK_LOOKALIKES,
+    _HAND_MISC_LOOKALIKES,
     _IBAN_MASKED_RE,
     _IBAN_SCAN_BUDGET,
     _IBAN_SCAN_MAX_TOKEN,
@@ -1318,3 +1321,92 @@ def test_free_text_budget_exhaustion_survivor_count_on_a_seven_value_payload() -
     # survive. Asserted as a count, not a hardcoded set, so this documents
     # the actual number rather than silently tolerating a different split.
     assert len(survivors) == 5, f"expected 5 of 7 to survive, got {survivors!r}"
+
+
+# --- Second drift gate: the hand-enumerated lookalike table ----------------
+#
+# Same SHAPE as `test_bundled_unicode_version_matches_the_version_the_ranges_
+# were_derived_against` above (pin the interpreter's bundled Unicode version,
+# fail the build the day it moves), but a DIFFERENT failure mode, stated
+# explicitly rather than copied from that gate's wording: the gate above
+# protects a mechanically-enumerable Unicode PROPERTY
+# (Default_Ignorable_Code_Point), so a count lock plus a category
+# characterization test can prove the CURRENT six ranges are still correct,
+# and this version pin catches the one thing they can't -- a brand-new
+# codepoint outside those six ranges. `_HAND_CYRILLIC_LOOKALIKES` and
+# `_HAND_GREEK_LOOKALIKES` (masking.py) protect something with no Unicode
+# property behind it at all: "visually confusable with a specific Latin
+# letter" is a judgment call, not an enumerable set, so there is no
+# `Cn`-style characterization test that could ever prove this table
+# complete, before or after a Unicode bump. This gate's job is narrower and
+# more honest about it: force a human to go look, because nothing else
+# will. Passing it is a statement that someone checked, not a proof the
+# table is complete -- and the count-lock test below it cannot detect a
+# BRAND NEW Cyrillic or Greek codepoint any more than the version pin's own
+# absence would; it only catches an ACCIDENTAL edit to the table already on
+# main.
+_HAND_LOOKALIKE_TABLE_DERIVED_AGAINST_UNICODE_VERSION = "15.0.0"
+
+
+def test_hand_lookalike_tables_have_the_documented_size() -> None:
+    """Accidental-edit lock, not a completeness proof: catches a stray
+    addition or deletion to `_HAND_CYRILLIC_LOOKALIKES`/
+    `_HAND_GREEK_LOOKALIKES`/`_HAND_MISC_LOOKALIKES` in an unrelated change,
+    the same way `test_default_ignorable_unassigned_ranges_total_3769_
+    codepoints` does for the other table. Does NOT, and cannot, detect a
+    Unicode version assigning a new confusable character -- that is what
+    the version-pin test below exists for."""
+    assert len(_HAND_CYRILLIC_LOOKALIKES) == 28  # 14 uppercase + 14 lowercase
+    assert len(_HAND_GREEK_LOOKALIKES) == 28  # 14 uppercase + 14 lowercase
+    assert len(_HAND_MISC_LOOKALIKES) == 1  # dotless i only
+
+
+def test_bundled_unicode_version_matches_the_version_the_lookalike_table_was_derived_against() -> (
+    None
+):
+    """The gate for the drift the count lock above cannot see: a newer
+    bundled Unicode version assigning a brand-new Cyrillic or Greek
+    codepoint with a Latin look-alike, sitting entirely outside the 57
+    codepoints `_HAND_CYRILLIC_LOOKALIKES`/`_HAND_GREEK_LOOKALIKES`/
+    `_HAND_MISC_LOOKALIKES` already enumerate."""
+    actual = unicodedata.unidata_version
+    pinned = _HAND_LOOKALIKE_TABLE_DERIVED_AGAINST_UNICODE_VERSION
+    assert actual == pinned, (
+        f"Bundled Unicode version is {actual!r}, but the hand-enumerated "
+        f"Cyrillic/Greek lookalike table in masking.py "
+        f"(_HAND_CYRILLIC_LOOKALIKES, _HAND_GREEK_LOOKALIKES) was derived "
+        f"against Unicode {pinned!r}.\n\n"
+        "This is NOT a completeness check, unlike the Default_Ignorable "
+        "drift gate above: there is no Unicode property that enumerates "
+        '"letters confusable with a Latin letter", so no test can '
+        "mechanically prove this table is complete, before or after a "
+        "Unicode bump. This gate's only job is to force a human to look, "
+        "because nothing else will -- a new Unicode version can assign a "
+        "brand-new codepoint to the Cyrillic (U+0400-U+04FF plus its "
+        "extension blocks) or Greek (U+0370-U+03FF plus its extension "
+        "blocks) scripts that happens to look like a Latin letter, and "
+        "neither this test nor the count lock on _HAND_CYRILLIC_LOOKALIKES/"
+        "_HAND_GREEK_LOOKALIKES would notice -- they only check the "
+        "codepoints already listed.\n\n"
+        "To fix, in order: (1) diff the new Unicode version's Cyrillic and "
+        "Greek script blocks (Scripts.txt or DerivedCoreProperties.txt at "
+        "https://www.unicode.org/Public/<version>/ucd/) against Unicode "
+        f"{pinned!r}'s, looking specifically for newly assigned codepoints "
+        "in those scripts; (2) for each newly assigned codepoint, judge by "
+        "eye whether it is a plausible Latin look-alike, the same bar every "
+        "existing entry was held to (visually identical, not merely "
+        "similar, to one specific Latin letter); (3) add any that qualify "
+        "to masking.py's _HAND_CYRILLIC_LOOKALIKES or "
+        "_HAND_GREEK_LOOKALIKES, both cases, per that table's own "
+        "docstring; (4) re-run tests/test_masking_homoglyph_measurement.py's "
+        "false-positive corpus (test_false_positives_on_legitimate_text) to "
+        "confirm the addition introduces no new false positive on realistic "
+        "Spanish/Catalan text; (5) update "
+        "_HAND_LOOKALIKE_TABLE_DERIVED_AGAINST_UNICODE_VERSION (this test, "
+        "this file) to the new unicodedata.unidata_version string, and the "
+        "size(s) in test_hand_lookalike_tables_have_the_documented_size if "
+        "the table's entry count changed. A version bump with NO qualifying "
+        "new characters found in step (1) still requires updating the pin "
+        "in step (5) -- passing this gate is a statement that a human "
+        "looked, not that the table changed."
+    )
