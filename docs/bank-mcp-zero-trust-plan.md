@@ -306,7 +306,7 @@ The per-operation audit chain (§9) is the core artifact: tool call and argument
 
 | Team | Question |
 |---|---|
-| Backend domain services | ZT-2: does every handler enforce on JWT `sub`? Pre-masked values in agent-facing projections (handoff §10.17)? Decides PCI DSS scope. |
+| Backend domain services | ZT-2: does every handler enforce on JWT `sub`? Do pre-masked agent-facing projections (handoff §10.17) decide PCI DSS scope? |
 | Fraud / risk platform | ZT-1: what signals exist, in what form? CAEP/SSF available? |
 | Mobile | Pairing-code screen (handoff Q10); session list and revocation UI (ZT-7) |
 | Platform / Vault | Two signing roles, JWKS hosting, sidecar pattern (handoff Q22, Q27) |
