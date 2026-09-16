@@ -20,6 +20,13 @@ async def append(
     arguments: dict[str, Any],
     outcome: str,
     detail: str | None,
+    # TEMPORARY seam: neither of the middleware's two call sites can pass a
+    # real value until that session publishes the API that measures budget
+    # exhaustion (separate follow-up). Until then every row this function
+    # writes records False here regardless of what actually happened during
+    # scrubbing, so a caller must not read a False on an existing row as
+    # evidence that the budget was not exhausted.
+    redaction_budget_exhausted: bool = False,
 ) -> None:
     session.add(
         AuditEntry(
@@ -29,6 +36,7 @@ async def append(
             arguments=arguments,
             outcome=outcome,
             detail=detail,
+            redaction_budget_exhausted=redaction_budget_exhausted,
         )
     )
     await session.commit()
