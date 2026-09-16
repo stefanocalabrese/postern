@@ -574,20 +574,29 @@ async def test_an_audit_write_failure_on_the_success_path_is_logged(
     """Requirement 3: the failure must be observable to an operator, not
     just inferable from the call itself failing.
 
-    `monkeypatch.setattr(audit_middleware.logger, "disabled", False)` works
-    around an unrelated environment quirk, not this module's own behaviour:
-    `migrations/env.py`'s `fileConfig(config.config_file_name)` (Alembic's
-    standard template) runs with `disable_existing_loggers` at its default
-    of `True`, and the session-scoped `pg_url` fixture runs it after this
+    This test used to carry a `monkeypatch.setattr(audit_middleware.logger,
+    "disabled", False)` workaround, because the session-scoped `pg_url`
+    fixture runs `migrations/env.py` (via `command.upgrade`) after this
     module's `logger = logging.getLogger(__name__)` already executed at
-    import time -- so Alembic's own logging setup, not this module's code,
-    leaves the real logger disabled for the rest of the test session.
-    Confirmed directly: `audit_middleware.logger.disabled` reads `True`
-    before this line, in every test in this file that reaches this point.
-    `caplog.set_level` cannot undo it -- it only restores `logging.disable`'s
-    global threshold, never a logger's own `.disabled` flag."""
+    import time, and `fileConfig`'s `disable_existing_loggers` default of
+    `True` disabled every pre-existing logger it found, this one included,
+    for the rest of the test session -- `caplog.set_level` cannot undo that,
+    since it only restores `logging.disable`'s global threshold, never a
+    logger's own `.disabled` flag.
+
+    `c1a1275` fixed the cause (`migrations/env.py` now passes
+    `disable_existing_loggers=False`), so the workaround was removed here
+    rather than kept as a belt-and-braces guard against a bug that no longer
+    exists -- see `docs/decisions/0006-audit-write-failure.md` for why a
+    silenced logger matters: it is the only signal an operator gets that
+    this middleware's fail-closed policy fired, so losing it silently turns
+    fail-closed into fail-silent. The hazard itself is not Alembic-specific
+    and will recur: any code that calls `fileConfig` or `dictConfig` in a
+    hosting process, with that same default, can disable a logger created
+    before it runs. If a log assertion in this file ever starts failing
+    again for no visible reason, check for that before reaching for this
+    workaround."""
     monkeypatch.setattr(store_audit, "append", _boom_append)
-    monkeypatch.setattr(audit_middleware.logger, "disabled", False)
     caplog.set_level(logging.ERROR, logger=audit_middleware.logger.name)
     async with Client(transport=audit_server) as c:
         with pytest.raises(MCPError):
@@ -634,10 +643,10 @@ async def test_an_audit_write_failure_on_the_failure_path_is_logged(
 ) -> None:
     """Companion to the success-path logging test: the audit failure is
     observable here too, even though the caller's own error text names only
-    the tool, never the database. See the success-path logging test's
-    docstring for why `logger.disabled` is reset here."""
+    the tool, never the database. See `docs/decisions/0006-audit-write-failure.md`
+    for why this log line matters: it is the only signal an operator gets
+    that this middleware's fail-closed policy fired."""
     monkeypatch.setattr(store_audit, "append", _boom_append)
-    monkeypatch.setattr(audit_middleware.logger, "disabled", False)
     caplog.set_level(logging.ERROR, logger=audit_middleware.logger.name)
     async with Client(transport=audit_server) as c:
         await c.call_tool("boom_tool", {}, raise_on_error=False)
