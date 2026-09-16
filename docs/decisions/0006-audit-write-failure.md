@@ -131,17 +131,39 @@ end user -- is expected to be looking. This is a plain `logging` call, not a
 metrics counter or an alert; whether that is enough to page someone depends
 on how this deployment ships logs, which is outside this record's scope.
 
-That claim assumes this module's logger is still enabled in the hosting
-process, and that assumption is not free: `migrations/env.py:33` calls
-`fileConfig(config.config_file_name)` with `disable_existing_loggers` at
-Alembic's template default of `True`, which silences any logger created
-before that call and not listed in `alembic.ini` -- including this one --
-for the rest of that process. It is harmless today because migrations run
-as their own process, but if migrations are ever run in-process at startup
-of whatever hosts this middleware, the log line this section describes goes
-silent with nothing else changing. That is `migrations/env.py`'s hazard to
-fix, not this module's; it has been reported to the session that owns it
-and is not addressed here.
+That claim rests on this module's logger being enabled in the hosting
+process, and until `c1a1275` that assumption was fragile: `migrations/env.py`'s
+`fileConfig` call ran with `disable_existing_loggers` at Alembic's template
+default of `True`, which sets `.disabled` on every logger already created in
+the process, for the rest of that process's life. Harmless when migrations
+run in their own process; not harmless if `alembic upgrade head` ever ran
+in-process at application startup, where it would have silenced every logger
+the application created before that call -- including this one, and
+specifically the ERROR line this section describes, which is the only signal
+an operator gets that the audit store is down. The reasoning is worth keeping
+even though the instance is fixed: a silenced logger does not overturn this
+record's fail-closed decision, it removes the only signal that the decision
+fired, which turns fail-closed into fail-silent. That is a property of
+`disable_existing_loggers`, not of Alembic specifically, so anyone
+configuring logging in a hosting process -- a second `fileConfig` call, a
+`dictConfig` with the same default, a library that touches `logging.config.*`
+on import -- can reproduce it against this logger or any other, regardless of
+what this fix changed.
+
+`c1a1275` fixed the instance: it passes `disable_existing_loggers=False` to
+that call, so pre-existing loggers survive it. The guarantee now rests on a
+test, not a fixed line. `tests/test_migrations_env_logging.py` runs the exact
+guard-and-call block from `migrations/env.py` in a subprocess, because
+`fileConfig` mutates process-wide logging state and an in-process test would
+have to prove a total restore rather than risk a partial one leaking into
+later tests; it extracts that block via `ast.get_source_segment` rather than
+retyping it, so a future edit that drops the keyword breaks the test by
+changing what it executes instead of leaving a hand-copied duplicate that
+keeps passing regardless of what `env.py` actually does; and it asserts both
+that a pre-existing logger survives the call and that
+`logging.getLogger("alembic").level == 20`, which proves the ini actually
+parsed rather than the `os.path.exists` guard silently taking its false
+branch and skipping `fileConfig` altogether.
 
 ## What this costs
 
