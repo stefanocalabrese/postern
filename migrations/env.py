@@ -29,8 +29,14 @@ if (url := os.environ.get("POSTERN_DATABASE_URL")) is not None:
 # This repo does keep an `alembic.ini` today, so the extra `os.path.exists`
 # check changes nothing right now -- it costs nothing and removes a landmine
 # for whoever later moves the config into `pyproject.toml`.
+# `disable_existing_loggers` defaults to `True`, which sets `.disabled` on
+# every logger that already exists in this process, for the rest of the
+# process's life. Harmless when migrations run in their own process; not
+# harmless when `alembic upgrade head` runs in-process at application
+# startup, which silences every logger the application created before this
+# line, including ones about to report that a downstream store is unreachable.
 if config.config_file_name is not None and os.path.exists(config.config_file_name):
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # add your model's MetaData object here
 # for 'autogenerate' support
