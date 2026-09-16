@@ -324,7 +324,7 @@ def _mask_pan(v: str) -> str:
 MaskedPan = Annotated[str, BeforeValidator(_mask_pan)]
 ```
 
-Every domain model field uses `MaskedPan` / `MaskedIban`. A handler that forgets fails validation rather than leaking. **Prefer the backend returning pre-masked values** — then the MCP server never holds a full PAN and stays out of PCI DSS scope (§6.5, open question 17).
+Every domain model field uses `MaskedPan` / `MaskedIban`. A handler that forgets fails validation rather than leaking. **Prefer the backend returning pre-masked values** — then the MCP server never holds a full `Card.pan` (§6.5, §10.17, tracked as a live dependency in the zero-trust plan §8). That does not settle PCI DSS scope on its own: a PAN a merchant typed into a descriptor arrives raw in the five `FreeText` fields (`Account.label`, `Transaction.counterparty_name`, `Transaction.description`, `Card.label`, `SessionInfo.confirmation_note`, lines 21, 37, 38, 59 and 76 of `packages/postern-core/src/postern_core/domain/models.py`) and in every agent-supplied tool argument; `FreeText` redacts it at validation time, once the raw value has already reached the process.
 
 ### 6.2 Consent-scoped tool visibility
 

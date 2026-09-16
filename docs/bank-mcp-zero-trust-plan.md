@@ -4,7 +4,7 @@
 
 **Audience:** a Claude Code session implementing this, with access to the codebase and AWS accounts.
 
-**Status:** assessment complete, work items defined, none implemented.
+**Status:** assessment complete, ZT-1 to ZT-8 defined, none implemented. Three of the seven §6.1 CI gates are live and blocking in `make ci` (golden masking, header/body mismatch, import-linter on `services/api`); the other four are not.
 
 ---
 
@@ -308,8 +308,8 @@ The per-operation audit chain (§9) is the core artifact: tool call and argument
 |---|---|
 | Backend domain services | ZT-2: does every handler enforce on JWT `sub`? Will agent-facing projections return pre-masked values (handoff §10.17)? |
 | Fraud / risk platform | ZT-1: what signals exist, in what form? CAEP/SSF available? |
-| Mobile | Pairing-code screen (handoff Q10); session list and revocation UI (ZT-7) |
-| Platform / Vault | Two signing roles, JWKS hosting, sidecar pattern (handoff Q22, Q27) |
-| Platform / supply chain | Signing, SBOM format, deploy-time verification (ZT-3, handoff Q26) |
+| Mobile | Pairing-code screen (handoff §10.10); session list and revocation UI (ZT-7) |
+| Platform / Vault | Two signing roles, JWKS hosting, sidecar pattern (handoff §10.22, §10.27) |
+| Platform / supply chain | Signing, SBOM format, deploy-time verification (ZT-3, handoff §10.26) |
 | Conduct / compliance | §5.3 rendering risk; §5.4 regulatory position |
-| DPO | Art. 9 basis and DPIA (handoff Q9); third-party disclosure analysis (Q19) |
+| DPO | Art. 9 basis and DPIA (handoff §10.9); third-party disclosure analysis (§10.19) |
