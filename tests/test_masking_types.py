@@ -1112,6 +1112,28 @@ def test_redaction_scope_does_not_expose_spend_or_remaining() -> None:
         assert not hasattr(scope, "remaining")
 
 
+def test_redaction_scope_exhausted_at_exactly_the_cost_of_one_full_scan() -> None:
+    """Pins the semantics `exhausted`'s docstring documents, so they cannot
+    silently drift back to "True means degraded": measure the exact
+    checksum cost of one full, uncontested scan (never hardcoded, so this
+    stays correct if the scan strategy's own cost ever changes), then set
+    the budget to exactly that cost. The token must still resolve to its
+    full, structured mask -- nothing was degraded -- AND `exhausted` must
+    still read True, because the budget's last unit was spent getting
+    there."""
+    iban = "MT92MALT01100ABCDEFGH1234IJKL56"
+    with redaction_budget(10_000):
+        Memo(text=iban)
+        budget = _current_budget.get()
+        assert budget is not None
+        cost = 10_000 - budget.remaining
+
+    with redaction_budget(cost) as scope:
+        out = Memo(text=iban).text
+    assert out == "MT•• •••• KL56"  # full match: nothing degraded
+    assert scope.exhausted is True  # yet exhausted reads True regardless
+
+
 # --- Default_Ignorable_Code_Point: unassigned codepoints that still render
 # as nothing, missed by category-only stripping -----------------------------
 #

@@ -227,8 +227,12 @@ _current_budget: contextvars.ContextVar[_ScanBudget | None] = contextvars.Contex
 class RedactionScope:
     """Read-only view onto the `_ScanBudget` active for one `redaction_budget`
     block, yielded by that context manager so a caller outside this module
-    can learn whether the block's redaction degraded, without ever gaining a
-    route to `_ScanBudget` itself.
+    can learn whether the block's checksum allowance ran out, without ever
+    gaining a route to `_ScanBudget` itself. That is a narrower question
+    than "did the block's redaction degrade" -- see `exhausted`'s own
+    docstring for exactly how the two can diverge in both directions; do
+    not repeat "ran out" as "degraded" elsewhere in this codebase without
+    that caveat attached.
 
     `spend()` and `remaining` stay unreachable through this on purpose: this
     class holds a `_ScanBudget` but does not subclass it, forward attribute
@@ -262,12 +266,39 @@ class RedactionScope:
 
     @property
     def exhausted(self) -> bool:
-        """Whether the underlying `_ScanBudget` had spent its whole
-        allowance, as of the moment this is read. True means at least one
-        `FreeText` value validated inside the originating `redaction_budget`
-        block was scanned with a degraded, bare-marker fallback (see
-        `_redact_iban_match`'s `budget.exhausted` branch) rather than the
-        full scan; it says nothing about which value, or how many."""
+        """Whether this scope's checksum allowance was fully spent at some
+        point during the block -- not "was any value in this scope
+        degraded because of it". The two are different questions, and
+        conflating them is wrong in both directions (verified against
+        `_find_iban_in_token`/`_redact_iban_match`, not asserted from
+        reading the code):
+
+        True does not imply anything was degraded. `_ScanBudget.exhausted`
+        is `remaining <= 0`, and `remaining` reaches zero on the
+        SUCCESSFUL spend of the last unit, not only when a caller is
+        refused one -- so the very token whose scan spends that last unit
+        can still resolve to a complete, structured mask. Measured: a full,
+        uncontested scan of "MT92MALT01100ABCDEFGH1234IJKL56" costs exactly
+        13 checksums; a budget of 13 masks it correctly (full country code
+        and last four) AND leaves `exhausted` True, the same reading a
+        budget of 11 or 12 gives for a bare, degraded mask.
+
+        False does not imply nothing was degraded, or even that nothing
+        was bare-masked. `_redact_iban_match`'s over-`_IBAN_SCAN_MAX_TOKEN`
+        branch and its ambiguous-match branch (`isinstance(compact,
+        _Ambiguous)`) both emit the bare marker WITHOUT spending any
+        budget at all -- an over-long or ambiguous token can be bare-masked
+        in a scope where `exhausted` reads False throughout.
+
+        What this DOES reliably report: whether the qualifying-start-
+        narrowed budget-exhaustion branch on `_redact_iban_match` (the
+        `if budget.exhausted:` check, taken before scanning) could have
+        fired for some token in this scope. `_ScanBudget.remaining` only
+        ever decreases, so once this reads True it stays True for the rest
+        of the scope's life -- True is therefore NECESSARY for that branch
+        to have fired for any token after the one that spent the last
+        unit, but not sufficient (as the 13-checksum example above shows),
+        and it says nothing about which token, or how many."""
         return self._budget.exhausted
 
 
