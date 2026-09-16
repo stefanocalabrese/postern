@@ -42,6 +42,29 @@ _FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
 # distinct probes, and nothing marks a row as truncated, so a genuine
 # 64-character name is indistinguishable from a clipped 200-character one.
 # Losing the row entirely, the alternative, is worse.
+#
+# A second, unrelated collision lands on this same field: `_scrub` masks a
+# PAN- or IBAN-shaped tool name to a fixed form (`•••• NNNN` for a PAN,
+# `XX•• •••• NNNN` for an IBAN), so two different tool names that happen to
+# share the same last four digits -- two distinct probe tools, say, or one
+# probe repeated behind a different prefix -- collapse to the same recorded
+# `tool_name`, and nothing in the row marks a name as having been masked at
+# all. The identity field of the audit row is lossy with no flag.
+#
+# Accepted for the same reason as the truncation case above: the
+# alternative is a raw PAN or IBAN sitting in a long-lived table, which is
+# worse. It stays contained today because nothing reads this column beyond
+# writing it -- no index, no foreign key, no query, no join anywhere in this
+# codebase (verified by search, 2026-09-16) -- so no code path currently
+# depends on two masked `tool_name` values being distinguishable. It STOPS
+# being contained the first time someone writes a query that does -- a
+# `GROUP BY tool_name` counting distinct tools called, or an alert rule
+# keyed on this column -- at which point the query silently under-counts
+# distinct PAN-/IBAN-shaped names, with nothing in the schema or the query
+# itself hinting why. A marker column (e.g. a `masked: bool` alongside
+# `tool_name`) would close this, but that is a schema change: migrations
+# are out of this file's scope, and it belongs wherever `store/models.py`
+# and its migrations are owned, not here.
 _MAX_TOOL_NAME = 64
 
 

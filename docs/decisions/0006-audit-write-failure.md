@@ -95,6 +95,23 @@ the caller in a `CallToolResult(is_error=True, ...)` exactly as it would if
 the audit write had succeeded; the simulated audit-store exception's message
 does not appear anywhere in that result.
 
+**Where each path's message containment actually lives.** On the failure
+path, this middleware itself is what keeps the store exception's text off
+the wire: `raise exc from audit_exc` substitutes the tool's own exception
+before anything leaves `on_call_tool`, so containment there is this code's
+property. The success path has no such substitution -- the raw store
+exception genuinely escapes `on_call_tool` unchanged -- and what keeps its
+text (a hostname, a DSN fragment, whatever the driver puts in the message)
+off the wire is the MCP SDK runner one layer up, which turns an unhandled
+exception that is not a `FastMCPError` into the generic `-32603 Internal
+server error` rather than echoing `str(exc)`, and does so regardless of
+`mask_error_details` (that setting only governs the `ToolError` wrapping
+used for genuine tool failures, not this path). That holds for realistic
+store exceptions today, but it is a property of the SDK's dispatcher, not
+of this module, and it would stop holding the moment an audit-store failure
+is ever wrapped in a `ToolError` instead of left as a plain exception, since
+the SDK does echo a `ToolError`'s own message.
+
 ## What an operator sees when the audit store is down
 
 Both paths log through `logging.getLogger("services.api.middleware.audit")`
@@ -113,6 +130,18 @@ server's own logs, which is where an operator -- not the model, not the
 end user -- is expected to be looking. This is a plain `logging` call, not a
 metrics counter or an alert; whether that is enough to page someone depends
 on how this deployment ships logs, which is outside this record's scope.
+
+That claim assumes this module's logger is still enabled in the hosting
+process, and that assumption is not free: `migrations/env.py:33` calls
+`fileConfig(config.config_file_name)` with `disable_existing_loggers` at
+Alembic's template default of `True`, which silences any logger created
+before that call and not listed in `alembic.ini` -- including this one --
+for the rest of that process. It is harmless today because migrations run
+as their own process, but if migrations are ever run in-process at startup
+of whatever hosts this middleware, the log line this section describes goes
+silent with nothing else changing. That is `migrations/env.py`'s hazard to
+fix, not this module's; it has been reported to the session that owns it
+and is not addressed here.
 
 ## What this costs
 

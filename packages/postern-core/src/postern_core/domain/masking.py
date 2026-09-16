@@ -21,6 +21,27 @@ from typing import Annotated
 
 from pydantic import AfterValidator
 
+# Byte width and character width diverge here, and the divergence runs the
+# opposite way most people guess: masking a value can GROW its byte length
+# even while it shrinks or holds its character length. The bullet is
+# U+2022, 3 bytes in UTF-8 against 1 byte for the ASCII digit or letter it
+# typically stands in for, so a string made entirely of masked output can
+# reach up to 3x its character count in bytes -- `len(("•" *
+# 64).encode())` is 192, not 64. Measured on a realistic value too, not
+# just the theoretical extreme: `'.'.join(['NO9386011117947'] * 4)` is 63
+# characters (and 63 bytes -- pure ASCII) going in, and comes back 59
+# characters but 107 UTF-8 bytes after masking -- narrower by every
+# character-based measure, wider by every byte-based one.
+#
+# This is safe for `audit_log.tool_name` specifically because Postgres
+# `VARCHAR(n)` counts characters, not bytes (see the tool-name clamp in
+# `services/api/middleware/audit.py`, which documents that column's own
+# reasoning). It is NOT safe in general: any consumer that counts bytes
+# rather than characters -- a byte-limited index key, a fixed-width export,
+# a buffer sized off a `VARCHAR(n)`'s `n`, or any downstream system that
+# receives a masked value over a wire format that counts bytes -- can
+# receive something noticeably wider than the schema it was measured
+# against advertises.
 _MASK = "••••"
 _PAN_MASKED_RE = re.compile(r"•••• [0-9]{4}")
 _IBAN_MASKED_RE = re.compile(r"[A-Z]{2}•• •••• [A-Z0-9]{4}")
