@@ -20,10 +20,16 @@ async def append(
     arguments: dict[str, Any],
     outcome: str,
     detail: str | None,
-    # TEMPORARY seam: neither of the middleware's two call sites can pass a
-    # real value until that session publishes the API that measures budget
-    # exhaustion (separate follow-up). Until then every row this function
-    # writes records False here regardless of what actually happened during
+    # TEMPORARY seam: `append()` has exactly one call site outside tests --
+    # `AuditMiddleware._write` (services/api/middleware/audit.py:159),
+    # reached from both its raised-path and returned-path branches -- and
+    # it cannot pass a real value yet. `redaction_budget()` returns
+    # `Iterator[None]` and `_ScanBudget`'s own tracking is a private
+    # context variable (masking.py:222,228), so nothing outside that
+    # module can read whether the allowance ran out once the `with` block
+    # exits; a follow-up has to add that before this default can become
+    # anything but False. Until then every row this function writes
+    # records False here regardless of what actually happened during
     # scrubbing, so a caller must not read a False on an existing row as
     # evidence that the budget was not exhausted.
     redaction_budget_exhausted: bool = False,
