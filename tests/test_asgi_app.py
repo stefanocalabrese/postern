@@ -26,12 +26,17 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import cast
 
 import httpx2
 import pytest
+from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from fastmcp.server.http import StarletteWithLifespan
 from postern_core.identity import CustomerRef
+from postern_core.store.engine import Database
+from postern_core.store.models import AuditEntry, ConsentRecord
+from sqlalchemy import delete, select
 from starlette.middleware import Middleware
 from starlette.types import Message, Scope
 
@@ -253,19 +258,38 @@ def test_create_app_fails_clearly_on_incomplete_environment(
 
 
 async def test_lifespan_runs_fastmcps_own_startup_then_closes_the_backend_client_after_its_shutdown(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, pg_url: str
 ) -> None:
-    settings = Settings.for_testing()
+    """Three hooks must all run, in order: FastMCP's own session-manager
+    lifespan, then (Task 6) both `BackendClient.aclose()` and
+    `Database.close()`, only after FastMCP's shutdown has finished.
+
+    Since Task 6, `AuditMiddleware` is installed unconditionally and writes a
+    real row after every call, so this test needs a real, reachable database
+    (`pg_url`) for the `tools/call` below to genuinely succeed rather than
+    fail inside the audit write with the app still reporting HTTP 200 -- see
+    `test_a_tool_call_still_succeeds_when_the_audit_database_is_unreachable`
+    below for the case where it is not reachable.
+    """
+    settings = Settings(backend_base_url="https://backend.test", database_url=pg_url)
     app = create_app(settings, resolver=_resolver, transport=httpx2.MockTransport(_handler))
     backend = app.state.backend_client
-    close_calls: list[None] = []
-    original_aclose = backend.aclose
+    db = app.state.postern_database
+    backend_close_calls: list[None] = []
+    db_close_calls: list[None] = []
+    original_backend_aclose = backend.aclose
+    original_db_close = db.close
 
-    async def spy_aclose() -> None:
-        close_calls.append(None)
-        await original_aclose()
+    async def spy_backend_aclose() -> None:
+        backend_close_calls.append(None)
+        await original_backend_aclose()
 
-    monkeypatch.setattr(backend, "aclose", spy_aclose)
+    async def spy_db_close() -> None:
+        db_close_calls.append(None)
+        await original_db_close()
+
+    monkeypatch.setattr(backend, "aclose", spy_backend_aclose)
+    monkeypatch.setattr(db, "close", spy_db_close)
 
     async with _drive_lifespan(app):
         # Proof FastMCP's own lifespan ran: without it, the session manager
@@ -287,17 +311,22 @@ async def test_lifespan_runs_fastmcps_own_startup_then_closes_the_backend_client
                 },
             )
         assert response.status_code == 200
-        assert close_calls == []  # not yet -- the app is still running
+        body = response.json()
+        assert "error" not in body  # a real, successful tool call, not a leak
+        assert body["result"]["isError"] is False
+        assert backend_close_calls == []  # not yet -- the app is still running
+        assert db_close_calls == []  # not yet -- the app is still running
 
-    assert close_calls == [None]  # closed exactly once, after shutdown
+    assert backend_close_calls == [None]  # closed exactly once, after shutdown
+    assert db_close_calls == [None]  # closed exactly once, after shutdown
     assert backend._client.is_closed
 
 
 # --- End-to-end proofs required by the adversarial pass --------------------
 
 
-async def test_end_to_end_call_reaches_a_tool_and_returns_masked_data() -> None:
-    settings = Settings.for_testing()
+async def test_end_to_end_call_reaches_a_tool_and_returns_masked_data(pg_url: str) -> None:
+    settings = Settings(backend_base_url="https://backend.test", database_url=pg_url)
     app = create_app(settings, resolver=_resolver, transport=httpx2.MockTransport(_handler))
     async with _drive_lifespan(app):
         transport = httpx2.ASGITransport(app=app)
@@ -346,6 +375,30 @@ async def test_end_to_end_header_body_mismatch_returns_400_and_32020() -> None:
     assert response.json()["error"]["code"] == -32020
 
 
+# --- Task 6: wire the database into the composition root ------------------
+
+
+def test_create_app_builds_a_database_from_settings() -> None:
+    app = create_app(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER)
+    assert getattr(app.state, "postern_database", None) is not None
+
+
+def test_create_app_installs_the_audit_middleware() -> None:
+    from services.api.middleware.audit import AuditMiddleware
+
+    app = create_app(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER)
+    server = app.state.postern_server
+    assert any(isinstance(m, AuditMiddleware) for m in server.middleware)
+
+
+async def test_the_database_is_closed_on_shutdown() -> None:
+    app = create_app(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER)
+    db = app.state.postern_database
+    async with app.router.lifespan_context(app):
+        pass
+    assert db.engine.pool.status() is not None
+
+
 async def test_end_to_end_body_over_max_body_bytes_returns_413() -> None:
     settings = Settings(backend_base_url="https://backend.test", max_body_bytes=64)
     app = create_app(settings, resolver=_resolver, transport=httpx2.MockTransport(_handler))
@@ -364,3 +417,151 @@ async def test_end_to_end_body_over_max_body_bytes_returns_413() -> None:
             )
     assert response.status_code == 413
     assert json.loads(response.text)["error"]
+
+
+# --- Adversarial pass: consent and audit running together, for real --------
+
+
+async def test_end_to_end_audit_row_is_written_for_a_real_call(
+    pg_url: str, database: Database
+) -> None:
+    """The first time consent and audit run together through the composed
+    app: a real JWT (`auth_override`), a seeded consent row, a real
+    `tools/call` over `httpx2.ASGITransport`, and the resulting row read
+    back from Postgres through a second, independent connection -- the same
+    `database` fixture `AuditMiddleware` itself writes through, per
+    `test_consent_enforcement.py`'s own finding that a rolled-back session
+    is invisible to the app's own connection.
+    """
+    key_pair = RSAKeyPair.generate()
+    issuer = "https://postern-audit-e2e.invalid"
+    audience = "postern"
+    customer = "cust_audite2e01"
+
+    async with database.sessionmaker() as session:
+        session.add(
+            ConsentRecord(
+                customer_ref=customer,
+                domain="accounts",
+                granted=True,
+                granted_at=datetime.now(UTC),
+                expires_at=None,
+            )
+        )
+        await session.commit()
+
+    try:
+        verifier = JWTVerifier(public_key=key_pair.public_key, issuer=issuer, audience=audience)
+        token = key_pair.create_token(subject=customer, issuer=issuer, audience=audience)
+        settings = Settings(
+            backend_base_url="https://backend.test",
+            database_url=pg_url,
+            allow_stub_token_minter=True,
+        )
+        app = create_app(
+            settings,
+            transport=httpx2.MockTransport(_handler),
+            auth_override=verifier,
+        )
+        async with _drive_lifespan(app):
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post(
+                    "/mcp",
+                    headers={
+                        "Accept": "application/json, text/event-stream",
+                        "Authorization": f"Bearer {token}",
+                        "Mcp-Method": "tools/call",
+                        "Mcp-Name": "accounts.list",
+                    },
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "accounts.list", "arguments": {}},
+                    },
+                )
+        assert response.status_code == 200
+        body = response.json()
+        assert "error" not in body
+        assert body["result"]["isError"] is False
+
+        async with database.sessionmaker() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(AuditEntry).where(AuditEntry.customer_ref == customer)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert [(r.tool_name, r.outcome, r.customer_ref) for r in rows] == [
+            ("accounts.list", "returned", customer)
+        ]
+    finally:
+        async with database.sessionmaker() as session:
+            await session.execute(
+                delete(ConsentRecord).where(ConsentRecord.customer_ref == customer)
+            )
+            await session.execute(delete(AuditEntry).where(AuditEntry.customer_ref == customer))
+            await session.commit()
+
+
+# --- Adversarial pass: the audit database is unreachable at startup --------
+
+
+async def test_a_tool_call_reports_a_json_rpc_error_when_the_audit_database_is_unreachable() -> (
+    None
+):
+    """`create_async_engine` is lazy (`Database.__init__` never connects), so
+    `create_app` succeeds even when `database_url` names an address that
+    will never resolve; only the first request that reaches
+    `AuditMiddleware`'s write discovers it.
+
+    Measured: the backend call itself succeeds (the `MockTransport` handler
+    runs and returns data), but the audit write's connection failure is
+    never caught by `AuditMiddleware.on_call_tool`'s own `try`/`except`
+    (which wraps only `call_next`, not the second, unconditional `_write`
+    call after it), so it propagates out of the whole tool dispatch.
+    FastMCP reports it as a top-level JSON-RPC `error` (`code: 0`, a generic
+    internal-error code, not a masking- or consent-specific one), still
+    inside an HTTP 200 envelope rather than the request's connection being
+    torn down or an ASGI 5xx being raised. The message embeds the raw
+    connection target (`127.0.0.1`, `1`), an internal-infrastructure
+    disclosure to the MCP client -- but not the database credentials
+    themselves, since asyncpg's own `ConnectionRefusedError` carries no DSN,
+    only the address it tried and failed to reach. A DNS-resolution failure
+    (an unresolvable host, tried first and reverted here for a
+    deterministic, environment-independent port) is even less specific: the
+    message it produces carries no connection target at all, only
+    `"nodename nor servname provided, or not known"`.
+    """
+    settings = Settings(
+        backend_base_url="https://backend.test",
+        database_url="postgresql+asyncpg://postern:postern@127.0.0.1:1/postern",
+    )
+    app = create_app(settings, resolver=_resolver, transport=httpx2.MockTransport(_handler))
+    async with _drive_lifespan(app):
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/mcp",
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Mcp-Method": "tools/call",
+                    "Mcp-Name": "accounts.list",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "accounts.list", "arguments": {}},
+                },
+            )
+    assert response.status_code == 200  # never surfaces as a real HTTP failure
+    body = response.json()
+    assert "result" not in body
+    assert body["error"]["code"] == 0
+    assert "127.0.0.1" in body["error"]["message"]  # leaks the connection target
+    assert "postern:postern" not in body["error"]["message"]  # not the DSN's credentials

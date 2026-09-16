@@ -5,8 +5,8 @@ composition"); the reasoning for each lives in
 `docs/decisions/0003-composition-root.md` and is summarised at its wiring
 site below:
 
-1. `BackendClient` lifecycle and `aclose()` on shutdown --
-   `_close_backend_after_fastmcp_shutdown`.
+1. `BackendClient` lifecycle and `aclose()` on shutdown, joined by `Database`
+   lifecycle (Task 6) -- `_close_resources_after_fastmcp_shutdown`.
 2. The façade's real per-call timeout budget -- `_backend_timeout`.
 3. `HeaderBodyValidation.max_body_bytes`, sourced from `Settings` -- wired
    into the `Middleware(...)` call below.
@@ -15,6 +15,16 @@ site below:
 Plus one the adversarial pass added: `create_app` refuses to start
 `StubTokenMinter` against a configuration that looks production-shaped,
 rather than silently minting fake bearer tokens no real backend accepts.
+
+Task 6 adds the database: one `Database` per process, built unconditionally
+from `settings.database_url` (the constructor never connects --
+`create_async_engine` is lazy), handed to `AuditMiddleware` so every tool
+call is recorded regardless of whether real customer auth is configured, and
+closed on shutdown alongside the backend client. Consent enforcement keeps
+its own, narrower condition (`has_real_customer_auth`, unchanged from Task
+4): `build_server` only receives a `db` to check consent against when there
+is a validated token's subject to check it for, since consent has nowhere to
+read a customer from otherwise.
 """
 
 from collections.abc import AsyncIterator
@@ -29,6 +39,7 @@ from postern_core.store.engine import Database
 from starlette.middleware import Middleware
 
 from services.api.asgi.header_validation import HeaderBodyValidation
+from services.api.middleware.audit import AuditMiddleware
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
 
@@ -90,10 +101,11 @@ def _backend_timeout(settings: Settings) -> httpx2.Timeout:
     )
 
 
-def _close_backend_after_fastmcp_shutdown(
-    app: StarletteWithLifespan, backend: BackendClient
+def _close_resources_after_fastmcp_shutdown(
+    app: StarletteWithLifespan, backend: BackendClient, db: Database
 ) -> None:
-    """Wires `backend.aclose()` into the app's own ASGI lifespan.
+    """Wires `backend.aclose()` and (Task 6) `db.close()` into the app's own
+    ASGI lifespan.
 
     `FastMCP.http_app()` returns a `StarletteWithLifespan` whose lifespan
     starts and stops FastMCP's session manager (`fastmcp/server/http.py`).
@@ -102,13 +114,14 @@ def _close_backend_after_fastmcp_shutdown(
     replace it: it reads the existing `app.router.lifespan_context`,
     wraps it, and writes the wrapped version back. FastMCP's startup and
     shutdown run completely unchanged inside the `async with`; the backend
-    client is closed only after that block exits, i.e. only after FastMCP's
-    own shutdown has finished, so no in-flight request can observe a closed
-    client. Proven in `tests/test_asgi_app.py`
+    client and the database are closed only after that block exits, i.e.
+    only after FastMCP's own shutdown has finished, so no in-flight request
+    can observe either as closed. Proven in `tests/test_asgi_app.py`
     (`test_lifespan_runs_fastmcps_own_startup_then_closes_the_backend_client_after_its_shutdown`):
     a real tool call succeeds while the app is running (which requires
-    FastMCP's own lifespan to have started the session manager), and the
-    backend is confirmed closed only once, after shutdown completes.
+    FastMCP's own lifespan to have started the session manager), and both
+    the backend and the database are confirmed closed exactly once, only
+    after shutdown completes.
     """
     original_lifespan = app.router.lifespan_context
 
@@ -117,6 +130,7 @@ def _close_backend_after_fastmcp_shutdown(
         async with original_lifespan(app):
             yield
         await backend.aclose()
+        await db.close()
 
     app.router.lifespan_context = lifespan
 
@@ -150,29 +164,45 @@ def create_app(
         transport=transport,
         timeout=_backend_timeout(settings),
     )
+    # Task 6: one `Database` per process, built unconditionally.
+    # `create_async_engine` is lazy (Task 1's own tests construct one against
+    # an address that is never reached), so this never blocks startup and
+    # never requires a reachable Postgres just to assemble the app -- only
+    # the first actual query does. Built here, not gated the way `consent_db`
+    # below is, because `AuditMiddleware` must record every call regardless
+    # of whether real customer auth is configured: the local docker-compose
+    # stack and `Settings.for_testing()` both still want an audit trail.
+    db = Database(settings.database_url)
+
     # Consent is enforced against `AuthContext.token`, which only exists when
     # real customer authentication is configured. `has_real_customer_auth`
     # reuses the exact signal `_refuse_stub_minter_in_production` already
     # uses for "is this production-shaped": both jwks_uri and issuer set, or
-    # (Task 4) a test-injected `auth_override`. Wiring a `Database` in
-    # regardless would deny every consent-gated call in the documented
-    # no-auth path (`Settings.for_testing()`, the local docker-compose
-    # stack) -- there is no validated token there for `services.api.consent`
-    # to read a subject from -- which would silently break that path's own
-    # stated purpose the moment this feature landed. Measured: every
-    # `tests/test_asgi_app.py` end-to-end call regressed to `Unknown tool`
-    # until this was scoped to real customer auth only.
+    # (Task 4) a test-injected `auth_override`. Passing `db` into
+    # `build_server` regardless would deny every consent-gated call in the
+    # documented no-auth path (`Settings.for_testing()`, the local
+    # docker-compose stack) -- there is no validated token there for
+    # `services.api.consent` to read a subject from -- which would silently
+    # break that path's own stated purpose the moment this feature landed.
+    # Measured: every `tests/test_asgi_app.py` end-to-end call regressed to
+    # `Unknown tool` until this was scoped to real customer auth only. This
+    # condition is about consent only; it does not gate whether `db` itself
+    # is built or whether audit runs.
     has_real_customer_auth = (
         settings.customer_jwks_uri is not None and settings.customer_token_issuer is not None
     ) or auth_override is not None
-    db = Database(settings.database_url) if has_real_customer_auth else None
+    consent_db = db if has_real_customer_auth else None
     server = build_server(
         settings,
         resolver or token_customer_resolver,
         backend,
-        db=db,
+        db=consent_db,
         auth_override=auth_override,
     )
+    # Task 6: one audit row per tool call, success or failure, regardless of
+    # whether consent enforcement itself is active -- see the module
+    # docstring and `services/api/middleware/audit.py`.
+    server.add_middleware(AuditMiddleware(db))
     app = server.http_app(
         path="/mcp",
         stateless_http=True,
@@ -190,8 +220,13 @@ def create_app(
     # `create_app` built -- its timeout, and that `aclose` was actually
     # called on shutdown -- without reaching into `build_server`/`server`
     # internals that have no reason to hold a reference to it themselves.
+    # `postern_server` and `postern_database` (Task 6) exist for the same
+    # reason: proving the audit middleware is installed on the real server
+    # object, and that the real database gets closed on shutdown.
     app.state.backend_client = backend
-    _close_backend_after_fastmcp_shutdown(app, backend)
+    app.state.postern_server = server
+    app.state.postern_database = db
+    _close_resources_after_fastmcp_shutdown(app, backend, db)
     return app
 
 
