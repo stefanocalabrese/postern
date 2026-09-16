@@ -58,8 +58,9 @@ def _scrub(value: Any) -> Any:
     an oversight.
 
     NUL bytes are stripped BEFORE redaction, not after, and the order is
-    load-bearing: `FreeText`'s PAN pattern (`\\d{12,19}`) matches a
-    CONTIGUOUS run of digits, so a NUL planted inside a PAN splits it into
+    load-bearing: `_PAN_IN_TEXT_RE` (`\\d{12,}`) matches a CONTIGUOUS run of
+    12 or more digits, with the 19-digit PAN length cap applied separately
+    when deciding what to emit, so a NUL planted inside a PAN splits it into
     two shorter runs that individually fail to match, and validation finds
     nothing to redact. Stripping the NUL afterwards then reassembles the
     full, unmasked PAN in the value that gets written -- one byte of
