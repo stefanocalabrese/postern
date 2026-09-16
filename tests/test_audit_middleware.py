@@ -2,6 +2,7 @@ import pytest
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.server.auth import AccessToken
+from postern_core.domain.masking import _MASK, redaction_budget
 from postern_core.store.models import AuditEntry
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -197,3 +198,87 @@ async def test_a_conforming_token_subject_does_reach_customer_ref(
         await c.call_tool("ok_tool", {"amount": 1})
     entry = (await rows(session))[0]
     assert entry.customer_ref == "cust_7f3a"
+
+
+# -- The request-scoped budget: `_scrub`'s whole tree walk shares ONE
+# `redaction_budget`, not a fresh one per string --------------------------
+#
+# Without this, `FreeText` gives every string it validates its own fresh
+# checksum budget (masking.py's `_IBAN_SCAN_BUDGET`), so an agent that
+# spreads junk across many short strings -- a list of them, rather than one
+# long one -- buys a fresh allowance per element instead of spending down
+# one shared one. Measured through the real `_scrub`, 1 MiB of
+# 128-character junk strings: 276ms (main) vs 7451ms (a list, per-string
+# budget only) vs bounded by `redaction_budget` -- see
+# `services/api/middleware/audit.py` and masking.py's `_redact_free_text`
+# for the full table.
+
+_JUNK_128 = "AB12" * 32  # never checksums, ~559 checksum operations each
+
+
+def test_scrub_budget_is_shared_across_a_list_not_reset_per_element() -> None:
+    """A small, explicit budget (rather than the production default) for a
+    fast, deterministic test: enough for roughly one element's full scan,
+    not two. The real IBAN in the third element must come back bare-masked
+    -- budget spent by the two junk elements ahead of it -- never with its
+    correct country code and last four, and never verbatim."""
+    real_iban = "MT84MALT011000012345MTLCAST001S"
+    payload = [_JUNK_128, _JUNK_128, f"{_JUNK_128} {real_iban}"]
+    with redaction_budget(600):
+        result = _scrub(payload)
+    assert real_iban not in str(result)
+    assert result[2].endswith(_MASK)
+    assert "MT••" not in result[2]  # never the correct, structured mask
+
+
+def test_scrub_budget_is_shared_across_a_nested_payload() -> None:
+    """Same property, through a nested dict-of-list-of-dict shape: `_scrub`
+    recurses through all of it under the SAME ambient budget, not a fresh
+    one at each level."""
+    real_iban = "MT84MALT011000012345MTLCAST001S"
+    payload = {
+        "a": [_JUNK_128, _JUNK_128],
+        "b": {"c": f"{_JUNK_128} {real_iban}"},
+    }
+    with redaction_budget(600):
+        result = _scrub(payload)
+    assert real_iban not in str(result)
+    assert result["b"]["c"].endswith(_MASK)
+    assert "MT••" not in result["b"]["c"]
+
+
+def test_scrub_without_an_ambient_budget_gives_each_string_its_own() -> None:
+    """Sanity check on the two tests above: OUTSIDE a `redaction_budget`
+    block, `_scrub` falls back to `_redact_free_text`'s own per-string
+    default (`_IBAN_SCAN_BUDGET`, 100,000 -- far more than 600), so the
+    same three-element payload is NOT starved and the real IBAN resolves
+    normally. This is what proves the previous two tests' bare masks are
+    genuinely caused by a SHARED budget, not by some unrelated breakage."""
+    real_iban = "MT84MALT011000012345MTLCAST001S"
+    payload = [_JUNK_128, _JUNK_128, f"{_JUNK_128} {real_iban}"]
+    result = _scrub(payload)
+    assert result[2].endswith("MT•• •••• 001S")
+
+
+async def test_on_call_tool_request_budget_bounds_a_junk_heavy_argument_list(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """Through the real middleware, not a hand-rolled combination of
+    `_scrub` and `redaction_budget`: enough 128-character junk elements to
+    exhaust the PRODUCTION default budget (100,000 checksums, ~559 per
+    element, so at least 179) inside one tool call's argument list,
+    followed by a genuine IBAN as the final element. The stored audit row
+    must never contain the real IBAN, and the trailing element must be
+    bare-masked rather than correctly identified -- proof that
+    `on_call_tool` actually wraps `_scrub` in `redaction_budget()` in
+    production, not just that the two primitives compose correctly in a
+    unit test."""
+    real_iban = "MT84MALT011000012345MTLCAST001S"
+    payload = [_JUNK_128] * 200 + [f"{_JUNK_128} {real_iban}"]
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1, "memo": payload}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    stored = str(entry.arguments)
+    assert real_iban not in stored
+    assert _MASK in stored
+    assert "MT••" not in stored

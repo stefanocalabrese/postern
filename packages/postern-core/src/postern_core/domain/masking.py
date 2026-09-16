@@ -12,7 +12,11 @@ toward a client MUST call `errors(include_input=False)` or
 `.json()`.
 """
 
+import contextvars
 import re
+import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Annotated
 
 from pydantic import AfterValidator
@@ -93,6 +97,203 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 # that cannot leave a residue for the mask to concatenate with.
 _PAN_IN_TEXT_RE = re.compile(r"\d{12,}")
 
+# ISO/IEC 7812-1 caps a PAN at 19 digits; no scheme issues a longer one.
+_PAN_MAX_DIGITS = 19
+
+# ISO 13616 caps an IBAN at 34 characters. 14 is this module's own historical
+# lower bound (the old `2 + 2 + {10,30}`), kept rather than tightened to the
+# registry's true 15-character minimum so that this change only ever adds
+# redaction and never removes any. Unchanged by the front-glue fix below:
+# widening or narrowing it is a separate decision this change does not make.
+_IBAN_MIN_LEN = 14
+_IBAN_MAX_LEN = 34
+
+# A per-token scan-cost bound, not an ISO invariant -- do not confuse this
+# with `_IBAN_MAX_LEN` above. `_find_iban_in_token` scanning every
+# qualifying start in a token is what closes the front-glue leak, but it
+# also means the work for a token that never checksums grows with the
+# token's own length: `services/api/middleware/audit.py` runs `FreeText`
+# over agent-supplied tool arguments of whatever length the agent sends, so
+# that growth is an agent-controllable cost sitting directly in the request
+# path, not a theoretical one. 128 is nearly four times `_IBAN_MAX_LEN`, so
+# no token this long can possibly be a real IBAN regardless of what it
+# checksums to, and no legitimate descriptor token comes anywhere close --
+# every merchant descriptor this module has been tested against tops out
+# well under 40 characters. `_redact_iban_match` checks this BEFORE calling
+# `_find_iban_in_token` at all, which is what makes an over-long token an
+# O(1) decision instead of an O(len(token)) one.
+#
+# This bound alone is NOT sufficient, and asserting otherwise was a mistake
+# corrected in this revision: it caps the cost of one LONG token, but an
+# attacker who tokenizes their own input controls token count as much as
+# token length, and every token up to and including 128 characters still
+# gets the full per-token scan. Splitting a payload into many token-sized
+# pieces (e.g. space-separated 128-character junk) multiplies the token's
+# own worst-case cost by however many of them fit in the payload, which
+# scales with total input size exactly the way a single unbounded token
+# used to. `_IBAN_SCAN_BUDGET` below is the bound that actually closes that:
+# a budget shared across every token in one `_redact_free_text` call, not
+# reset per token.
+_IBAN_SCAN_MAX_TOKEN = 128
+
+
+class _ScanBudget:
+    """A checksum-operation allowance shared across one `_redact_free_text`
+    call, not reset between tokens.
+
+    `_IBAN_SCAN_MAX_TOKEN` bounds the cost of any ONE token but not the
+    total across a payload made of many of them, and an attacker chooses
+    the tokenization of their own input: space-separated tokens sized just
+    at the per-token bound each buy the full scan, and the number of such
+    tokens that fit scales with total payload size the same way a single
+    unbounded token used to. Every checksum attempt across the whole call
+    -- not per token -- draws from this one allowance; once it is spent, no
+    further token is scanned at all (`_redact_iban_match` checks
+    `exhausted` before calling `_find_iban_in_token`), so the bound is a
+    property of the call, not of any token in it. See `_IBAN_SCAN_BUDGET`
+    for the chosen size and how it was derived.
+    """
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, total: int) -> None:
+        self.remaining = total
+
+    def spend(self) -> bool:
+        """Spend one checksum operation. Fails closed: once `remaining`
+        hits zero this stops decrementing and returns False forever, so a
+        caller that keeps calling it after exhaustion cannot go negative or
+        wrap around."""
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining <= 0
+
+
+# Chosen so that the worst-case cost of scanning ONE `FreeText` STRING at
+# 1 MiB -- `settings.max_body_bytes`'s default, the largest single value
+# that can reach this code today -- does not exceed the UNFIXED code's own
+# cost on the same input, with margin. Derived empirically, not by
+# intuition: swept against the adversarial shape review identified
+# (space-separated tokens sized exactly at `_IBAN_SCAN_MAX_TOKEN`,
+# maximum-density letter-letter-digit-digit filler) at 1 MiB, picking the
+# largest value whose measured worst case stays comfortably under the
+# unfixed code's own measured cost on the identical input. 100,000 measured
+# ~223-242ms across five runs against an unfixed-code baseline of
+# ~302-315ms on the same machine, the same five runs -- roughly 25%
+# margin, not a photo finish. 1 MiB of ORDINARY transaction text
+# (realistic merchant descriptors and sentences, repeated to size,
+# including genuine embedded IBANs and PANs) consumed 2,101 checksum
+# operations end to end -- about 2% of this budget -- so legitimate use is
+# nowhere near it. See `_redact_free_text` for the full measurement
+# tables, including the shapes invented specifically to try to beat the
+# chosen shape and why none of them did.
+#
+# This is a PER-STRING amount, used verbatim only when no ambient budget
+# is active (see `redaction_budget` immediately below). On its own it does
+# NOT bound a request that validates many strings -- `services/api/
+# middleware/audit.py:_scrub` walks a whole argument tree and validates
+# every string in it, so without an ambient budget each one gets a fresh
+# 100,000, and an attacker who spreads junk across many short strings
+# (a list of 128-character elements, say) pays this cost once per element,
+# not once per call. That gap, found and closed after this constant was
+# first chosen, is exactly what `redaction_budget` exists to close: see
+# its own docstring, and the request-level numbers on `_redact_free_text`.
+_IBAN_SCAN_BUDGET = 100_000
+
+# The context-local budget for the CURRENT call, when one has been made
+# ambient by `redaction_budget`. `contextvars.ContextVar`, not a plain
+# module global: `AuditMiddleware.on_call_tool` is async, and a module
+# global would be shared mutable state across every concurrently-served
+# request on the same instance -- one request's spend would count against
+# another's allowance, or a slow request could starve a fast one that
+# started later. A `ContextVar` is local to the current context, and
+# `asyncio` gives every `Task` its own copy of the context it was created
+# in, so two concurrently-running requests never observe each other's
+# budget. `default=None` is "no ambient budget active": `_redact_free_text`
+# falls back to a fresh per-string `_ScanBudget(_IBAN_SCAN_BUDGET)`
+# exactly as before `redaction_budget` existed, so every caller that does
+# not opt in keeps its current behaviour unchanged -- see
+# `redaction_budget` for which callers that is, and why it is acceptable.
+_current_budget: contextvars.ContextVar[_ScanBudget | None] = contextvars.ContextVar(
+    "_current_budget", default=None
+)
+
+
+@contextmanager
+def redaction_budget(checksums: int = _IBAN_SCAN_BUDGET) -> Iterator[None]:
+    """Make one checksum-operation allowance ambient for every `FreeText`
+    validation performed inside this `with` block, across as many separate
+    strings as it validates.
+
+    Built for `services/api/middleware/audit.py:_scrub`'s tree walk: one
+    tool call can carry its arguments as one long string, a list of short
+    ones, a nested structure of dicts and lists, or any mix, and the
+    attacker chooses which. Without this, each string validated through
+    `FreeText` creates its OWN fresh `_ScanBudget(_IBAN_SCAN_BUDGET)` (see
+    `_redact_free_text`), so splitting a payload into many short strings
+    multiplies the total allowance by however many strings it is split
+    into -- measured through the real `_scrub`, a 1 MiB LIST of
+    128-character junk strings cost 7.60 SECONDS against a per-string
+    budget (independently re-measured; a prior review pass measured 7.45s
+    for the same shape), because the split bought a fresh
+    100,000-checksum allowance for every element instead of spending down
+    one shared one -- a 1 MiB DICT of them, which validates a key AND a
+    value per entry, cost 14.66 seconds the same way. Wrapping the whole
+    walk in `with redaction_budget():` makes every `FreeText` validation
+    inside it spend from the SAME `_ScanBudget`, so the total cost is
+    bounded by `checksums` regardless of how the value is shaped -- both
+    of those shapes cost ~173-181ms with this wrapped around them, see
+    `_redact_free_text`'s module-level comment for the full request-level
+    table.
+
+    Sets the `ContextVar` on entry and resets it (not just clears it, so a
+    NESTED caller's own earlier budget -- if this is ever called
+    reentrantly -- is restored rather than wiped to `None`) in a `finally`
+    on exit, so an exception raised anywhere inside the block -- a
+    `ValidationError` from a non-`FreeText` field partway through the tree,
+    for instance -- cannot leave a spent, stale budget ambient for
+    whatever unrelated work runs next in the same context. Callers that
+    validate `FreeText` OUTSIDE of this context manager are unaffected and
+    keep today's per-string behaviour; see `_current_budget` for why that
+    is a deliberate, stated choice and not an oversight, and
+    `services/api/middleware/audit.py` for the one caller that opts in
+    today.
+
+    Entirely synchronous, on purpose: set and reset happen in the same
+    synchronous call with no `await` between them, so no `asyncio` task
+    boundary is ever crossed while the budget is ambient, and there is
+    nothing for a concurrently-scheduled coroutine on the same task to
+    observe even if `ContextVar` did not already isolate it by task.
+    """
+    budget = _ScanBudget(checksums)
+    token = _current_budget.set(budget)
+    try:
+        yield
+    finally:
+        _current_budget.reset(token)
+
+
+class _Ambiguous:
+    """Sentinel type returned by `_find_iban_in_token` when a token's
+    correct interpretation cannot be established -- either because more
+    than one start position inside it checksums, or because `_ScanBudget`
+    ran out before the token could be fully ruled unambiguous. Deliberately
+    a distinct type, not `None`: `None` means "scanned to completion, zero
+    matches, confirmed not an IBAN, leave the text as written"; this means
+    "do not know, and guessing is not safe" -- and both cases get the same
+    treatment (`_MASK`, no country code, no last four) precisely because
+    the caller must not be able to tell "ambiguous" from "ran out of
+    budget" and quietly treat the budget-exhaustion case as safer than it
+    is."""
+
+
+_AMBIGUOUS = _Ambiguous()
+
 # Same lesson, IBAN side: the candidate pattern is unbounded above too, and
 # for a sharper reason than the ceiling. `[A-Za-z0-9]{10,30}` matched a whole
 # token only up to 34 characters, and `_redact_iban_match` then checksummed
@@ -104,59 +305,238 @@ _PAN_IN_TEXT_RE = re.compile(r"\d{12,}")
 # rejected the greedy 30-character attempt and every backtrack with it, so
 # the pattern matched nothing at all. Neither failure is a length problem.
 # Match the maximal token, then look for an IBAN inside it.
-_IBAN_IN_TEXT_RE = re.compile(r"\b[A-Za-z]{2}[0-9]{2}[A-Za-z0-9]{10,}\b")
+#
+# The candidate pattern no longer requires the IBAN's own opening shape
+# (`[A-Za-z]{2}[0-9]{2}`) at the token's start -- that requirement was a
+# third, sharper instance of the same lesson: one alphanumeric character
+# glued to the FRONT of a valid IBAN ("XMT92MALT...") moves the opening
+# shape one position to the right, where an anchored pattern can never look
+# -- not "checksums the token and fails", not attempted at all, because the
+# token does not even match the candidate regex. `_IBAN_MIN_LEN` is the only
+# length constraint left at this boundary; `_find_iban_in_token` below does
+# the work of locating the opener inside the token, wherever it sits.
+#
+# Boundaries are `(?<![A-Za-z0-9])` / `(?![A-Za-z0-9])`, not `\b`, for a
+# fourth instance of the SAME lesson, found live on main: `\b` is defined
+# against `\w`, which includes `_`. "_MT92MALT01100ABCDEFGH1234IJKL56" has
+# no `\b` between the underscore and the "M" that follows it -- both are
+# word characters -- so the pattern's own leading `\b` can only land before
+# the underscore, where `[A-Za-z0-9]` immediately fails to match it, and the
+# whole run is never scanned at all: a complete, valid IBAN reaching the
+# output verbatim, one underscore away from being found by the very same
+# front-glue fix above. An explicit "not alphanumeric" test on each side
+# does not have this gap, because it does not go through `\w` at all: `_`
+# fails `[A-Za-z0-9]` exactly like a space or a hyphen does, so it splits a
+# token the same way they always did, and the front-glue and ambiguity
+# logic below operate on the correctly split "MT92MALT..." token as if the
+# underscore were a space. This also fixes the mirror case (an underscore
+# glued to the END or in the MIDDLE of a reference like "REF_MT92MALT...")
+# for the same reason, in the same change: the assertion is checked on both
+# sides of every candidate span, not just the leading one.
+_IBAN_IN_TEXT_RE = re.compile(rf"(?<![A-Za-z0-9])[A-Za-z0-9]{{{_IBAN_MIN_LEN},}}(?![A-Za-z0-9])")
 
-# ISO/IEC 7812-1 caps a PAN at 19 digits; no scheme issues a longer one.
-_PAN_MAX_DIGITS = 19
 
-# ISO 13616 caps an IBAN at 34 characters. 14 is this module's own historical
-# lower bound (the old `2 + 2 + {10,30}`), kept rather than tightened to the
-# registry's true 15-character minimum so that this change only ever adds
-# redaction and never removes any.
-_IBAN_MIN_LEN = 14
-_IBAN_MAX_LEN = 34
+def _find_iban_in_token(token: str, budget: _ScanBudget) -> str | None | _Ambiguous:
+    """The checksum-valid IBAN substring inside `token`, wherever it starts
+    -- or `_AMBIGUOUS` if that is not a well-defined question for this
+    token, or `None` if the token was fully scanned and nothing checksums.
 
+    Structural prefilter before any checksum, not a window scan: ISO
+    13616's own opening shape is letter, letter, digit, digit, which is an
+    O(1) character-class test per start position. A position only buys
+    checksums -- at most `_IBAN_MAX_LEN - _IBAN_MIN_LEN + 1 == 21` of them,
+    the same budget `_redact_iban_match` always spent on the token's own
+    start before front-glue was ever considered -- if it clears that gate
+    first. On real text almost every position is pruned for free: a digit,
+    or a letter pair that isn't followed by two digits, never reaches a
+    checksum. This is what makes an IBAN with junk glued to its FRONT
+    findable without turning the scan into a window scan of every
+    substring at every length.
 
-def _longest_iban_prefix(token: str) -> str | None:
-    """The longest leading slice of `token` that checksums as an IBAN.
+    EVERY qualifying start is checked, not just the first that succeeds.
+    Stopping at the first success was this function's original front-glue
+    behaviour, and it is wrong: longest-match-wins is only meaningful
+    WITHIN one start position (a coincidentally valid short prefix of a
+    longer real IBAN, the "SC18SSCB..." registry case below), not ACROSS
+    different starts, and a coincidental hit at an early start can end in
+    the middle of a real IBAN sitting further right in the same token --
+    measured, with a random letter-letter-digit-digit prefix glued in
+    front of a real IBAN, at roughly 18-27% of tokens, essentially all of
+    them with a wrong country code and a last-four sliced out of the real
+    account number's interior, e.g.
+    "NB91ODZDOC9IMT92MALT01100ABCDEFGH1234IJKL56" -> country code "NB",
+    which was never in the input, and last-four "00AB", which is not the
+    end of anything. The real IBAN never survived in either case measured
+    (this is not a leak), but a WRONG, CONFIDENT last-four is exactly the
+    failure `_redact_pan_match`'s over-19-digit branch and
+    `_redact_iban_match`'s over-128 branch both already refuse to commit:
+    an unverified disclosure reads as authoritative to whatever sees it
+    next. So: collect every start's own longest match (if it has one), and
+    only emit a country code and last four when EXACTLY ONE start
+    produced one. Two or more is `_AMBIGUOUS` -- correct precisely because
+    it is not knowable from the checksum alone which start (if any) is the
+    "real" IBAN, so no start's answer is disclosed. Zero is `None`: the
+    token was fully IBAN-shaped-checked and nothing in it is a real IBAN.
 
-    Longest first, not shortest: a genuine IBAN's own length is the answer
-    wanted, and shorter slices of it can checksum by coincidence -- the
-    registry example "SC18SSCB11010000000000001497USD" has a mod-97-valid
-    18-character prefix, and returning that would emit a last-four taken
-    from the middle of the real account number instead of its end.
+    Longest-at-a-start is unchanged from before: the registry example
+    "SC18SSCB11010000000000001497USD" has a mod-97-valid 18-character
+    prefix, and returning that would emit a last-four taken from the
+    middle of the real account number instead of its end.
 
-    At most 21 checks per token however long the token is, because nothing
-    longer than 34 characters can be an IBAN. Scanning every WINDOW of the
-    token rather than its prefixes would cost O(len(token)) checks and hand
-    an attacker a CPU-burn primitive through a field they write; the price
-    of the cheap version is that an IBAN with junk glued to its FRONT is
-    not found (documented limitation, see `_redact_free_text`).
+    Checking every start costs strictly more checksums than stopping at
+    the first success, which is exactly why `budget` exists: this function
+    spends nothing of its own accord and instead calls `budget.spend()`
+    immediately before every checksum, anywhere in the double loop. The
+    first call that returns False aborts the scan for this token
+    immediately and returns `_AMBIGUOUS` -- not `None` -- because the scan
+    did not run to completion and a real IBAN might be sitting in the part
+    that was never reached; treating an aborted scan as "confirmed clean"
+    would be exactly the guess this function exists to refuse. See
+    `_IBAN_SCAN_BUDGET` for why the budget is total across a call rather
+    than per token, and what a token this long already cost before any
+    budget existed.
     """
-    for end in range(min(len(token), _IBAN_MAX_LEN), _IBAN_MIN_LEN - 1, -1):
-        prefix = token[:end]
-        if _mod97_ok(prefix):
-            return prefix
-    return None
+    found: str | None = None
+    limit = len(token) - _IBAN_MIN_LEN
+    for start in range(limit + 1):
+        if not (
+            token[start].isalpha()
+            and token[start + 1].isalpha()
+            and token[start + 2].isdigit()
+            and token[start + 3].isdigit()
+        ):
+            continue
+        max_end = min(len(token), start + _IBAN_MAX_LEN)
+        start_match: str | None = None
+        for end in range(max_end, start + _IBAN_MIN_LEN - 1, -1):
+            if not budget.spend():
+                return _AMBIGUOUS
+            candidate = token[start:end]
+            if _mod97_ok(candidate):
+                start_match = candidate
+                break
+        if start_match is not None:
+            if found is not None:
+                return _AMBIGUOUS
+            found = start_match
+    return found
 
 
-def _redact_iban_match(match: re.Match[str]) -> str:
+def _has_qualifying_start(token: str) -> bool:
+    """True if any position in `token` has ISO 13616's own opening shape
+    (letter, letter, digit, digit) -- the identical O(1)-per-position
+    structural test `_find_iban_in_token` runs before spending a single
+    checksum, with the checksum loop itself removed. Spends no budget, and
+    is exactly what a caller needs after the budget IS exhausted: a token
+    with no qualifying start could never have reached `_mod97_ok` even
+    with an unlimited budget, so it could never have been found to be a
+    real IBAN regardless of how much allowance was left. Leaving such a
+    token untouched loses nothing on the leak axis.
+
+    O(len(token)), one pass, exact rather than approximate: every position
+    is the SAME `str.isalpha`/`str.isdigit` test `_find_iban_in_token`
+    itself uses to decide whether a position is even worth a checksum, not
+    a cheaper, looser stand-in for it -- so "conservative if unsure" has no
+    case to cover here: this function is never unsure, it runs the real
+    test and only omits the part that costs a checksum.
+    """
+    limit = len(token) - _IBAN_MIN_LEN
+    for start in range(limit + 1):
+        if (
+            token[start].isalpha()
+            and token[start + 1].isalpha()
+            and token[start + 2].isdigit()
+            and token[start + 3].isdigit()
+        ):
+            return True
+    return False
+
+
+def _redact_iban_match(match: re.Match[str], budget: _ScanBudget) -> str:
     candidate = match.group(0)
-    compact = _longest_iban_prefix(candidate.upper())
+    if len(candidate) > _IBAN_SCAN_MAX_TOKEN:
+        # Not scanned at all, checksum or no checksum: a token this long
+        # cannot be a real IBAN regardless of what any slice of it computes
+        # to, because ISO 13616 caps a real one at `_IBAN_MAX_LEN`
+        # characters. Emitting the bare marker -- no country code, no
+        # last four -- mirrors the PAN path's over-19-digit branch exactly
+        # (`_redact_pan_match` below): nothing here has been positively
+        # checksummed, so there is no identified IBAN and therefore no
+        # approved last-four disclosure to make. Emitting one anyway would
+        # assert a confident, wrong "account ending NNNN" to whatever
+        # reads the text next. This masks strictly MORE than a full scan
+        # would -- a real IBAN embedded in an over-long token is covered
+        # by the same bare marker, never left readable -- so the bound
+        # cannot reopen the leak it sits next to; it can only over-redact.
+        # Free: no call to `_find_iban_in_token`, so no budget is spent
+        # deciding this, which is what keeps this branch effective even
+        # after `budget` itself runs out (see below).
+        return _MASK
+    if budget.exhausted:
+        # The call-wide budget was spent by earlier tokens in this same
+        # value, not by this one. Fail closed on anything that could
+        # POSSIBLY have matched -- bare-mask, never scan for free, because
+        # scanning "for free" is precisely the per-token exemption that
+        # made the budget necessary in the first place -- but narrow that
+        # to tokens that could possibly have matched, using
+        # `_has_qualifying_start`, which spends no budget of its own.
+        #
+        # Without this narrowing, budget exhaustion is a denial-of-audit
+        # primitive, found by review: pad a request with ~23 KB of junk
+        # tokens (179 of them, one past the budget) and EVERY later
+        # alphanumeric token 14 characters or longer in the SAME request
+        # -- a payee reference, a challenge ID, a device ID, an IBAN, none
+        # of them junk -- comes back as a bare `••••`, indistinguishable
+        # from an actual redaction, in the attacker's OWN audit row. Fail
+        # SAFE on the leak axis throughout (verified: no post-exhaustion
+        # branch ever leaks), but forensic erasure of the very call being
+        # audited is its own cost, and one this module can remove for
+        # free: a token with no letter-letter-digit-digit start anywhere
+        # in it (e.g. "ACMECORP20260912X") can never reach `_mod97_ok`
+        # regardless of budget, so it was never a candidate this budget
+        # exhaustion could have cost -- masking it anyway is pure
+        # collateral damage, not a safety margin.
+        #
+        # Cost, precisely: this branch used to be O(1) per remaining
+        # token; it is now O(length) per remaining token, because
+        # `_has_qualifying_start` is one full pass over the token (the
+        # same pass `_find_iban_in_token` runs before spending its first
+        # checksum, minus the checksum loop). That does not reopen the
+        # bound `_IBAN_SCAN_BUDGET` exists to hold: the quantity it caps is
+        # CHECKSUM operations, and this branch spends zero of those --
+        # `candidate.upper()` and `_find_iban_in_token` itself are still
+        # never called here. Re-measured against the same adversarial
+        # shapes as before to confirm the wall-clock bound still holds
+        # with this extra linear pass added; see `_redact_free_text`.
+        if _has_qualifying_start(candidate):
+            return _MASK
+        return candidate
+    compact = _find_iban_in_token(candidate.upper(), budget)
     if compact is None:
         # IBAN-shaped but nothing in it checksums: not a real IBAN (e.g. a
         # merchant reference that happens to look like one). Leave it as
         # written rather than mangling ordinary text on a false positive.
         return candidate
+    if isinstance(compact, _Ambiguous):
+        # Either more than one start position in this token checksummed
+        # (see `_find_iban_in_token`'s docstring for why picking one would
+        # be a guess dressed as a disclosure), or the budget ran out before
+        # that could be ruled out. Both get the bare marker: masking more
+        # than a confirmed single match is the safe direction, the same
+        # "cannot reopen the leak, can only over-redact" property the
+        # over-length and budget-exhausted branches above already rely on.
+        return _MASK
     # The WHOLE token is replaced, tail included, not just the IBAN prefix.
     # Keeping the tail would set the mask's own last four directly against
     # unconsumed, attacker-influenced characters of the same token
     # ("KL56" + "REF9"), which is exactly the shape that let the PAN scan
     # reassemble a card out of its own mask. Country code plus last four is
-    # kept, and only that: the checksum has positively identified a genuine
-    # IBAN here, and that is precisely the disclosure `MaskedIban` is
-    # approved to make about one -- unlike an over-long digit run, which is
-    # definitionally not a card and so has no approved last-four at all.
+    # kept, and only that: the checksum has positively, UNAMBIGUOUSLY
+    # identified a genuine IBAN here, and that is precisely the disclosure
+    # `MaskedIban` is approved to make about one -- unlike an over-long
+    # digit run, which is definitionally not a card and so has no approved
+    # last-four at all, or an ambiguous token, which has one but does not
+    # say which.
     return f"{compact[:2]}•• {_MASK} {compact[-4:]}"
 
 
@@ -177,7 +557,226 @@ def _redact_pan_match(match: re.Match[str]) -> str:
     return f"{_MASK} {candidate[-4:]}"
 
 
+# Unicode characters stripped from `FreeText` before either pass runs,
+# found live on main the same day as the underscore hole above and by the
+# same reasoning: a human or a model reading the RENDERED text sees a
+# complete IBAN, while a pattern matching on codepoints sees it split into
+# fragments below `_IBAN_MIN_LEN`, because the inserted character is a
+# non-alphanumeric codepoint the same way a space or an underscore is.
+#
+# The rule, stated once so it survives a rewrite of the set below: a
+# character that renders as NOTHING is stripped; a character that renders
+# as visible whitespace is not, because a reader sees a break there and
+# that break is this module's own already-documented grouped-IBAN
+# limitation (the "no separator handling" comment on `_PAN_IN_TEXT_RE`
+# above), not an evasion. Applied category by category:
+#
+# `Cf` ("format") is every zero-width/invisible format character -- U+200B
+# ZERO WIDTH SPACE, U+00AD SOFT HYPHEN, U+200D ZERO WIDTH JOINER among them
+# -- planted mid-token specifically because it renders as nothing. Stripped
+# in full: no exceptions in this category render as anything.
+#
+# `Mn` ("nonspacing mark", combining diacritics) is included too, on
+# purpose, not swept in as part of `Cf`: a combining mark attaches visually
+# to the character before it rather than being invisible, so the rendered
+# text still looks like one continuous token to a reader, but the
+# codepoint itself is just as non-alphanumeric as a `Cf` character and
+# breaks a token the same way. No real IBAN or PAN ever legitimately
+# contains one -- both are plain ASCII by their respective standards
+# (ISO 13616, ISO/IEC 7812) -- so, unlike the `Cf` case, this one does have
+# a cost, and it is accepted deliberately rather than by omission:
+# legitimate prose using a DECOMPOSED accented character (a combining mark
+# following a bare letter, rather than the single precomposed codepoint --
+# "cafe" + U+0301 rather than the single "é") loses the accent on output.
+# Precomposed (NFC) form is what every system this module has been tested
+# against actually sends; a decomposed merchant descriptor was not among
+# the realistic ones checked, and if one is ever found reaching this code,
+# stripping `Mn` should be revisited rather than assumed still correct.
+#
+# `Cc` ("control") closes a hole this revision found on main, in the same
+# bug class and the same day: U+0001, for instance, renders as nothing and
+# splits a token exactly like a `Cf` character does --
+# "MT92MALT01100AB\x01CDEFGH1234IJKL56" reached the output unchanged, and
+# "41111111\x0111114417" leaked a complete, Luhn-valid PAN. `_scrub`
+# (`services/api/middleware/audit.py`) already strips NUL specifically,
+# before this function ever runs, for a REASSEMBLY reason of its own (see
+# its docstring); this is a different, broader fix, for `FreeText` callers
+# other than `_scrub` and for NUL's 30-odd siblings in the same category,
+# which share NUL's "renders as nothing" property and were never covered
+# by a NUL-only strip. Not all of `Cc` renders as nothing, though: TAB,
+# LF and CR are the visible-whitespace exception the rule above carves
+# out, listed explicitly in `_VISIBLE_WHITESPACE_CONTROLS` because there
+# is no Unicode category that means exactly "control character that
+# happens to render as a break" -- every OTHER `Cc` character (the rest of
+# the C0 block, DEL, and the C1 block U+0080-U+009F) renders as nothing
+# and is stripped.
+_STRIPPED_CATEGORIES = frozenset({"Cf", "Mn", "Cc"})
+
+_VISIBLE_WHITESPACE_CONTROLS = frozenset("\t\n\r")
+
+# A handful of individual characters that render as blank but do not share
+# a category that means only that: `Lo` ("letter, other") is most of CJK,
+# and `So` ("symbol, other") is a large swath of ordinary symbols, so
+# stripping either category whole would destroy legitimate text far
+# outside this module's remit. Enumerated one by one instead, each found
+# live and each doing the identical trick as the categories above --
+# rendering as a blank cell so a reader sees one continuous IBAN while the
+# codepoint stream is split below `_IBAN_MIN_LEN`:
+#   U+115F  HANGUL CHOSEONG FILLER
+#   U+1160  HANGUL JUNGSEONG FILLER
+#   U+3164  HANGUL FILLER
+#   U+FFA0  HALFWIDTH HANGUL FILLER
+#   U+2800  BRAILLE PATTERN BLANK (the all-dots-lowered, i.e. blank, cell)
+_BLANK_RENDERING_CHARACTERS = frozenset("ᅟᅠㅤﾠ⠀")
+
+# Unicode 15.0's `Default_Ignorable_Code_Point` property -- the property
+# that MEANS "render as nothing in a conforming renderer" -- covers 4,174
+# codepoints; `Cf`/`Mn`/`Cc` above catch the ASSIGNED ones (a Default
+# Ignorable codepoint that has been given a purpose is typically `Cf`), but
+# 3,769 of the 4,174 are unassigned (`Cn`) and none of those are stripped
+# by any category check above, because this module deliberately does not
+# treat all of `Cn` as strippable -- doing that would silently strip every
+# codepoint Unicode has not assigned a meaning to YET, an unbounded,
+# unreviewable set that grows with every future Unicode version without
+# this file changing at all. Default_Ignorable is a specific, named,
+# version-pinned list, not "any Cn", which is why it is enumerated by
+# range instead. Demonstrated live, not inferred from the property's name:
+# planting any one of these mid-value defeats BOTH the IBAN and the PAN
+# scan, and deleting the single codepoint recovers the complete original
+# value -- a full-PAN bypass.
+#
+# `unicodedata` (the stdlib module this file already uses) does not expose
+# Default_Ignorable_Code_Point directly, so the ranges below are transcribed
+# from Unicode 15.0's DerivedCoreProperties.txt by hand and must be
+# RE-CHECKED whenever the Python interpreter's bundled Unicode version
+# changes (`unicodedata.unidata_version`; 15.0.0 as of this writing).
+# `U+E0002-U+E001F` is why this needed checking against the property and
+# not just patched from examples: it sits INSIDE the Tags block whose
+# ASSIGNED members -- U+E0001 LANGUAGE TAG and U+E0020-U+E007F (tag
+# characters) -- are `Cf` and already stripped by the category check above.
+# A codepoint in this list can be reassigned a category (typically `Cf`)
+# in a future Unicode version without ever stopping being Default
+# Ignorable, exactly as already happened to that block's other members;
+# the category check would then cover it too, redundantly but harmlessly,
+# so there is no need to remove a range from here when that happens.
+#
+# Weaker evidence than the assigned strips above, and worth saying
+# plainly: Default_Ignorable is a SHOULD for a renderer encountering an
+# unassigned codepoint, not a MUST, and real renderers vary -- some show
+# nothing per the property, some show a ".notdef" replacement box instead.
+# This module strips them anyway, because the alternative, weighed
+# against a demonstrated full-PAN/full-IBAN bypass, is worse: a renderer
+# that shows a visible box for one of these still shows the reader
+# something between the fragments, which is closer to today's grouped-
+# IBAN limitation (a visible break) than to a silent, complete bypass.
+_DEFAULT_IGNORABLE_UNASSIGNED_RANGES: tuple[tuple[int, int], ...] = (
+    (0x2065, 0x2065),
+    (0xFFF0, 0xFFF8),
+    (0xE0000, 0xE0000),
+    (0xE0002, 0xE001F),
+    (0xE0080, 0xE00FF),
+    (0xE01F0, 0xE0FFF),
+)
+
+_DEFAULT_IGNORABLE_UNASSIGNED = frozenset(
+    chr(cp) for start, end in _DEFAULT_IGNORABLE_UNASSIGNED_RANGES for cp in range(start, end + 1)
+)
+
+# Known, not overlooked: `_SEPARATORS` (above) already treats U+00A0
+# (NO-BREAK SPACE) as legitimate IBAN grouping punctuation for
+# `MaskedIban`/`MaskedPan` -- "ES91 2100 0418..." compacts and
+# validates. `FreeText` cannot do the equivalent: `_IBAN_IN_TEXT_RE` has no
+# grouped-IBAN detection at all (the "no separator handling" limitation
+# documented on `_PAN_IN_TEXT_RE` above applies to every separator,
+# including U+00A0, not just ones this revision touches), so a
+# free-text IBAN grouped with non-breaking spaces is not found by either
+# path. U+00A0 is category `Zs`, not `Cf`/`Mn`/`Cc`, so `_strip_invisible`
+# does not remove it either -- correctly, since it renders as a visible
+# gap and stripping it would not close the grouped-IBAN gap anyway (the
+# groups would still be individually under `_IBAN_MIN_LEN`). Left as is;
+# flagged here so the asymmetry between the two types is a known limit,
+# not a surprise found again later.
+
+
+def _is_stripped(ch: str) -> bool:
+    if ch in _BLANK_RENDERING_CHARACTERS or ch in _DEFAULT_IGNORABLE_UNASSIGNED:
+        return True
+    category = unicodedata.category(ch)
+    return category in _STRIPPED_CATEGORIES and ch not in _VISIBLE_WHITESPACE_CONTROLS
+
+
+# Fast path for `_strip_invisible`: every character `_is_stripped` can ever
+# say yes to for a plain-ASCII string is a C0 control below U+0020 or DEL
+# (U+007F) -- `Cf`, `Mn`, every character in `_BLANK_RENDERING_CHARACTERS`,
+# and every codepoint in `_DEFAULT_IGNORABLE_UNASSIGNED` (lowest member
+# U+2065) are non-ASCII by construction, so a string that IS ASCII can only
+# ever need this table. `str.translate` runs the
+# removal in C rather than a Python-level loop calling
+# `unicodedata.category` once per character; measured on 1 MiB of plain
+# ASCII text, the difference is documented on `_strip_invisible` below.
+_ASCII_STRIP_TABLE = str.maketrans(
+    "",
+    "",
+    "".join(chr(cp) for cp in range(0x20) if chr(cp) not in _VISIBLE_WHITESPACE_CONTROLS) + "\x7f",
+)
+
+
+def _strip_invisible(value: str) -> str:
+    """Remove every character `_is_stripped` matches, before any IBAN or
+    PAN scanning runs.
+
+    Same ordering principle as the NUL strip in
+    `services/api/middleware/audit.py._scrub`, applied here to a broader
+    character set for the same reason: strip the evasion character before
+    either pattern ever runs, never after. Stripping afterwards would let,
+    say, a zero-width character split a token below `_IBAN_MIN_LEN` (or
+    split a PAN's digit run the same way a NUL byte does) so that neither
+    pass matches anything, and then removing the character re-assembles
+    the very thing that should have been caught -- the identical
+    reassembly failure the NUL fix documents, for a character an attacker
+    chooses specifically because it renders as nothing, or as an accent on
+    the previous character, rather than because it survived an ordinary
+    copy-paste.
+
+    This changes output text for legitimate input too, not just
+    adversarial input: any stripped character present in otherwise-
+    ordinary free text is silently removed, including the accent-loss case
+    described where `Mn` is added to `_STRIPPED_CATEGORIES`. That is a
+    deliberate decision for text heading to a model, not an accident of
+    implementation.
+
+    The `value.isascii()` branch is a pure performance fast path, not a
+    behaviour difference -- see `_ASCII_STRIP_TABLE`; confirmed identical
+    output on both plain-ASCII and non-ASCII input before this was landed.
+    Measured on 1 MiB of plain ASCII transaction text, repeated runs on an
+    ordinary development machine (not an isolated benchmarking host, and
+    the ratio is noisy at this scale): the general per-character path
+    (calling `unicodedata.category` once per character, now also checking
+    membership in `_DEFAULT_IGNORABLE_UNASSIGNED`) consistently costs
+    65-75ms; `str.translate` on the ASCII fast path consistently costs
+    under 1ms (0.46-0.9ms observed). That is a speedup somewhere in the
+    90-155x range depending on the run -- a prior pass on this same code
+    reported 123x, and an independent review measured 86x -- rather than
+    one precise multiplier; the two stable, load-bearing facts are "tens of
+    milliseconds" versus "a fraction of a millisecond" per MiB, and that
+    the fast path is consistently and by far the cheaper of the two, not
+    the exact ratio between them. Non-ASCII text always takes the general
+    path, unchanged -- `_BLANK_RENDERING_CHARACTERS`,
+    `_DEFAULT_IGNORABLE_UNASSIGNED`, and `Cf`/`Mn` are all non-ASCII by
+    construction, so the fast path never needs to consider them.
+    """
+    if value.isascii():
+        return value.translate(_ASCII_STRIP_TABLE)
+    return "".join(ch for ch in value if not _is_stripped(ch))
+
+
 def _redact_free_text(value: str) -> str:
+    # Strip invisible/format and combining-mark characters before either
+    # pass below runs. See `_strip_invisible` for why this has to happen
+    # first rather than last, and `_STRIPPED_CATEGORIES` for exactly which
+    # characters and why.
+    value = _strip_invisible(value)
+
     # IBAN pass first: an IBAN's digits (e.g. "9121000418450200051332", 22
     # digits) would otherwise be greedily chewed by the PAN scan first,
     # consuming the IBAN's whole numeric run without leaving anything for
@@ -188,14 +787,289 @@ def _redact_free_text(value: str) -> str:
     # `\b`-anchored at both ends, so no digit can sit against the "1332" it
     # emits, and the bullets in it are not digits.
     #
-    # Known limitation, deliberate: `_longest_iban_prefix` checks prefixes,
-    # so an IBAN with junk glued to its FRONT ("REF9MT92MALT...") is not
-    # found -- that token does not even match the candidate pattern, whose
-    # `[A-Za-z]{2}[0-9]{2}` opener has to land at the token start. Closing
-    # it means scanning every window of every token, which is O(len(token))
-    # checksum checks on attacker-written text. Worth doing behind an input
-    # length cap; not worth doing unbounded.
-    text = _IBAN_IN_TEXT_RE.sub(_redact_iban_match, value)
+    # Front-glue closed, at a measured cost: `_find_iban_in_token` now finds
+    # an IBAN with junk glued to its FRONT ("REF9MT92MALT...", "XMT92MALT
+    # ..."), which used to reach the output verbatim -- the candidate
+    # pattern's old `[A-Za-z]{2}[0-9]{2}` opener had to land at the token's
+    # own start, and one glued character moved it out of the pattern's
+    # reach entirely. The structural prefilter (letter, letter, digit,
+    # digit -- an O(1) test) that makes this possible without a window scan
+    # is documented on `_find_iban_in_token`, along with the ambiguity rule
+    # that decides what to do when more than one start position checksums
+    # (bare-mask rather than guess, not "first one wins" -- that was this
+    # module's own first attempt, and it guessed a wrong country code and
+    # an interior last-four on 18-27% of tokens; see `_find_iban_in_token`
+    # for the measured numbers and why "leftmost" was never a safe rule).
+    # Underscore- and invisible-character evasion of the token boundary
+    # itself are separate holes with their own fixes and their own comments
+    # (on `_IBAN_IN_TEXT_RE` and `_strip_invisible` respectively); this
+    # comment is about the cost of the scan once a token is correctly
+    # delimited, not about delimiting it.
+    #
+    # That prefilter is not free, and the honest numbers, measured on random
+    # alphanumeric non-IBAN tokens forced to open with the same four-
+    # character shape (letter, letter, digit, digit) so they reach a
+    # checksum in both the old and new code -- the shape that actually
+    # costs checksum-collision false positives, not inert text the old code
+    # never looked at:
+    #
+    #   length   old (single start)   new (every qualifying start)
+    #     14           1.08%                  1.08%   (only one start fits)
+    #     24          10.67%                 11.65%
+    #     34          19.86%                 24.62%
+    #     60          19.62%                 38.58%
+    #
+    # On fully unstructured random alphanumeric text (no forced opener --
+    # the more realistic shape of an arbitrary reference string), the
+    # absolute numbers are far lower but the same growth shows up: 0.04% /
+    # 0.43% / 0.80% / 0.80% (old) versus 0.04% / 2.67% / 8.84% / 26.14%
+    # (new) at the same four lengths. Ten realistic merchant descriptors
+    # ("AMZN MKTP ES*2X4B91", "CARREFOUR 3421 BARCELONA", ...) showed zero
+    # regressions either way; the cost lands on long, unbroken, punctuation-
+    # free alphanumeric runs (reference codes, hashes, tracking numbers),
+    # not on ordinary prose, because a space or separator still ends a
+    # token the way it always did. Both tables are for tokens under
+    # `_IBAN_SCAN_MAX_TOKEN`; none of these lengths (14/24/34/60) are
+    # affected by the bound described next, and the numbers do not move
+    # from the values above once it exists.
+    #
+    # The ambiguity rule (above, and on `_find_iban_in_token`) does not
+    # change these "masked at all" numbers either -- scanning every start
+    # instead of stopping at the first hit still masks a token exactly when
+    # at least one start checksums, the same condition as before -- but it
+    # does change WHAT gets emitted for some of them. Reclassifying the
+    # same forced-opener corpus by match count rather than by "masked or
+    # not": at length 14, every masked token has exactly one match (0.00%
+    # ambiguous, because only one start position can even fit). At 24, 34,
+    # 60: 0.11% / 1.25% / 6.66% of ALL tokens (not just the masked ones)
+    # have two or more checksum-valid starts, and now get the bare `_MASK`
+    # instead of the wrong, confident guess the old leftmost-wins code
+    # would have emitted for every one of them. That is the no-guess rule's
+    # measured cost: up to roughly 1 in 6 tokens at length 60, all of them
+    # cases that were already being altered (never a case that used to
+    # pass through untouched and now doesn't), trading a wrong structured
+    # answer for an honest "do not know".
+    #
+    # CPU, worst case -- and why a PER-TOKEN bound was not enough on its
+    # own, corrected in this revision after review found the gap and
+    # measured it independently: `_IBAN_SCAN_MAX_TOKEN` caps the cost of
+    # any ONE token, but an attacker who controls the whole value also
+    # controls how it is split into tokens, and every token up to and
+    # including the 128-character bound still gets the full scan.
+    # Space-separated tokens sized just at the bound each buy the maximum
+    # the prefilter allows, and the number of them that fit in a payload
+    # scales with the payload's own size -- so the earlier claim that this
+    # module's cost was "bounded regardless of attacker input size" was
+    # true per token and false for the call as a whole. Measured: a 1 MiB
+    # payload of 128-character space-separated junk tokens cost 7.5
+    # SECONDS on the per-token-only version of this fix (`services/
+    # api/middleware/audit.py` calls this synchronously before `call_next`,
+    # so that is 7.5 seconds of blocked event loop, stalling every
+    # concurrent request on the instance, contained only by
+    # `settings.max_body_bytes`), against 278ms for the unfixed code on the
+    # identical input -- 26x slower than doing nothing at all.
+    #
+    # `_ScanBudget` closes this by making the allowance a property of ONE
+    # `_redact_free_text` CALL -- one STRING's validation -- rather than of
+    # any token inside it, and `_IBAN_SCAN_BUDGET = 100_000` was chosen
+    # empirically, not by intuition: swept against this exact adversarial
+    # shape at 1 MiB, picking the largest value whose measured worst case
+    # still stays comfortably under the UNFIXED code's own measured cost on
+    # the identical input, five runs each, same machine, interleaved to
+    # cancel drift:
+    #
+    #   unfixed code, 1 MiB, space-separated 128-char tokens: 278-282ms
+    #   this fix, budget=100,000, same input, five runs:      197-202ms
+    #
+    # Re-measured against every shape in the table below, 1 MiB each,
+    # unfixed code vs this fix, including two shapes invented specifically
+    # to try to beat the budget:
+    #
+    #   shape                                        unfixed      budget=100,000
+    #   single "AB12"-repeated token (no separators)    6.6ms          35.4ms
+    #   space-separated 128-char tokens (review's)    278.5ms         197.1ms
+    #   127-char tokens + space (invented)            281.9ms         197.2ms
+    #   34-char tokens + space (invented)            1012.8ms         191.4ms
+    #   128-char tokens + "_" separator (invented)      9.0ms         202.3ms
+    #
+    # No invented shape beat the review's own space-separated-at-the-bound
+    # shape under this fix; every budgeted run landed in a narrow 191-202ms
+    # band regardless of token size or separator, which is the point of a
+    # budget that spans a whole STRING -- the total cost of validating ONE
+    # string is a function of the budget, not of how the attacker chops up
+    # that string into tokens. (This does NOT yet cover an attacker who
+    # chops up the REQUEST into many separate strings instead of one long
+    # one -- that gap, and its own fix, `redaction_budget`, is covered in
+    # the "Request-scoped budget" paragraph below.) Two rows are worth
+    # reading carefully rather than as a regression: the single-token and
+    # underscore-separated shapes are SLOWER under this fix than under the
+    # unfixed code (35ms and 202ms vs 6.6ms and 9.0ms), because the unfixed
+    # code's `\b`-based tokenizer never correctly recognizes either shape
+    # as many separate tokens in the first place -- it treats the whole
+    # value as one giant word-run and only ever checksums its first 34
+    # characters, which is fast because it is wrong (this IS the
+    # underscore hole and a variant of the front-glue hole, both closed
+    # elsewhere in this function). A cheap answer to a question the old
+    # code never actually answered is not a baseline worth preserving; the
+    # 34-char-token row shows the same tokenizer costing over a SECOND once
+    # it does correctly split the input, which is the realistic comparison.
+    # The realistic sub-200-character memo costs low single-digit
+    # microseconds either way (2.99us unfixed, 7.31us with every fix in
+    # this revision applied, `_strip_invisible`'s per-character pass
+    # included) -- not a concern at the sizes `FreeText` actually carries
+    # in practice.
+    #
+    # Legitimate use, for comparison: 1 MiB of ordinary transaction text
+    # (the ten realistic merchant descriptors and typical memo sentences,
+    # repeated to size, including genuine embedded IBANs and PANs) consumed
+    # 2,101 checksum operations end to end against the 100,000 budget --
+    # about 2% of it. Legitimate `FreeText` values are nowhere near this
+    # bound; if that ever stops being true, the budget is the wrong number
+    # to move first -- see `_IBAN_SCAN_BUDGET`.
+    #
+    # Request-scoped budget: `_ScanBudget` bounding one STRING is not the
+    # same as bounding one REQUEST, and asserting the latter was a mistake
+    # corrected in this revision, found by review: `services/api/
+    # middleware/audit.py:_scrub` walks a whole argument TREE and validates
+    # every string in it, and without more, each one creates its own fresh
+    # `_ScanBudget(_IBAN_SCAN_BUDGET)` -- so an attacker who spreads junk
+    # across many short strings (a LIST of them, rather than one long one)
+    # buys a fresh 100,000-checksum allowance per element instead of
+    # spending down one shared one, and the total cost again scales with
+    # how much of the request is junk, exactly the shape of gap this
+    # revision's own per-token bound had. Measured through the real
+    # `_scrub`, 1 MiB, unfixed code / per-string budget only / this
+    # revision's `redaction_budget` wrapped around the whole walk:
+    #
+    #   shape                                  unfixed   per-string budget   redaction_budget
+    #   one string, space-separated tokens     288.6ms          206.4ms            171.6ms
+    #   a LIST of 128-char strings              288.6ms         7602.1ms           172.6ms
+    #   a DICT of 128-char keys and values      302.2ms        14664.1ms           181.3ms
+    #   nested lists of 128-char strings        302.8ms         7841.7ms           183.8ms
+    #
+    # The dict row costs roughly double the list row under a per-string
+    # budget because `_scrub` validates a key AND a value per entry, each
+    # buying its own fresh allowance. `redaction_budget` (see its own
+    # docstring, and `services/api/middleware/audit.py`'s
+    # `on_call_tool`, the one caller that wraps `_scrub`'s whole walk in
+    # it) closes this by making the checksum allowance ambient for the
+    # whole walk via a `contextvars.ContextVar`, so every string validated
+    # inside it spends from the SAME `_ScanBudget` -- all four shapes above
+    # land in a narrow ~172-184ms band, under the unfixed code's ~289-303ms
+    # on the identical input, regardless of whether the request is one
+    # string, a list, a dict, or nested. Tried, and did not beat the
+    # budgeted result: 500 levels of single-element list nesting around
+    # one ordinary junk token (near-zero cost either way, since it is
+    # still only one `FreeText` validation) and short-but-genuinely-
+    # IBAN-shaped strings sized at 20/34/60/128 characters, tens of
+    # thousands of them per MiB -- all four land in the same ~163-187ms
+    # band. One shape DOES cost more under this fix than under the unfixed
+    # code: tens of thousands of short strings whose incidental
+    # letter-letter-digit-digit opener sits a few characters INSIDE the
+    # string rather than at its start (unremarkable-looking text, not
+    # crafted to look IBAN-shaped) costs 184ms here against 20ms unfixed --
+    # for the same reason the single-token and underscore-separated rows
+    # above do: the unfixed code's own opener-must-be-at-position-zero
+    # pattern never recognizes such a string as a candidate at all, which
+    # is the front-glue hole itself, not a baseline this fix should be
+    # measured against. Callers that validate `FreeText` OUTSIDE of
+    # `redaction_budget` -- today, that is every tool RESPONSE validated
+    # through a pydantic model on data returned from the bank's own
+    # backend, as opposed to agent-supplied tool ARGUMENTS -- keep a fresh
+    # per-string budget each, unchanged from before this section existed.
+    # That is a stated decision, not an oversight: response data is not
+    # agent-controlled the way arguments are, so splitting it into many
+    # strings is not a lever an attacker holds there. See `_current_budget`
+    # and `redaction_budget` for the mechanism, and
+    # `services/api/middleware/audit.py` for the one caller that opts in.
+    #
+    # Narrowing what exhaustion destroys: unconditionally bare-masking
+    # every token once the budget runs out is fail-safe on the leak axis
+    # (verified: nothing post-exhaustion ever leaks) but it is also a
+    # denial-of-audit primitive review demonstrated -- pad a request with
+    # ~23 KB of junk (179 tokens, one past the budget) and every OTHER
+    # alphanumeric token 14+ characters long in the SAME request, junk or
+    # not, comes back as an indistinguishable bare `••••` in the
+    # attacker's own audit row. `_has_qualifying_start` (see its own
+    # docstring, and the `budget.exhausted` branch on
+    # `_redact_iban_match`) narrows this to "could this token EVER have
+    # matched, with any amount of budget": a token with no
+    # letter-letter-digit-digit start anywhere in it can never reach a
+    # checksum regardless of allowance, so leaving it untouched costs
+    # nothing on the leak axis. On an illustrative 7-value reconstruction
+    # of review's payload shape (179 tokens of padding, then a payee
+    # reference, a challenge ID, a device ID, a transaction reference, and
+    # an IBAN, plus two values already immune for unrelated reasons -- one
+    # short, one hyphen-split), 5 of 7 survive after this change, versus 2
+    # of 7 before it: the two that stay masked are the real IBAN (whose
+    # own format guarantees a qualifying start) and the one reference that
+    # happens to be IBAN-opener-shaped, both correctly treated as "could
+    # plausibly have been a real IBAN, was never checked, so mask".
+    #
+    # Cost of the narrowing: `_has_qualifying_start` spends no checksums --
+    # it is the same structural pass `_find_iban_in_token` already runs
+    # before spending its first one, with the checksum loop removed -- so
+    # `_IBAN_SCAN_BUDGET` (a budget over checksum operations) is untouched
+    # by it. It does cost one O(length) pass per post-exhaustion token,
+    # where the branch used to be O(1); re-measured against the same
+    # shapes as the request-scoped table above to confirm this did not
+    # move the wall-clock bound:
+    #
+    #   shape                                   before narrowing   after narrowing
+    #   one string, space-separated tokens            171.3ms            174.3ms
+    #   a LIST of 128-char strings                     172.2ms            174.6ms
+    #   list of 69,905 tokens, 14 chars each           136.5ms            137.1ms
+    #   list of 29,959 tokens, 34 chars each           172.5ms            177.2ms
+    #   list of 17,189 tokens, 60 chars each           175.4ms            179.7ms
+    #   list of 8,128 tokens, 128 chars each           174.1ms            176.5ms
+    #
+    # A few milliseconds across the board, comfortably inside run-to-run
+    # noise, because scanning up to 128 characters with plain
+    # `str.isalpha`/`str.isdigit` calls is cheap next to the checksum work
+    # that already dominates the pre-exhaustion cost.
+    #
+    # Accepted trade-off, not a free fix: this module holds firm on two
+    # decisions that would cut the false-positive and CPU cost further --
+    # no country-code-to-length registry, no `max_length` added to any
+    # `FreeText`-typed field -- because both are decisions about a bank's
+    # own tool contracts and backend field limits, not about this masking
+    # function, and adding either here would be making that call by
+    # accident. `_IBAN_SCAN_MAX_TOKEN` and `_IBAN_SCAN_BUDGET` are a
+    # different kind of decision and not an exception to that: both bound
+    # what THIS function will spend, the same way the PAN path's
+    # over-19-digit branch already declines to scan an arbitrarily long
+    # digit run, and both only ever mask MORE than an unbounded scan would,
+    # never less, so neither can reopen the leak. The severity asymmetry is
+    # what justifies the remaining cost: the failure mode being closed is a
+    # complete, verbatim IBAN reaching a vendor's chat history and the
+    # audit table with no redaction at all and no way to recall it, against
+    # an over-redaction rate that stays at zero on every realistic
+    # descriptor tested and only grows on a token shape -- 34-plus unbroken
+    # alphanumeric characters -- that ordinary payee names and merchant
+    # strings do not take, at a CPU cost that is now bounded for one
+    # string's own validation regardless of any one token in it, AND -- for
+    # the one caller that wraps its whole argument tree in
+    # `redaction_budget` -- for the request as a whole, regardless of how
+    # many strings the request is split into.
+    ambient_budget = _current_budget.get()
+    # Explicit `is None`, not `ambient_budget or _ScanBudget(...)`: `or`
+    # falls back to a fresh budget for anything falsy, not just `None`, and
+    # `_ScanBudget` defines no `__bool__`/`__len__` today, so an ambient
+    # budget is always truthy regardless of how much it has spent -- but
+    # that is an absence of a bug, not a guarantee, and a later change
+    # adding either dunder to `_ScanBudget` (a natural thing to add, e.g.
+    # "is this budget still useful") would silently make an EXHAUSTED
+    # ambient budget (falsy, if `__bool__` reflected `not exhausted`) get
+    # replaced by a fresh, full one here -- reopening the request-wide hole
+    # `redaction_budget` exists to close, for every request from then on,
+    # with no test failing to say so. `is None` only ever means "no ambient
+    # budget was set", which is the one condition this fallback exists for.
+    budget = ambient_budget if ambient_budget is not None else _ScanBudget(_IBAN_SCAN_BUDGET)
+
+    def _redact_iban(m: re.Match[str]) -> str:
+        return _redact_iban_match(m, budget)
+
+    text = _IBAN_IN_TEXT_RE.sub(_redact_iban, value)
     return _PAN_IN_TEXT_RE.sub(_redact_pan_match, text)
 
 

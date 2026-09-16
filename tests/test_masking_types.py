@@ -1,13 +1,21 @@
+import asyncio
 import re
+import unicodedata
 
 import pytest
 from postern_core.domain.masking import (
+    _DEFAULT_IGNORABLE_UNASSIGNED_RANGES,
     _IBAN_MASKED_RE,
+    _IBAN_SCAN_BUDGET,
+    _IBAN_SCAN_MAX_TOKEN,
     _MASK,
     _PAN_MASKED_RE,
     FreeText,
     MaskedIban,
     MaskedPan,
+    _current_budget,
+    _has_qualifying_start,
+    redaction_budget,
 )
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -379,21 +387,43 @@ def test_free_text_digit_run_of_any_length_never_leaves_a_pan(length: int, sourc
         assert _luhn_valid_pan_substrings(out) == [], f"{text!r} -> {out!r}"
 
 
-_WORD_CHAR_RE = re.compile(r"\w")
+_ALNUM_CHAR_RE = re.compile(r"[A-Za-z0-9]")
 
 
 def _assert_iban_mask_is_token_aligned(text: str, out: str) -> None:
-    """No IBAN mask in `out` may have a word character against either side.
+    """No IBAN mask in `out` may have an alphanumeric character against
+    either side, and something must actually have been redacted.
 
     That adjacency is the precondition the PAN leak needed: a mask emitting
     its own last four directly against unconsumed characters of the same
     token. Checked wherever an IBAN redaction is produced.
+
+    The first assertion exists because this check is otherwise vacuous: on
+    unfixed code, `_IBAN_MASKED_RE.finditer(out)` finds zero matches for an
+    input the boundary bug defeats entirely (e.g. an IBAN with an
+    underscore glued to it), the loop body never runs, and a helper with no
+    failing assertion "passes" -- proving nothing about the input it was
+    called with. `out != text` is deliberately the broad "some redaction
+    ran" check, not "a structured IBAN mask specifically": a token that
+    turns out to be ambiguous (`_find_iban_in_token`'s `_AMBIGUOUS`) is
+    correctly redacted to the bare `_MASK` marker, which does not match
+    `_IBAN_MASKED_RE`, and this helper must not treat that safe outcome as
+    a failure to redact.
+
+    Uses `[A-Za-z0-9]`, not `\\w`, for the character class being checked
+    against: `\\w` includes `_`, but this module's tokenization now treats
+    `_` as a token separator exactly like a space or a hyphen (the
+    underscore-boundary fix), so a mask legitimately sitting next to a
+    literal underscore from the ORIGINAL text (as opposed to unconsumed
+    alphanumeric remainder of the same token) is not the reconstitution
+    shape this check exists to catch, and must not be flagged as one.
     """
+    assert out != text, f"{text!r} -> {out!r} was not redacted at all"
     for match in _IBAN_MASKED_RE.finditer(out):
         before = out[match.start() - 1 : match.start()]
         after = out[match.end() : match.end() + 1]
-        assert not _WORD_CHAR_RE.fullmatch(before or " "), f"{text!r} -> {out!r}"
-        assert not _WORD_CHAR_RE.fullmatch(after or " "), f"{text!r} -> {out!r}"
+        assert not _ALNUM_CHAR_RE.fullmatch(before or " "), f"{text!r} -> {out!r}"
+        assert not _ALNUM_CHAR_RE.fullmatch(after or " "), f"{text!r} -> {out!r}"
 
 
 @pytest.mark.parametrize(
@@ -513,8 +543,21 @@ def test_free_text_iban_never_survives_a_tail_of_any_length(name: str, tail_len:
 
     Stated on the output rather than on the matching strategy: whatever the
     IBAN pass emits, neither the IBAN nor the token it sits in may reach
-    the output, something must have been redacted in IBAN shape, and the
-    mask must stay token-aligned."""
+    the output, something must have been redacted, and any STRUCTURED mask
+    that does appear must stay token-aligned.
+
+    Not "a structured IBAN mask must appear", which is what this asserted
+    before the ambiguity rule existed. It no longer holds universally:
+    "MT84MALT011000012345MTLCAST001S" plus a tail of 6 to 10 characters
+    from "REF9A7X2QZ" is a genuine, found-not-invented case where the real
+    IBAN at position 0 and a SECOND, coincidentally mod-97-valid substring
+    starting at position 6 ("LT011000012345MTLCAST001SREF9A7...") both
+    checksum inside the same token -- checked directly against
+    `_find_iban_in_token`. Two valid interpretations means neither is
+    disclosed (`_AMBIGUOUS` -> bare `_MASK`), which is correct and exactly
+    what the ambiguity rule (see `_find_iban_in_token`) exists to do: the
+    real IBAN still never reaches the output either way, which is the
+    property this test is actually named for and still asserts below."""
     iban, _ = _TAILED_IBANS[name]
     tail = "REF9A7X2QZ"[:tail_len]
     token = iban + tail
@@ -522,5 +565,582 @@ def test_free_text_iban_never_survives_a_tail_of_any_length(name: str, tail_len:
         out = Memo(text=text).text
         assert iban not in out, f"{text!r} -> {out!r} carries the IBAN verbatim"
         assert token not in out, f"{text!r} -> {out!r} carries the token verbatim"
-        assert _IBAN_MASKED_RE.search(out), f"{text!r} -> {out!r} was not redacted"
+        assert _MASK in out, f"{text!r} -> {out!r} was not redacted"
         _assert_iban_mask_is_token_aligned(text, out)
+
+
+# --- An IBAN with junk glued to its FRONT (the third hole, same lesson) -----
+#
+# `_IBAN_IN_TEXT_RE`'s own opener, `[A-Za-z]{2}[0-9]{2}`, had to land at the
+# very start of the `\b`-bounded token. One alphanumeric character glued to
+# the front of a genuine IBAN moves that opening shape one position into
+# the token, where the anchored pattern never looks -- not "checksums and
+# fails", not attempted at all. Reusing the tail country shapes: their BBAN
+# carries letters, so the digit run stays short and the PAN pass does not
+# incidentally catch what the IBAN pass missed.
+_FRONT_GLUED_IBANS = {
+    "MT-synth": ("XMT92MALT01100ABCDEFGH1234IJKL56", "MT•• •••• KL56"),
+    "MT-real": ("XMT84MALT011000012345MTLCAST001S", "MT•• •••• 001S"),
+    "SC": ("XSC18SSCB11010000000000001497USD", "SC•• •••• 7USD"),
+    "BR": ("XBR9700360305000010009795493P1", "BR•• •••• 93P1"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FRONT_GLUED_IBANS))
+def test_free_text_redacts_an_iban_with_one_character_glued_in_front(name: str) -> None:
+    """Measured leak: this is the sharpest form, one character defeating
+    redaction completely, across every alphanumeric country shape."""
+    token, expected = _FRONT_GLUED_IBANS[name]
+    assert Memo(text=token).text == expected
+
+
+def test_free_text_redacts_an_iban_with_a_multi_character_prefix_glued_in_front() -> None:
+    """A whole reference code glued in front, not just one stray character."""
+    assert Memo(text="REF9MT92MALT01100ABCDEFGH1234IJKL56").text == "MT•• •••• KL56"
+
+
+def test_free_text_redacts_an_iban_with_junk_glued_at_both_ends() -> None:
+    """Front and tail junk together: neither end may defeat the other's fix."""
+    assert Memo(text="REF9MT92MALT01100ABCDEFGH1234IJKL56XYZ").text == "MT•• •••• KL56"
+
+
+def test_free_text_redacts_an_iban_mid_sentence_with_a_glued_prefix() -> None:
+    out = Memo(text="please send to XMT92MALT01100ABCDEFGH1234IJKL56 today").text
+    assert out == "please send to MT•• •••• KL56 today"
+    assert "MT92MALT01100ABCDEFGH1234IJKL56" not in out
+
+
+def test_free_text_still_masks_the_existing_separator_prefixed_case() -> None:
+    """A non-word separator immediately before the IBAN already split the
+    text into two tokens, so this case never depended on the front-glue
+    fix. Locked in as a regression guard against the fix disturbing it."""
+    assert Memo(text="ref:MT92MALT01100ABCDEFGH1234IJKL56").text == "ref:MT•• •••• KL56"
+
+
+def test_free_text_front_glue_does_not_break_the_longest_match_choice() -> None:
+    """The registry example with a coincidental mod-97-valid 18-character
+    prefix (see `_find_iban_in_token`'s docstring), now with a character
+    glued to the front too: the longest, genuine match must still win over
+    the shorter coincidence, at whatever start position it is found."""
+    assert Memo(text="XSC18SSCB11010000000000001497USD").text == "SC•• •••• 7USD"
+
+
+@pytest.mark.parametrize("name", sorted(_FRONT_GLUED_IBANS))
+def test_free_text_front_glued_iban_mask_is_token_aligned(name: str) -> None:
+    token, _ = _FRONT_GLUED_IBANS[name]
+    for text in (token, f"SEPA CT {token} ok"):
+        _assert_iban_mask_is_token_aligned(text, Memo(text=text).text)
+
+
+_REALISTIC_MERCHANT_DESCRIPTORS = [
+    "AMZN MKTP ES*2X4B91",
+    "CARREFOUR 3421 BARCELONA",
+    "N26 TRANSFER REF 88213X",
+    "MERCADONA S.A. TERRASSA",
+    "GLOVO*ORDER9931 BCN",
+    "RENFE VENTA ONLINE MADRID",
+    "SPOTIFY P1234567890",
+    "DECATHLON ESPANA SL",
+    "OBRAS Y SERVICIOS SL FRA 2026-0912",
+    "TRANSFERENCIA NOMINA SEPTIEMBRE",
+]
+
+
+@pytest.mark.parametrize("descriptor", _REALISTIC_MERCHANT_DESCRIPTORS)
+def test_free_text_leaves_realistic_merchant_descriptors_unchanged(descriptor: str) -> None:
+    """None of these are PAN- or IBAN-shaped; the front-glue fix must not
+    turn an ordinary merchant descriptor into a false positive."""
+    assert Memo(text=descriptor).text == descriptor
+
+
+# --- The scan-cost bound: `_IBAN_SCAN_MAX_TOKEN` ----------------------------
+#
+# `_find_iban_in_token` scanning every qualifying start closes the
+# front-glue leak, but the cost of a token that never checksums grows with
+# the token's own length -- and `services/api/middleware/audit.py` runs
+# `FreeText` over agent-supplied tool arguments of whatever length the
+# agent sends. A token longer than `_IBAN_SCAN_MAX_TOKEN` is not scanned at
+# all: it cannot be a real IBAN regardless of what it checksums to (ISO
+# 13616 caps one at 34 characters), so it is replaced wholesale with the
+# bare marker instead.
+
+
+def test_free_text_replaces_an_over_long_token_with_a_bare_mask() -> None:
+    """One character past the bound: no scan, no country code, no last
+    four -- just the bare marker, the same emit-nothing shape as the PAN
+    path's over-19-digit branch."""
+    token = "A1" * 65  # 130 characters, 2 past the 128 bound
+    assert len(token) > _IBAN_SCAN_MAX_TOKEN
+    assert Memo(text=token).text == _MASK
+
+
+def test_free_text_token_under_the_bound_still_gets_the_normal_scan() -> None:
+    """One character under the bound: behaviour is unchanged from before
+    this bound existed. A real IBAN padded out to 127 characters must
+    still be found and given its proper country code and last four, not
+    the bare marker."""
+    iban = "MT84MALT011000012345MTLCAST001S"  # 32 chars
+    padded = iban + "X" * (127 - len(iban))
+    assert len(padded) == 127
+    assert Memo(text=padded).text == "MT•• •••• 001S"
+
+
+def test_free_text_an_iban_inside_an_over_long_token_does_not_survive() -> None:
+    """The bound must not reopen the leak it sits next to: a genuine IBAN
+    embedded in a token past the bound is masked wholesale along with the
+    rest of the token, never left readable because the scan that would
+    have found it never ran."""
+    iban = "MT84MALT011000012345MTLCAST001S"  # 32 chars
+    token = iban + "X" * (_IBAN_SCAN_MAX_TOKEN + 50 - len(iban))
+    assert len(token) > _IBAN_SCAN_MAX_TOKEN
+    out = Memo(text=token).text
+    assert iban not in out
+    assert out == _MASK
+
+
+# --- The call-wide checksum budget: `_IBAN_SCAN_BUDGET` --------------------
+#
+# `_IBAN_SCAN_MAX_TOKEN` alone bounds one token's cost, not a payload made
+# of many token-sized pieces -- an attacker who tokenizes their own input
+# controls token count as much as token length. `_ScanBudget` makes the
+# allowance a property of the whole `_redact_free_text` call: once spent,
+# no further token is scanned at all, and must still be masked, never left
+# readable, because an un-scanned token might contain a real IBAN.
+
+# One 128-character junk token that never checksums spends 559 checksum
+# operations (measured directly against `_find_iban_in_token`); comfortably
+# more than enough of them exhausts `_IBAN_SCAN_BUDGET` well before the
+# trailing real IBAN below is reached, however the exact per-token cost
+# might shift with a future change to the scan itself.
+_JUNK_TOKENS_TO_EXHAUST_BUDGET = _IBAN_SCAN_BUDGET // 100 + 50
+
+
+def test_free_text_budget_exhaustion_still_masks_a_later_iban() -> None:
+    """Once the call-wide checksum budget is spent by earlier tokens, a
+    later token is not scanned at all -- `_redact_iban_match` checks
+    `budget.exhausted` before ever calling `_find_iban_in_token` -- but it
+    must still be masked (bare `_MASK`, fail closed), never left readable
+    just because scanning it was skipped."""
+    junk = " ".join(["AB12" * 32] * _JUNK_TOKENS_TO_EXHAUST_BUDGET)  # 128-char tokens
+    real_iban = "MT84MALT011000012345MTLCAST001S"
+    text = f"{junk} {real_iban}"
+    out = Memo(text=text).text
+    assert real_iban not in out, f"budget exhaustion let a real IBAN through: {out!r}"
+    # The trailing IBAN specifically must have been bare-masked (no country
+    # code, no last four), which is the observable signature of "was not
+    # scanned" rather than "was scanned and happened to be ambiguous".
+    assert out.endswith(_MASK), f"trailing token was not bare-masked: {out!r}"
+
+
+def test_free_text_budget_exhaustion_does_not_affect_a_value_within_budget() -> None:
+    """Sanity check on the fixture above: comfortably fewer junk tokens
+    than needed to exhaust the budget must still let the trailing real IBAN
+    resolve normally, proving the previous test's failure mode (if it were
+    to fail) is genuinely about budget exhaustion and not some unrelated
+    breakage."""
+    junk = " ".join(["AB12" * 32] * 3)  # far fewer than needed to exhaust
+    real_iban = "MT84MALT011000012345MTLCAST001S"
+    text = f"{junk} {real_iban}"
+    out = Memo(text=text).text
+    assert out.endswith("MT•• •••• 001S")
+
+
+# --- The ambiguity rule: exactly one checksum-valid start wins, two or
+# more get the bare mask, never a guess ------------------------------------
+#
+# `_find_iban_in_token` used to return on the FIRST start position that
+# checksummed. That is wrong across starts (only right within one, for
+# "SC18SSCB..."-style coincidental short prefixes of a longer real IBAN):
+# a coincidental hit at an early start can end in the middle of a real IBAN
+# sitting further right in the same token. The three tokens below are
+# exactly this, found by review, not invented for the test.
+_AMBIGUOUS_TOKENS = [
+    "NB91ODZDOC9IMT92MALT01100ABCDEFGH1234IJKL56",
+    "BV18UVW53EMT92MALT01100ABCDEFGH1234IJKL56",
+    "ZZ99MU17BOMM0101101030300200000MUR",
+]
+
+
+@pytest.mark.parametrize("token", _AMBIGUOUS_TOKENS)
+def test_free_text_ambiguous_token_gets_the_bare_mask_not_a_guess(token: str) -> None:
+    """More than one start position checksums in each of these. The safe
+    output is the bare marker, matching the over-length and
+    budget-exhausted branches: no country code and no last four, because
+    neither can be disclosed without picking one interpretation over
+    another with nothing but luck to justify the pick."""
+    out = Memo(text=token).text
+    assert out == _MASK
+    assert "MT92MALT01100ABCDEFGH1234IJKL56" not in out
+
+
+def test_free_text_unambiguous_token_still_gets_the_full_mask() -> None:
+    """The other half of the same rule: exactly one checksum-valid start
+    must still resolve to the ordinary structured mask, not the bare one --
+    the ambiguity rule must not turn into "always bare-mask a multi-start
+    scan". Every front-glue and tail test elsewhere in this file already
+    exercises this; this is the rule stated as its own, explicit test."""
+    assert Memo(text="MT84MALT011000012345MTLCAST001S").text == "MT•• •••• 001S"
+
+
+# --- Underscore family: `_` must not defeat tokenization -------------------
+#
+# `\b` is defined against `\w`, which includes `_`, so the old boundary let
+# an underscore glued to an IBAN suppress the whole scan the same way one
+# glued alphanumeric character used to (the front-glue hole this module
+# already closed once). `(?<![A-Za-z0-9])`/`(?![A-Za-z0-9])` treats `_`
+# as a separator instead, the same as a space or a hyphen.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "_MT92MALT01100ABCDEFGH1234IJKL56",
+        "MT92MALT01100ABCDEFGH1234IJKL56_",
+        "REF_MT92MALT01100ABCDEFGH1234IJKL56",
+    ],
+)
+def test_free_text_underscore_does_not_defeat_redaction(text: str) -> None:
+    out = Memo(text=text).text
+    assert "MT92MALT01100ABCDEFGH1234IJKL56" not in out
+    assert "•• •••• KL56" in out
+
+
+def test_pan_pass_is_not_affected_by_underscore() -> None:
+    """Verified, not assumed: `_PAN_IN_TEXT_RE` (`\\d{12,}`) has no `\\b`
+    at all, so it is unanchored and cannot be defeated by an underscore the
+    way the old IBAN pattern was."""
+    for text in (
+        "_4111111111114417",
+        "4111111111114417_",
+        "REF_4111111111114417",
+    ):
+        out = Memo(text=text).text
+        assert "4111111111114417" not in out
+        assert _MASK in out
+
+
+# --- Zero-width and combining-mark family: invisible/format characters must
+# not defeat tokenization either --------------------------------------------
+#
+# Unlike a space or a hyphen, these render as nothing (Cf) or as an accent
+# on the previous character (Mn) -- a human or a model reading the
+# RENDERED text sees one continuous IBAN either way, while the unstripped
+# codepoint stream splits it into fragments below `_IBAN_MIN_LEN`.
+_ZERO_WIDTH_SPACE = "​"
+_SOFT_HYPHEN = "­"
+_ZERO_WIDTH_JOINER = "‍"
+_COMBINING_ACUTE_ACCENT = "́"
+
+
+@pytest.mark.parametrize(
+    "invisible",
+    [_ZERO_WIDTH_SPACE, _SOFT_HYPHEN, _ZERO_WIDTH_JOINER, _COMBINING_ACUTE_ACCENT],
+)
+def test_free_text_invisible_characters_inside_an_iban_do_not_survive(invisible: str) -> None:
+    iban = "MT92MALT01100ABCDEFGH1234IJKL56"
+    # Scatter the character at three different positions, including inside
+    # the country-code opener itself, which is the part most sensitive to
+    # being split.
+    planted = invisible.join([iban[:2], iban[2:15], iban[15:]])
+    out = Memo(text=planted).text
+    assert iban not in out
+    assert planted not in out
+    assert out == "MT•• •••• KL56"
+
+
+def test_free_text_invisible_characters_are_removed_from_ordinary_text_too() -> None:
+    """Documented, deliberate side effect: a `Cf`/`Mn` character in text
+    that never touches an IBAN or PAN is still stripped."""
+    out = Memo(text=f"Coffee{_ZERO_WIDTH_SPACE} at Blue Bottle").text
+    assert _ZERO_WIDTH_SPACE not in out
+    assert out == "Coffee at Blue Bottle"
+
+
+# --- Cc control characters: render as nothing, get stripped -- except the
+# visible-whitespace exceptions (tab, newline, carriage return) ------------
+#
+# Found live, same bug class and same day as the invisible-character family
+# above: "MT92MALT01100AB\x01CDEFGH1234IJKL56" reached the output unchanged
+# on the code that only stripped `Cf`/`Mn`, and "41111111\x0111114417"
+# leaked a complete, Luhn-valid PAN split by the same character.
+_ALL_CC_CHARACTERS = [chr(cp) for cp in (*range(0x00, 0x20), 0x7F, *range(0x80, 0xA0))]
+_VISIBLE_WHITESPACE_CC = {"\t", "\n", "\r"}
+_STRIPPED_CC_CHARACTERS = [ch for ch in _ALL_CC_CHARACTERS if ch not in _VISIBLE_WHITESPACE_CC]
+
+
+def test_all_enumerated_cc_characters_are_actually_category_cc() -> None:
+    """Characterization test locking the enumeration above to Unicode's own
+    category data, so a future Unicode version silently reclassifying one
+    of these does not go unnoticed by the tests below that rely on it."""
+    for ch in _ALL_CC_CHARACTERS:
+        assert unicodedata.category(ch) == "Cc", f"{ch!r} (U+{ord(ch):04X}) is not Cc"
+
+
+def test_the_two_reported_examples_exactly() -> None:
+    """The two leaks as reported, verbatim, before the parametrized sweep
+    below generalizes them."""
+    assert Memo(text="MT92MALT01100AB\x01CDEFGH1234IJKL56").text == "MT•• •••• KL56"
+    assert Memo(text="41111111\x0111114417").text == "•••• 4417"
+
+
+@pytest.mark.parametrize("ch", _STRIPPED_CC_CHARACTERS, ids=lambda ch: f"U+{ord(ch):04X}")
+def test_free_text_strips_cc_control_characters_inside_an_iban(ch: str) -> None:
+    iban = "MT92MALT01100ABCDEFGH1234IJKL56"
+    planted = ch.join([iban[:2], iban[2:15], iban[15:]])
+    out = Memo(text=planted).text
+    assert iban not in out
+    assert out == "MT•• •••• KL56"
+
+
+@pytest.mark.parametrize("ch", _STRIPPED_CC_CHARACTERS, ids=lambda ch: f"U+{ord(ch):04X}")
+def test_free_text_strips_cc_control_characters_inside_a_pan(ch: str) -> None:
+    pan = "4111111111114417"
+    planted = ch.join([pan[:8], pan[8:]])
+    out = Memo(text=planted).text
+    assert pan not in out
+    assert out == "•••• 4417"
+
+
+@pytest.mark.parametrize("ch", sorted(_VISIBLE_WHITESPACE_CC), ids=lambda ch: f"U+{ord(ch):04X}")
+def test_free_text_does_not_strip_visible_whitespace_controls(ch: str) -> None:
+    """Tab, newline and carriage return render as a visible break, so they
+    are not stripped. Planting one mid-IBAN splits the token into pieces
+    too short (or, for the trailing piece, not IBAN-shaped) to redact --
+    the module's own already-documented grouped-IBAN limitation, not a new
+    leak: the full IBAN never appears as a contiguous run either way, and
+    the character is preserved rather than silently dropped."""
+    iban = "MT92MALT01100ABCDEFGH1234IJKL56"
+    planted = ch.join([iban[:2], iban[2:15], iban[15:]])
+    out = Memo(text=planted).text
+    assert out == planted
+
+
+# --- Blank-rendering characters outside Cc/Cf/Mn: enumerated individually,
+# not by category (their categories are mostly ordinary visible text) -----
+_HANGUL_FILLERS = ["ᅟ", "ᅠ", "ㅤ", "ﾠ"]
+_BRAILLE_BLANK = "⠀"
+
+
+@pytest.mark.parametrize("ch", _HANGUL_FILLERS, ids=lambda ch: f"U+{ord(ch):04X}")
+def test_free_text_strips_hangul_filler_characters_inside_an_iban(ch: str) -> None:
+    iban = "MT92MALT01100ABCDEFGH1234IJKL56"
+    planted = ch.join([iban[:2], iban[2:15], iban[15:]])
+    out = Memo(text=planted).text
+    assert iban not in out
+    assert out == "MT•• •••• KL56"
+
+
+def test_free_text_strips_braille_pattern_blank_inside_an_iban() -> None:
+    iban = "MT92MALT01100ABCDEFGH1234IJKL56"
+    planted = _BRAILLE_BLANK.join([iban[:2], iban[2:15], iban[15:]])
+    out = Memo(text=planted).text
+    assert iban not in out
+    assert out == "MT•• •••• KL56"
+
+
+# --- The ambient budget: `redaction_budget` -------------------------------
+
+
+def test_redaction_budget_defaults_to_no_ambient_budget() -> None:
+    assert _current_budget.get() is None
+
+
+def test_redaction_budget_resets_on_exception() -> None:
+    """An exception raised anywhere inside the block must not leave a
+    spent, stale budget ambient for whatever unrelated work runs next in
+    the same context."""
+    assert _current_budget.get() is None
+    with pytest.raises(ValueError, match="boom"), redaction_budget(10):
+        assert _current_budget.get() is not None
+        raise ValueError("boom")
+    assert _current_budget.get() is None
+
+
+def test_redaction_budget_restores_a_nested_callers_own_budget() -> None:
+    """`reset`, not a blind `set(None)`: a caller already inside its own
+    `redaction_budget` block must get its own budget back, not `None`, if
+    something nests another one inside it."""
+    with redaction_budget(500):
+        outer = _current_budget.get()
+        with redaction_budget(10):
+            assert _current_budget.get() is not outer
+        assert _current_budget.get() is outer
+
+
+async def test_redaction_budget_is_isolated_between_concurrent_tasks() -> None:
+    """Two tasks each open their own `redaction_budget`, interleaved via
+    `await asyncio.sleep(0)` so both context managers are active at once
+    from the event loop's perspective. Neither may observe or spend from
+    the other's allowance -- the property that makes this safe for
+    concurrently-served requests on the same instance, proven by actually
+    interleaving them rather than by running them one after the other."""
+    results: dict[str, int] = {}
+
+    async def worker(name: str, total: int) -> None:
+        with redaction_budget(total):
+            await asyncio.sleep(0)
+            budget = _current_budget.get()
+            assert budget is not None
+            budget.spend()
+            await asyncio.sleep(0)
+            results[name] = budget.remaining
+
+    await asyncio.gather(worker("a", 10), worker("b", 20))
+    assert results == {"a": 9, "b": 19}
+
+
+def test_redaction_budget_is_shared_across_separate_free_text_validations() -> None:
+    """The property `redaction_budget` exists for: the allowance is spent
+    down across SEPARATE `FreeText` validations inside the same block, not
+    given a fresh budget for each one. A junk token that would each cost
+    ~559 checksums on its own (measured against `_find_iban_in_token`)
+    exhausts a small ambient budget after the first, so a genuine IBAN
+    validated afterward -- in its OWN `Memo`, a separate `FreeText`
+    validation -- is never scanned and comes back bare-masked rather than
+    with its correct country code and last four."""
+    junk = "AB12" * 32  # 128 chars, never checksums
+    real_iban = "MT84MALT011000012345MTLCAST001S"
+    with redaction_budget(600):  # enough for one junk token's scan, not two
+        Memo(text=junk)
+        out = Memo(text=f"{junk} {real_iban}").text
+    assert real_iban not in out
+    assert out.endswith(_MASK)
+
+
+# --- Default_Ignorable_Code_Point: unassigned codepoints that still render
+# as nothing, missed by category-only stripping -----------------------------
+#
+# `Cf`/`Mn`/`Cc` cover ASSIGNED codepoints that render as nothing (or as an
+# accent). Unicode's `Default_Ignorable_Code_Point` property is the
+# property that actually MEANS "renders as nothing", and 3,769 of its
+# 4,174 members are UNASSIGNED (`Cn`) -- a category this module does not
+# otherwise touch, on purpose (stripping all of `Cn` would strip every
+# codepoint Unicode has not assigned a meaning to yet). Verified live, not
+# assumed from the property's name: any one of the ranges below, planted
+# mid-value on unpatched code, defeats both the IBAN and the PAN scan, and
+# deleting the single codepoint recovers the complete original value.
+
+
+def _all_default_ignorable_unassigned() -> list[str]:
+    return [
+        chr(cp)
+        for start, end in _DEFAULT_IGNORABLE_UNASSIGNED_RANGES
+        for cp in range(start, end + 1)
+    ]
+
+
+def test_default_ignorable_unassigned_ranges_total_3769_codepoints() -> None:
+    """Locks the range list to the count review verified against Unicode
+    15.0's DerivedCoreProperties.txt, so a future edit that trims or
+    extends a range notices immediately rather than silently narrowing
+    coverage."""
+    assert len(_all_default_ignorable_unassigned()) == 3769
+
+
+def test_all_enumerated_default_ignorable_codepoints_are_actually_unassigned() -> None:
+    """Characterization test tying the enumeration to THIS interpreter's
+    bundled Unicode data (`unicodedata.unidata_version`), not just to the
+    Unicode 15.0 spec text: if the bundled version ever reassigns one of
+    these, this fails loudly rather than the coverage silently degrading
+    to "still works, for a reason nobody wrote down"."""
+    for ch in _all_default_ignorable_unassigned():
+        assert unicodedata.category(ch) == "Cn", f"U+{ord(ch):04X} is no longer Cn"
+
+
+def test_free_text_strips_every_default_ignorable_unassigned_codepoint_inside_an_iban() -> None:
+    """The whole property list, not a sample, against the IBAN path."""
+    iban = "MT92MALT01100ABCDEFGH1234IJKL56"
+    for ch in _all_default_ignorable_unassigned():
+        planted = ch.join([iban[:2], iban[2:15], iban[15:]])
+        out = Memo(text=planted).text
+        assert iban not in out, f"U+{ord(ch):04X} was not stripped from an IBAN"
+        assert out == "MT•• •••• KL56", f"U+{ord(ch):04X}: got {out!r}"
+
+
+def test_free_text_strips_every_default_ignorable_unassigned_codepoint_inside_a_pan() -> None:
+    """The whole property list, not a sample, against the PAN path."""
+    pan = "4111111111114417"
+    for ch in _all_default_ignorable_unassigned():
+        planted = ch.join([pan[:8], pan[8:]])
+        out = Memo(text=planted).text
+        assert pan not in out, f"U+{ord(ch):04X} was not stripped from a PAN"
+        assert out == "•••• 4417", f"U+{ord(ch):04X}: got {out!r}"
+
+
+# --- Narrowing what budget exhaustion destroys ------------------------------
+#
+# Denial-of-audit primitive, found by review: unconditionally bare-masking
+# every token after the budget runs out blanks every OTHER legitimate
+# value in the same request too -- a payee reference, a challenge ID, a
+# device ID, none of them junk. `_has_qualifying_start` narrows this to
+# "could this token EVER have matched, with any amount of budget" -- a
+# token with no letter-letter-digit-digit start anywhere in it can never
+# reach a checksum regardless of budget, so leaving it untouched loses
+# nothing on the leak axis.
+
+
+def test_has_qualifying_start_is_false_for_a_value_that_can_never_checksum() -> None:
+    """No letter-letter-digit-digit run anywhere in this token -- not
+    within the last-`_IBAN_MIN_LEN` characters where `_find_iban_in_token`
+    would even look -- so it could never have bought a single checksum."""
+    assert not _has_qualifying_start("ACMECORP20260912X")
+
+
+def test_has_qualifying_start_is_true_for_a_real_iban() -> None:
+    """A real IBAN's own opening shape is exactly this test's condition by
+    construction (country code, two check digits)."""
+    assert _has_qualifying_start("MT84MALT011000012345MTLCAST001S")
+
+
+def test_free_text_budget_exhaustion_preserves_a_value_that_could_never_match() -> None:
+    """The fix, end to end: a value with no possible IBAN-shaped start
+    survives budget exhaustion untouched, closing the denial-of-audit
+    primitive without reopening the leak axis (nothing here could ever
+    have checksummed, budget or no budget)."""
+    junk = " ".join(["AB12" * 32] * _JUNK_TOKENS_TO_EXHAUST_BUDGET)
+    safe_value = "ACMECORP20260912X"
+    out = Memo(text=f"{junk} {safe_value}").text
+    assert out.endswith(safe_value)
+
+
+def test_free_text_budget_exhaustion_still_masks_a_token_that_could_have_matched() -> None:
+    """The other half of the same rule: a token that DOES have a
+    qualifying start is still bare-masked after exhaustion. The narrowing
+    only ever removes masking from tokens that could never have been
+    found regardless of budget -- it must not weaken the fail-closed
+    behaviour for anything that could plausibly have been a real IBAN."""
+    junk = " ".join(["AB12" * 32] * _JUNK_TOKENS_TO_EXHAUST_BUDGET)
+    plausible_but_unverified = "AB99XYZQWERTYUIOPAS"
+    assert _has_qualifying_start(plausible_but_unverified.upper())
+    out = Memo(text=f"{junk} {plausible_but_unverified}").text
+    assert plausible_but_unverified not in out
+    assert out.endswith(_MASK)
+
+
+def test_free_text_budget_exhaustion_survivor_count_on_a_seven_value_payload() -> None:
+    """Illustrative reconstruction of review's payload shape (179 tokens of
+    padding, one past the exhaustion point, then several legitimate
+    values) -- not review's own literal strings, which were not part of
+    this report, but the same shape: some values immune regardless (too
+    short, or split by a separator already) and some that were blanked
+    outright before this fix. Locks in the count this change actually
+    produces for a representative mix rather than only for the two
+    single-value cases above."""
+    junk = " ".join(["AB12" * 32] * _JUNK_TOKENS_TO_EXHAUST_BUDGET)
+    immune_regardless = ["DEV42AB", "TXN-2026-0912"]
+    previously_destroyed = [
+        "PAYEEREF88213XBCN",
+        "a1b2c3d4e5f67890fedcba9876543210",
+        "DEVICE7A9B3C1D2E4F5061728394A5B6",
+        "REF20260912ABCDEFGH",
+        "ES9121000418450200051332",
+    ]
+    all_values = immune_regardless + previously_destroyed
+    out = Memo(text=f"{junk} {' '.join(all_values)}").text
+    survivors = [v for v in all_values if v in out]
+    for v in immune_regardless:
+        assert v in survivors, f"{v!r} should have been immune regardless"
+    # A real IBAN and an IBAN-opener-shaped reference both have a
+    # qualifying start, so both stay conservatively masked; the other
+    # three previously-destroyed values have no qualifying start and now
+    # survive. Asserted as a count, not a hardcoded set, so this documents
+    # the actual number rather than silently tolerating a different split.
+    assert len(survivors) == 5, f"expected 5 of 7 to survive, got {survivors!r}"

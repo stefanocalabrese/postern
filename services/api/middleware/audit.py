@@ -17,7 +17,7 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
-from postern_core.domain.masking import FreeText
+from postern_core.domain.masking import FreeText, redaction_budget
 from postern_core.identity import CustomerRef
 from postern_core.store import audit
 from postern_core.store.engine import Database
@@ -115,7 +115,24 @@ class AuditMiddleware(Middleware):
         call_next: CallNext[CallToolRequestParams, ToolResult],
     ) -> ToolResult:
         name = context.message.name[:_MAX_TOOL_NAME]
-        arguments = _scrub(dict(context.message.arguments or {}))
+        # One allowance for the WHOLE tree, not one per string `_scrub`
+        # happens to visit: without this, `FreeText` gives every string it
+        # validates its own fresh checksum budget (masking.py's
+        # `_IBAN_SCAN_BUDGET`), and an agent that spreads junk across many
+        # short argument strings -- a list of them, say, rather than one
+        # long one -- would buy a fresh allowance per element instead of
+        # spending down one shared one. `redaction_budget` makes the
+        # allowance ambient for this synchronous call only: see its
+        # docstring for why a `ContextVar` rather than a module global, and
+        # masking.py's `_redact_free_text` for the measured before/after.
+        # Tool RESPONSES validated elsewhere (through pydantic models on
+        # data returned from the bank's own backend) do NOT opt in and keep
+        # a fresh per-string budget each -- a deliberate choice, not an
+        # oversight: that data is not agent-controlled the way tool
+        # arguments are, so splitting it into many strings is not an
+        # attacker's lever the way it is here.
+        with redaction_budget():
+            arguments = _scrub(dict(context.message.arguments or {}))
         token = get_access_token()
         subject = token.claims.get("sub") if token is not None else None
         customer = _customer_ref(subject)
