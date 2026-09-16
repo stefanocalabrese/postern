@@ -1,3 +1,4 @@
+import logging
 import random
 import string
 
@@ -5,11 +6,14 @@ import pytest
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.server.auth import AccessToken
+from mcp.shared.exceptions import MCPError
 from postern_core.domain.masking import _IBAN_SCAN_BUDGET, _MASK, redaction_budget
+from postern_core.store import audit as store_audit
 from postern_core.store.models import AuditEntry
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from services.api.middleware import audit as audit_middleware
 from services.api.middleware.audit import _MAX_TOOL_NAME, _scrub
 
 
@@ -503,3 +507,172 @@ async def test_the_name_is_scrubbed_before_the_arguments_so_their_exhaustion_doe
     entry = (await rows(session))[0]
     assert entry.tool_name == "ES•• •••• 1332"
     assert entry.redaction_budget_exhausted is True
+
+
+# -- The audit-write-failure policy: docs/decisions/0006-audit-write-failure.md --
+#
+# `_write` raises when the audit store itself is unavailable (connection
+# refused, pool exhausted, ...). `audit.append` is monkeypatched to raise
+# directly, simulating that outage without taking a real database down, per
+# the task's own instruction.
+#
+# Both paths below are FAIL CLOSED, deliberately: a database outage takes
+# down every tool call, including ones that would otherwise have succeeded.
+# That cost is the point of the decision record, not a bug to route around
+# here. What these tests pin is narrower than the policy itself:
+#   - the success path actually fails the call rather than returning a
+#     silent, unaudited success;
+#   - the failure path surfaces the TOOL's own exception on the wire, never
+#     the database's, even though the call still fails overall;
+#   - either failure is observable to an operator through the logs, not
+#     just through a support ticket about a missing row.
+
+
+class _SimulatedAuditOutage(RuntimeError):
+    """Distinct from anything a tool itself could plausibly raise, so a test
+    asserting this message is ABSENT from the caller-visible result is
+    actually exercising the database-vs-tool distinction, not a coincidence
+    of wording."""
+
+
+async def _boom_append(*args: object, **kwargs: object) -> None:
+    raise _SimulatedAuditOutage("simulated audit store outage")
+
+
+async def test_an_audit_write_failure_on_the_success_path_fails_the_call(
+    audit_server: FastMCP,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chosen policy: fail closed. `ok_tool` runs and returns successfully,
+    but the audit write for that success raises -- the call must not come
+    back as a success with its audit trail silently missing. FastMCP only
+    turns a `FastMCPError` (e.g. `ToolError`) into a `CallToolResult
+    (is_error=True)`; an audit-store exception is neither, so it reaches the
+    client as a raw protocol-level `MCPError`, exactly as it did before this
+    fix -- the wire shape is unchanged, only the fact that this is a chosen
+    policy, logged, is new."""
+    monkeypatch.setattr(store_audit, "append", _boom_append)
+    async with Client(transport=audit_server) as c:
+        with pytest.raises(MCPError):
+            await c.call_tool("ok_tool", {"amount": 1}, raise_on_error=False)
+    assert await rows(session) == []
+
+
+async def test_an_audit_write_failure_on_the_success_path_is_logged(
+    audit_server: FastMCP,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Requirement 3: the failure must be observable to an operator, not
+    just inferable from the call itself failing.
+
+    `monkeypatch.setattr(audit_middleware.logger, "disabled", False)` works
+    around an unrelated environment quirk, not this module's own behaviour:
+    `migrations/env.py`'s `fileConfig(config.config_file_name)` (Alembic's
+    standard template) runs with `disable_existing_loggers` at its default
+    of `True`, and the session-scoped `pg_url` fixture runs it after this
+    module's `logger = logging.getLogger(__name__)` already executed at
+    import time -- so Alembic's own logging setup, not this module's code,
+    leaves the real logger disabled for the rest of the test session.
+    Confirmed directly: `audit_middleware.logger.disabled` reads `True`
+    before this line, in every test in this file that reaches this point.
+    `caplog.set_level` cannot undo it -- it only restores `logging.disable`'s
+    global threshold, never a logger's own `.disabled` flag."""
+    monkeypatch.setattr(store_audit, "append", _boom_append)
+    monkeypatch.setattr(audit_middleware.logger, "disabled", False)
+    caplog.set_level(logging.ERROR, logger=audit_middleware.logger.name)
+    async with Client(transport=audit_server) as c:
+        with pytest.raises(MCPError):
+            await c.call_tool("ok_tool", {"amount": 1}, raise_on_error=False)
+    assert any(
+        record.levelno == logging.ERROR
+        and "ok_tool" in record.getMessage()
+        and record.exc_info is not None
+        and isinstance(record.exc_info[1], _SimulatedAuditOutage)
+        for record in caplog.records
+    )
+
+
+async def test_an_audit_write_failure_on_the_failure_path_still_surfaces_the_tools_own_exception(
+    audit_server: FastMCP,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bug this task exists to fix: `boom_tool` raises its own
+    `ValueError`, and the audit write recording THAT failure also raises.
+    Before the fix, the database exception replaced the tool's via implicit
+    `__context__` chaining and reached the caller as a generic `MCPError`
+    ("Internal server error") -- the exact same shape as the success-path
+    outage above, which told the caller nothing true about either failure.
+    After the fix, the tool's own `ToolError` (a `FastMCPError`) propagates
+    unchanged and is still converted into an ordinary `CallToolResult
+    (is_error=True)` carrying `boom_tool`'s own message -- the call still
+    fails overall (fail-closed), but for the reason the caller can see."""
+    monkeypatch.setattr(store_audit, "append", _boom_append)
+    async with Client(transport=audit_server) as c:
+        result = await c.call_tool("boom_tool", {}, raise_on_error=False)
+    assert result.is_error is True
+    text = str(result.content)
+    assert "internal detail" in text or "boom_tool" in text
+    assert "simulated audit store outage" not in text
+    assert await rows(session) == []
+
+
+async def test_an_audit_write_failure_on_the_failure_path_is_logged(
+    audit_server: FastMCP,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Companion to the success-path logging test: the audit failure is
+    observable here too, even though the caller's own error text names only
+    the tool, never the database. See the success-path logging test's
+    docstring for why `logger.disabled` is reset here."""
+    monkeypatch.setattr(store_audit, "append", _boom_append)
+    monkeypatch.setattr(audit_middleware.logger, "disabled", False)
+    caplog.set_level(logging.ERROR, logger=audit_middleware.logger.name)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("boom_tool", {}, raise_on_error=False)
+    assert any(
+        record.levelno == logging.ERROR
+        and "boom_tool" in record.getMessage()
+        and record.exc_info is not None
+        and isinstance(record.exc_info[1], _SimulatedAuditOutage)
+        for record in caplog.records
+    )
+
+
+async def test_an_audit_write_failure_on_the_failure_path_chains_the_audit_exception_as_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unit-level pin on the exact chaining `on_call_tool` must use: `raise
+    exc from audit_exc`, not a bare `raise` inside the inner `except` (which
+    would let the audit exception's own implicit propagation take over) and
+    not swallowing `audit_exc` outright (which would lose it from the
+    traceback entirely, defeating the requirement that the audit failure
+    stay visible)."""
+    from fastmcp.exceptions import ToolError
+
+    from services.api.middleware.audit import AuditMiddleware
+
+    middleware = AuditMiddleware(db=None)  # type: ignore[arg-type]
+
+    class _FakeContext:
+        timestamp = None
+
+        class message:  # noqa: N801 -- mirrors the real MiddlewareContext shape
+            name = "boom_tool"
+            arguments: dict[str, object] = {}
+
+    async def call_next(context: object) -> None:
+        raise ToolError("Error calling tool 'boom_tool': internal detail")
+
+    async def boom_write(*args: object, **kwargs: object) -> None:
+        raise _SimulatedAuditOutage("simulated audit store outage")
+
+    monkeypatch.setattr(middleware, "_write", boom_write)
+    with pytest.raises(ToolError) as excinfo:
+        await middleware.on_call_tool(_FakeContext(), call_next)  # type: ignore[arg-type]
+    assert isinstance(excinfo.value.__cause__, _SimulatedAuditOutage)

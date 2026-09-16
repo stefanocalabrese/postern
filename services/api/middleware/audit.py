@@ -10,6 +10,7 @@ the leak path CLAUDE.md's hard rule describes, and an audit table is a
 long-lived store.
 """
 
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -22,6 +23,8 @@ from postern_core.identity import CustomerRef
 from postern_core.store import audit
 from postern_core.store.engine import Database
 from pydantic import TypeAdapter, ValidationError
+
+logger = logging.getLogger(__name__)
 
 _FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
 
@@ -223,11 +226,55 @@ class AuditMiddleware(Middleware):
         try:
             result = await call_next(context)
         except Exception as exc:
-            await self._write(
-                at, customer, name, arguments, "raised", type(exc).__name__, scope.exhausted
+            # Fail closed (docs/decisions/0006-audit-write-failure.md): an
+            # audit-write failure here must never become the exception the
+            # caller sees. Before this, an exception from `_write` replaced
+            # `exc` by propagating unchanged, which put the DATABASE's
+            # exception on the wire in place of the TOOL's -- through
+            # implicit `__context__` chaining, since raising while already
+            # handling `exc` sets that automatically. `raise exc from
+            # audit_exc` re-raises the original exception OBJECT (same type,
+            # same message, so `FastMCPError` handling above this middleware
+            # still applies to it as before) and attaches the audit failure
+            # as its explicit `__cause__` instead, so a traceback shows both
+            # without either one hiding the other. The audit failure is
+            # logged separately too: `__cause__` only helps someone already
+            # looking at a traceback for this one call, and an outage needs
+            # to be visible without one.
+            try:
+                await self._write(
+                    at, customer, name, arguments, "raised", type(exc).__name__, scope.exhausted
+                )
+            except Exception as audit_exc:
+                logger.error(
+                    "audit write failed for tool %r after it raised %s: %s",
+                    name,
+                    type(exc).__name__,
+                    audit_exc,
+                    exc_info=audit_exc,
+                )
+                raise exc from audit_exc
+            raise
+        try:
+            await self._write(at, customer, name, arguments, "returned", None, scope.exhausted)
+        except Exception as audit_exc:
+            # Fail closed here too, and deliberately rather than by
+            # accident: the audit table is the artefact a regulator asks
+            # for, and CLAUDE.md's operating assumption is that the caller
+            # is under adversarial influence at all times -- a call that ran
+            # but left no audit trail is worse than a call that failed
+            # loudly. The cost is real and is not hidden: a database outage
+            # now takes down every tool call, including ones that would
+            # otherwise have succeeded. See
+            # docs/decisions/0006-audit-write-failure.md for the rejected
+            # alternative (write-through-and-log) and the reasoning.
+            logger.error(
+                "audit write failed for tool %r after it returned successfully; "
+                "failing the call because the audit row could not be written",
+                name,
+                exc_info=audit_exc,
             )
             raise
-        await self._write(at, customer, name, arguments, "returned", None, scope.exhausted)
         return result
 
     async def _write(
