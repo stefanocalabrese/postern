@@ -10,9 +10,9 @@ Skeleton. Tasks 0 and 1 of the 15-task plan are done: uv workspace, six-gate `ma
 
 ## Source documents, in reading order
 
-1. `docs/bank-mcp-design-handoff (7).md` (868 lines): the architecture. Note the space and `(7)` in the filename; quote it in shell.
-2. `docs/bank-mcp-zero-trust-plan.md` (315 lines): threat model, ZT-1..ZT-8 work items, CI gates, sequencing.
-3. `docs/bank-mcp-python-implementation-guide.md` (437 lines): FastMCP specifics, repo layout, code patterns.
+1. `docs/bank-mcp-design-handoff (7).md`: the architecture. Note the space and `(7)` in the filename; quote it in shell.
+2. `docs/bank-mcp-zero-trust-plan.md`: threat model, ZT-1..ZT-8 work items, CI gates, sequencing.
+3. `docs/bank-mcp-python-implementation-guide.md`: FastMCP specifics, repo layout, code patterns.
 
 Cross-references: `§N.N` points at the handoff, `ZT-N` at the zero-trust plan, `A1..A11` at the attack scenarios in its §3.2.
 
