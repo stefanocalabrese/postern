@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.13,<3",
+    "joserfc>=1.7.5,<2",
 ]
 
 [build-system]
