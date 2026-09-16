@@ -1045,6 +1045,47 @@ def test_all_enumerated_default_ignorable_codepoints_are_actually_unassigned() -
         assert unicodedata.category(ch) == "Cn", f"U+{ord(ch):04X} is no longer Cn"
 
 
+# Unicode version the ranges above were derived against. The count lock and
+# the `Cn` characterization test above both check the SIX enumerated ranges
+# against the running interpreter, but neither one notices a codepoint
+# OUTSIDE those ranges: if a Python upgrade bundles a newer Unicode version
+# that assigns Default_Ignorable_Code_Point to some new codepoint elsewhere,
+# both of those tests stay green while coverage silently degrades. This is
+# the version pin the test below fails against.
+_RANGES_DERIVED_AGAINST_UNICODE_VERSION = "15.0.0"
+
+
+def test_bundled_unicode_version_matches_the_version_the_ranges_were_derived_against() -> None:
+    """Neither the count lock nor the `Cn` characterization test above
+    detects a newer bundled Unicode version assigning Default_Ignorable to a
+    codepoint OUTSIDE the six ranges enumerated in
+    `_DEFAULT_IGNORABLE_UNASSIGNED_RANGES` -- both would stay green while
+    redaction coverage silently degrades. This test is the gate for that
+    case: it pins the exact Unicode version the ranges were derived
+    against, so a Python upgrade that moves `unicodedata.unidata_version`
+    fails the build immediately instead of leaving a residual bypass
+    nobody notices."""
+    assert unicodedata.unidata_version == _RANGES_DERIVED_AGAINST_UNICODE_VERSION, (
+        f"Bundled Unicode version is {unicodedata.unidata_version!r}, but "
+        f"_DEFAULT_IGNORABLE_UNASSIGNED_RANGES was derived against Unicode "
+        f"{_RANGES_DERIVED_AGAINST_UNICODE_VERSION!r}. A newer Unicode version "
+        "can assign Default_Ignorable_Code_Point to codepoints outside the six "
+        "ranges already enumerated, and neither the count-lock test nor the "
+        "Cn characterization test above would catch that -- they only check "
+        "the codepoints already listed. To fix, in order: (1) re-derive the "
+        "Default_Ignorable_Code_Point list from the new Unicode version's "
+        "DerivedCoreProperties.txt, keeping only the codepoints unassigned "
+        "(category Cn) in that version; (2) update "
+        "_DEFAULT_IGNORABLE_UNASSIGNED_RANGES in "
+        "packages/postern-core/src/postern_core/domain/masking.py to match; "
+        "(3) update the expected count in "
+        "test_default_ignorable_unassigned_ranges_total_3769_codepoints "
+        "(tests/test_masking_types.py) to the new total; (4) update "
+        "_RANGES_DERIVED_AGAINST_UNICODE_VERSION (tests/test_masking_types.py, "
+        "this test) to the new unicodedata.unidata_version string."
+    )
+
+
 def test_free_text_strips_every_default_ignorable_unassigned_codepoint_inside_an_iban() -> None:
     """The whole property list, not a sample, against the IBAN path."""
     iban = "MT92MALT01100ABCDEFGH1234IJKL56"

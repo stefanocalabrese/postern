@@ -649,7 +649,12 @@ _BLANK_RENDERING_CHARACTERS = frozenset("ᅟᅠㅤﾠ⠀")
 # Default_Ignorable_Code_Point directly, so the ranges below are transcribed
 # from Unicode 15.0's DerivedCoreProperties.txt by hand and must be
 # RE-CHECKED whenever the Python interpreter's bundled Unicode version
-# changes (`unicodedata.unidata_version`; 15.0.0 as of this writing).
+# changes (`unicodedata.unidata_version`; 15.0.0 as of this writing). That
+# recheck is gated, not just requested: see
+# `test_bundled_unicode_version_matches_the_version_the_ranges_were_derived_against`
+# in `tests/test_masking_types.py`, which fails the build the day the
+# bundled version moves, rather than relying on a reader noticing this
+# comment.
 # `U+E0002-U+E001F` is why this needed checking against the property and
 # not just patched from examples: it sits INSIDE the Tags block whose
 # ASSIGNED members -- U+E0001 LANGUAGE TAG and U+E0020-U+E007F (tag
