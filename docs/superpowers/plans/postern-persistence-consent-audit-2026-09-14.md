@@ -8,6 +8,8 @@
 
 **Tech Stack:** Postgres 17, SQLAlchemy 2.0.52 async + asyncpg, Alembic 1.20, testcontainers 4.15, on the existing FastMCP 4.0.3 / Python 3.12 stack.
 
+**Status (2026-09-16):** Tasks 0 to 5 are complete and merged. Tasks 6 and 7 have not started. `main` is at `1c21989`.
+
 ---
 
 ## Scope and boundaries
@@ -36,7 +38,7 @@ Measured on 2026-09-14 against the installed packages and a real Postgres contai
 - `require_scopes` cannot express this: `_RequireScopes.__call__` is a frozenset subset test against token scopes (`authorization.py:70-84`).
 - A custom check makes `scope_requirements()` return `None` (`authorization.py:202-227`), so FastMCP emits a plain `AuthorizationError` rather than an RFC 6750 `insufficient_scope` step-up. Correct here: consent is not a scope the client can go obtain.
 
-**Cost, not in any documentation:** `mcp/server/_streamable_http_modern.py:285-359` runs a full internal `tools/list` dispatch through the middleware chain before every `tools/call` carrying non-empty `arguments`, to validate `Mcp-Param-*` headers against the tool's `inputSchema`. So an uncached consent check runs twice per real call, and that path swallows exceptions (`except Exception: logger.exception(...); return None`), meaning a throwing consent lookup degrades header validation silently. Cache per request.
+**Cost, not in any documentation:** `mcp/server/_streamable_http_modern.py:285-359` runs a full internal `tools/list` dispatch through the middleware chain before every `tools/call` carrying non-empty `arguments`, to validate `Mcp-Param-*` headers against the tool's `inputSchema`. **That dispatch only fires when the request carries a real `MCP-Protocol-Version: 2026-07-28` header** (`mcp/server/streamable_http_manager.py:191-196`); without that header the modern-dispatch branch never runs at all, and Task 4's own test helper omits it, so this path is invisible to any test written from the plan's snippet. **Corrected from "twice per call":** measured with the header present, against `accounts.get_balance`, one internal `tools/list` pass evaluates every consent-gated tool's check once each (`accounts.list`, `accounts.get_balance`, `transactions.list`, `cards.list`, four calls, because `accounts.list` and `accounts.get_balance` share one `consent_for("accounts", db)` closure but remain two separate `Tool` objects), plus one more from the real dispatch's own `_get_tool` check: five evaluations of `check()` for a single real call, not two. Uncached, all five hit the database; cached, only the first does. That path also swallows exceptions (`except Exception: logger.exception(...); return None`), meaning a throwing consent lookup degrades header validation silently. Cache per request.
 
 **Identity in hooks:** `get_access_token()` works inside a middleware hook over HTTP (`fastmcp/server/dependencies.py:606-636` reads `get_http_request().scope["user"]`), and returns `None` under the in-process `Client`. The repo's own `token_customer_resolver` works unchanged inside `on_list_tools`. An UNCAUGHT exception in a hook becomes JSON-RPC `-32603`, so the hook must catch `PermissionError` itself.
 
@@ -57,6 +59,12 @@ Measured on 2026-09-14 against the installed packages and a real Postgres contai
 
 **Test fixtures:** the container fixture must be SYNC. The async `env.py` ends in `asyncio.run(...)`, so calling `command.upgrade` from inside a coroutine raises `RuntimeError: asyncio.run() cannot be called from a running event loop`. Pooled asyncpg connections break across event loops; the repo's existing `asyncio_default_test_loop_scope = "session"` prevents it, and `poolclass=NullPool` survives a mismatch outright. `testcontainers.postgres` is deprecated in favour of `testcontainers.community.postgres`, and `PostgresContainer` defaults to `driver="psycopg2"`, so `driver="asyncpg"` must be passed explicitly.
 
+**Masking fixes landed during this plan, in Plan 1's `masking.py`:** found while executing Plan 2's audit-scrubbing step (Task 5), fixed in the file Plan 1 owns rather than this plan's own files. Plan 2's readers should know the library changed under them.
+
+- `FreeText` leaked a complete Amex out of a long contiguous digit run: the bounded 19-digit match emitted `••••` plus that run's own last four, and the unconsumed residue sat directly against it, so mask-plus-residue reconstituted a valid card number. Fixed (`537d66b`) by consuming the entire run and branching on its length: 12 to 19 digits emit `•••• NNNN`, over 19 emit a bare `••••`.
+- `FreeText` returned a mod-97-valid IBAN completely untouched when any junk was glued to it, starting at one appended character. The candidate matched, the checksum was computed over IBAN-plus-tail, it failed, and the function returned the input unchanged. Fixed (`1c21989`) by matching the maximal token and checksumming its 14-to-34 character prefixes, longest first.
+- Still open in `masking.py`, documented there: junk glued to the FRONT of an IBAN is not redacted, because closing it needs a window scan, which is a CPU-burn primitive on attacker-written text without an input length cap.
+
 ## Design decisions this plan locks in
 
 **D1. Consent is enforced by per-tool `auth=`, never by catalogue filtering alone.** Filtering is a usability affordance; the `auth=` check is the control. Any tool added later that touches a consented domain must carry one.
@@ -75,7 +83,9 @@ Measured on 2026-09-14 against the installed packages and a real Postgres contai
 
 Measured on this machine, `postgres:17-alpine` already pulled, three consecutive runs: `make ci` was ~1.49s wall / 0.91s pytest before Task 3, ~3.3-3.8s wall / 2.4-2.6s pytest after, all as one `pytest` session because the container fixture is session-scoped (paid once per run, not per test). An addition of ~2s to a local pre-commit gate is not the kind of cost that justifies excluding the tests: Task 4 adds the actual consent-enforcement tests, the security control this whole plan exists to build, and a default `make ci` that skips them via a marker nobody remembers to pass would gate nothing that matters while still exiting 0.
 
-Docker unreachable degrades to an explicit `pytest.skip("Docker is not reachable, skipping database-backed tests: ...")` raised from `pg_url` after a `docker.from_env().ping()` check, rather than the raw 15-frame `docker.errors.DockerException` traceback `PostgresContainer.__init__` produces on its own (measured, both ways, with `DOCKER_HOST` pointed at a socket that does not exist: the un-guarded fixture fails 7 times, once per dependent test, each with the full traceback; the guarded fixture skips 7 times in 0.01s total with one specific reason line each). `make test`'s pytest invocation also gained `-rs`, so every skip's reason prints in the summary `make ci` output, not just its count — a developer running `make ci` without Docker sees exactly why 7 tests didn't run, every time, rather than a "212 passed" that looks identical whether or not the consent tests executed. The CI workflow's `gates` job already has a Postgres service container (Task 2) and unconditionally runs `make test`, so there is one gate, dispatched manually, where these tests cannot be silently skipped.
+Docker unreachable degrades to an explicit `pytest.skip("Docker is not reachable, skipping database-backed tests: ...")` raised from `pg_url` after a `docker.from_env().ping()` check, rather than the raw 15-frame `docker.errors.DockerException` traceback `PostgresContainer.__init__` produces on its own (measured, both ways, with `DOCKER_HOST` pointed at a socket that does not exist: the un-guarded fixture fails 7 times, once per dependent test, each with the full traceback; the guarded fixture skips 7 times in 0.01s total with one specific reason line each). `make test`'s pytest invocation also gained `-rs`, so every skip's reason prints in the summary `make ci` output, not just its count: a developer running `make ci` without Docker sees exactly why 7 tests didn't run, every time, rather than a "212 passed" that looks identical whether or not the consent tests executed. The CI workflow's `gates` job already has a Postgres service container (Task 2) and unconditionally runs `make test`, so there is one gate, dispatched manually, where these tests cannot be silently skipped.
+
+**D8. `strict_input_validation=True` is a Task 5 test-fixture setting only. It must never reach `build_server` or `create_app`.** Measured: both modes leak, to different places. Under the lax default, fastmcp prints the raw offending argument in its own WARNING log line. Under `strict_input_validation=True`, the `ValidationError` message, carrying `input_value='4111111111114417'`, is returned to the CLIENT as the error content. For this project the second is strictly worse: anything reaching a client lands in vendor retention and is unrecallable, the premise `CLAUDE.md` states throughout. So `strict_input_validation=True` belongs in the Task 5 test fixture and nowhere else: never in `build_server`, never in `create_app`. This is the same leak channel for the fourth time in this project: FastMCP surfacing a pydantic error with the raw input attached. Earlier instances are documented in `masking.py` as a caller obligation, fixed for the customer resolver, and fixed for return-value projection via `build_model`. **Task 6 wires the real server and could reasonably turn this flag on there. Do not.**
 
 ## File structure
 
@@ -657,7 +667,7 @@ async def test_a_customer_with_no_rows_has_no_consent(session) -> None:
     assert await consents.granted_domains(session, CUST) == set()
 ```
 
-**Extended beyond this snippet:** a seventh test, `test_rollback_isolation_row_from_other_test_is_not_visible`, asserting `CUST` has no granted domains — the direct proof that the `session` fixture's rollback isolates tests from each other, run alongside the row-inserting test above in both collection orders (both pass; see Task 3's completion note after Step 6).
+**Extended beyond this snippet:** a seventh test, `test_rollback_isolation_row_from_other_test_is_not_visible`, asserting `CUST` has no granted domains: the direct proof that the `session` fixture's rollback isolates tests from each other, run alongside the row-inserting test above in both collection orders (both pass; see Task 3's completion note after Step 6).
 
 - [x] **Step 3: Run it to verify it fails**
 
@@ -713,9 +723,9 @@ Expected: PASS, 6 passed. Actual: **7 passed** in 1.62-1.75s (the seventh is the
 
 Each of the three filters in `granted_domains` (customer, `granted is True`, expiry) was broken one at a time and confirmed to fail a specific test, not a vague one:
 
-- Dropping `ConsentRecord.customer_ref == customer.value` made `test_granted_domains_returns_only_this_customers_rows` fail with `{'accounts', 'payments'} == {'accounts'}` — `OTHER`'s `payments` grant leaked into `CUST`'s result.
-- Dropping `ConsentRecord.granted.is_(True)` made `test_an_ungranted_row_is_not_returned` fail with `{'payments'} == set()` — a revoked row was returned as granted.
-- Dropping the expiry clause made `test_an_expired_row_is_treated_as_absent` fail with `{'cards'} == set()` — a row expired a day ago was returned as current.
+- Dropping `ConsentRecord.customer_ref == customer.value` made `test_granted_domains_returns_only_this_customers_rows` fail with `{'accounts', 'payments'} == {'accounts'}`: `OTHER`'s `payments` grant leaked into `CUST`'s result.
+- Dropping `ConsentRecord.granted.is_(True)` made `test_an_ungranted_row_is_not_returned` fail with `{'payments'} == set()`: a revoked row was returned as granted.
+- Dropping the expiry clause made `test_an_expired_row_is_treated_as_absent` fail with `{'cards'} == set()`: a row expired a day ago was returned as current.
 
 Each break was reverted before moving to the next; the final implementation is byte-for-byte the code block in Step 4.
 
@@ -899,6 +909,8 @@ async def test_a_malformed_subject_yields_an_empty_catalogue_not_an_error(
 ```
 
 `banking_start_session` carries no consent requirement on purpose: it is how a customer with no consent learns what to authorize, and it returns only their own account labels and the consent state itself.
+
+**Corrected after execution:** the test above, `test_a_malformed_subject_yields_an_empty_catalogue_not_an_error`, asserts `out["result"]["tools"] == []`. That assertion is structurally impossible: `banking_start_session` is deliberately ungated (see the line above), so it is always present regardless of whether the token's subject parses as a customer. The merged test, `test_a_malformed_subject_yields_no_error_and_no_consent_gated_tool`, asserts `{t["name"] for t in out["result"]["tools"]} == {"banking_start_session"}` instead. The property the test actually proves, no JSON-RPC `-32603` on a malformed subject, is unchanged.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -1105,13 +1117,21 @@ async def test_the_exception_still_propagates_after_being_recorded(
 Add this fixture to `tests/conftest.py`:
 
 ```python
-@pytest.fixture
-def audit_server(database):
+async def _clear_audit_log(database: Database) -> None:
+    async with database.sessionmaker() as s:
+        await s.execute(delete(AuditEntry))
+        await s.commit()
+
+
+@pytest_asyncio.fixture
+async def audit_server(database: Database):
     from fastmcp import FastMCP
 
     from services.api.middleware.audit import AuditMiddleware
 
-    mcp = FastMCP(name="audit-test")
+    await _clear_audit_log(database)
+
+    mcp = FastMCP(name="audit-test", strict_input_validation=True)
     mcp.add_middleware(AuditMiddleware(database))
 
     @mcp.tool
@@ -1126,10 +1146,19 @@ def audit_server(database):
     async def leaky_tool(pan: int) -> str:
         return "unreachable"
 
-    return mcp
+    yield mcp
+
+    await _clear_audit_log(database)
 ```
 
+Requires `from sqlalchemy import delete` and `from postern_core.store.models import AuditEntry` alongside `tests/conftest.py`'s existing imports.
+
 `leaky_tool` takes an `int` so passing a PAN string triggers argument coercion and a `ValidationError`, which is the exception type that carries the raw value.
+
+**As originally drafted this fixture cannot pass.** Two fixes are required, both already in the merged code:
+
+- `FastMCP(..., strict_input_validation=True)`. Measured: fastmcp 4.0.3 coerces type-mismatched tool arguments by default rather than raising. `leaky_tool(pan: int)` called with the string `"4111111111114417"` succeeds under the default, logging a warning and handing the handler the coerced int. A per-field `Annotated[int, Field(strict=True)]` does NOT override the server-level default; only `strict_input_validation=True` does. Without it, `test_the_detail_records_the_exception_type_not_its_message` fails on `assert None in {...}` because the call returned instead of raising.
+- The `_clear_audit_log` calls, once before the tools are registered and again after `yield`. `audit.append` commits through `database.sessionmaker()`, a session bound directly to the engine and outside the `session` fixture's rolled-back transaction, so rows one test writes survive into the next test. Without the clear it is 4 failed, 1 passed.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -1408,7 +1437,12 @@ git commit -m "docs: verify consent filtering, enforcement and the audit log aga
 | Whether real clients honour `cacheScope` | Honouring is client opt-in; treat it as unhonoured until measured against each vendor | out of repo |
 | Expiry renewal and the 180-day RTS re-authentication | Needs the device-grant flow | Plan 4 |
 | Audit chain for writes | There is no write path yet; the chain a regulator asks for ends at execution, which does not exist | Plans 5 and 6 |
-| Distinguishing a denied call from a typo in the audit log | `NotFoundError` fires for both; telling them apart means recording the consent decision inside the check | unscheduled |
+| Distinguishing a denied call from a typo in the audit log | `NotFoundError` fires for both: consent denial returns `NotFoundError` (`_get_tool` returns `None` for both an unknown name and an unauthorized one), and the audit middleware records `type(exc).__name__`, so both land as `outcome="raised", detail="NotFoundError"` with identical shape. Verified live: no longer theoretical, and invisible in the artifact a regulator would read. One option, undecided: the consent check records its own decision, since only the check knows why it said no, rather than deriving it downstream from an exception type. | decision needed at Task 6 |
+| `customer_ref IS NULL` means three different things | No token at all, a token with no `sub` claim, or a `sub` that failed `CustomerRef` validation. The third is the compromised-issuer case `identity.py` describes, and nothing in the row distinguishes it. In production the tool path usually also refuses such a token and records `detail="PermissionError"` as a co-located signal, but that is incidental rather than the column that should answer the question. | unscheduled |
+| `audit_log.customer_ref` can overflow | Column is `String(64)`; a maximum-length `CustomerRef` is 65 characters (`cust_` plus 60) | unscheduled |
+| Audit store unavailability has no decision record | Whether a tool call proceeds unaudited or fails closed when the audit store cannot be reached is undecided | unscheduled |
+| Audit rows cannot be correlated within one request | `audit_log` carries no `duration_ms` and no request identifier | unscheduled |
+| `tests/conftest.py`'s `session` fixture cannot commit | Bound to an externally-managed transaction that is rolled back, so `await session.commit()` never reaches Postgres. Two different local workarounds exist: Task 4 shadows a genuinely-committing `session` fixture inside its own test module, Task 5 clears `audit_log` directly instead. Known wart, not something for Tasks 6 or 7 to fix | Plan 3 |
 
 ## Self-review
 
