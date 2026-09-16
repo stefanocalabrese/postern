@@ -69,7 +69,15 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    # Without `compare_server_default`, `alembic check` only compares column
+    # presence, type and nullability -- a `server_default` edited on just the
+    # model or just the migration passes silently. This is the online path
+    # `alembic check` runs, so it is the one that needs the flag.
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_server_default=True,
+    )
 
     with context.begin_transaction():
         context.run_migrations()
