@@ -1,6 +1,6 @@
 # Bank MCP — Zero Trust Implementation and Mitigation Plan
 
-**Companion to** `bank-mcp-design-handoff.md`. That document is the architecture; this one is the security posture, the threat model, and the work items needed to make zero trust real rather than claimed. Section references in the form §N.N point to the handoff document.
+**Companion to** `bank-mcp-design-handoff (7).md`. That document is the architecture; this one is the security posture, the threat model, and the work items needed to make zero trust real rather than claimed. Section references in the form §N.N point to the handoff document.
 
 **Audience:** a Claude Code session implementing this, with access to the codebase and AWS accounts.
 

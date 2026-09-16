@@ -1,6 +1,6 @@
 # Bank MCP — Python / FastMCP Implementation Guide
 
-**Third document in the set.** Read `bank-mcp-design-handoff.md` (architecture) and `bank-mcp-zero-trust-plan.md` (security) first. §N.N references point to the handoff; ZT-N references point to the zero-trust plan.
+**Third document in the set.** Read `bank-mcp-design-handoff (7).md` (architecture) and `bank-mcp-zero-trust-plan.md` (security) first. §N.N references point to the handoff; ZT-N references point to the zero-trust plan.
 
 **Purpose:** turn the design into a repo. This document covers framework specifics, project layout, and the code patterns that carry security properties.
 
@@ -103,32 +103,36 @@ Two deployables sharing a core library (§8.2 of the handoff — this is a decis
 bank-mcp/
 ├── pyproject.toml
 ├── Dockerfile                       # multi-target, see §8
-├── packages/bank_mcp_core/
+├── migrations/                      # Alembic env.py + versions/
+├── packages/postern-core/src/postern_core/
+│   ├── identity.py                  # CustomerRef, CustomerResolver
 │   ├── domain/
-│   │   ├── types.py                 # MaskedPan, MaskedIban, Money, CustomerRef
-│   │   ├── account.py card.py transaction.py payment.py
+│   │   ├── masking.py               # MaskedPan, MaskedIban, FreeText
+│   │   ├── money.py                 # Money
+│   │   └── models.py                # Account, Balance, Transaction, Card, SessionInfo
 │   ├── facade/
 │   │   ├── client.py                # httpx + internal JWT + tracing
 │   │   └── accounts.py cards.py transactions.py payments.py
 │   ├── store/
 │   │   ├── models.py
-│   │   ├── consents.py challenges.py audit.py
-│   │   └── migrations/
+│   │   └── consents.py challenges.py audit.py
 │   ├── auth/
-│   │   ├── vault.py                 # key fetch + cache + rotation
+│   │   ├── keys.py                  # KeySource: generated, file, or Vault
 │   │   └── internal_jwt.py          # mint() — role injected at construction
 │   └── risk/
 │       └── tiers.py                 # tier selection (§7.4)
 ├── services/api/                    # bank-mcp-api — READ Vault role
-│   ├── server.py                    # FastMCP assembly → ASGI `app`
+│   ├── main.py                      # composition root, ASGI `app`
+│   ├── server.py                    # FastMCP assembly
+│   ├── consent.py                   # tool visibility by consent
 │   ├── tools/
 │   │   ├── bootstrap.py accounts.py cards.py transactions.py payments.py
 │   ├── oauth/
 │   │   ├── authorize.py token.py device_flow.py qr.py
+│   ├── asgi/
+│   │   └── header_validation.py     # §3.3, ASGI not FastMCP middleware
 │   └── middleware/
-│       ├── header_validation.py     # §3.3
-│       ├── cache_scope.py           # §3.4
-│       └── consent_scope.py         # tool visibility by consent
+│       └── cache_scope.py           # §3.4
 ├── services/confirm/                # bank-mcp-confirm — WRITE Vault role
 │   ├── callback.py
 │   └── execute.py
@@ -145,7 +149,9 @@ bank-mcp/
 
 ```ini
 [importlinter]
-root_packages = bank_mcp_core, services
+root_packages =
+    services
+    postern_core
 
 [importlinter:contract:api-cannot-write]
 name = API service must not import the write path
@@ -166,7 +172,7 @@ Run in CI. This is the ZT/A3 control expressed as a lint rule.
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 
-from services.api.middleware.header_validation import HeaderBodyValidation
+from services.api.asgi.header_validation import HeaderBodyValidation
 from services.api.middleware.consent_scope import ConsentScope
 
 verifier = JWTVerifier(
@@ -187,8 +193,8 @@ register_cards(mcp)
 register_transactions(mcp)
 register_payments(mcp)
 
-# ASGI export. stateless_http + json_response are required for horizontal scaling
-# behind an ALB (§3.2) — no sticky sessions, no SSE.
+# ASGI export, in `services/api/main.py`. stateless_http + json_response are
+# required for horizontal scaling behind an ALB (§3.2) — no sticky sessions, no SSE.
 app = mcp.http_app(
     path="/mcp",
     stateless_http=True,
@@ -228,7 +234,7 @@ Endpoints to implement (RFC 8628 shapes):
 
 ## 4. Internal JWT minting (§7.2)
 
-`packages/bank_mcp_core/auth/internal_jwt.py`:
+`packages/postern-core/src/postern_core/auth/internal_jwt.py`:
 
 ```python
 from dataclasses import dataclass
@@ -313,7 +319,7 @@ Return **account labels and opaque refs**, never IBANs (§6.5). Personalised con
 
 ```python
 from typing import Annotated
-from pydantic import BeforeValidator
+from pydantic import AfterValidator
 
 def _mask_pan(v: str) -> str:
     digits = "".join(c for c in str(v) if c.isdigit())
@@ -321,7 +327,7 @@ def _mask_pan(v: str) -> str:
         raise ValueError("insufficient digits for masking")
     return f"•••• {digits[-4:]}"
 
-MaskedPan = Annotated[str, BeforeValidator(_mask_pan)]
+MaskedPan = Annotated[str, AfterValidator(_mask_pan)]
 ```
 
 `Card.pan` is `MaskedPan` and `Account.iban` is `MaskedIban`, the only two masked-type fields in the model; masking happens in the validator, so a handler that forgets fails validation rather than leaking. **Prefer the backend returning pre-masked values** — then the MCP server never holds a full `Card.pan` (§6.5, §10.17, tracked as a live dependency in the zero-trust plan §8). That does not settle PCI DSS scope on its own: a PAN a merchant typed into a descriptor arrives raw in the five `FreeText` fields (`Account.label`, `Transaction.counterparty_name`, `Transaction.description`, `Card.label`, `SessionInfo.confirmation_note`, lines 21, 37, 38, 59 and 76 of `packages/postern-core/src/postern_core/domain/models.py`) and in every agent-supplied tool argument; `FreeText` redacts it at validation time, once the raw value has already reached the process.
@@ -403,7 +409,7 @@ WORKDIR /app
 USER 1000:1000
 
 FROM runtime-slim AS api
-CMD ["uvicorn", "services.api.server:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "services.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 FROM runtime-slim AS confirm
 CMD ["uvicorn", "services.confirm.callback:app", "--host", "0.0.0.0", "--port", "8080"]
