@@ -350,11 +350,13 @@ def redaction_budget(checksums: int = _IBAN_SCAN_BUDGET) -> Iterator[RedactionSc
 
     Yields a `RedactionScope`, not the `_ScanBudget` itself: a caller
     outside this module -- `services/api/middleware/audit.py`'s audit-log
-    write, specifically -- needs to know whether this block's redaction
-    degraded, but must never gain a route to `_ScanBudget.spend()` or
-    `.remaining`. See `RedactionScope` for why that view is read-only, one
-    property wide, and safe to read after this block has already exited and
-    reset the `ContextVar` above.
+    write, specifically -- needs to know whether this block's checksum
+    allowance ran out, but must never gain a route to `_ScanBudget.spend()`
+    or `.remaining`. That is a narrower question than "did this block's
+    redaction degrade" -- see `RedactionScope.exhausted`'s own docstring for
+    exactly how the two diverge. See `RedactionScope` for why that view is
+    read-only, one property wide, and safe to read after this block has
+    already exited and reset the `ContextVar` above.
     """
     budget = _ScanBudget(checksums)
     token = _current_budget.set(budget)

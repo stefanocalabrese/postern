@@ -1010,7 +1010,9 @@ def test_redaction_budget_is_shared_across_separate_free_text_validations() -> N
 # else public ----------------------------------------------------------------
 #
 # `services/api/middleware/audit.py` needs to know, from OUTSIDE this module,
-# whether a call's redaction degraded, without gaining a route to
+# whether a call's checksum allowance ran out -- a narrower question than
+# whether its redaction degraded, see `RedactionScope.exhausted`'s own
+# docstring for how the two diverge -- without gaining a route to
 # `_ScanBudget` itself: `spend()` and `remaining` stay private on purpose --
 # `remaining`'s meaning has already changed shape three times (per-token
 # bound, call-wide budget, qualifying-start narrowing), and anything built
@@ -1203,13 +1205,15 @@ def test_bundled_unicode_version_matches_the_version_the_ranges_were_derived_aga
         "Cn characterization test above would catch that -- they only check "
         "the codepoints already listed. To fix, in order: (1) re-derive the "
         "Default_Ignorable_Code_Point list from the new Unicode version's "
-        "DerivedCoreProperties.txt, keeping only the codepoints unassigned "
-        "(category Cn) in that version; (2) update "
-        "_DEFAULT_IGNORABLE_UNASSIGNED_RANGES in "
+        "DerivedCoreProperties.txt "
+        "(https://www.unicode.org/Public/<version>/ucd/DerivedCoreProperties.txt), "
+        "keeping only the codepoints unassigned (category Cn) in that "
+        "version; (2) update _DEFAULT_IGNORABLE_UNASSIGNED_RANGES in "
         "packages/postern-core/src/postern_core/domain/masking.py to match; "
         "(3) update the expected count in "
         "test_default_ignorable_unassigned_ranges_total_3769_codepoints "
-        "(tests/test_masking_types.py) to the new total; (4) update "
+        "(tests/test_masking_types.py) to the new total, renaming the test "
+        "itself too since its name embeds the old count (3769); (4) update "
         "_RANGES_DERIVED_AGAINST_UNICODE_VERSION (tests/test_masking_types.py, "
         "this test) to the new unicodedata.unidata_version string."
     )
