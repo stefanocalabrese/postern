@@ -8,7 +8,16 @@ Neither model exposes an update or delete helper, deliberately.
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Index, String, Text, UniqueConstraint, false
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    false,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -70,5 +79,49 @@ class AuditEntry(Base):
     redaction_budget_exhausted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=false()
     )
+    # How long the tool call took, in whole milliseconds, measured with
+    # `time.monotonic()` around `call_next` alone
+    # (`services/api/middleware/audit.py`'s `_elapsed_ms`) -- not around the
+    # argument scrubbing that precedes it, and not with a wall clock, which
+    # can step backwards under an NTP correction and write a negative number
+    # into a regulator-facing table.
+    #
+    # Nullable with NO `server_default`, unlike `redaction_budget_exhausted`
+    # above, and the difference is the point: NULL here means "this row
+    # predates the column", and every row the application writes from now on
+    # carries a measured value, on the returned path AND on the raised path
+    # (a slow failure is exactly what an investigator looks for). A default
+    # would stamp every pre-existing row with a number indistinguishable
+    # from a call that genuinely took that long, so the table would be
+    # asserting a latency nobody measured.
+    #
+    # A sub-millisecond call therefore records 0, not NULL: 0 means
+    # "measured, under one millisecond", NULL means "no measurement exists
+    # for this row". Collapsing the first into the second would make live
+    # rows indistinguishable from pre-migration ones.
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The JSON-RPC id of the client request this call arrived on, stored as
+    # its string form: an id may be a string or a number on the wire, and
+    # one column cannot hold both shapes without a reader having to guess
+    # which it is looking at.
+    #
+    # What it buys is TRACEABILITY, not deduplication: an investigator can
+    # tie this row to one client request and line it up against client-side
+    # logs. It does not identify a retry. MCP 2026-07-28 has no SSE
+    # resumability, so a dropped stream makes the client re-issue the call,
+    # and the re-issued call carries a NEW id -- two rows that a reader
+    # cannot collapse, because at the protocol level they were two separate
+    # requests. Nothing here detects, counts or merges duplicates.
+    #
+    # Nullable because the id is genuinely absent sometimes:
+    # `MiddlewareContext.fastmcp_context` is typed `Context | None`, and
+    # `Context.request_id` raises `RuntimeError` when no MCP request context
+    # is established. NULL records that real state; the audit row is written
+    # either way, because a missing identifier must never become a missing
+    # audit row. `String(128)`, with the middleware truncating to the same
+    # bound before the insert, for the reason `tool_name` is clamped there:
+    # an over-long value would raise `StringDataRightTruncationError` and
+    # cost the whole row.
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (Index("ix_audit_log_customer_at", "customer_ref", "at"),)

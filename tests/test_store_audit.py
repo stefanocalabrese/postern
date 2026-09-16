@@ -53,6 +53,8 @@ async def test_append_with_redaction_budget_exhausted_true_persists_true(
             outcome="returned",
             detail=None,
             redaction_budget_exhausted=True,
+            duration_ms=0,
+            request_id=None,
         )
     async with database.sessionmaker() as s:
         row = (await s.execute(select(AuditEntry))).scalar_one()
@@ -72,6 +74,8 @@ async def test_append_with_redaction_budget_exhausted_false_persists_false(
             outcome="returned",
             detail=None,
             redaction_budget_exhausted=False,
+            duration_ms=0,
+            request_id=None,
         )
     async with database.sessionmaker() as s:
         row = (await s.execute(select(AuditEntry))).scalar_one()

@@ -59,6 +59,8 @@ async def test_a_maximum_length_customer_ref_round_trips_through_audit_log(
             outcome="returned",
             detail=None,
             redaction_budget_exhausted=False,
+            duration_ms=0,
+            request_id=None,
         )
     async with database.sessionmaker() as s:
         row = (

@@ -27,6 +27,21 @@ async def append(
     # `RedactionScope.exhausted` value to supply. A default here would let
     # a future caller silently record False instead of a measured value.
     redaction_budget_exhausted: bool,
+    # Required for the same reason, with a sharper consequence than the
+    # boolean above: `AuditEntry.duration_ms` is NULLABLE, and NULL on that
+    # column already carries a meaning -- "this row predates the column"
+    # (models.py). A default here would let a future caller write NULL from
+    # a live call, which is not a gap in the data but a false statement
+    # about when the row was written, on a regulator-facing table. Both
+    # branches of `AuditMiddleware.on_call_tool` measure a real value,
+    # including the one that handles a raised exception.
+    duration_ms: int,
+    # Required even though `None` is a legitimate value here, unlike on
+    # `duration_ms`: NULL must mean "the middleware looked for a request id
+    # and there was none", never "a caller forgot the argument". Only the
+    # caller knows which of the two it is, and a default would erase that
+    # difference at the one point where it is still known.
+    request_id: str | None,
 ) -> None:
     session.add(
         AuditEntry(
@@ -37,6 +52,8 @@ async def append(
             outcome=outcome,
             detail=detail,
             redaction_budget_exhausted=redaction_budget_exhausted,
+            duration_ms=duration_ms,
+            request_id=request_id,
         )
     )
     await session.commit()

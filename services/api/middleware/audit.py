@@ -11,6 +11,7 @@ long-lived store.
 """
 
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -66,6 +67,17 @@ _FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
 # are out of this file's scope, and it belongs wherever `store/models.py`
 # and its migrations are owned, not here.
 _MAX_TOOL_NAME = 64
+
+# `request_id` is `String(128)` (models.py), and the JSON-RPC id on the wire
+# is chosen by the client, which makes its length as agent-controlled as the
+# tool name above. Same failure mode, same fix: an over-long value reaches
+# the INSERT and raises `asyncpg.exceptions.StringDataRightTruncationError`,
+# which under this module's fail-closed policy costs the entire audit row
+# and replaces the tool's own error. Clamped before the write. A truncated
+# id still correlates with a client-side log whose id shares those first 128
+# characters, which is the whole use for this column; nothing marks the row
+# as truncated, exactly as with `tool_name`.
+_MAX_REQUEST_ID = 128
 
 
 def _scrub(value: Any) -> Any:
@@ -130,6 +142,76 @@ def _customer_ref(subject: object) -> str | None:
         return CustomerRef(value=subject).value
     except ValidationError:
         return None
+
+
+def _elapsed_ms(started: float) -> int:
+    """Whole milliseconds since `started`, a `time.monotonic()` reading.
+
+    `time.monotonic()` and not `datetime.now()`, `time.time()` or
+    `context.timestamp`: a wall clock can step backwards under an NTP
+    correction in the middle of a call and produce a negative or absurd
+    duration, which lands in an append-only, regulator-facing table with
+    nothing in the row marking it as a clock artefact. `monotonic` is
+    guaranteed non-decreasing for the life of the process, which is exactly
+    the span being measured here.
+
+    Rounded DOWN (`int()` truncates a non-negative float toward zero), not
+    to nearest: a floor can never report a call as slower than it was, and
+    an over-reported latency on this table is a claim about the bank's own
+    behaviour that the measurement does not support. The cost is a
+    systematic under-report of up to one millisecond per row, stated here
+    rather than left for a reader to discover.
+
+    A call faster than a millisecond therefore records 0, never NULL. The
+    two are different statements on this column (models.py): 0 means
+    "measured, and it was under a millisecond", NULL means "no measurement
+    exists for this row", which is true only of rows written before the
+    column existed. Writing NULL for a fast call would make a live row
+    indistinguishable from a pre-migration one.
+    """
+    return int((time.monotonic() - started) * 1000)
+
+
+def _request_id(context: MiddlewareContext[CallToolRequestParams]) -> str | None:
+    """The JSON-RPC id of the client request this call arrived on, or None.
+
+    Absent in two distinct ways, both recorded as NULL rather than raised.
+    `MiddlewareContext.fastmcp_context` is typed `Context | None` (fastmcp
+    4.0.3, `fastmcp/server/middleware/middleware.py`), so there may be no
+    context object at all; and `Context.request_id` is a PROPERTY that
+    raises `RuntimeError` when `request_context` is None, i.e. when the MCP
+    session is not established yet, so a non-None context is not enough on
+    its own. An audit row must never be lost because an identifier was
+    unavailable -- that would turn a missing correlation key into a missing
+    audit trail, which is strictly worse -- so every failure to read it ends
+    in None and the row is written regardless.
+
+    The `except` is deliberately broad rather than `except RuntimeError`:
+    `request_id` reaches through `request_context` into SDK state this
+    module does not own and cannot pin the exception type of across
+    versions, and the cost of being wrong about that type is the whole row.
+
+    `str()` because a JSON-RPC id may be a string or a number; fastmcp's
+    property already returns `str` today, and the coercion keeps this
+    module's own contract independent of that. Truncated to
+    `_MAX_REQUEST_ID` for the reason that constant documents.
+
+    What the recorded id buys is TRACEABILITY, not deduplication: an
+    investigator can tie one audit row to one client request and correlate
+    it with client-side logs. It does not detect a retry. Under MCP
+    2026-07-28 there is no SSE resumability, so a dropped stream makes the
+    client re-issue the call, and the re-issued call genuinely carries a NEW
+    id -- two rows that still read as two calls, because at the protocol
+    level they were two requests. Nothing here collapses or counts them.
+    """
+    fastmcp_context = context.fastmcp_context
+    if fastmcp_context is None:
+        return None
+    try:
+        request_id = fastmcp_context.request_id
+    except Exception:
+        return None
+    return str(request_id)[:_MAX_REQUEST_ID]
 
 
 class AuditMiddleware(Middleware):
@@ -245,10 +327,29 @@ class AuditMiddleware(Middleware):
         subject = token.claims.get("sub") if token is not None else None
         customer = _customer_ref(subject)
         at = context.timestamp
+        request_id = _request_id(context)
 
+        # Started HERE, on the line before `call_next`, and read on both the
+        # returned and the raised path: the recorded number means "how long
+        # the tool took", not "how long this middleware spent scrubbing".
+        # The `_scrub` pass above is unbounded in the argument tree it walks
+        # (masking.py spends up to a 100,000-checksum allowance on one
+        # call), so including it would let an agent inflate its own recorded
+        # duration by padding its arguments, and would blur the one thing an
+        # investigator reads this column for: which TOOL was slow.
+        started = time.monotonic()
         try:
             result = await call_next(context)
         except Exception as exc:
+            # A failing call has a duration too, and a SLOW failure -- a
+            # backend timeout, a lock held to the end of a transaction -- is
+            # exactly the shape an investigator looks for, so this branch
+            # records one from the same `started` reading rather than
+            # leaving NULL and making the row indistinguishable from a
+            # pre-migration one. Read before `_write`, on both paths, so the
+            # audit write's own database round trip is never attributed to
+            # the tool.
+            duration_ms = _elapsed_ms(started)
             # Fail closed (docs/decisions/0006-audit-write-failure.md): an
             # audit-write failure here must never become the exception the
             # caller sees. Before this, an exception from `_write` replaced
@@ -266,7 +367,15 @@ class AuditMiddleware(Middleware):
             # to be visible without one.
             try:
                 await self._write(
-                    at, customer, name, arguments, "raised", type(exc).__name__, scope.exhausted
+                    at,
+                    customer,
+                    name,
+                    arguments,
+                    "raised",
+                    type(exc).__name__,
+                    scope.exhausted,
+                    duration_ms,
+                    request_id,
                 )
             except Exception as audit_exc:
                 logger.error(
@@ -278,8 +387,23 @@ class AuditMiddleware(Middleware):
                 )
                 raise exc from audit_exc
             raise
+        # Same reading, taken before the write for the reason the raised
+        # path above states: `_write`'s own database round trip is not the
+        # tool's latency by any reading, and it is the slowest thing in this
+        # function.
+        duration_ms = _elapsed_ms(started)
         try:
-            await self._write(at, customer, name, arguments, "returned", None, scope.exhausted)
+            await self._write(
+                at,
+                customer,
+                name,
+                arguments,
+                "returned",
+                None,
+                scope.exhausted,
+                duration_ms,
+                request_id,
+            )
         except Exception as audit_exc:
             # Fail closed here too, and deliberately rather than by
             # accident: the audit table is the artefact a regulator asks
@@ -309,6 +433,14 @@ class AuditMiddleware(Middleware):
         outcome: str,
         detail: str | None,
         redaction_budget_exhausted: bool,
+        # Required, no default, matching `audit.append`'s own parameters:
+        # this is the only call site that reaches `append` outside tests,
+        # and it is reached from both branches of `on_call_tool`, each of
+        # which measures its own value. A default here would let a future
+        # branch record NULL, which on `duration_ms` means "this row
+        # predates the column" (models.py) and would be false.
+        duration_ms: int,
+        request_id: str | None,
     ) -> None:
         async with self.db.sessionmaker() as session:
             await audit.append(
@@ -320,4 +452,6 @@ class AuditMiddleware(Middleware):
                 outcome=outcome,
                 detail=detail,
                 redaction_budget_exhausted=redaction_budget_exhausted,
+                duration_ms=duration_ms,
+                request_id=request_id,
             )

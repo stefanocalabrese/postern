@@ -1,20 +1,26 @@
+import asyncio
 import logging
 import random
 import string
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.client import Client
+from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken
+from fastmcp.tools import ToolResult
 from mcp.shared.exceptions import MCPError
 from postern_core.domain.masking import _IBAN_SCAN_BUDGET, _MASK, redaction_budget
 from postern_core.store import audit as store_audit
+from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.middleware import audit as audit_middleware
-from services.api.middleware.audit import _MAX_TOOL_NAME, _scrub
+from services.api.middleware.audit import _MAX_TOOL_NAME, AuditMiddleware, _scrub
 
 
 async def rows(session: AsyncSession) -> list[AuditEntry]:
@@ -661,6 +667,7 @@ async def test_an_audit_write_failure_on_the_failure_path_chains_the_audit_excep
 
     class _FakeContext:
         timestamp = None
+        fastmcp_context = None
 
         class message:  # noqa: N801 -- mirrors the real MiddlewareContext shape
             name = "boom_tool"
@@ -676,3 +683,242 @@ async def test_an_audit_write_failure_on_the_failure_path_chains_the_audit_excep
     with pytest.raises(ToolError) as excinfo:
         await middleware.on_call_tool(_FakeContext(), call_next)  # type: ignore[arg-type]
     assert isinstance(excinfo.value.__cause__, _SimulatedAuditOutage)
+
+
+# -- duration_ms and request_id ----------------------------------------------
+#
+# Both columns are nullable and NULL means something specific on each
+# (models.py): on `duration_ms`, "this row predates the column"; on
+# `request_id`, "no id was available for this call". So every test below
+# asserts on the difference between NULL and a value, not just on presence.
+#
+# All of them read the row back through the `session` fixture, a second
+# connection whose identity map has never held the middleware's own
+# objects, so a value that only ever existed in SQLAlchemy memory cannot
+# pass them -- the middleware commits through `database.sessionmaker()`,
+# which is a different session entirely.
+
+# A tool sleeps 60 ms and the assertion floor is 50, deliberately not 60.
+# `_elapsed_ms` floors (audit.py), and asyncio's timer may fire up to one
+# clock resolution early -- `BaseEventLoop._run_once` compares against
+# `self.time() + self._clock_resolution` -- so a 60 ms sleep can legitimately
+# measure a hair under 60 and floor to 59. The 10 ms of slack buys that
+# without weakening what the test proves: a real measurement of the tool's
+# own latency cannot land under 50 for a 60 ms sleep, and both a hardcoded
+# 0 and a NULL fail it.
+_SLEEP_SECONDS = 0.06
+_SLEEP_FLOOR_MS = 50
+
+# Catches a unit error in the other direction, which the floor above cannot:
+# seconds recorded as-is would floor to 0 and fail the lower bound, but
+# MICROseconds would record about 60,000 and sail past it. Ten seconds for a
+# 60 ms sleep is far enough above any scheduling delay on a loaded CI box
+# that it does not make this test flaky.
+_IMPLAUSIBLE_MS = 10_000
+
+
+class _DirectContext:
+    """The parts of `MiddlewareContext` that `on_call_tool` actually reads.
+
+    Verified against `services/api/middleware/audit.py`: it touches
+    `message.name`, `message.arguments`, `timestamp` and `fastmcp_context`,
+    and nothing else. Used only where no real client call can produce the
+    state under test -- `fastmcp_context is None`, and a `Context` whose
+    `request_id` raises -- because FastMCP always supplies a usable context
+    on a real in-process call. Both states are states of the REAL types:
+    `MiddlewareContext.fastmcp_context` is declared `Context | None = None`
+    (fastmcp 4.0.3, `fastmcp/server/middleware/middleware.py`), and
+    `Context.request_id` raises `RuntimeError` whenever `request_context` is
+    None, which the test below asserts before relying on it.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        arguments: dict[str, object] | None = None,
+        fastmcp_context: Context | None = None,
+    ) -> None:
+        self.message = SimpleNamespace(name=name, arguments=arguments or {})
+        self.timestamp = datetime.now(UTC)
+        self.fastmcp_context = fastmcp_context
+
+
+async def test_a_successful_call_records_the_duration_the_tool_actually_took(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """A row with a duration is the whole point: an investigator reading
+    `audit_log` before this column could not tell a 3-second call from a
+    3-millisecond one."""
+
+    async def slow_tool() -> str:
+        await asyncio.sleep(_SLEEP_SECONDS)
+        return "ok"
+
+    audit_server.tool(name="slow_tool")(slow_tool)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("slow_tool", {})
+    entry = (await rows(session))[0]
+    assert entry.outcome == "returned"
+    assert entry.duration_ms is not None
+    assert entry.duration_ms >= _SLEEP_FLOOR_MS
+    assert entry.duration_ms < _IMPLAUSIBLE_MS
+
+
+async def test_a_failing_call_records_its_duration_too(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """The `except` branch computes the duration from the same
+    `time.monotonic()` reading the success path uses. A SLOW FAILURE -- a
+    backend timeout, a lock held for the length of a transaction -- is
+    exactly what an investigator goes looking for, so leaving this branch at
+    NULL would drop the rows the column exists for. This tool sleeps before
+    raising so the assertion distinguishes a real measurement from a
+    hardcoded 0."""
+
+    async def slow_boom_tool() -> str:
+        await asyncio.sleep(_SLEEP_SECONDS)
+        raise ValueError("internal detail")
+
+    audit_server.tool(name="slow_boom_tool")(slow_boom_tool)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("slow_boom_tool", {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert entry.outcome == "raised"
+    assert entry.duration_ms is not None
+    assert entry.duration_ms >= _SLEEP_FLOOR_MS
+    assert entry.duration_ms < _IMPLAUSIBLE_MS
+
+
+@pytest.mark.parametrize("audit_write_raises", [False, True])
+async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged(
+    monkeypatch: pytest.MonkeyPatch, audit_write_raises: bool
+) -> None:
+    """Asserted, not reasoned about: `on_call_tool`'s failure path is a
+    try/except nested inside a try/except, and it reads as correct while
+    being wrong (that is the bug
+    docs/decisions/0006-audit-write-failure.md records). Adding two
+    arguments to the `_write` call inside the inner `try` is exactly the
+    kind of edit that can move which exception leaves the function, so this
+    pins the OBJECT identity, the type and the message -- not just "some
+    ToolError came out".
+
+    Both parametrisations matter. With the audit write succeeding, the bare
+    `raise` must re-raise `exc`; with it failing, `raise exc from audit_exc`
+    must substitute the tool's exception back in and attach the audit
+    failure as `__cause__` rather than letting it propagate in its place.
+
+    The captured `_write` arguments prove the second half: the audit row
+    still carries a measured `duration_ms` on the raised path, and a
+    `request_id` of None for a context that has no `fastmcp_context`."""
+    middleware = AuditMiddleware(db=None)  # type: ignore[arg-type]
+    tool_error = ToolError("Error calling tool 'boom_tool': internal detail")
+    written: list[dict[str, object]] = []
+
+    async def call_next(context: object) -> ToolResult:
+        raise tool_error
+
+    async def record_write(
+        at: object,
+        customer: object,
+        name: object,
+        arguments: object,
+        outcome: object,
+        detail: object,
+        redaction_budget_exhausted: object,
+        duration_ms: object,
+        request_id: object,
+    ) -> None:
+        written.append({"outcome": outcome, "duration_ms": duration_ms, "request_id": request_id})
+        if audit_write_raises:
+            raise _SimulatedAuditOutage("simulated audit store outage")
+
+    monkeypatch.setattr(middleware, "_write", record_write)
+    with pytest.raises(ToolError) as excinfo:
+        await middleware.on_call_tool(_DirectContext("boom_tool"), call_next)  # type: ignore[arg-type]
+
+    assert excinfo.value is tool_error
+    assert type(excinfo.value) is ToolError
+    assert str(excinfo.value) == "Error calling tool 'boom_tool': internal detail"
+    assert isinstance(excinfo.value.__cause__, _SimulatedAuditOutage) is audit_write_raises
+    assert written[0]["outcome"] == "raised"
+    assert isinstance(written[0]["duration_ms"], int)
+    assert written[0]["request_id"] is None
+
+
+async def test_the_request_id_is_recorded_and_differs_per_client_request(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """Two calls on ONE client session produce two rows with two different
+    ids, which is the honest demonstration of what this column does and does
+    not do. It ties a row to a single client request, so an investigator can
+    line it up against that client's own logs. It does NOT identify a retry:
+    MCP 2026-07-28 has no SSE resumability, so a client whose stream drops
+    re-issues the call as a NEW request with a NEW id, and the second row
+    below is indistinguishable from that case -- two rows, two ids, nothing
+    here to collapse them with."""
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1})
+        await c.call_tool("ok_tool", {"amount": 2})
+    first, second = await rows(session)
+    assert first.request_id is not None
+    assert second.request_id is not None
+    assert first.request_id != second.request_id
+    assert len(first.request_id) <= 128
+
+
+async def test_a_call_with_no_fastmcp_context_still_writes_the_row(
+    audit_server: FastMCP, database: Database, session: AsyncSession
+) -> None:
+    """`fastmcp_context` is `Context | None`. When it is None there is no
+    request id to record, and the row must still be written with NULL: an
+    audit row lost because an optional correlation key was unavailable turns
+    a missing identifier into a missing audit trail, which is strictly
+    worse.
+
+    Driven through `on_call_tool` directly with the REAL middleware and the
+    real database, because a client call cannot produce this state -- FastMCP
+    always attaches a context. `audit_server` is requested for its
+    clear-`audit_log`-before-and-after behaviour (see its docstring), not
+    for the server object."""
+    middleware = AuditMiddleware(database)
+
+    async def call_next(context: object) -> ToolResult:
+        return ToolResult(content=[])
+
+    context = _DirectContext("ok_tool", {"amount": 1})
+    assert context.fastmcp_context is None
+    await middleware.on_call_tool(context, call_next)  # type: ignore[arg-type]
+
+    entry = (await rows(session))[0]
+    assert entry.request_id is None
+    assert entry.tool_name == "ok_tool"
+    assert entry.outcome == "returned"
+    assert entry.duration_ms is not None
+
+
+async def test_a_context_whose_request_id_raises_still_writes_the_row(
+    audit_server: FastMCP, database: Database, session: AsyncSession
+) -> None:
+    """The second way the id goes missing, and the one a `is None` check
+    alone does not cover: `Context.request_id` is a PROPERTY that raises
+    `RuntimeError` when `request_context` is None, so a non-None
+    `fastmcp_context` is not enough to make the read safe. The `pytest.raises`
+    below pins that precondition against the real `Context`, so this test
+    starts failing if fastmcp ever changes the property to return None
+    instead -- at which point the handling here would be dead code, not a
+    silent no-op."""
+    real_context = Context(audit_server)
+    with pytest.raises(RuntimeError):
+        _ = real_context.request_id
+
+    middleware = AuditMiddleware(database)
+
+    async def call_next(context: object) -> ToolResult:
+        return ToolResult(content=[])
+
+    context = _DirectContext("ok_tool", {"amount": 1}, fastmcp_context=real_context)
+    await middleware.on_call_tool(context, call_next)  # type: ignore[arg-type]
+
+    entry = (await rows(session))[0]
+    assert entry.request_id is None
+    assert entry.outcome == "returned"
