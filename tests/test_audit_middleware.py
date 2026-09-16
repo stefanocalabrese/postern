@@ -2,7 +2,7 @@ import pytest
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.server.auth import AccessToken
-from postern_core.domain.masking import _MASK, redaction_budget
+from postern_core.domain.masking import _IBAN_SCAN_BUDGET, _MASK, redaction_budget
 from postern_core.store.models import AuditEntry
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -282,3 +282,63 @@ async def test_on_call_tool_request_budget_bounds_a_junk_heavy_argument_list(
     assert real_iban not in stored
     assert _MASK in stored
     assert "MT••" not in stored
+
+
+# -- `redaction_budget_exhausted`: `on_call_tool` reads `RedactionScope
+# .exhausted` after the `with redaction_budget():` block and threads it into
+# BOTH `_write` call sites -----------------------------------------------
+#
+# Same derivation as `tests/test_masking_types.py`'s
+# `_JUNK_TOKENS_TO_EXHAUST_BUDGET`: one 128-character junk token that never
+# checksums spends ~559 checksum operations, so this many of them exhausts
+# `_IBAN_SCAN_BUDGET` -- the middleware's own allowance, since `on_call_tool`
+# calls `redaction_budget()` with no override -- well before the last one is
+# scanned.
+_JUNK_TOKENS_TO_EXHAUST_BUDGET = _IBAN_SCAN_BUDGET // 100 + 50
+_EXHAUSTING_MEMO = " ".join([_JUNK_128] * _JUNK_TOKENS_TO_EXHAUST_BUDGET)
+
+
+async def test_a_call_that_exhausts_the_redaction_budget_records_it_true_on_the_returned_path(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """`ok_tool` succeeds, so this goes through `on_call_tool`'s
+    `"returned"` write -- its `memo` parameter is free text, so a
+    succeeding call can still carry enough junk to exhaust the allowance."""
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1, "memo": _EXHAUSTING_MEMO})
+    entry = (await rows(session))[0]
+    assert entry.outcome == "returned"
+    assert entry.redaction_budget_exhausted is True
+
+
+async def test_a_call_that_exhausts_the_redaction_budget_records_it_true_on_the_raised_path(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """`leaky_tool` rejects a non-integer `pan`, so this goes through
+    `on_call_tool`'s `"raised"` write -- the exhausting payload is scrubbed
+    from the raw arguments before `call_next` ever validates them."""
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("leaky_tool", {"pan": _EXHAUSTING_MEMO}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert entry.outcome == "raised"
+    assert entry.redaction_budget_exhausted is True
+
+
+async def test_an_ordinary_call_records_the_budget_as_not_exhausted_on_the_returned_path(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 50})
+    entry = (await rows(session))[0]
+    assert entry.outcome == "returned"
+    assert entry.redaction_budget_exhausted is False
+
+
+async def test_an_ordinary_call_records_the_budget_as_not_exhausted_on_the_raised_path(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("boom_tool", {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert entry.outcome == "raised"
+    assert entry.redaction_budget_exhausted is False

@@ -132,7 +132,7 @@ class AuditMiddleware(Middleware):
         # oversight: that data is not agent-controlled the way tool
         # arguments are, so splitting it into many strings is not an
         # attacker's lever the way it is here.
-        with redaction_budget():
+        with redaction_budget() as scope:
             arguments = _scrub(dict(context.message.arguments or {}))
         token = get_access_token()
         subject = token.claims.get("sub") if token is not None else None
@@ -142,9 +142,11 @@ class AuditMiddleware(Middleware):
         try:
             result = await call_next(context)
         except Exception as exc:
-            await self._write(at, customer, name, arguments, "raised", type(exc).__name__)
+            await self._write(
+                at, customer, name, arguments, "raised", type(exc).__name__, scope.exhausted
+            )
             raise
-        await self._write(at, customer, name, arguments, "returned", None)
+        await self._write(at, customer, name, arguments, "returned", None, scope.exhausted)
         return result
 
     async def _write(
@@ -155,6 +157,7 @@ class AuditMiddleware(Middleware):
         arguments: dict[str, Any],
         outcome: str,
         detail: str | None,
+        redaction_budget_exhausted: bool,
     ) -> None:
         async with self.db.sessionmaker() as session:
             await audit.append(
@@ -165,4 +168,5 @@ class AuditMiddleware(Middleware):
                 arguments=arguments,
                 outcome=outcome,
                 detail=detail,
+                redaction_budget_exhausted=redaction_budget_exhausted,
             )

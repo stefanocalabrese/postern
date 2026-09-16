@@ -76,25 +76,3 @@ async def test_append_with_redaction_budget_exhausted_false_persists_false(
     async with database.sessionmaker() as s:
         row = (await s.execute(select(AuditEntry))).scalar_one()
     assert row.redaction_budget_exhausted is False
-
-
-async def test_append_without_the_parameter_persists_false(
-    database: Database, clean_audit_log: None
-) -> None:
-    """Pins the default's value, not the seam's existence: a follow-up can
-    wire a measured value into the middleware's call site and leave
-    `= False` in place on `append()` itself, and this test keeps passing
-    either way."""
-    async with database.sessionmaker() as s:
-        await audit.append(
-            s,
-            at=datetime.now(UTC),
-            customer_ref=None,
-            tool_name="probe",
-            arguments={},
-            outcome="returned",
-            detail=None,
-        )
-    async with database.sessionmaker() as s:
-        row = (await s.execute(select(AuditEntry))).scalar_one()
-    assert row.redaction_budget_exhausted is False

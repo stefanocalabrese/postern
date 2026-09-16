@@ -20,19 +20,13 @@ async def append(
     arguments: dict[str, Any],
     outcome: str,
     detail: str | None,
-    # TEMPORARY seam: `append()` has exactly one call site outside tests --
-    # `AuditMiddleware._write` (services/api/middleware/audit.py:159),
-    # reached from both its raised-path and returned-path branches -- and
-    # it cannot pass a real value yet. `redaction_budget()` returns
-    # `Iterator[None]` and `_ScanBudget`'s own tracking is a private
-    # context variable (masking.py:222,228), so nothing outside that
-    # module can read whether the allowance ran out once the `with` block
-    # exits; a follow-up has to add that before this default can become
-    # anything but False. Until then every row this function writes
-    # records False here regardless of what actually happened during
-    # scrubbing, so a caller must not read a False on an existing row as
-    # evidence that the budget was not exhausted.
-    redaction_budget_exhausted: bool = False,
+    # Required, not defaulted: `AuditEntry.redaction_budget_exhausted`
+    # (models.py) is what this parameter fills in, and `AuditMiddleware
+    # ._write` -- the one call site outside tests, reached from both its
+    # raised-path and returned-path branches -- always has a real
+    # `RedactionScope.exhausted` value to supply. A default here would let
+    # a future caller silently record False instead of a measured value.
+    redaction_budget_exhausted: bool,
 ) -> None:
     session.add(
         AuditEntry(
