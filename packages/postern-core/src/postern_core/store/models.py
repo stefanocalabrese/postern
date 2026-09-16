@@ -19,7 +19,13 @@ class ConsentRecord(Base):
     __tablename__ = "consents"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    customer_ref: Mapped[str] = mapped_column(String(64), index=True)
+    # 128, not 64: identity.py's `_OPAQUE` accepts `cust` + one separator +
+    # up to 60 alphanumerics, 65 characters, which a 64-wide column cannot
+    # hold at all (`NOT NULL` here, so the insert fails outright rather
+    # than truncating). 128 leaves room for `_OPAQUE`'s suffix bound to
+    # widen again without another migration; matching it to 65 exactly
+    # would put this column back at the edge on the next such change.
+    customer_ref: Mapped[str] = mapped_column(String(128), index=True)
     domain: Mapped[str] = mapped_column(String(32))
     granted: Mapped[bool] = mapped_column(Boolean, default=False)
     granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -35,7 +41,11 @@ class AuditEntry(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    customer_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 128, same reasoning as `ConsentRecord.customer_ref` above: `_OPAQUE`'s
+    # current maximum is 65 characters, and a failed insert here means no
+    # audit row exists for that call at all, on a regulator-facing,
+    # append-only table.
+    customer_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
     tool_name: Mapped[str] = mapped_column(String(64))
     arguments: Mapped[dict[str, Any]] = mapped_column(JSONB)
     outcome: Mapped[str] = mapped_column(String(16))
