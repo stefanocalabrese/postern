@@ -3,6 +3,10 @@ root_packages =
     services
     postern_core
 
+# Two contracts, not one, because the services are separately deployed with
+# different Vault key material: coupling in either direction defeats the
+# split. Neither was trusted until observed to fail — see
+# services/confirm/jwks.py's docstring for the longer argument.
 [importlinter:contract:api-not-confirm]
 name = API service must not import the write path
 type = forbidden
@@ -10,3 +14,11 @@ source_modules =
     services.api
 forbidden_modules =
     services.confirm
+
+[importlinter:contract:confirm-not-api]
+name = Write path must not import the API service
+type = forbidden
+source_modules =
+    services.confirm
+forbidden_modules =
+    services.api
