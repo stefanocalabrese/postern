@@ -15,8 +15,9 @@ from mcp.shared.exceptions import MCPError
 from postern_core.domain.masking import _IBAN_SCAN_BUDGET, _MASK, redaction_budget
 from postern_core.store import audit as store_audit
 from postern_core.store.engine import Database
-from postern_core.store.models import AuditEntry
+from postern_core.store.models import REFUSAL_REASONS, AuditEntry
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.middleware import audit as audit_middleware
@@ -817,8 +818,10 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
     failure as `__cause__` rather than letting it propagate in its place.
 
     The captured `_write` arguments prove the second half: the audit row
-    still carries a measured `duration_ms` on the raised path, and a
-    `request_id` of None for a context that has no `fastmcp_context`."""
+    still carries a measured `duration_ms` on the raised path, a
+    `request_id` of None for a context that has no `fastmcp_context`, and a
+    `refusal_reason` of None for a call that reached no consent check at
+    all."""
     middleware = AuditMiddleware(db=None)  # type: ignore[arg-type]
     tool_error = ToolError("Error calling tool 'boom_tool': internal detail")
     written: list[dict[str, object]] = []
@@ -836,8 +839,16 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
         redaction_budget_exhausted: object,
         duration_ms: object,
         request_id: object,
+        refusal_reason: object,
     ) -> None:
-        written.append({"outcome": outcome, "duration_ms": duration_ms, "request_id": request_id})
+        written.append(
+            {
+                "outcome": outcome,
+                "duration_ms": duration_ms,
+                "request_id": request_id,
+                "refusal_reason": refusal_reason,
+            }
+        )
         if audit_write_raises:
             raise _SimulatedAuditOutage("simulated audit store outage")
 
@@ -852,6 +863,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
     assert written[0]["outcome"] == "raised"
     assert isinstance(written[0]["duration_ms"], int)
     assert written[0]["request_id"] is None
+    assert written[0]["refusal_reason"] is None
 
 
 async def test_the_request_id_is_recorded_and_differs_per_client_request(
@@ -931,3 +943,123 @@ async def test_a_context_whose_request_id_raises_still_writes_the_row(
     entry = (await rows(session))[0]
     assert entry.request_id is None
     assert entry.outcome == "returned"
+
+
+# -- refusal_reason ----------------------------------------------------------
+#
+# NULL on this column means "this call was not refused, or the row predates
+# the column" (models.py). Every call below arrives through the in-process
+# `Client`, which carries no access token and reaches no consent check
+# (`Client(transport=server)` accepts no auth argument), so NULL here is the
+# first of those two readings. The consent-denied rows that make the column
+# worth having need a real HTTP request and a real token; they live in
+# `tests/test_audit_refusal_reason.py`, next to the wire-response assertion
+# that pins what a denied caller is still told.
+
+
+async def test_an_ordinary_successful_call_records_no_refusal_reason(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 50})
+    entry = (await rows(session))[0]
+    assert entry.outcome == "returned"
+    assert entry.refusal_reason is None
+
+
+async def test_an_ordinary_tool_failure_records_no_refusal_reason(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """The row this column most easily gets wrong. `boom_tool` raises on its
+    own, and a refused call raises too -- both write through
+    `on_call_tool`'s `except` branch, the one that looks a refusal up. A
+    tool that failed for its own reasons was not refused, and recording
+    otherwise on a regulator-facing table would invent a consent event that
+    never happened."""
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("boom_tool", {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert entry.outcome == "raised"
+    # `ToolError`, not `ValueError`: FastMCP wraps a tool's own exception
+    # before the middleware sees it. Asserted anyway, because it is what
+    # separates this row from the refusal rows, which carry `NotFoundError`.
+    assert entry.detail == "ToolError"
+    assert entry.refusal_reason is None
+
+
+async def test_an_unknown_tool_name_records_no_refusal_reason(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """Half of the pair this column exists to separate, with no consent
+    check in play at all: a name FastMCP does not know raises
+    `NotFoundError` before any `auth=` callable runs, so nothing files a
+    decision and the row reads as the non-refusal it is. The other half --
+    the same `NotFoundError`, the same `detail`, a consent denial behind it
+    -- is in `tests/test_audit_refusal_reason.py`."""
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("no_such_tool", {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert entry.tool_name == "no_such_tool"
+    assert entry.outcome == "raised"
+    assert entry.detail == "NotFoundError"
+    assert entry.refusal_reason is None
+
+
+async def test_the_database_refuses_a_reason_outside_the_documented_set(
+    database: Database,
+) -> None:
+    """`ck_audit_log_refusal_reason` (models.py) is enforcement, not
+    documentation. Nothing an agent sends reaches this column -- every value
+    comes from `services/api/consent.py` -- so the only way an unlisted
+    string arrives is a code change that added a refusal reason without the
+    migration that widens the constraint, on a table read by queries that
+    filter on the documented values. Failing the INSERT makes that change
+    loud at the first refusal instead of leaving behind a value no query
+    counts. Asserted against the real Postgres: a constraint that exists
+    only in the SQLAlchemy metadata enforces nothing.
+
+    On its own session rather than the `session` fixture's: a violated
+    constraint aborts the transaction it lands in, and that fixture's
+    transaction is shared with everything else a test does. Nothing commits
+    here, so there is no row to clean up either."""
+    async with database.sessionmaker() as own_session:
+        with pytest.raises(IntegrityError):
+            await store_audit.append(
+                own_session,
+                at=datetime.now(UTC),
+                customer_ref=None,
+                tool_name="ok_tool",
+                arguments={},
+                outcome="raised",
+                detail="NotFoundError",
+                redaction_budget_exhausted=False,
+                duration_ms=0,
+                request_id=None,
+                refusal_reason="reason_nobody_declared",
+            )
+
+
+async def test_both_documented_reasons_are_accepted_by_that_constraint(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """The companion the test above needs: a constraint that rejected every
+    value would satisfy it just as well. Each value in `REFUSAL_REASONS`
+    goes through the real `append` and is read back, so a migration listing
+    fewer values than the code can produce fails here rather than in
+    production, where the cost is the audit row itself (fail closed, see
+    docs/decisions/0006-audit-write-failure.md)."""
+    for reason in REFUSAL_REASONS:
+        await store_audit.append(
+            session,
+            at=datetime.now(UTC),
+            customer_ref=None,
+            tool_name="cards.list",
+            arguments={},
+            outcome="raised",
+            detail="NotFoundError",
+            redaction_budget_exhausted=False,
+            duration_ms=0,
+            request_id=None,
+            refusal_reason=reason,
+        )
+    assert [e.refusal_reason for e in await rows(session)] == list(REFUSAL_REASONS)

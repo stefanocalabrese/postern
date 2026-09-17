@@ -8,6 +8,16 @@ envelope is built above the middleware chain, so a hook inspecting
 `pydantic.ValidationError` message embeds the raw offending value, which is
 the leak path CLAUDE.md's hard rule describes, and an audit table is a
 long-lived store.
+
+`refusal_reason` is TRANSCRIBED here, never inferred. A consent denial and a
+mistyped tool name both arrive as one `NotFoundError`, so this module cannot
+tell them apart from what it can see: the exception type is identical, and
+reading the reason out of a message string would couple the audit row to
+wording nobody promised to keep. `services/api/consent.py` is the only place
+that knows it refused and which of its refusals it made, so it files that
+decision and this module copies it onto the row. A future third refusal
+reason therefore changes that module and this one's vocabulary, not this
+module's logic.
 """
 
 import logging
@@ -24,6 +34,8 @@ from postern_core.identity import CustomerRef
 from postern_core.store import audit
 from postern_core.store.engine import Database
 from pydantic import TypeAdapter, ValidationError
+
+from services.api import consent
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +362,20 @@ class AuditMiddleware(Middleware):
             # audit write's own database round trip is never attributed to
             # the tool.
             duration_ms = _elapsed_ms(started)
+            # Read here and not before `call_next`, because the consent
+            # check runs INSIDE it: FastMCP evaluates a tool's `auth=` in
+            # `_get_tool` (`fastmcp/server/server.py:886-915`), which the
+            # dispatch this `call_next` reaches calls before the tool body,
+            # so a denial is always filed by the time this line runs.
+            #
+            # Keyed on the RAW requested name, not the scrubbed `name` about
+            # to be written: `consent._refuse` files its decision under the
+            # registered tool's own name, which is the name the client asked
+            # for, while `name` may have been clipped to `_MAX_TOOL_NAME` or
+            # masked by `_scrub`. Neither of those can be a registered tool,
+            # so the lookup can only miss for them, and a miss records NULL
+            # -- under-reporting a refusal instead of inventing one.
+            refusal_reason = consent.refusal_for(context.message.name)
             # Fail closed (docs/decisions/0006-audit-write-failure.md): an
             # audit-write failure here must never become the exception the
             # caller sees. Before this, an exception from `_write` replaced
@@ -376,6 +402,7 @@ class AuditMiddleware(Middleware):
                     scope.exhausted,
                     duration_ms,
                     request_id,
+                    refusal_reason,
                 )
             except Exception as audit_exc:
                 logger.error(
@@ -403,6 +430,18 @@ class AuditMiddleware(Middleware):
                 scope.exhausted,
                 duration_ms,
                 request_id,
+                # NULL, written literally rather than looked up. A tool that
+                # returned a result was not refused: a denied `auth=` check
+                # makes `_get_tool` answer None and the dispatch raise
+                # `NotFoundError`, so a refused call never reaches this
+                # line. Passing the constant makes "outcome='returned'
+                # implies refusal_reason IS NULL" a property of this
+                # function, instead of a property of whatever the consent
+                # module happens to have left on the request -- which, for
+                # one `tools/call` carrying arguments, is a decision for
+                # every consent-gated tool on the server, not just this one
+                # (see `services/api/consent.py`'s module docstring).
+                None,
             )
         except Exception as audit_exc:
             # Fail closed here too, and deliberately rather than by
@@ -441,6 +480,14 @@ class AuditMiddleware(Middleware):
         # predates the column" (models.py) and would be false.
         duration_ms: int,
         request_id: str | None,
+        # Required, no default, for the reason `duration_ms` and
+        # `request_id` above are: the raised branch asks
+        # `consent.refusal_for` and the returned branch writes None by
+        # construction, so both callers hold a real answer. A default would
+        # let a future branch record "not refused" without either branch's
+        # reasoning behind it, on the one column that distinguishes a
+        # consent record from an agent's typo.
+        refusal_reason: str | None,
     ) -> None:
         async with self.db.sessionmaker() as session:
             await audit.append(
@@ -454,4 +501,5 @@ class AuditMiddleware(Middleware):
                 redaction_budget_exhausted=redaction_budget_exhausted,
                 duration_ms=duration_ms,
                 request_id=request_id,
+                refusal_reason=refusal_reason,
             )

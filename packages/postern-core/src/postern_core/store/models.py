@@ -10,18 +10,41 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    column,
     false,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from postern_core.store.base import Base
+
+# The closed vocabulary of `AuditEntry.refusal_reason`, kept here rather than
+# in `services/api/consent.py` (where the decisions are made) so the values
+# and the CHECK constraint that enforces them cannot drift apart: the
+# constraint below is built from this tuple, and the consent check imports
+# these names instead of retyping the strings. Migration 0eb813c87298
+# hardcodes its own copy of both values deliberately -- a migration records
+# what the schema became on one date, so importing a tuple that later grows
+# would silently change what an already-applied migration claims to have done.
+#
+# Each value names what the consent check actually established, and nothing
+# more. `no_customer_ref`: the request's access token yielded nothing that
+# parses as a `CustomerRef`, so there was no customer to look consent up for
+# -- it does not say the token was absent, expired or forged, which are
+# different facts this column does not carry. `domain_not_consented`: a
+# customer reference was read and the tool's domain was not among that
+# customer's currently granted domains (`consents.granted_domains`, which
+# already treats an expired grant as absent).
+REFUSAL_NO_CUSTOMER_REF = "no_customer_ref"
+REFUSAL_DOMAIN_NOT_CONSENTED = "domain_not_consented"
+REFUSAL_REASONS: tuple[str, ...] = (REFUSAL_NO_CUSTOMER_REF, REFUSAL_DOMAIN_NOT_CONSENTED)
 
 
 class ConsentRecord(Base):
@@ -123,5 +146,66 @@ class AuditEntry(Base):
     # an over-long value would raise `StringDataRightTruncationError` and
     # cost the whole row.
     request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Why this call was refused before the tool ran, or NULL.
+    #
+    # The column exists because a consent denial and a mistyped tool name
+    # were byte-identical rows. FastMCP's `_get_tool` returns None both for
+    # a name it does not know and for a tool whose `auth=` check said no
+    # (fastmcp 4.0.3, `fastmcp/server/server.py:886-915`), and the dispatch
+    # turns both into one `NotFoundError`, so both landed here as
+    # `outcome='raised'`, `detail='NotFoundError'`, differing only in
+    # `tool_name`. Measured against the running server, 2026-09-17: a denied
+    # `cards.list` and a nonexistent `no_such_tool` produced the same two
+    # fields. One of those rows is a consent record a regulator can act on,
+    # the other is an agent spelling a name wrong.
+    #
+    # The vocabulary is `REFUSAL_REASONS` at the top of this module, held to
+    # two values by the CHECK constraint below; each names what the consent
+    # check established and not why the caller ended up in that state.
+    #
+    # NULL is every other row: the call was not refused, or the row was
+    # written before this column existed. The column cannot separate those
+    # two on its own -- `at`, read against the date migration 0eb813c87298
+    # was applied, is what separates them. No third "not a refusal" string
+    # exists, because writing one would make a claim about pre-migration
+    # rows that nothing in this table can support.
+    #
+    # `String(32)`: the longest value is 20 characters, and a regulator or a
+    # DBA reads the values straight out of a `SELECT` with no enum catalog
+    # lookup and no join. A Postgres `ENUM` would put the same closed set
+    # one `ALTER TYPE` away from every future change, including one that
+    # cannot run in the same transaction that uses it; a widened CHECK is a
+    # one-statement migration.
+    #
+    # This is the ONLY place the distinction is recorded. The MCP client is
+    # told `Unknown tool: '<name>'` for a refusal and for an unknown name
+    # alike, and that must stay true (see `services/api/consent.py`'s module
+    # docstring): naming the refusal on the wire would tell an agent that
+    # `cards.list` exists and that this customer holds cards.
+    refusal_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
-    __table_args__ = (Index("ix_audit_log_customer_at", "customer_ref", "at"),)
+    __table_args__ = (
+        Index("ix_audit_log_customer_at", "customer_ref", "at"),
+        # The closed set is enforced by the database, not by convention.
+        # Unlike `tool_name` or `arguments`, nothing an agent sends can
+        # reach this column: every value is chosen by
+        # `services/api/consent.py`, so the only way an unlisted string
+        # arrives at the INSERT is a code change that added a refusal reason
+        # without the migration that widens this constraint.
+        #
+        # The cost is stated rather than left to be discovered. Under the
+        # fail-closed policy (docs/decisions/0006-audit-write-failure.md) a
+        # violation costs the entire audit row and fails the call, and it
+        # would land on exactly the refusal rows this column exists to
+        # record. That is the same trade that record already made: a loud,
+        # bounded failure beats an undocumented string sitting in a
+        # regulator-facing table, silently missed by every query that
+        # filters on the documented ones.
+        #
+        # NULL is admitted without being listed: `NULL IN (...)` evaluates
+        # to NULL, and a CHECK constraint passes unless it evaluates FALSE.
+        CheckConstraint(
+            column("refusal_reason").in_(REFUSAL_REASONS),
+            name="ck_audit_log_refusal_reason",
+        ),
+    )

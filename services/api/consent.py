@@ -24,6 +24,32 @@ check: 5 evaluations of `check()` for a single real call, not 2. Without
 this cache every one of those 5 hits the database; with it, only the first
 does, because all 5 share one `customer.value` cache key on
 `request.state` regardless of which domain's closure runs first.
+
+A denial also FILES ITSELF, for the audit row. `auth=` answers a bare bool
+and the wire answer is `Unknown tool: '<name>'` either way, so before this
+the audit table recorded a consent refusal and a mistyped tool name as the
+same `outcome='raised'`, `detail='NotFoundError'` pair. Only this check
+knows which of the two happened, and only it knows which of its own two
+refusals it made, so it records that here rather than leaving the
+middleware to infer a reason from an exception type or a message string --
+an inference that breaks the first time a third refusal reason exists.
+`refusal_for` is what `services/api/middleware/audit.py` reads back, after
+`call_next` raises: FastMCP evaluates `auth=` inside `_get_tool`
+(`fastmcp/server/server.py:886-915`), which the middleware's own `call_next`
+reaches, so the decision is always filed before the middleware looks.
+
+Filed PER TOOL NAME, and that is not a detail. One `tools/call` evaluates
+several tools' checks, and most of them are for tools nobody called:
+measured on 2026-09-17, `accounts.get_balance` with arguments and a real
+`MCP-Protocol-Version` header, for a customer consented to `accounts` only,
+ran accounts.list=True, accounts.get_balance=True, transactions.list=False,
+cards.list=False, accounts.get_balance=True -- two denials recorded during
+one call that succeeded. A single "last denial" slot on the request would
+have stamped `domain_not_consented` onto that successful row, which on a
+regulator-facing table is a false statement about a call that was allowed.
+Keying by `AuthContext.component.name` -- the registered name, which is the
+name the client asked for -- keeps each decision attached to the tool it
+was made about.
 """
 
 from collections.abc import Awaitable, Callable
@@ -33,10 +59,17 @@ from fastmcp.server.dependencies import get_http_request
 from postern_core.identity import CustomerRef
 from postern_core.store import consents
 from postern_core.store.engine import Database
+from postern_core.store.models import (
+    REFUSAL_DOMAIN_NOT_CONSENTED,
+    REFUSAL_NO_CUSTOMER_REF,
+)
 from pydantic import ValidationError
 
 _CACHE_ATTR = "postern_consent_domains"
 _Cache = dict[str, set[str]]
+
+_REFUSALS_ATTR = "postern_consent_refusals"
+_Refusals = dict[str, str]
 
 
 def _customer(ctx: AuthContext) -> CustomerRef | None:
@@ -74,13 +107,89 @@ async def _domains(db: Database, customer: CustomerRef) -> set[str]:
     return granted
 
 
+def _refuse(ctx: AuthContext, reason: str) -> None:
+    """File this denial against the tool it was made about, for the audit row.
+
+    `request.state` carries it, the same place and lifetime as the domain
+    cache above: the audit middleware and this check run inside one HTTP
+    request, and `request.state` is scoped to exactly that request, so a
+    decision cannot outlive the call it describes or reach a concurrent one.
+    A `ContextVar` would be the other candidate and is rejected here -- this
+    check runs deeper in the call stack than the middleware that reads it,
+    and a value set in a child task's context does not propagate back to the
+    parent, which would make the route depend on whether FastMCP or the MCP
+    SDK spawns a task between the two. Neither is this module's to pin.
+
+    No HTTP request means no route and no record: `get_http_request` raises
+    when a call arrives through the in-process `Client` transport, which
+    carries no access token at all (`Client(transport=server)` accepts no
+    auth argument), so there is no consent decision to file in the first
+    place. The middleware records NULL for that call, which is what a call
+    nobody refused should read as.
+
+    Never raises. A refusal whose bookkeeping failed must still BE a
+    refusal: this returns and the caller answers False regardless, so the
+    worst outcome is an audit row that under-reports a denial as NULL, never
+    a tool call that goes through because recording the denial went wrong.
+    """
+    try:
+        request = get_http_request()
+    except Exception:
+        return
+    refusals: _Refusals | None = getattr(request.state, _REFUSALS_ATTR, None)
+    if not isinstance(refusals, dict):
+        refusals = {}
+        setattr(request.state, _REFUSALS_ATTR, refusals)
+    refusals[ctx.component.name] = reason
+
+
+def refusal_for(tool_name: str) -> str | None:
+    """Why this request's consent check refused `tool_name`, or None.
+
+    None covers three states that share one answer: no consent check ran for
+    this name (an unknown tool never reaches one -- FastMCP raises
+    `NotFoundError` before evaluating `auth=`), the check ran and allowed the
+    call, or there is no HTTP request to have filed anything on. All three
+    mean "this call was not refused by consent", which is exactly what NULL
+    says on `audit_log.refusal_reason`.
+
+    The lookup is by the name the client asked for, which is the name the
+    tool is registered under and therefore the name `_refuse` filed the
+    decision under. A transform that ever makes those two differ turns a
+    denial into a miss, and a miss reads as None: this under-reports a
+    refusal rather than inventing one, which is the direction this column
+    must fail in.
+    """
+    try:
+        request = get_http_request()
+    except Exception:
+        return None
+    refusals: _Refusals | None = getattr(request.state, _REFUSALS_ATTR, None)
+    if not isinstance(refusals, dict):
+        return None
+    reason = refusals.get(tool_name)
+    return reason if isinstance(reason, str) else None
+
+
 def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[bool]]:
     """An AuthCheck granting access to `domain` only if the customer consented."""
 
     async def check(ctx: AuthContext) -> bool:
         customer = _customer(ctx)
         if customer is None:
+            # Distinct from the domain refusal below, and the distinction is
+            # the whole reason this column exists: nothing identified a
+            # customer here, so no consent was ever looked up. Every way
+            # `_customer` returns None collapses into this one value -- no
+            # token, a `sub` that is not a string, a `sub` that does not
+            # parse as a `CustomerRef` -- because separating them is a
+            # statement about the TOKEN, and `audit_log.customer_ref` is
+            # where that question belongs.
+            _refuse(ctx, REFUSAL_NO_CUSTOMER_REF)
             return False
-        return domain in await _domains(db, customer)
+        if domain in await _domains(db, customer):
+            return True
+        _refuse(ctx, REFUSAL_DOMAIN_NOT_CONSENTED)
+        return False
 
     return check

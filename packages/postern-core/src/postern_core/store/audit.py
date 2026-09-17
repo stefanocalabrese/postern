@@ -42,6 +42,15 @@ async def append(
     # caller knows which of the two it is, and a default would erase that
     # difference at the one point where it is still known.
     request_id: str | None,
+    # Required for the same reason as `request_id`, applied to a column
+    # where the wrong value is not a gap but a contradiction: NULL on
+    # `AuditEntry.refusal_reason` means "this call was not refused"
+    # (models.py), and a call that WAS refused is the row a regulator reads
+    # this table for. `AuditMiddleware._write` reaches `append` from both
+    # branches of `on_call_tool`, and only one of them can carry a refusal;
+    # a default would let a future branch answer "not refused" without ever
+    # asking `services/api/consent.py` whether it refused.
+    refusal_reason: str | None,
 ) -> None:
     session.add(
         AuditEntry(
@@ -54,6 +63,7 @@ async def append(
             redaction_budget_exhausted=redaction_budget_exhausted,
             duration_ms=duration_ms,
             request_id=request_id,
+            refusal_reason=refusal_reason,
         )
     )
     await session.commit()
