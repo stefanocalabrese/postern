@@ -89,6 +89,48 @@ criterion gates the bank's real domain services in their own CI
 (`docs/bank-mcp-zero-trust-plan.md:110`), not this stub, so this record
 notes the difference without treating it as a discrepancy to fix here.
 
+## Correction, 2026-09-17: the divergence above is closed
+
+The paragraph above is left as written, because it was true on 2026-09-16:
+at that time, this stub returned 404 for a foreign account while the
+zero-trust plan's acceptance wording asked the real services for 403. This
+section corrects it rather than editing it in place, because a dated
+verification record states what was observed on its date, and what changed
+afterward belongs in a dated addition, not a silent rewrite.
+
+Commit `ca00af8` ("docs: ZT-2 cross-customer criterion answers 404, not 403")
+changed the plan, not the stub. The divergence recorded above no longer
+exists: `docs/bank-mcp-zero-trust-plan.md:108` now asks the real services for
+the same 404 this stub already returns, for the reason the stub's own code
+gave first. Read directly from the current file, that line's contract-test
+instruction is: "Add a contract test per domain service asserting both
+halves: customer A's token gets 404 and no account data for B's account, and
+200 with A's own data for A's own account. 404, not 403: a 403 confirms B's
+account exists, handing a guessed identifier an enumeration oracle (A5), so a
+foreign account and an invented one must return the same status and the same
+body. A status-only test also passes against a service that 404s its own
+customers." Anyone who later argues for 403 on HTTP-semantics grounds needs
+that enumeration-oracle argument in front of them first, not just the status
+code this correction changes.
+
+The same commit also fixed a second defect on the line immediately below,
+`docs/bank-mcp-zero-trust-plan.md:110`, which is a different and more
+consequential fix than the status-code change above. The old acceptance
+wording read: "an automated test suite, run in the backend services' CI,
+covering every MCP-reachable endpoint with a cross-customer request. Zero
+passes." A service that returns 404 -- or any other refusal -- to every
+caller, including its own legitimate customers, satisfies "zero passes"
+without enforcing subject scoping at all, so that criterion was unenforceable
+from the day it was written: it could not distinguish a service that
+correctly excludes customer B from a service that has never once returned
+data to anyone. Read directly from the current file, the acceptance line now
+reads: "an automated test suite, run in the backend services' CI, covering
+every MCP-reachable endpoint with a cross-customer request and a
+same-customer control. Zero cross-customer reads return data; every control
+read still returns its own." Pairing each cross-customer probe with a
+same-customer control is what closes that hole: a service that refuses
+everyone now fails the control half instead of vacuously passing.
+
 ## The control was shown to be a control, by its author, not re-measured here
 
 Commit `316b51c`'s own message states the regression check: "`86` tests;
@@ -213,3 +255,10 @@ worth the coverage is not this record's call.
   own services in their own CI, not this stub; this record only notes the
   stub took a different status code, for a stated reason, and does not
   extend that choice into a recommendation for the real services.
+  **Correction, 2026-09-17 (see "Correction, 2026-09-17" above):** the
+  question as posed no longer applies. Commit `ca00af8` changed the
+  criterion itself from 403 to 404, for the same enumeration-oracle reason
+  the stub already gave, so the stub's choice and the plan's criterion now
+  agree instead of diverging. This does not mean the real services were
+  verified here or anywhere in this session -- that remains unchecked, for
+  the same reason it always was: they are not in this repository.

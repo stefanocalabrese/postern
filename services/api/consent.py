@@ -183,8 +183,8 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
             # `_customer` returns None collapses into this one value -- no
             # token, a `sub` that is not a string, a `sub` that does not
             # parse as a `CustomerRef` -- because separating them is a
-            # statement about the TOKEN, and `audit_log.customer_ref` is
-            # where that question belongs.
+            # statement about the TOKEN, and `audit_log.customer_ref_absence_reason`
+            # is where that question belongs.
             _refuse(ctx, REFUSAL_NO_CUSTOMER_REF)
             return False
         if domain in await _domains(db, customer):
