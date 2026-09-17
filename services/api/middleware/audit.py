@@ -227,8 +227,8 @@ def _elapsed_ms(started: float) -> int:
 
     Rounded DOWN (`int()` truncates a non-negative float toward zero), not
     to nearest: a floor can never report a call as slower than it was, and
-    an over-reported latency on this table is a claim about the bank's own
-    behaviour that the measurement does not support. The cost is a
+    an over-reported latency on this table is a claim about the operator's
+    own behaviour that the measurement does not support. The cost is a
     systematic under-report of up to one millisecond per row, stated here
     rather than left for a reader to discover.
 
@@ -304,8 +304,8 @@ class AuditMiddleware(Middleware):
         # docstring for why a `ContextVar` rather than a module global, and
         # masking.py's `_redact_free_text` for the measured before/after.
         # Tool RESPONSES validated elsewhere (through pydantic models on
-        # data returned from the bank's own backend) do NOT opt in and keep
-        # a fresh per-string budget each -- a deliberate choice, not an
+        # data returned from the operator's own backend) do NOT opt in and
+        # keep a fresh per-string budget each -- a deliberate choice, not an
         # oversight: that data is not agent-controlled the way tool
         # arguments are, so splitting it into many strings is not an
         # attacker's lever the way it is here.
@@ -315,7 +315,7 @@ class AuditMiddleware(Middleware):
         # `redaction_budget()` block of its own. `context.message.name` is
         # exactly as agent-chosen as any argument value: `_MAX_TOOL_NAME`
         # (64) leaves room for a 16-digit PAN or a 31-character IBAN, and an
-        # agent that wants one in the bank's audit table does not need an
+        # agent that wants one in the operator's audit table does not need an
         # argument at all, it names a tool after one. A separate scope for
         # the name alone would quietly reintroduce a per-string allowance
         # for exactly the value this fix exists to close, defeating the one

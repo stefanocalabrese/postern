@@ -28,7 +28,7 @@ def register(
         """List the customer's accounts with their refs, labels and masked IBANs.
 
         Use the returned `ref` for every other account argument. Call
-        `banking_start_session` first if you have not already.
+        `start_session` first if you have not already.
         """
         return await facade.list_accounts(backend, resolver())
 

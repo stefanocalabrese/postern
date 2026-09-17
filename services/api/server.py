@@ -28,8 +28,8 @@ from services.api.tools import transactions as transactions_tools
 
 SERVER_INSTRUCTIONS = """\
 Postern exposes read access to the customer's own bank accounts, cards and
-transactions. Call `banking_start_session` first: it returns the accounts you
-may reference, which domains are consented, and the rules for this session.
+transactions. Call `start_session` first: it returns the accounts you may
+reference, which domains are consented, and the rules for this session.
 
 Reference accounts and cards by their `ref` values, never by IBAN or card
 number. Amounts always carry an explicit currency; report them as given and
@@ -89,9 +89,9 @@ def build_server(
         # set is the documented no-auth path (`Settings.for_testing()`, the
         # local docker-compose stack); both set is normal production. Failing
         # open here -- silently returning `auth=None`, indistinguishable from
-        # the deliberate no-auth path -- would serve a bank-facing MCP server
-        # with no authentication at all on a forgotten or misspelled
-        # environment variable. Fail startup instead.
+        # the deliberate no-auth path -- would serve an MCP server fronting
+        # the operator's backend with no authentication at all on a forgotten
+        # or misspelled environment variable. Fail startup instead.
         raise ValueError(
             "customer_jwks_uri and customer_token_issuer must both be set or "
             "both be unset (got customer_jwks_uri="

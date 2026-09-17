@@ -12,7 +12,7 @@ from dataclasses import dataclass
 class ConfirmSettings:
     write_key_pem_path: str | None = None
     write_key_kid: str = "write-1"
-    write_token_issuer: str = "https://mcp-write.bank.internal"  # noqa: S105
+    write_token_issuer: str = "https://mcp-write.internal"  # noqa: S105
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -20,7 +20,7 @@ class ConfirmSettings:
             write_key_pem_path=os.environ.get("POSTERN_WRITE_KEY_PEM_PATH") or None,
             write_key_kid=os.environ.get("POSTERN_WRITE_KEY_KID", "write-1"),
             write_token_issuer=os.environ.get(
-                "POSTERN_WRITE_TOKEN_ISSUER", "https://mcp-write.bank.internal"
+                "POSTERN_WRITE_TOKEN_ISSUER", "https://mcp-write.internal"
             ),
         )
 

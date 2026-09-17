@@ -104,7 +104,7 @@ GATED_TOOL = "accounts.list"
 # Nothing listens on port 1, so asyncpg's connect is refused immediately.
 REFUSED_URL = "postgresql+asyncpg://postern:postern@127.0.0.1:1/postern"
 
-# Every consent-gated tool registered by `build_server`. `banking_start_session`
+# Every consent-gated tool registered by `build_server`. `start_session`
 # is deliberately NOT in this set: `bootstrap.py` carries no `auth=` at all, so
 # `list_tools` never evaluates a check against it and it survives every
 # condition in this file. That is existing behaviour, asserted in

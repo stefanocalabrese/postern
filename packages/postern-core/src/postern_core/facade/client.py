@@ -38,9 +38,9 @@ class BackendError(RuntimeError):
     `detail` is always the *scrubbed* backend text (see `_detail` below): a
     `BackendError` raised inside a tool handler propagates to FastMCP and
     from there into the model's context, which lands in a vendor chat history
-    that cannot be recalled. A bank backend's 4xx/5xx body can carry a PAN,
-    an IBAN, an account number or a customer name; nothing derived from it
-    may reach this exception unscrubbed.
+    that cannot be recalled. An operator backend's 4xx/5xx body can carry a
+    PAN, an IBAN, an account number or a customer name; nothing derived from
+    it may reach this exception unscrubbed.
     """
 
     def __init__(self, status: int, detail: str, guidance: str) -> None:
@@ -79,11 +79,11 @@ class StubTokenMinter:
 
 _GUIDANCE = {
     401: "The session is no longer authorized; ask the customer to reconnect Postern.",
-    403: "This account is not covered by the current consent; call banking_start_session.",
+    403: "This account is not covered by the current consent; call start_session.",
     404: "No such record. List the available refs with the matching list tool first.",
-    429: "The bank is rate limiting this client. Wait before retrying.",
+    429: "The backend is rate limiting this client. Wait before retrying.",
 }
-_DEFAULT_GUIDANCE = "The bank could not answer right now. Tell the customer and retry later."
+_DEFAULT_GUIDANCE = "The backend could not answer right now. Tell the customer and retry later."
 
 
 def _validate_path(path: str) -> None:

@@ -1,4 +1,4 @@
-"""Stub of the bank's domain services for local development (handoff §8.7).
+"""Stub of the operator's domain services for local development (handoff §8.7).
 
 Runs only inside `docker compose`'s `backend-stub` service (see
 `docker-compose.yml`), never inside the `api`/`confirm` images -- it is
@@ -15,7 +15,7 @@ All four domain routes scope their answer to the subject of the internal
 token they receive (handoff §7.1's layer 2, `MCP server -> backend`) and
 refuse a request that carries none. That is not ZT-2 itself: the domain
 services that must enforce on `sub` belong to another team and are not in
-this repo, and `docs/bank-mcp-zero-trust-plan.md:88` still records A5's
+this repo, and `docs/postern-zero-trust-plan.md:88` still records A5's
 enforcement as unverified there. It is what gives a cross-customer test
 something that can fail here. Before it, every route took `_request: Request`
 and never read it, so a caller naming `acc_4111111111114417` got `acc_7f3a`
@@ -215,7 +215,7 @@ async def balance(request: Request) -> JSONResponse:
     # A 403 here would confirm that `acc_7f3a` is a real account while an
     # invented ref got a 404, which hands an attacker holding one valid
     # customer token a working account-enumeration oracle -- the disclosure
-    # `docs/bank-mcp-zero-trust-plan.md:88` calls A5, the confused deputy
+    # `docs/postern-zero-trust-plan.md:88` calls A5, the confused deputy
     # ZT-2 exists to stop. Both cases take this one branch and return the
     # same body, so they are indistinguishable from outside. It reads like a
     # lost 403; it is the point.
@@ -248,8 +248,8 @@ async def cards(request: Request) -> JSONResponse:
 
 # --- Local dev-only identity-provider stand-in (Task 13 finding) -----------
 #
-# Not "the bank's domain services" -- this module's own docstring and scope
-# -- this is a disposable RSA keypair and two routes standing in for the
+# Not "the operator's domain services" -- this module's own docstring and
+# scope -- this is a disposable RSA keypair and two routes standing in for the
 # customer-facing OAuth/JWKS layer (handoff §7.1's "agent to MCP server"
 # axis), a different concern from the domain data above with no real
 # equivalent anywhere else in this repo.

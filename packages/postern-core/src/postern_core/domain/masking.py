@@ -1599,7 +1599,7 @@ def _redact_free_text(value: str) -> str:
     # is the front-glue hole itself, not a baseline this fix should be
     # measured against. Callers that validate `FreeText` OUTSIDE of
     # `redaction_budget` -- today, that is every tool RESPONSE validated
-    # through a pydantic model on data returned from the bank's own
+    # through a pydantic model on data returned from the operator's own
     # backend, as opposed to agent-supplied tool ARGUMENTS -- keep a fresh
     # per-string budget each, unchanged from before this section existed.
     # That is a stated decision, not an oversight: response data is not
@@ -1656,7 +1656,7 @@ def _redact_free_text(value: str) -> str:
     # Accepted trade-off, not a free fix: this module holds firm on two
     # decisions that would cut the false-positive and CPU cost further --
     # no country-code-to-length registry, no `max_length` added to any
-    # `FreeText`-typed field -- because both are decisions about a bank's
+    # `FreeText`-typed field -- because both are decisions about an operator's
     # own tool contracts and backend field limits, not about this masking
     # function, and adding either here would be making that call by
     # accident. `_IBAN_SCAN_MAX_TOKEN` and `_IBAN_SCAN_BUDGET` are a

@@ -7,7 +7,7 @@ from postern_core.auth.read_minter import READ_SCOPES, ReadTokenMinter
 from postern_core.identity import CustomerRef
 
 CUST = CustomerRef(value="cust_7f3a")
-ISS = "https://mcp-read.bank.internal"
+ISS = "https://mcp-read.internal"
 
 
 @pytest.fixture

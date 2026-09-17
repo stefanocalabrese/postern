@@ -6,13 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Skeleton. Tasks 0 and 1 of the 15-task plan are done: uv workspace, six-gate `make ci`, import-linter contract, one decision record. No tools, no database, no auth, no backend calls. Everything in "Architecture" and "Hard rules" below describes the target, not what exists.
 
-**Naming is settled: `postern`.** The design docs predate the name and still say `bank-mcp` / `bank_mcp_core` / `bank-mcp-api`; the code uses `postern`, `postern_core`, `services/api`, `services/confirm`. Do not rename the docs. The PyPI distribution name must be `postern-mcp`, since bare `postern` is taken.
+**Naming is settled: `postern`.** Docs and code agree: `postern`, `postern_core`, `services/api`, `services/confirm`. The three design docs carried a `bank-mcp-` prefix until 17 September 2026 and were renamed then, along with the MCP tool `banking_start_session`, which is now `start_session`. The dated records under `docs/verification/` and `docs/decisions/` still carry the old names and are left that way on purpose: they record what was observed on a date. The PyPI distribution name must be `postern-mcp`, since bare `postern` is taken.
 
 ## Source documents, in reading order
 
-1. `docs/bank-mcp-design-handoff (7).md`: the architecture. Note the space and `(7)` in the filename; quote it in shell.
-2. `docs/bank-mcp-zero-trust-plan.md`: threat model, ZT-1..ZT-8 work items, CI gates, sequencing.
-3. `docs/bank-mcp-python-implementation-guide.md`: FastMCP specifics, repo layout, code patterns.
+1. `docs/postern-design-handoff.md`: the architecture.
+2. `docs/postern-zero-trust-plan.md`: threat model, ZT-1..ZT-8 work items, CI gates, sequencing.
+3. `docs/postern-python-implementation-guide.md`: FastMCP specifics, repo layout, code patterns.
 
 Cross-references: `§N.N` points at the handoff, `ZT-N` at the zero-trust plan, `A1..A11` at the attack scenarios in its §3.2.
 
@@ -20,11 +20,11 @@ Also current, and corrected against what execution actually found: `docs/superpo
 
 ## What this is
 
-An MCP server exposing a bank's own backend services to external consumer AI clients (Claude, ChatGPT, Perplexity) as tools across four domains: accounts, transactions, cards, payments.
+An MCP server exposing an operator's own backend services to external consumer AI clients (Claude, ChatGPT, Perplexity) as tools across four domains: accounts, transactions, cards, payments.
 
-**The bank is the ASPSP, not the TPP.** This inverts almost all public Open Banking prior art, where every project is a third party reading accounts through an aggregator. No inbound TPP certificate verification, no multi-ASPSP adapter layer, no eIDAS certificates presented outbound. Tool contracts borrow Open Banking semantics for familiarity only.
+**The operator is the ASPSP, not the TPP.** This inverts almost all public Open Banking prior art, where every project is a third party reading accounts through an aggregator. No inbound TPP certificate verification, no multi-ASPSP adapter layer, no eIDAS certificates presented outbound. Tool contracts borrow Open Banking semantics for familiarity only.
 
-The defining property that drives every decision: an LLM the bank does not control chooses which tools to call, against real money, with attacker-controllable text (transaction memos, payee names, merchant strings) in its context. The operating assumption is not "the network is hostile" but **"the caller is under adversarial influence at all times, even when correctly authenticated."**
+The defining property that drives every decision: an LLM the operator does not control chooses which tools to call, against real money, with attacker-controllable text (transaction memos, payee names, merchant strings) in its context. The operating assumption is not "the network is hostile" but **"the caller is under adversarial influence at all times, even when correctly authenticated."**
 
 ## Architecture
 
@@ -53,7 +53,7 @@ These are decisions carried over from the design conversation. Do not relitigate
 - **Execution belongs to the approval callback**, never a tool handler. The tool-handler process must not hold the credentials or network permission to reach backend write endpoints.
 - **The confirmation payload is built server-side from the stored challenge row**, never from agent input. This is the property that makes prompt injection at tool-call time survivable.
 - **Never accept `user_id` as a tool argument** and never hand it to the client. The server derives the customer from the token on every call. A user identifier the model can set is a direct object reference an agent can be talked into changing.
-- **Never write "Face ID" anywhere in this codebase or its docs.** The bank app brands its identity-verification feature that way, but it is server-side selfie matching in the backend cluster, not Apple's on-device feature. Any reader, human or model, will implement the wrong thing. Use "app identity verification"; write "device unlock biometric" when the phone's own biometric is meant.
+- **Never write "Face ID" anywhere in this codebase or its docs.** The operator's app brands its identity-verification feature that way, but it is server-side selfie matching in the backend cluster, not Apple's on-device feature. Any reader, human or model, will implement the wrong thing. Use "app identity verification"; write "device unlock biometric" when the phone's own biometric is meant.
 - **Masking is a type property, not a function someone remembers to call.** `MaskedPan`, `MaskedIban` via `Annotated` + Pydantic validator, whose only constructor masks. A handler that forgets must fail validation, not leak. Prefer the backend returning pre-masked values so the server never holds a full PAN and stays out of PCI DSS scope.
 - **A `ValidationError` from a masked type carries the raw PAN or IBAN.** `hide_input_in_errors` covers only `str()` and `repr()` of the exception; its structured `errors()` output and `.json()` still contain the raw offending value by default. Any handler that serializes a masking `ValidationError` toward a client must call `errors(include_input=False)` or `json(include_input=False)`, or the value the type exists to protect leaks through the error instead of the response.
 - **`payments.create_payment` takes a `payee_ref`, never a raw IBAN.** A new payee's IBAN is typed in the bank app during confirmation and never passes through the agent channel.
@@ -129,4 +129,4 @@ Four from handoff §8.7, plus three from the zero-trust plan §6.1. These block,
 
 Handoff §10 lists 28 open questions. Several change the architecture rather than the code, and four gate the payment path specifically: headless challenge initiation (§10.4), the app's pairing-code screen (§10.10), where dynamic linking is enforced (§10.13), and whether domain teams will expose pre-masked projections (§10.17). Build all four domains' tool contracts up front but ship payments last, so those three cross-team dependencies do not block reads and tier-1 writes.
 
-The §5 residual risks in the zero-trust plan are bounded, not closed: client runtime integrity cannot be attested, third-party retention is unrecallable, rendering is outside the bank's control, and the regulatory treatment of consumer AI agents against bank APIs is unsettled. Do not let anyone record them as solved.
+The §5 residual risks in the zero-trust plan are bounded, not closed: client runtime integrity cannot be attested, third-party retention is unrecallable, rendering is outside the operator's control, and the regulatory treatment of consumer AI agents against bank APIs is unsettled. Do not let anyone record them as solved.

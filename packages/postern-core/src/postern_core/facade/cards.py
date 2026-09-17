@@ -17,7 +17,7 @@ controls or a backend's event volume drives: a widenable time window
 handoff §6.5's own "not 200 records" framing already treats as routinely
 exceeding a few hundred rows. `cards.list` has neither factor -- it takes
 no arguments, so there is no parameter for a model to widen or be talked
-into widening, and a card row is created by the bank's own card-issuance
+into widening, and a card row is created by the operator's own card-issuance
 process (a discrete, ops-gated action), not logged once per event the way a
 transaction is. That is a materially different risk shape, not the same
 shape assumed safe twice.

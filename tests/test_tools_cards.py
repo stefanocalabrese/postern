@@ -4,7 +4,7 @@
 `accounts.list`'s structured-content shape from Task 8: a tool returning
 `list[Model]` wraps the list under a `"result"` key). No row cap: see
 `packages/postern-core/src/postern_core/facade/cards.py`'s module docstring
-for the reasoning (card count is bounded by the bank's own provisioning
+for the reasoning (card count is bounded by the operator's own provisioning
 process, not by a widenable query parameter the way `transactions.list`'s
 window is, so this façade does not carry the same `MAX_ROWS`/`truncated`
 treatment Task 9 added there).

@@ -1,6 +1,6 @@
 """The backend stub must enforce on the internal token's subject (ZT-2).
 
-`docs/bank-mcp-zero-trust-plan.md:301` makes ZT-2 the critical path: "If the
+`docs/postern-zero-trust-plan.md:301` makes ZT-2 the critical path: "If the
 domain services do not enforce on the token subject, nothing else in this
 plan matters." Those services are another team's code and are not in this
 repo, so what this file tests is the local test double, `stub/backend.py` --

@@ -1,6 +1,6 @@
-# Bank MCP — Python / FastMCP Implementation Guide
+# Postern — Python / FastMCP Implementation Guide
 
-**Third document in the set.** Read `bank-mcp-design-handoff (7).md` (architecture) and `bank-mcp-zero-trust-plan.md` (security) first. §N.N references point to the handoff; ZT-N references point to the zero-trust plan.
+**Third document in the set.** Read `postern-design-handoff.md` (architecture) and `postern-zero-trust-plan.md` (security) first. §N.N references point to the handoff; ZT-N references point to the zero-trust plan.
 
 **Purpose:** turn the design into a repo. This document covers framework specifics, project layout, and the code patterns that carry security properties.
 
@@ -62,7 +62,7 @@ Mixing imports between them produces confusing type errors. Pin `fastmcp>=4.0.3,
 
 ```toml
 [project]
-name = "bank-mcp"
+name = "postern"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -100,7 +100,7 @@ strict = true
 Two deployables sharing a core library (§8.2 of the handoff — this is a decision, not a preference):
 
 ```
-bank-mcp/
+postern/
 ├── pyproject.toml
 ├── Dockerfile                       # multi-target, see §8
 ├── migrations/                      # Alembic env.py + versions/
@@ -121,7 +121,7 @@ bank-mcp/
 │   │   └── internal_jwt.py          # mint() — role injected at construction
 │   └── risk/
 │       └── tiers.py                 # tier selection (§7.4)
-├── services/api/                    # bank-mcp-api — READ Vault role
+├── services/api/                    # postern-api — READ Vault role
 │   ├── main.py                      # composition root, ASGI `app`
 │   ├── server.py                    # FastMCP assembly
 │   ├── consent.py                   # tool visibility by consent
@@ -133,7 +133,7 @@ bank-mcp/
 │   │   └── header_validation.py     # §3.3, ASGI not FastMCP middleware
 │   └── middleware/
 │       └── cache_scope.py           # §3.4
-├── services/confirm/                # bank-mcp-confirm — WRITE Vault role
+├── services/confirm/                # postern-confirm — WRITE Vault role
 │   ├── callback.py
 │   └── execute.py
 └── tests/
@@ -178,11 +178,11 @@ from services.api.middleware.consent_scope import ConsentScope
 verifier = JWTVerifier(
     jwks_uri=settings.customer_jwks_uri,
     issuer=settings.customer_token_issuer,
-    audience="bank-mcp",
+    audience="postern",
     required_scopes=None,          # scope checks are per-tool, not global
 )
 
-mcp = FastMCP(name="bank-mcp", auth=verifier, instructions=SERVER_INSTRUCTIONS)
+mcp = FastMCP(name="postern", auth=verifier, instructions=SERVER_INSTRUCTIONS)
 
 mcp.add_middleware(HeaderBodyValidation())
 mcp.add_middleware(ConsentScope())
@@ -248,9 +248,9 @@ class InternalTokenMinter:
     """One instance per Vault role. The API service constructs the READ minter
     only; the confirm service constructs the WRITE minter only. There is no
     code path that gives a process both."""
-    issuer: str            # https://mcp-read.bank.internal | mcp-write...
+    issuer: str            # https://mcp-read.internal | mcp-write...
     key: RSAKey            # fetched from Vault at startup, cached, rotated
-    actor: str = "svc:bank-mcp"
+    actor: str = "svc:postern"
 
     def mint(
         self,
@@ -294,7 +294,7 @@ Load-bearing, because client support for server `instructions` varies and we des
 
 ```python
 @mcp.tool
-async def banking_start_session(ctx: Context = CurrentContext()) -> SessionInfo:
+async def start_session(ctx: Context = CurrentContext()) -> SessionInfo:
     """Start here. Returns your available accounts, what this session may do,
     and how confirmations work. Call this before any other banking tool."""
     token = get_access_token()

@@ -39,7 +39,7 @@ def register(
 
         `items` may not be the complete window: this call never returns more
         than a fixed number of rows in one response, no matter how wide
-        `days` is or how many the bank's backend holds. Check `truncated`
+        `days` is or how many the operator's backend holds. Check `truncated`
         before reporting a total or a count to the customer -- if it is
         `true`, narrow `days` (or ask the customer to narrow the period)
         rather than presenting `items` as the whole history for the window.

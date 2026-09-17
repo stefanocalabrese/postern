@@ -1,4 +1,4 @@
-# Bank MCP Server — Design Handoff
+# Postern — Design Handoff
 
 **Purpose:** This document carries the design decisions from a planning conversation into an implementation session. It is written for a Claude Code session that has access to the actual codebase, AWS accounts, and internal service contracts.
 
@@ -23,11 +23,11 @@ Before writing any code, do these six things in order:
 
 4. **Answer the open questions in §10 with the user before implementing.** Several of them change the architecture, not just the code.
 
-5. **Read `bank-mcp-python-implementation-guide.md`** for framework specifics, repo layout, and code patterns. **Its §0 verification protocol is mandatory** — FastMCP is at v4 (PrefectHQ org, not jlowin), and almost every FastMCP example in training data and on the web is v2 or v3. Do not reconstruct API shapes from memory.
+5. **Read `postern-python-implementation-guide.md`** for framework specifics, repo layout, and code patterns. **Its §0 verification protocol is mandatory** — FastMCP is at v4 (PrefectHQ org, not jlowin), and almost every FastMCP example in training data and on the web is v2 or v3. Do not reconstruct API shapes from memory.
 
-6. **Read the companion document `bank-mcp-zero-trust-plan.md`.** It carries the threat model, the zero-trust gap analysis, and the security work items. **ZT-2 in that document (do the backend domain services enforce on the JWT `sub`?) is on the critical path** — if they do not, the whole authorization layer is decorative, and finding that out six weeks in would be the worst available outcome. Answer it in week one.
+6. **Read the companion document `postern-zero-trust-plan.md`.** It carries the threat model, the zero-trust gap analysis, and the security work items. **ZT-2 in that document (do the backend domain services enforce on the JWT `sub`?) is on the critical path** — if they do not, the whole authorization layer is decorative, and finding that out six weeks in would be the worst available outcome. Answer it in week one.
 
-**Terminology trap — read before writing code:** the bank app's identity-verification feature is branded "Face ID" internally, but it is **server-side selfie matching running in the backend cluster**, not Apple's on-device Face ID. Never use the term "Face ID" in this codebase. See §7.4.
+**Terminology trap — read before writing code:** the operator's app brands its identity-verification feature "Face ID" internally, but it is **server-side selfie matching running in the backend cluster**, not Apple's on-device Face ID. Never use the term "Face ID" in this codebase. See §7.4.
 
 **Things in this document that are decisions, not suggestions:** the tool surface must not contain a payment execution tool (§6.2); consent state and eIDAS keys live in the MCP account only (§5); the confirmation payload is built server-side from stored state, never from agent input (§6.3).
 
@@ -35,24 +35,24 @@ Before writing any code, do these six things in order:
 
 ## 1. What is being built
 
-An MCP server that exposes a bank's capabilities to AI agents (Claude and others) as tools, organised by banking domain, covering both read and write operations, with tool contracts shaped to match Open Banking API semantics.
+An MCP server that exposes an operator's capabilities to AI agents (Claude and others) as tools, organised by banking domain, covering both read and write operations, with tool contracts shaped to match Open Banking API semantics.
 
 **Confirmed scope (answered by Stefano):**
 
 - **Consumers: external third-party agents.** Not internal-only. Internet-facing edge, public OAuth callback, client registration gate, per-client rate limiting.
-- **Backend: the org's own services only.** The server does NOT act as a TPP consuming other banks' Open Banking APIs. No multi-ASPSP adapter layer (§8 collapses).
+- **Backend: the org's own services only.** The server does NOT act as a TPP consuming other ASPSPs' Open Banking APIs. No multi-ASPSP adapter layer (§8 collapses).
 - **Domains in v1: accounts, transactions, cards, payments** — all four. See §11 for why payments should still land last *within* v1.
 
-**We are the ASPSP, not the TPP.** This inverts the usual Open Banking posture and much of the public prior art (§14), where every project is a third party reading accounts via an aggregator. Here the bank services the accounts and external agents consume. Tool contracts are still modelled on Open Banking semantics for familiarity and future portability, but the eIDAS direction reverses — see §7.1.
+**We are the ASPSP, not the TPP.** This inverts the usual Open Banking posture and much of the public prior art (§14), where every project is a third party reading accounts via an aggregator. Here the operator services the accounts and external agents consume. Tool contracts are still modelled on Open Banking semantics for familiarity and future portability, but the eIDAS direction reverses — see §7.1.
 
-**Who the "third parties" are: consumer AI clients, not licensed TPPs.** The customers are the bank's own; the third party is the *client software* (Claude, ChatGPT, Perplexity). The customer authenticates directly with us via the QR flow (§7.3) and reaches only their own accounts. The AI vendor is a software supplier, comparable to a browser — not a payment institution.
+**Who the "third parties" are: consumer AI clients, not licensed TPPs.** The customers are the operator's own; the third party is the *client software* (Claude, ChatGPT, Perplexity). The customer authenticates directly with us via the QR flow (§7.3) and reaches only their own accounts. The AI vendor is a software supplier, comparable to a browser — not a payment institution.
 
 **Working assumption: this is our own direct channel, NOT a PSD2 dedicated interface.** That means no inbound TPP certificate verification, no testing facility, no published availability statistics, no fallback mechanism. **Confirm with compliance (§10.2)** — the regulatory treatment of consumer AI agents against bank APIs is not settled, and if it were ever judged a dedicated interface the obligation set is a programme, not a feature.
 
 **What follows from external consumer clients:**
 
 - **We control nothing about rendering.** No say in the system prompt, the UI, or whether a model paraphrases a balance wrongly. Mitigate in the tool layer: structured amounts with explicit currency and `as_of`, account identifier alongside every balance, strict `outputSchema` (§6.5).
-- **Customer data lands in third-party chat histories** under their retention policies, unrecallable by the bank. Minimization is the control (§6.5).
+- **Customer data lands in third-party chat histories** under their retention policies, unrecallable by the operator. Minimization is the control (§6.5).
 - **Allowlist clients.** With CIMD anyone with a metadata document can present themselves. Start with a known set, each with its own client ID, rate limits, and kill switch.
 - **Design for the weakest client, not for Claude.** MCP feature support varies across vendors and some will lag the `2026-07-28` revision. This makes the bootstrap tool (§4.2) load-bearing: it is the only context-delivery mechanism that works everywhere, because it arrives as a tool result. Depend on neither `resources` being read nor MRTR being supported.
 - **Attended access, so no four-poll cap.** PSD2's four-polls-per-day limit applies to *unattended* access. Users are present in the conversation.
@@ -125,14 +125,14 @@ Caveat that drives the design below: client support has been inconsistent. Claud
 
 ### 4.2 A bootstrap tool (required — do not skip)
 
-Expose a tool such as `banking_start_session` that the instructions and every tool description point to as the required first call. It returns:
+Expose a tool such as `start_session` that the instructions and every tool description point to as the required first call. It returns:
 
 - The user's available accounts and their identifiers
 - Current consent status per domain (which reads are authorized, which writes are enabled, consent expiry dates)
 - The operating rules: how to reference accounts, currency/amount formats, pagination conventions, what the confirmation flow looks like and what to tell the user during it
 - Which tools are currently callable given consent state
 
-This guarantees the guidance arrives regardless of client behaviour, and it is personalized rather than static — which for a banking server is more useful than a fixed instruction blob anyway.
+This guarantees the guidance arrives regardless of client behaviour, and it is personalized rather than static. Every answer this server gives is per-customer, so personalization is worth more here than a fixed instruction blob anyway.
 
 ### 4.3 Tool descriptions
 
@@ -283,7 +283,7 @@ Initial AIS (account information) consent authorization needs SCA too, and re-au
 
 ### 6.5 Data masking and minimization
 
-**Why this is a primary control, not hygiene.** Consumers are external AI clients (Claude, ChatGPT, Perplexity — §1). Tool results land in those vendors' chat histories, under their retention policies, and **the bank cannot recall them**. There is no MCP "do not persist" flag, and a note in a tool description is a prompt, not a control. Ephemeral/incognito modes are user settings we cannot require, detect, or verify.
+**Why this is a primary control, not hygiene.** Consumers are external AI clients (Claude, ChatGPT, Perplexity — §1). Tool results land in those vendors' chat histories, under their retention policies, and **the operator cannot recall them**. There is no MCP "do not persist" flag, and a note in a tool description is a prompt, not a control. Ephemeral/incognito modes are user settings we cannot require, detect, or verify.
 
 Therefore: **data we never return cannot be retained anywhere.** Minimization is the mechanism.
 
@@ -325,7 +325,7 @@ This is better security regardless of masking. A new-payee IBAN arriving as a mo
 
 #### Consent must state the disclosure
 
-The authorization screen (§7.3) must name the client receiving the data and say plainly that account data will be sent to it and retained under that client's policy, not the bank's. The client name is available from the token.
+The authorization screen (§7.3) must name the client receiving the data and say plainly that account data will be sent to it and retained under that client's policy, not the operator's. The client name is available from the token.
 
 ### 6.6 Tool quality
 
@@ -359,7 +359,7 @@ Also worth investigating with the org: the **Enterprise Managed Authorization (E
 
 #### Do not conflate workload identity with user identity
 
-Two separate layers. Getting this wrong makes the MCP server a confused deputy with blanket access to every account in the bank.
+Two separate layers. Getting this wrong makes the MCP server a confused deputy with blanket access to every account the operator holds.
 
 | | Question answered | Source |
 |---|---|---|
@@ -382,9 +382,9 @@ This makes the §6.2 rule ("the tool handler can never reach a backend write end
 
 ```json
 {
-  "iss": "https://mcp-write.bank.internal",
+  "iss": "https://mcp-write.internal",
   "sub": "cust:7f3a...",
-  "act": { "sub": "svc:bank-mcp" },
+  "act": { "sub": "svc:postern" },
   "aud": "payments.svc",
   "scope": "payments:execute",
   "consent_id": "...",
@@ -489,7 +489,7 @@ Three mitigations, all required — not a menu:
 
 #### Terminology — read this before writing any code
 
-**The bank's app calls its identity-verification feature "Face ID". It is NOT Apple Face ID.** It is a **server-side selfie matching service running in the backend cluster**: the app captures a selfie, sends it to the backend, and the backend performs matching and liveness detection.
+**The operator's app calls its identity-verification feature "Face ID". It is NOT Apple Face ID.** It is a **server-side selfie matching service running in the backend cluster**: the app captures a selfie, sends it to the backend, and the backend performs matching and liveness detection.
 
 **Never write "Face ID" in this codebase or in design docs.** Any reader — human or model — will assume Apple's on-device Secure Enclave feature and generate the wrong implementation. Use **"app identity verification"** (or the product's real internal name) throughout. Where the *phone's* own biometric unlock is meant, write "device unlock biometric" explicitly.
 
@@ -557,18 +557,18 @@ Tempting and wrong. The verb is a backend implementation detail and maps badly i
 
 | Service | Contains | Vault role | Can reach |
 |---|---|---|---|
-| **`bank-mcp-api`** | MCP tools, OAuth/device-grant endpoints, QR page | **read** | Backend read endpoints only |
-| **`bank-mcp-confirm`** | Approval callback handler, execution | **write** | Backend write endpoints |
+| **`postern-api`** | MCP tools, OAuth/device-grant endpoints, QR page | **read** | Backend read endpoints only |
+| **`postern-confirm`** | Approval callback handler, execution | **write** | Backend write endpoints |
 
 Shared code (`domain/`, `store/`, `facade/`) ships as an internal library used by both. If these run as one process, a compromised tool handler holds the write key and the entire structural argument in §6.2 collapses into a code-review promise.
 
 ### 8.3 Layout
 
 ```
-bank-mcp/
+postern/
   pyproject.toml
   packages/
-    bank_mcp_core/              # shared library
+    postern_core/               # shared library
       domain/
         types.py                # MaskedPan, MaskedIban, Money, CustomerRef
         account.py card.py transaction.py payment.py
@@ -582,17 +582,17 @@ bank-mcp/
         vault.py                # key fetch + in-memory cache + rotation
         internal_jwt.py         # mint(sub, aud, scope, ...) — role injected
   services/
-    api/                        # bank-mcp-api  (READ role)
+    api/                        # postern-api  (READ role)
       server.py                 # FastMCP assembly -> ASGI `app`
       tools/
-        bootstrap.py            # banking_start_session (§4.2)
+        bootstrap.py            # start_session (§4.2)
         accounts.py cards.py transactions.py payments.py
       oauth/
         authorize.py token.py device_flow.py qr.py
       middleware/
         header_validation.py    # §3.3 — Mcp-Method/Mcp-Name vs body, 400 / -32020
         cache_scope.py          # §3.4 — per-user, never global
-    confirm/                    # bank-mcp-confirm  (WRITE role)
+    confirm/                    # postern-confirm  (WRITE role)
       callback.py               # signed approval -> validate -> execute
       execute.py
   tests/
@@ -681,7 +681,7 @@ Postgres in the MCP VPC. At minimum:
 
 ## 10. Open questions — resolve with Stefano before implementing
 
-1. ~~Internal or internet-facing ALB?~~ **Answered: internet-facing.** Consumers are the bank's own customers using external AI clients (Claude, ChatGPT, Perplexity). WAF, public OAuth callback, client allowlist, per-client rate limits and kill switches all required.
+1. ~~Internal or internet-facing ALB?~~ **Answered: internet-facing.** Consumers are the operator's own customers using external AI clients (Claude, ChatGPT, Perplexity). WAF, public OAuth callback, client allowlist, per-client rate limits and kill switches all required.
 2. ~~TPP or internal-only?~~ **Answered: own backend only, and we are the ASPSP.** No TPP QWAC, no multi-ASPSP adapter (§8). Still to confirm with **compliance**: whether consumer AI clients acting for our own customers make this a PSD2 dedicated interface. Current working assumption is no — the customer authenticates directly with us and the AI vendor is a software supplier — but the treatment of consumer AI agents against bank APIs is not settled. Get an opinion; do not let it block the build.
 3. **Multi-tenant or single-institution?** Per-user consent records and a full OAuth redirect handler, versus one credential set.
 4. **Does the confirmation service support headless challenge initiation,** or does it assume a web session it can redirect? If redirect-based today, an API is needed that opens a challenge from a server-side context and returns a status handle. **This is a dependency on another team — raise it early.**
@@ -691,7 +691,7 @@ Postgres in the MCP VPC. At minimum:
 8. ~~Where does matching happen?~~ **Answered: server-side, in the backend cluster.** Art. 9 therefore applies on every tier-2 use (§7.4).
 9. **What Art. 9(2) basis does the existing identity-verification service rely on,** and does a DPIA already cover agent-initiated use? If not, a new DPIA is needed before tier 2 ships.
 10. **Does the bank app support a pairing-code confirmation screen** for cross-device flows (§7.3), or does it currently approve without one? If not, that is an app-side change and a dependency on the mobile team.
-11. **Is the QR rotating or static** in any existing cross-device flow the bank already runs? Reuse it if it rotates; flag it if it doesn't.
+11. **Is the QR rotating or static** in any existing cross-device flow the operator already runs? Reuse it if it rotates; flag it if it doesn't.
 12. **What accessibility fallback exists** when a user cannot complete identity verification?
 13. **Does the app hold a device-bound key from enrolment that can sign a challenge payload, or does the backend mint the authentication code after verifying both factors?** Determines where dynamic linking is enforced (§7.4). **Confirm from the source — do not assume.**
 14. **Token lifetime and refresh.** An agent session can run for hours. Is there a refresh token, and is refresh silent or does it require re-authentication? Separately: what should the agent do when the underlying AIS consent lapses mid-session?
@@ -750,7 +750,7 @@ lifecycle { ignore_changes = [task_definition, desired_count] }
 
 The app pipeline registers new task-definition revisions and updates the service. **Terraform owns shape; the app pipeline owns version.**
 
-**Cross-repo contract via SSM Parameter Store, not hardcoded values.** Terraform publishes under a known prefix (e.g. `/bank-mcp/<env>/`): ECR repository URIs, cluster name, both service names, subnet and security group IDs, secret ARNs, the JWKS URL. The app pipeline reads them at deploy time. This avoids duplicating values across repos **and** avoids granting the app pipeline access to Terraform state.
+**Cross-repo contract via SSM Parameter Store, not hardcoded values.** Terraform publishes under a known prefix (e.g. `/postern/<env>/`): ECR repository URIs, cluster name, both service names, subnet and security group IDs, secret ARNs, the JWKS URL. The app pipeline reads them at deploy time. This avoids duplicating values across repos **and** avoids granting the app pipeline access to Terraform state.
 
 ### 12.2 Image
 
@@ -758,8 +758,8 @@ The app pipeline registers new task-definition revisions and updates the service
 
 | Image | Entrypoint | Task role |
 |---|---|---|
-| `bank-mcp-api` | ASGI app (FastMCP + OAuth endpoints) | read |
-| `bank-mcp-confirm` | Approval callback handler | write |
+| `postern-api` | ASGI app (FastMCP + OAuth endpoints) | read |
+| `postern-confirm` | Approval callback handler | write |
 
 The security boundary is the task role and Vault role (§7.2, §8.2), not code presence — but an RCE in the read container should not even find the write path's code. Cheap, and keeps the separation visible in the registry.
 
@@ -770,7 +770,7 @@ The security boundary is the task role and Vault role (§7.2, §8.2), not code p
 - **Build for ARM64.** Graviton on Fargate is roughly 20% cheaper for identical work; no reason for a Python service not to.
 - Avoid Alpine for Python — musl breaks wheels and is slower.
 
-**⚠ Distroless kills ECS Exec.** Distroless has no shell, which is why it is attractive in a bank and exactly why `ecs execute-command` will not work (it needs `/bin/sh`). **Decide deliberately, not during an incident.**
+**⚠ Distroless kills ECS Exec.** Distroless has no shell, which is why it is attractive at a regulated operator and exactly why `ecs execute-command` will not work (it needs `/bin/sh`). **Decide deliberately, not during an incident.**
 
 Recommendation: distroless in production, `python:3.12-slim` in non-prod so debugging is possible where it is safe. If the platform team requires distroless everywhere, logging and tracing must be genuinely good before shipping — that is all you will have.
 
@@ -788,7 +788,7 @@ Vault role configuration may be owned by the platform team rather than this repo
 
 - **GitHub OIDC to AWS.** No long-lived access keys.
 - ECR image scanning **plus** Trivy in CI.
-- **SBOM generation and image signing (cosign)** — likely mandatory in a bank. Ask the platform team what supply-chain requirements already exist rather than inventing new ones.
+- **SBOM generation and image signing (cosign)** — likely mandatory at a regulated operator. Ask the platform team what supply-chain requirements already exist rather than inventing new ones.
 - The four CI gates from §8.7 (golden masking test, header/body mismatch, import-linter, backend contract tests) block the build, not just warn.
 - Separate pipelines per environment; production deploys gated.
 
@@ -815,7 +815,7 @@ Relevant SEPs: 2575 (handshake removal), 2567 (session removal), 2243 (header ro
 
 ## 14. Prior art (GitHub survey, Sept 2026)
 
-Surveyed ~24 public repos matching "open banking mcp server". Summary: **the read-only AIS surface is a solved, crowded problem; the write/PIS surface is essentially unbuilt; nothing exists for the bank-internal first-party case.** Treat prior art as a source of tool-shape conventions, not as a starting point.
+Surveyed ~24 public repos matching "open banking mcp server". Summary: **the read-only AIS surface is a solved, crowded problem; the write/PIS surface is essentially unbuilt; nothing exists for the operator-internal first-party case.** Treat prior art as a source of tool-shape conventions, not as a starting point.
 
 ### Worth reading
 
@@ -851,7 +851,7 @@ Adjacent but different problems: `codespar/mcp-dev-latam` (~271 stars, LatAm com
 ### What this means for us
 
 1. No reference implementation exists for the write path. We are building it, not adopting it. Budget accordingly.
-2. No reference implementation exists for a bank exposing its own internal services. Every project is a third party reading accounts via an aggregator.
+2. No reference implementation exists for an operator exposing its own internal services. Every project is a third party reading accounts via an aggregator.
 3. Nothing integrates a first-party biometric confirmation service. Our §6.3 flow is the novel part of this design and deserves the most review.
 4. If the org ever wants an aggregator rather than direct ASPSP integrations, **Enable Banking** is the one the ecosystem has converged on for Europe.
 

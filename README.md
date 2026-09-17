@@ -2,17 +2,18 @@
 
 A small guarded gate, not the main entrance.
 
-Postern is an MCP server that exposes a bank's own backend services to external AI
-clients (Claude, ChatGPT, Perplexity) as tools, across four domains: accounts,
-transactions, cards, payments. The bank is the ASPSP. Customers are the bank's own,
-and they authenticate directly with Postern through a QR device-grant flow; the AI
-vendor is a software supplier, closer to a browser than to a payment institution.
+Postern is an MCP server that exposes an operator's own backend services to
+external AI clients (Claude, ChatGPT, Perplexity) as tools, across four domains:
+accounts, transactions, cards, payments. The operator is the ASPSP, and the
+customers are the operator's own: they authenticate directly with Postern through
+a QR device-grant flow, and the AI vendor is a software supplier, closer to a
+browser than to a payment institution.
 
 That inverts nearly all public Open Banking prior art, where the project is a third
 party reading accounts through an aggregator. A survey of 24 public "open banking
 mcp server" repos in September 2026 found the read-only surface crowded, the write
-surface essentially unbuilt, and nothing at all for the bank-internal first-party
-case.
+surface essentially unbuilt, and nothing at all for the operator-internal
+first-party case.
 
 ## Status
 
@@ -29,7 +30,7 @@ read/write key split.
 
 ## The design in one paragraph
 
-An LLM the bank does not control decides which tools to call, on behalf of a
+An LLM the operator does not control decides which tools to call, on behalf of a
 customer, against their real money, with attacker-controllable text (transaction
 memos, payee names, merchant strings) sitting in its context. So the operating
 assumption is not "the network is hostile" but "the caller is under adversarial
@@ -71,7 +72,7 @@ Read `CLAUDE.md` before changing anything. The load-bearing ones:
 - **Masking is a type property.** `MaskedPan` and `MaskedIban` mask on construction.
   A handler that forgets fails validation instead of leaking. Counterparty account
   numbers are omitted entirely: name only.
-- **Never write "Face ID" in this codebase.** The bank app brands its
+- **Never write "Face ID" in this codebase.** The operator's app brands its
   identity-verification feature that way, but it is server-side selfie matching in
   the backend cluster, not Apple's on-device feature. Any reader, human or model,
   will build the wrong thing. Write "app identity verification", and "device unlock
@@ -133,13 +134,14 @@ instead. See `docs/decisions/0001-facade-http-client.md`.
 
 Read in this order:
 
-1. `docs/bank-mcp-design-handoff (7).md`, the architecture, 868 lines. Section 10
+1. `docs/postern-design-handoff.md`, the architecture, 868 lines. Section 10
    lists 28 open questions; several change the architecture rather than the code.
-2. `docs/bank-mcp-zero-trust-plan.md`, the threat model and work items ZT-1 to ZT-8.
-3. `docs/bank-mcp-python-implementation-guide.md`, framework specifics and code
+2. `docs/postern-zero-trust-plan.md`, the threat model and work items ZT-1 to ZT-8.
+3. `docs/postern-python-implementation-guide.md`, framework specifics and code
    patterns. Its section 0 verification protocol is mandatory.
 
 **ZT-2 is the critical path and it is not answered in this repo.** Istio validates
-the JWT; the bank's domain services must enforce on it. If any handler scopes its
-query by an account ID taken from the request body rather than by the token `sub`,
-the whole authorization layer is decorative and cross-customer access is live.
+the JWT; the operator's domain services must enforce on it. If any handler
+scopes its query by an account ID taken from the request body rather than by
+the token `sub`, the whole authorization layer is decorative and
+cross-customer access is live.

@@ -21,7 +21,7 @@ class Settings:
     # S105 fires on the name containing "token", not on the value: this is
     # the `iss` claim every read token carries, a URL a verifier compares
     # against, and it is published in the JWKS discovery path.
-    read_token_issuer: str = "https://mcp-read.bank.internal"  # noqa: S105
+    read_token_issuer: str = "https://mcp-read.internal"  # noqa: S105
     customer_jwks_uri: str | None = None
     customer_token_issuer: str | None = None
     audience: str = "postern"
@@ -89,7 +89,7 @@ class Settings:
             read_key_pem_path=os.environ.get("POSTERN_READ_KEY_PEM_PATH") or None,
             read_key_kid=os.environ.get("POSTERN_READ_KEY_KID", "read-1"),
             read_token_issuer=os.environ.get(
-                "POSTERN_READ_TOKEN_ISSUER", "https://mcp-read.bank.internal"
+                "POSTERN_READ_TOKEN_ISSUER", "https://mcp-read.internal"
             ),
             customer_jwks_uri=os.environ.get("POSTERN_JWKS_URI") or None,
             customer_token_issuer=os.environ.get("POSTERN_TOKEN_ISSUER") or None,

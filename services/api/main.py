@@ -152,7 +152,7 @@ def create_app(
     generated key pair so a consent-enforcement test can mint its own
     tokens, the same way every other task in this plan already mocks its
     external dependencies because there is no live customer token, real
-    bank or real identity provider to call against in CI.
+    operator backend or real identity provider to call against in CI.
     """
     settings = settings or Settings.from_env()
 

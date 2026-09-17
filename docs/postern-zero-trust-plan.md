@@ -1,6 +1,6 @@
-# Bank MCP — Zero Trust Implementation and Mitigation Plan
+# Postern — Zero Trust Implementation and Mitigation Plan
 
-**Companion to** `bank-mcp-design-handoff (7).md`. That document is the architecture; this one is the security posture, the threat model, and the work items needed to make zero trust real rather than claimed. Section references in the form §N.N point to the handoff document.
+**Companion to** `postern-design-handoff.md`. That document is the architecture; this one is the security posture, the threat model, and the work items needed to make zero trust real rather than claimed. Section references in the form §N.N point to the handoff document.
 
 **Audience:** a Claude Code session implementing this, with access to the codebase and AWS accounts.
 
@@ -20,7 +20,7 @@
 
 ## 1. What "zero trust" means for this system specifically
 
-The system's defining property: **an LLM the bank does not control decides which tools to call, on behalf of a customer, against their real money.** Prompt injection is not a hypothetical — transaction descriptions, payee names and merchant strings are attacker-controllable text that lands in the model's context.
+The system's defining property: **an LLM the operator does not control decides which tools to call, on behalf of a customer, against their real money.** Prompt injection is not a hypothetical — transaction descriptions, payee names and merchant strings are attacker-controllable text that lands in the model's context.
 
 So the operating assumption is not "the network is hostile." It is stronger:
 
@@ -71,7 +71,7 @@ Ranked by severity. Detail and acceptance criteria in §4.
 |---|---|
 | **Prompt injection** via attacker-controlled text in the model's context | Can cause any tool call the model is capable of making, with arbitrary arguments |
 | **Compromised AI vendor** | Holds valid client credentials, customer tokens, and full chat history |
-| **Compromised MCP server** (RCE in `bank-mcp-api`) | Read-path Vault key, database access, all in-flight sessions |
+| **Compromised MCP server** (RCE in `postern-api`) | Read-path Vault key, database access, all in-flight sessions |
 | **Stolen customer device** | App access if unlocked; cannot pass tier-2 identity verification |
 | **Cross-device phishing attacker** | Can display our QR on their own page and harvest a session |
 | **Malicious insider** with Vault access | Can mint tokens for any subject |
@@ -83,7 +83,7 @@ Ranked by severity. Detail and acceptance criteria in §4.
 |---|---|---|---|
 | **A1** | Injected text in a transaction memo causes `create_payment` to an attacker IBAN | No execute tool (§6.2); push payload built server-side from the stored row (§6.3); `payee_ref` only, no raw IBAN from the agent (§6.5) | User approves a payment they did not intend but *can see correctly*. Social engineering remains. |
 | **A2** | QR relayed to a phishing page; victim approves the attacker's session | Pairing code shown on both surfaces and confirmed **before** identity verification; rotating QR; short TTL (§7.3) | Depends on the app actually implementing the pairing screen — **open question 10** |
-| **A3** | RCE in `bank-mcp-api` attempts a payment | Read-path Vault key only; Istio rejects write-audience claims; write path is a separate deployable (§7.2, §8.2) | Attacker can read everything the read role can read |
+| **A3** | RCE in `postern-api` attempts a payment | Read-path Vault key only; Istio rejects write-audience claims; write path is a separate deployable (§7.2, §8.2) | Attacker can read everything the read role can read |
 | **A4** | Valid token replayed from attacker infrastructure | **None — bearer tokens** | **ZT-6** |
 | **A5** | Confused deputy: customer A's session reads customer B's accounts | JWT `sub` propagated (§7.2) — **enforcement unverified** | **ZT-2 — critical** |
 | **A6** | Bulk exfiltration via many legitimate-looking reads | Bounded result sets, per-client rate limits (§6.5) | No per-customer behavioural baseline — **ZT-5** |
@@ -184,8 +184,8 @@ Static tiers plus payment risk rules, but nothing watches the session. Forty cal
 The handoff specifies two deployables but not the network policy between them.
 
 **Do:**
-- Separate security groups per service. `bank-mcp-api` must **not** be able to reach `bank-mcp-confirm` directly — the confirmation callback arrives from the backend, not from the API service.
-- Database-level separation: distinct Postgres roles per service, with `bank-mcp-api` holding no write grant on the challenges table beyond inserting pending rows.
+- Separate security groups per service. `postern-api` must **not** be able to reach `postern-confirm` directly — the confirmation callback arrives from the backend, not from the API service.
+- Database-level separation: distinct Postgres roles per service, with `postern-api` holding no write grant on the challenges table beyond inserting pending rows.
 - PrivateLink endpoint security groups scoped to the specific task security groups, not the VPC CIDR.
 - Document explicitly that network isolation is **defence in depth, not the control**.
 
@@ -239,7 +239,7 @@ Tool results land in vendor chat histories under vendor retention policies. Ther
 
 **Bounding:** minimization as the primary mechanism (§6.5); masked types; bounded result sets; consent screen naming the client and the disclosure; per-client kill switch (ZT-7).
 
-**Accepted residual:** everything ever returned through this channel is permanently outside the bank's control. **This is a legitimate reason to scope this channel more tightly than the bank's own app.**
+**Accepted residual:** everything ever returned through this channel is permanently outside the operator's control. **This is a legitimate reason to scope this channel more tightly than the operator's own app.**
 
 ### 5.3 We do not control rendering
 A client may paraphrase a balance incorrectly and a customer may act on it.
@@ -249,7 +249,7 @@ A client may paraphrase a balance incorrectly and a customer may act on it.
 **Open:** conduct-risk position on erroneous rendering by a third-party client. **Needs a decision from the conduct/compliance function — this is not an engineering call.**
 
 ### 5.4 Regulatory treatment is unsettled
-Whether consumer AI agents acting for a bank's own customers constitute an account information service has not been tested (handoff §1, open question 2).
+Whether consumer AI agents acting for an operator's own customers constitute an account information service has not been tested (handoff §1, open question 2).
 
 **Bounding:** design as reading (a); do not market to third-party organizations; keep the dedicated-interface option open by using Open Banking-shaped contracts.
 

@@ -32,7 +32,7 @@ def test_the_write_minter_uses_the_write_issuer(settings: ConfirmSettings) -> No
     claims = jwt.decode(
         token, KeySet.import_key_set(source.public_jwks()), algorithms=["RS256"]
     ).claims
-    assert claims["iss"] == "https://mcp-write.bank.internal"
+    assert claims["iss"] == "https://mcp-write.internal"
     assert claims["aud"] == "payments.svc"
 
 

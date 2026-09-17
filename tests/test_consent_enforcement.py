@@ -179,7 +179,7 @@ async def test_a_customer_with_no_consent_sees_only_the_bootstrap_tool(
 ) -> None:
     app = app_for(pg_url, key_pair, backend)
     out = await rpc(app, token_for(key_pair, "cust_7f3a"), "tools/list", {})
-    assert {t["name"] for t in out["result"]["tools"]} == {"banking_start_session"}
+    assert {t["name"] for t in out["result"]["tools"]} == {"start_session"}
 
 
 async def test_a_malformed_subject_yields_no_error_and_no_consent_gated_tool(
@@ -187,12 +187,12 @@ async def test_a_malformed_subject_yields_no_error_and_no_consent_gated_tool(
 ) -> None:
     """An uncaught exception in the auth check becomes JSON-RPC -32603.
 
-    Corrected from the plan's original `tools == []`: `banking_start_session`
+    Corrected from the plan's original `tools == []`: `start_session`
     deliberately carries no consent check at all (Step 4 -- "Do NOT attach a
-    check to banking_start_session", and `bootstrap.py` is out of this
-    task's scope), so FastMCP's `list_tools` never evaluates any check
-    against it and it is unconditionally listed regardless of whether the
-    token's subject parses as a customer. Measured directly against this
+    check to start_session", and `bootstrap.py` is out of this task's scope),
+    so FastMCP's `list_tools` never evaluates any check against it and it is
+    unconditionally listed regardless of whether the token's subject parses
+    as a customer. Measured directly against this
     implementation: it is the only tool that survives. The property this
     test actually guards -- a malformed subject degrades to a clean, empty
     *consent-gated* catalogue rather than surfacing `error` (JSON-RPC
@@ -205,4 +205,4 @@ async def test_a_malformed_subject_yields_no_error_and_no_consent_gated_tool(
         {},
     )
     assert "error" not in out
-    assert {t["name"] for t in out["result"]["tools"]} == {"banking_start_session"}
+    assert {t["name"] for t in out["result"]["tools"]} == {"start_session"}

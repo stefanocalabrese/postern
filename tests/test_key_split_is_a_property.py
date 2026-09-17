@@ -19,7 +19,7 @@ from services.confirm.minter import WriteTokenMinter, build_write_minter
 from services.confirm.settings import ConfirmSettings
 
 CUST = CustomerRef(value="cust_7f3a")
-WRITE_ISS = "https://mcp-write.bank.internal"
+WRITE_ISS = "https://mcp-write.internal"
 
 
 def istio_write_endpoint(token: str, write_jwks: KeySetSerialization) -> Claims:
@@ -55,7 +55,7 @@ def write_jwks(write_service: tuple[WriteTokenMinter, KeySource]) -> KeySetSeria
 def api_minter() -> ReadTokenMinter:
     source = GeneratedKeySource(kid="read-1")
     return ReadTokenMinter(
-        InternalTokenMinter(issuer="https://mcp-read.bank.internal", key_source=source)
+        InternalTokenMinter(issuer="https://mcp-read.internal", key_source=source)
     )
 
 

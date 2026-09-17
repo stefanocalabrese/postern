@@ -1,4 +1,4 @@
-"""`banking_start_session` (Task 11, handoff §4.2, "required, do not skip").
+"""`start_session` (Task 11, handoff §4.2, "required, do not skip").
 
 The only context-delivery mechanism that works across every client, because
 it arrives as a tool result rather than as `server/discover`'s `instructions`
@@ -32,21 +32,21 @@ def server() -> FastMCP:
 
 async def test_bootstrap_returns_accounts_with_masked_ibans(server: FastMCP) -> None:
     async with Client(transport=server) as client:
-        result = await client.call_tool("banking_start_session", {})
+        result = await client.call_tool("start_session", {})
     assert result.structured_content is not None
     assert result.structured_content["accounts"][0]["iban"] == "ES•• •••• 1332"
 
 
 async def test_bootstrap_reports_no_write_capability_in_this_release(server: FastMCP) -> None:
     async with Client(transport=server) as client:
-        result = await client.call_tool("banking_start_session", {})
+        result = await client.call_tool("start_session", {})
     assert result.structured_content is not None
     assert result.structured_content["write_enabled"] == []
 
 
 async def test_bootstrap_explains_the_confirmation_model(server: FastMCP) -> None:
     async with Client(transport=server) as client:
-        result = await client.call_tool("banking_start_session", {})
+        result = await client.call_tool("start_session", {})
     assert result.structured_content is not None
     note = result.structured_content["confirmation_note"]
     assert "banking app" in note
@@ -54,7 +54,7 @@ async def test_bootstrap_explains_the_confirmation_model(server: FastMCP) -> Non
 
 async def test_bootstrap_lists_consent_per_domain(server: FastMCP) -> None:
     async with Client(transport=server) as client:
-        result = await client.call_tool("banking_start_session", {})
+        result = await client.call_tool("start_session", {})
     assert result.structured_content is not None
     domains = {c["domain"] for c in result.structured_content["consents"]}
     assert domains == {"accounts", "transactions", "cards", "payments"}
@@ -68,7 +68,7 @@ async def test_bootstrap_payments_consent_is_not_granted(server: FastMCP) -> Non
     session could do would need payments consent granted.
     """
     async with Client(transport=server) as client:
-        result = await client.call_tool("banking_start_session", {})
+        result = await client.call_tool("start_session", {})
     assert result.structured_content is not None
     consents = {c["domain"]: c["granted"] for c in result.structured_content["consents"]}
     assert consents["payments"] is False
@@ -77,20 +77,20 @@ async def test_bootstrap_payments_consent_is_not_granted(server: FastMCP) -> Non
 async def test_server_instructions_point_at_the_bootstrap_tool() -> None:
     from services.api.server import SERVER_INSTRUCTIONS
 
-    assert "banking_start_session" in SERVER_INSTRUCTIONS
+    assert "start_session" in SERVER_INSTRUCTIONS
 
 
 async def test_bootstrap_is_annotated_read_only(server: FastMCP) -> None:
     async with Client(transport=server) as client:
         tools = {t.name: t for t in await client.list_tools()}
-    assert tools["banking_start_session"].annotations is not None
-    assert tools["banking_start_session"].annotations.read_only_hint is True
+    assert tools["start_session"].annotations is not None
+    assert tools["start_session"].annotations.read_only_hint is True
 
 
 async def test_bootstrap_takes_no_arguments(server: FastMCP) -> None:
     async with Client(transport=server) as client:
         tools = {t.name: t for t in await client.list_tools()}
-    properties = tools["banking_start_session"].input_schema.get("properties", {})
+    properties = tools["start_session"].input_schema.get("properties", {})
     assert properties == {}
 
 
@@ -105,7 +105,7 @@ async def test_no_write_tool_is_registered_on_the_server(server: FastMCP) -> Non
     async with Client(transport=server) as client:
         names = {tool.name for tool in await client.list_tools()}
     assert names == {
-        "banking_start_session",
+        "start_session",
         "accounts.list",
         "accounts.get_balance",
         "transactions.list",
@@ -131,7 +131,7 @@ async def test_bootstrap_confirmation_note_flags_labels_as_customer_data(
     `instructions` -- states plainly that a label is data, not a directive.
     """
     async with Client(transport=server) as client:
-        result = await client.call_tool("banking_start_session", {})
+        result = await client.call_tool("start_session", {})
     assert result.structured_content is not None
     note = result.structured_content["confirmation_note"]
     assert "not instructions" in note or "not a directive" in note or "customer" in note.lower()

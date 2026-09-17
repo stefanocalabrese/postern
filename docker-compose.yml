@@ -1,6 +1,6 @@
 # Local development stack (handoff §8.7): Postgres is not wired yet (no
 # database exists in this plan), so this is the `api` image plus a stub of
-# the bank's backend. No VPC, no Vault, no real customer.
+# the operator's backend. No VPC, no Vault, no real customer.
 #
 # `POSTERN_JWKS_URI`/`POSTERN_TOKEN_ISSUER` point at `backend-stub`'s own
 # disposable local IdP (`stub/backend.py`'s `/.well-known/jwks.json` and

@@ -12,7 +12,7 @@ module or the backend at all.
 of `days`. The plan as originally drafted bounded the window and stopped
 there, but a wide window on an active current account is plausibly several
 thousand rows, and every one of them would land in a vendor chat history the
-bank cannot recall (handoff §6.5's own framing: "One unbounded call persists
+operator cannot recall (handoff §6.5's own framing: "One unbounded call persists
 five years of history permanently, somewhere we cannot reach" -- the same
 sentence that motivates the day bound motivates a row bound just as
 directly, since days-bounded is not rows-bounded on an active account).

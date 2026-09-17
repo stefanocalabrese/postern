@@ -15,7 +15,7 @@ from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource
 from postern_core.identity import CustomerRef
 
-READ_ISS = "https://mcp-read.bank.internal"
+READ_ISS = "https://mcp-read.internal"
 CUST = CustomerRef(value="cust_7f3a")
 
 _BASE_CLAIM_KEYS = {"iss", "sub", "act", "aud", "scope", "iat", "exp", "jti"}

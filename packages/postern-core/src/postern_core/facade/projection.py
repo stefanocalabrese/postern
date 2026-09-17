@@ -18,10 +18,10 @@ FastMCP's own dispatcher (`fastmcp/server/server.py`, `call_tool`'s `except
 PydanticValidationError as e:` branch, verified by reading that source),
 which logs it via `logger.warning(..., e.errors(include_url=False))` --
 `.errors()`, not `.str()`, so `hide_input_in_errors` does not apply, and the
-raw value reaches the server's own logs. In a bank those logs typically ship
-to a SIEM, often a third party: a real egress channel for exactly the values
-this system exists to keep in, distinct from (and in addition to) the
-model-facing channel the golden masking harness scans.
+raw value reaches the server's own logs. In a regulated deployment those logs
+typically ship to a SIEM, often a third party: a real egress channel for
+exactly the values this system exists to keep in, distinct from (and in
+addition to) the model-facing channel the golden masking harness scans.
 
 `build_model` is the one place every façade projection module (accounts,
 transactions, cards, the session bootstrap) should construct a domain model
@@ -77,5 +77,5 @@ def build_model[Model](factory: Callable[[], Model], *, resource: str) -> Model:
         raise BackendError(
             502,
             f"backend response for {resource!r} failed validation on field(s): {fields}",
-            "The bank returned data in an unexpected shape. Tell the customer and retry later.",
+            "The backend returned data in an unexpected shape. Tell the customer and retry later.",
         ) from None
