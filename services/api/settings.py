@@ -41,6 +41,19 @@ class Settings:
     backend_write_timeout_seconds: float = 2.0
     backend_read_timeout_seconds: float = 5.0
     backend_pool_timeout_seconds: float = 1.0
+    # The same treatment for the consent/audit store, which had none of it:
+    # `create_async_engine` carried no `connect_args`, so connecting fell
+    # back to asyncpg's `connect(timeout=60)` default and a statement that
+    # stalled after the connection was up had no deadline whatsoever. These
+    # three reach `Database.__init__` at `services/api/main.py`, which
+    # documents what each one bounds and what the command timeout costs; the
+    # values are smaller than the backend's because everything this engine
+    # runs is one indexed SELECT on the consents table or one audit INSERT,
+    # not a transaction export. Worst case per database operation: 1.0 +
+    # 2.0 + 3.0 = 6.0s.
+    database_connect_timeout_seconds: float = 2.0
+    database_command_timeout_seconds: float = 3.0
+    database_pool_timeout_seconds: float = 1.0
     # Task 12: `HeaderBodyValidation.max_body_bytes` is opt-in and unset by
     # default (Task 5) because nothing in that task's scope could pick a
     # number on a deployment's behalf. This deployment's tool surface is
@@ -107,6 +120,15 @@ class Settings:
             ),
             backend_pool_timeout_seconds=float(
                 os.environ.get("POSTERN_BACKEND_POOL_TIMEOUT_SECONDS", "1.0")
+            ),
+            database_connect_timeout_seconds=float(
+                os.environ.get("POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS", "2.0")
+            ),
+            database_command_timeout_seconds=float(
+                os.environ.get("POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS", "3.0")
+            ),
+            database_pool_timeout_seconds=float(
+                os.environ.get("POSTERN_DATABASE_POOL_TIMEOUT_SECONDS", "1.0")
             ),
             max_body_bytes=int(os.environ.get("POSTERN_MAX_BODY_BYTES", str(1_048_576))),
         )

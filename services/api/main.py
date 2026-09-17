@@ -182,7 +182,23 @@ def create_app(
     # below is, because `AuditMiddleware` must record every call regardless
     # of whether real customer auth is configured: the local docker-compose
     # stack and `Settings.for_testing()` both still want an audit trail.
-    db = Database(settings.database_url)
+    #
+    # The three timeouts are the store's equivalent of `_backend_timeout`
+    # above, and they are passed as asyncpg `connect_args` rather than in the
+    # URL, which silently hands the driver a string it cannot add to a float.
+    # They bound the connect, every statement, and the wait for a pooled
+    # connection; `Database.__init__` carries the per-phase reasoning and,
+    # more importantly, what the command timeout costs. In short: under
+    # `docs/decisions/0006-audit-write-failure.md` a failed audit write fails
+    # the call, so a store slow enough to blow the statement budget now fails
+    # calls it would previously have served late. That is the trade, taken
+    # against a path whose two queries are one indexed SELECT and one INSERT.
+    db = Database(
+        settings.database_url,
+        connect_timeout_seconds=settings.database_connect_timeout_seconds,
+        command_timeout_seconds=settings.database_command_timeout_seconds,
+        pool_timeout_seconds=settings.database_pool_timeout_seconds,
+    )
 
     # Consent is enforced against `AuthContext.token`, which only exists when
     # real customer authentication is configured. `has_real_customer_auth`

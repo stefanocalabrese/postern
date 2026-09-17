@@ -33,19 +33,23 @@ opposite answers:
   - BLACKHOLE (the TCP handshake completes and the server never speaks --
     the shape a hung database or a dropping network path actually has).
     Measured against a real listener that accepts and stays silent:
-    `TimeoutError` after **60.0 seconds**, which is asyncpg's own default
-    `connect(timeout=60)`. That driver default is the ONLY deadline anywhere
-    on this path: no `command_timeout`, no `statement_timeout`, no pool
-    timeout and no request deadline is configured in this repository -- every
-    timeout in it belongs to the backend HTTP client
-    (`services/api/main.py:_backend_timeout`), which is a different
-    dependency. So a hung store holds the request for a minute and only then
-    denies it. Slower, not different: still `Exception`, still caught, still
-    denied, and the backend is never reached.
+    `TimeoutError` after **60.0 seconds**, which was asyncpg's own default
+    `connect(timeout=60)` and, as measured on 2026-09-17, the ONLY
+    deadline anywhere on this path -- no `command_timeout`, no
+    `statement_timeout`, no pool timeout, with every configured timeout in
+    the repository belonging to the backend HTTP client
+    (`services/api/main.py:_backend_timeout`), a different dependency. So a
+    hung store held the request for a minute and only then denied it.
+    `Database.__init__` now sets all three itself (2.0s connect, 3.0s per
+    statement, 1.0s pool, each configurable), which changes how long that
+    minute is and nothing else: still `Exception`, still caught, still
+    denied, and the backend still never reached. That invariance is the
+    point of keeping this test.
 
-`test_a_blackholed_consent_store_...` below lowers that 60s to 1s so CI does
-not wait a minute; the 60s figure above is the measured production default,
-not an estimate. Passing the timeout in the URL query string does NOT work
+`test_a_blackholed_consent_store_...` below passes 1s through that
+constructor so CI does not spend even the 2; the 60s figure above is the
+driver default this path actually ran on, measured, not an estimate.
+Passing the timeout in the URL query string does NOT work
 and was tried: SQLAlchemy hands asyncpg the string "1" and the connect dies
 with `TypeError: unsupported operand type(s) for +: 'float' and 'str'` in
 0.0s, which would have made the test pass for entirely the wrong reason.
@@ -88,7 +92,7 @@ from postern_core.facade.client import BackendClient
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry, ConsentRecord
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware import Middleware
 
 from services.api.asgi.header_validation import HeaderBodyValidation
@@ -453,23 +457,22 @@ async def test_a_blackholed_consent_store_currently_denies_only_after_the_driver
     """The other failure shape: accepted, then silence. Same verdict, later.
 
     A refused connection raises in 0.0s. A blackhole raises only when
-    something above it gives up, and the only thing that does is asyncpg's
-    own `connect(timeout=...)`, whose production default is 60 seconds --
-    measured, and the sole deadline on this path. The timeout is lowered to
-    1s here so CI does not spend a minute proving it; the assertion that the
-    call took AT LEAST that long is what distinguishes a real wait from a
-    fast failure for some other reason, which is how the URL-query-string
-    attempt described in the module docstring was caught.
+    something above it gives up, and until `Database` took `connect_args` the
+    only thing that did was asyncpg's own `connect(timeout=...)` at its
+    60-second default -- measured, and the sole deadline on this path. It is
+    now a constructor argument defaulting to 2.0s, lowered to 1s here so CI
+    does not spend even that; the assertion that the call took AT LEAST that
+    long is what distinguishes a real wait from a fast failure for some other
+    reason, which is how the URL-query-string attempt described in the module
+    docstring was caught.
     """
     await _seed(consent_session, CUSTOMER, "accounts")
     url = f"postgresql+asyncpg://postern:postern@127.0.0.1:{blackhole_port}/postern"
-    hanging = Database(url)
-    # `Database` takes no `connect_args`, and the query-string form silently
-    # passes asyncpg a string it cannot add to a float. Replacing the engine
-    # is the only way to reach the driver's connect timeout from here; the
-    # engine built by the constructor is discarded unconnected.
-    hanging.engine = create_async_engine(url, connect_args={"timeout": 1.0})
-    hanging.sessionmaker = async_sessionmaker(hanging.engine, expire_on_commit=False)
+    # Through `Database`'s own constructor, which passes it to asyncpg as
+    # `connect_args={"timeout": ...}`. The query-string form still does not
+    # work and is still the trap: it hands asyncpg a string it cannot add to
+    # a float, in 0.0s.
+    hanging = Database(url, connect_timeout_seconds=1.0)
     try:
         backend = RecordingBackend()
         app = _app(hanging, database, key_pair, backend, _settings(pg_url))
