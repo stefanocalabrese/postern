@@ -15,8 +15,15 @@ from mcp.shared.exceptions import MCPError
 from postern_core.domain.masking import _IBAN_SCAN_BUDGET, _MASK, redaction_budget
 from postern_core.store import audit as store_audit
 from postern_core.store.engine import Database
-from postern_core.store.models import REFUSAL_REASONS, AuditEntry
-from sqlalchemy import select
+from postern_core.store.models import (
+    ABSENCE_NO_ACCESS_TOKEN,
+    ABSENCE_NO_STRING_SUBJECT,
+    ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
+    CUSTOMER_REF_ABSENCE_REASONS,
+    REFUSAL_REASONS,
+    AuditEntry,
+)
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -212,6 +219,321 @@ async def test_a_conforming_token_subject_does_reach_customer_ref(
         await c.call_tool("ok_tool", {"amount": 1})
     entry = (await rows(session))[0]
     assert entry.customer_ref == "cust_7f3a"
+
+
+# -- Which absence produced the NULL: `customer_ref_absence_reason` ----------
+#
+# A NULL `customer_ref` meant three different things and the row said which
+# of them nowhere: no access token at all, a token with no usable `sub`, and
+# a token whose `sub` is a string that fails `CustomerRef`. The third is the
+# compromised-issuer case identity.py warns about, and its evidence sat in
+# this table indistinguishable from an anonymous call.
+#
+# Every test below that inspects a row reads it back through the `session`
+# fixture -- a second connection whose identity map never held the
+# middleware's own objects -- so a value that only ever existed in SQLAlchemy
+# memory cannot pass any of them. The three constraint tests at the end use
+# their own session instead, because a violated constraint aborts the
+# transaction it lands in and that fixture's transaction is shared with
+# everything else a test does.
+
+# A PAN, used as a token subject. `CustomerRef` rejects it (identity.py's
+# `_OPAQUE` requires a `cust` namespace prefix), which is the shape a
+# compromised issuer would mint and the reason this column exists. The same
+# value the C3 tests above use.
+_ISSUER_MINTED_PAN = "4111111111111111"
+
+
+async def row_texts(session: AsyncSession) -> list[str]:
+    """Every audit row, every column, as PostgreSQL itself renders them.
+
+    `audit_log::text` on a whole-row reference emits one record literal per
+    row covering EVERY column, including any added after this test was
+    written, so the "the rejected subject is nowhere in the row" assertion
+    below cannot quietly stop covering a column somebody adds later. Reading
+    named attributes off an `AuditEntry` instead would only ever check the
+    columns the author thought of.
+    """
+    result = await session.execute(text("SELECT audit_log::text FROM audit_log ORDER BY id"))
+    return [str(row[0]) for row in result]
+
+
+async def test_a_call_with_no_access_token_records_that_no_token_was_present(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """Case 1, and the one that needs no monkeypatch to produce: the
+    in-process `fastmcp.Client` carries no credentials, so
+    `get_access_token()` returns None for every call made through it -- the
+    same property `tests/test_audit_refusal_reason.py`'s module docstring
+    gives as its reason for running over real HTTP instead. This is an
+    ordinary unauthenticated call, and the row must read as one rather than
+    as anything about a subject."""
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1})
+    entry = (await rows(session))[0]
+    assert entry.customer_ref is None
+    assert entry.customer_ref_absence_reason == ABSENCE_NO_ACCESS_TOKEN
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [{}, {"sub": None}, {"sub": 12345}],
+    ids=["no_sub_claim", "sub_is_null", "sub_is_a_number"],
+)
+async def test_a_token_with_no_usable_subject_records_its_own_class(
+    audit_server: FastMCP,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    claims: dict[str, object],
+) -> None:
+    """Case 2: a token that passed signature, issuer and audience
+    verification and still yielded no string `sub`. `_customer_ref` gates on
+    `isinstance(subject, str)`, so an absent claim, an explicit null and a
+    number all land here, and all three record the same value deliberately
+    -- none of them is the compromised-issuer case, and splitting them later
+    is a widened CHECK (see `CUSTOMER_REF_ABSENCE_REASONS` in models.py).
+
+    What must NOT happen is any of them reading as `no_access_token`: a
+    verified token with a broken subject is an issuer-side defect, while no
+    token at all is just an unauthenticated caller."""
+    token = AccessToken(token="t", client_id="c", scopes=[], claims=claims)  # noqa: S106
+    monkeypatch.setattr("services.api.middleware.audit.get_access_token", lambda: token)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1})
+    entry = (await rows(session))[0]
+    assert entry.customer_ref is None
+    assert entry.customer_ref_absence_reason == ABSENCE_NO_STRING_SUBJECT
+
+
+async def test_a_pan_shaped_token_subject_records_the_compromised_issuer_class(
+    audit_server: FastMCP, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 3, the reason this column exists, and the one whose value must
+    never be written.
+
+    The token is well-formed and its `sub` is a full PAN -- what an issuer
+    under attacker control mints, per identity.py's own warning that
+    `_OPAQUE` is a provenance convention and not proof of opacity.
+    `services/api/server.py`'s `token_customer_resolver` refuses exactly this
+    on the tool path; the audit row now says so instead of recording the same
+    bare NULL an unauthenticated call produces.
+
+    The second assertion is the hard constraint: the rejected string appears
+    in NO column of the row. `audit_log::text` renders the whole record, so
+    this covers `detail`, `arguments`, `tool_name` and the new column alike
+    -- storing the offending subject "so an investigator can see what was
+    minted" would be the one write that survives the refusal it documents."""
+    token = AccessToken(
+        token="t",  # noqa: S106
+        client_id="c",
+        scopes=[],
+        claims={"sub": _ISSUER_MINTED_PAN},
+    )
+    monkeypatch.setattr("services.api.middleware.audit.get_access_token", lambda: token)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1})
+
+    entry = (await rows(session))[0]
+    assert entry.customer_ref is None
+    assert entry.customer_ref_absence_reason == ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF
+    whole_row = (await row_texts(session))[0]
+    assert _ISSUER_MINTED_PAN not in whole_row
+    # Nor a masked form of it: `_scrub` never sees the token subject, so a
+    # `•••• 1111` anywhere in this row would mean someone routed the rejected
+    # value through the redactor and stored the remainder. The class of
+    # absence is the whole of what the row is allowed to carry, and it is
+    # there.
+    assert f"{_MASK} 1111" not in whole_row
+    assert ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF in whole_row
+
+
+async def test_a_conforming_subject_records_the_reference_and_no_absence_reason(
+    audit_server: FastMCP, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fourth state, and the one that keeps the column from being a
+    blanket stamp: an authenticated call with a valid `sub` records the
+    reference and leaves this column NULL. NULL here means "`customer_ref` is
+    present, or the row predates the column" (models.py) and nothing else --
+    there is no "a customer was found" value, because `customer_ref` already
+    carries that fact and a second copy could disagree with it."""
+    token = AccessToken(
+        token="t",  # noqa: S106
+        client_id="c",
+        scopes=[],
+        claims={"sub": "cust_7f3a"},
+    )
+    monkeypatch.setattr("services.api.middleware.audit.get_access_token", lambda: token)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1})
+    entry = (await rows(session))[0]
+    assert entry.customer_ref == "cust_7f3a"
+    assert entry.customer_ref_absence_reason is None
+
+
+async def test_the_three_absences_are_one_predicate_apart_in_the_stored_rows(
+    audit_server: FastMCP, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The measurement the column was added for: all three absences in one
+    table, told apart by a single `WHERE` on a single column.
+
+    Each of the three calls produces a row whose `customer_ref` is NULL, and
+    before this column those three rows were byte-identical in every field a
+    reader could key on. The `SELECT` below is the search an investigator
+    actually runs, executed against Postgres rather than reasoned about, and
+    it returns the compromised-issuer row alone -- not two rows, not three."""
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1})
+
+    no_subject = AccessToken(token="t", client_id="c", scopes=[], claims={})  # noqa: S106
+    monkeypatch.setattr("services.api.middleware.audit.get_access_token", lambda: no_subject)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 2})
+
+    minted = AccessToken(
+        token="t",  # noqa: S106
+        client_id="c",
+        scopes=[],
+        claims={"sub": _ISSUER_MINTED_PAN},
+    )
+    monkeypatch.setattr("services.api.middleware.audit.get_access_token", lambda: minted)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 3})
+
+    entries = await rows(session)
+    assert [e.customer_ref for e in entries] == [None, None, None]
+    assert [e.customer_ref_absence_reason for e in entries] == [
+        ABSENCE_NO_ACCESS_TOKEN,
+        ABSENCE_NO_STRING_SUBJECT,
+        ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
+    ]
+    found = await session.execute(
+        select(AuditEntry).where(
+            AuditEntry.customer_ref_absence_reason == ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF
+        )
+    )
+    assert [e.arguments for e in found.scalars().all()] == [{"amount": 3}]
+
+
+async def test_the_database_refuses_an_absence_reason_outside_the_documented_set(
+    database: Database,
+) -> None:
+    """`ck_audit_log_customer_ref_absence_reason` (models.py) is enforcement,
+    not documentation, and nothing an agent sends can reach this column:
+    every value comes from `_customer_ref`. The only way an unlisted string
+    arrives is a code change that added a class of absence without the
+    migration that widens the constraint, on a table whose readers filter on
+    the documented values. Asserted against the real Postgres, because a
+    constraint that exists only in the SQLAlchemy metadata enforces nothing
+    -- and because migration 3186c04c018c writes this one out itself rather
+    than importing the tuple.
+
+    Its own session, like the refusal-vocabulary test below it: a violated
+    constraint aborts the transaction it lands in, and the `session`
+    fixture's transaction is shared with everything else a test does."""
+    async with database.sessionmaker() as own_session:
+        with pytest.raises(IntegrityError):
+            await store_audit.append(
+                own_session,
+                at=datetime.now(UTC),
+                customer_ref=None,
+                customer_ref_absence_reason="a_class_nobody_declared",
+                tool_name="ok_tool",
+                arguments={},
+                outcome="returned",
+                detail=None,
+                redaction_budget_exhausted=False,
+                duration_ms=0,
+                request_id=None,
+                refusal_reason=None,
+            )
+
+
+async def test_every_documented_absence_reason_is_accepted_by_that_constraint(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """The companion the test above needs: a constraint rejecting every value
+    would satisfy it just as well. Each value in
+    `CUSTOMER_REF_ABSENCE_REASONS` goes through the real `append` and is read
+    back, so a migration listing fewer values than the code can produce fails
+    here rather than in production, where the cost is the audit row itself
+    and the call with it (fail closed, see
+    docs/decisions/0006-audit-write-failure.md)."""
+    for reason in CUSTOMER_REF_ABSENCE_REASONS:
+        await store_audit.append(
+            session,
+            at=datetime.now(UTC),
+            customer_ref=None,
+            customer_ref_absence_reason=reason,
+            tool_name="ok_tool",
+            arguments={},
+            outcome="returned",
+            detail=None,
+            redaction_budget_exhausted=False,
+            duration_ms=0,
+            request_id=None,
+            refusal_reason=None,
+        )
+    assert [e.customer_ref_absence_reason for e in await rows(session)] == list(
+        CUSTOMER_REF_ABSENCE_REASONS
+    )
+
+
+async def test_the_database_refuses_a_row_with_neither_a_reference_nor_a_reason(
+    database: Database,
+) -> None:
+    """Half of `ck_audit_log_customer_ref_xor_absence`, and the half that
+    matters most: a NULL `customer_ref` whose cause went unrecorded is the
+    exact defect this column removes, and without this constraint a future
+    code path could reintroduce it one branch at a time while every existing
+    test kept passing.
+
+    This is also the shape every row written before migration 3186c04c018c
+    has, which is why that migration adds this constraint `NOT VALID`:
+    PostgreSQL then enforces it on every INSERT -- as this test proves
+    against the real database -- without scanning the rows that predate it."""
+    async with database.sessionmaker() as own_session:
+        with pytest.raises(IntegrityError):
+            await store_audit.append(
+                own_session,
+                at=datetime.now(UTC),
+                customer_ref=None,
+                customer_ref_absence_reason=None,
+                tool_name="ok_tool",
+                arguments={},
+                outcome="returned",
+                detail=None,
+                redaction_budget_exhausted=False,
+                duration_ms=0,
+                request_id=None,
+                refusal_reason=None,
+            )
+
+
+async def test_the_database_refuses_a_row_with_both_a_reference_and_a_reason(
+    database: Database,
+) -> None:
+    """The other half: a reason sitting beside the reference it claims is
+    absent. Nothing in the row would say which of the two to believe, and a
+    query counting absences by this column would over-count rows that have a
+    customer. `_customer_ref` cannot produce this pair -- its `_Subject`
+    fills exactly one field -- so the constraint guards a future change, at
+    the cost the fail-closed policy sets out: the row, and the call."""
+    async with database.sessionmaker() as own_session:
+        with pytest.raises(IntegrityError):
+            await store_audit.append(
+                own_session,
+                at=datetime.now(UTC),
+                customer_ref="cust_7f3a",
+                customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
+                tool_name="ok_tool",
+                arguments={},
+                outcome="returned",
+                detail=None,
+                redaction_budget_exhausted=False,
+                duration_ms=0,
+                request_id=None,
+                refusal_reason=None,
+            )
 
 
 # -- The request-scoped budget: `_scrub`'s whole tree walk shares ONE
@@ -819,9 +1141,12 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
 
     The captured `_write` arguments prove the second half: the audit row
     still carries a measured `duration_ms` on the raised path, a
-    `request_id` of None for a context that has no `fastmcp_context`, and a
+    `request_id` of None for a context that has no `fastmcp_context`, a
     `refusal_reason` of None for a call that reached no consent check at
-    all."""
+    all, and the `customer_ref`/`customer_ref_absence_reason` pair that
+    `ck_audit_log_customer_ref_xor_absence` (models.py) requires -- this call
+    runs outside any request, so `get_access_token()` answers None and the
+    row records `no_access_token` rather than a second bare NULL."""
     middleware = AuditMiddleware(db=None)  # type: ignore[arg-type]
     tool_error = ToolError("Error calling tool 'boom_tool': internal detail")
     written: list[dict[str, object]] = []
@@ -832,6 +1157,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
     async def record_write(
         at: object,
         customer: object,
+        customer_ref_absence_reason: object,
         name: object,
         arguments: object,
         outcome: object,
@@ -847,6 +1173,8 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
                 "duration_ms": duration_ms,
                 "request_id": request_id,
                 "refusal_reason": refusal_reason,
+                "customer_ref": customer,
+                "customer_ref_absence_reason": customer_ref_absence_reason,
             }
         )
         if audit_write_raises:
@@ -864,6 +1192,8 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
     assert isinstance(written[0]["duration_ms"], int)
     assert written[0]["request_id"] is None
     assert written[0]["refusal_reason"] is None
+    assert written[0]["customer_ref"] is None
+    assert written[0]["customer_ref_absence_reason"] == ABSENCE_NO_ACCESS_TOKEN
 
 
 async def test_the_request_id_is_recorded_and_differs_per_client_request(
@@ -1028,6 +1358,12 @@ async def test_the_database_refuses_a_reason_outside_the_documented_set(
                 own_session,
                 at=datetime.now(UTC),
                 customer_ref=None,
+                # A documented value, so the only constraint this row can
+                # violate is the refusal vocabulary one under test:
+                # `ck_audit_log_customer_ref_xor_absence` (models.py) would
+                # also reject a NULL `customer_ref` with no reason beside it,
+                # and either violation raises the same `IntegrityError`.
+                customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
                 tool_name="ok_tool",
                 arguments={},
                 outcome="raised",
@@ -1053,6 +1389,7 @@ async def test_both_documented_reasons_are_accepted_by_that_constraint(
             session,
             at=datetime.now(UTC),
             customer_ref=None,
+            customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
             tool_name="cards.list",
             arguments={},
             outcome="raised",

@@ -54,6 +54,10 @@ async def test_a_maximum_length_customer_ref_round_trips_through_audit_log(
             s,
             at=datetime.now(UTC),
             customer_ref=MAX_REF,
+            # NULL because this row HAS a customer reference:
+            # `ck_audit_log_customer_ref_xor_absence` (models.py) rejects a
+            # row carrying both.
+            customer_ref_absence_reason=None,
             tool_name="probe",
             arguments={},
             outcome="returned",

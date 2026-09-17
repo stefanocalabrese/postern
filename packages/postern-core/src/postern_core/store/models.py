@@ -46,6 +46,51 @@ REFUSAL_NO_CUSTOMER_REF = "no_customer_ref"
 REFUSAL_DOMAIN_NOT_CONSENTED = "domain_not_consented"
 REFUSAL_REASONS: tuple[str, ...] = (REFUSAL_NO_CUSTOMER_REF, REFUSAL_DOMAIN_NOT_CONSENTED)
 
+# The closed vocabulary of `AuditEntry.customer_ref_absence_reason`, kept here
+# for the same reason `REFUSAL_REASONS` above is: the CHECK constraint on that
+# column is built from this tuple, and `services/api/middleware/audit.py`
+# imports these names instead of retyping the strings. Migration 3186c04c018c
+# hardcodes its own copy of all three, deliberately, so a later widening
+# cannot change what an already-applied revision claims to have done.
+#
+# Each value names the class of absence the middleware established, never the
+# value it refused. `no_access_token`: `get_access_token()` returned None, so
+# the call carried no validated token at all. `no_string_subject`: a token was
+# present and its `sub` claim was absent or was not a string, so there was no
+# subject to validate. `subject_not_a_customer_ref`: a token was present, its
+# `sub` WAS a string, and that string failed `CustomerRef` validation
+# (`postern_core.identity`) -- the one value here that is a security signal
+# rather than an ordinary unauthenticated call, because identity.py's own
+# warning is that a compromised issuer can mint a `sub` shaped like a bare
+# PAN, IBAN or DNI, and `services/api/server.py`'s `token_customer_resolver`
+# refuses exactly that shape on the tool path.
+#
+# `no_access_token` and `no_string_subject` are kept apart even though both
+# mean "the caller presented nothing usable": the first is reachable by any
+# client that simply did not authenticate (the in-process `fastmcp.Client`
+# produces it on every call), while the second requires a token that passed
+# signature, issuer and audience verification and still carried no subject,
+# which is an issuer-side defect rather than a client-side one. Merging them
+# would put a routine unauthenticated call and a malformed-but-verified token
+# in the same bucket. The second value does merge two facts the middleware
+# could separate -- `sub` absent versus `sub` present with a non-string type
+# -- because neither is the compromised-issuer case this column exists for and
+# both leave the same hole; splitting them later is a widened CHECK, one
+# statement, the same trade `refusal_reason` documents.
+#
+# The `noqa` below is bandit's S105, which fires on any name ending in TOKEN
+# that is assigned a string literal. This one is a value written into an
+# audit column, never a credential, and the name has to keep saying "access
+# token" because that is the thing whose absence it reports.
+ABSENCE_NO_ACCESS_TOKEN = "no_access_token"  # noqa: S105
+ABSENCE_NO_STRING_SUBJECT = "no_string_subject"
+ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF = "subject_not_a_customer_ref"
+CUSTOMER_REF_ABSENCE_REASONS: tuple[str, ...] = (
+    ABSENCE_NO_ACCESS_TOKEN,
+    ABSENCE_NO_STRING_SUBJECT,
+    ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
+)
+
 
 class ConsentRecord(Base):
     __tablename__ = "consents"
@@ -77,6 +122,11 @@ class AuditEntry(Base):
     # current maximum is 65 characters, and a failed insert here means no
     # audit row exists for that call at all, on a regulator-facing,
     # append-only table.
+    #
+    # NULL here says nothing on its own about WHY there is no customer:
+    # `customer_ref_absence_reason` at the bottom of this class carries that,
+    # one value per class of absence, and the CHECK constraint below makes
+    # "this is NULL" and "that is not NULL" the same statement.
     customer_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
     tool_name: Mapped[str] = mapped_column(String(64))
     arguments: Mapped[dict[str, Any]] = mapped_column(JSONB)
@@ -183,6 +233,70 @@ class AuditEntry(Base):
     # docstring): naming the refusal on the wire would tell an agent that
     # `cards.list` exists and that this customer holds cards.
     refusal_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Which of three absences produced a NULL `customer_ref` on this row.
+    #
+    # The column exists because that NULL meant three different things and
+    # `services/api/middleware/audit.py`'s `_customer_ref` collapsed all of
+    # them: no access token at all; a token whose `sub` claim was absent or
+    # not a string; and a token whose `sub` was a string that failed
+    # `CustomerRef` validation. The first two are ordinary. The third is the
+    # compromised-issuer case identity.py warns about -- `_OPAQUE` is a
+    # provenance convention, not proof of opacity, so an issuer under
+    # attacker control can mint a `sub` shaped like a bare PAN, IBAN or DNI,
+    # which `services/api/server.py`'s `token_customer_resolver` refuses on
+    # the tool path. Before this column, that refusal's audit trail was
+    # indistinguishable from an anonymous call: same NULL, same everything.
+    #
+    # One column, so the security case is one predicate --
+    # `WHERE customer_ref_absence_reason = 'subject_not_a_customer_ref'` --
+    # rather than a join of `customer_ref IS NULL` against `refusal_reason`
+    # and `detail`, which cannot separate the three in any combination:
+    # `refusal_reason = 'no_customer_ref'` is written for all three alike and
+    # only on calls that a consent check actually refused.
+    #
+    # THE REJECTED SUBJECT'S VALUE IS NEVER STORED, here or in any other
+    # column, and that is the deliberate inversion of the obvious design. The
+    # rejected string is the PAN-, IBAN- or DNI-shaped value that
+    # `_customer_ref` refuses to put in `customer_ref`; writing it into this
+    # column instead would be the one write that survives the refusal it
+    # documents, in the longest-lived table this system has. Even the
+    # rejection is not a safe carrier for it: `CustomerRef` sets
+    # `hide_input_in_errors`, which scrubs `str()` and `repr()` of the
+    # resulting `ValidationError` but leaves the raw value in its structured
+    # `.errors()` (see `token_customer_resolver`'s comment). This column
+    # records the CLASS of absence and nothing else.
+    #
+    # The cost is stated rather than left to be found: an investigator
+    # reading this table learns that a subject was minted which is not a
+    # customer reference, when, how often, from which tool and under which
+    # `request_id` -- never what the string was. Recovering that means going
+    # to the identity issuer's own logs, which is where a claim about what an
+    # issuer minted belongs. A table that could answer "what did it mint"
+    # would also be a table holding attacker-supplied PANs.
+    #
+    # Vocabulary: `CUSTOMER_REF_ABSENCE_REASONS` at the top of this module,
+    # held to three values by the CHECK constraint below.
+    #
+    # `String(64)`, where `refusal_reason` above is `String(32)`, because the
+    # longest value here is 26 characters and 26 of 32 is a column sized at
+    # its own maximum. This repo has paid for that once already: migration
+    # 1c64b7ed3f4b widened both `customer_ref` columns from 64 to 128 because
+    # `_OPAQUE`'s 65-character maximum did not fit the width someone had
+    # matched to the then-current bound. 64 leaves room for a fourth value --
+    # splitting `no_string_subject` into the absent and wrongly-typed cases,
+    # say -- without a second migration for the width alone. A `VARCHAR` plus
+    # a CHECK rather than a Postgres `ENUM`, for the reason `refusal_reason`
+    # gives: widening is one statement instead of an `ALTER TYPE` that cannot
+    # run in the same transaction that uses it.
+    #
+    # NULL, with no server default: `customer_ref` is present on this row, or
+    # the row predates this column. Those two are separated by `customer_ref`
+    # itself on every row written since migration 3186c04c018c, and by `at`
+    # against that migration's deploy time on the rows before it. No fourth
+    # value marks "a customer reference was found" -- that fact is already in
+    # `customer_ref`, and a value here saying it would be the same claim
+    # stored twice, free to disagree with itself.
+    customer_ref_absence_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index("ix_audit_log_customer_at", "customer_ref", "at"),
@@ -207,5 +321,67 @@ class AuditEntry(Base):
         CheckConstraint(
             column("refusal_reason").in_(REFUSAL_REASONS),
             name="ck_audit_log_refusal_reason",
+        ),
+        # Same enforcement, same reasoning, for the absence vocabulary: every
+        # value is chosen by `services/api/middleware/audit.py`'s
+        # `_customer_ref`, never by an agent, so the only way an unlisted
+        # string reaches an INSERT is a code change that added a class of
+        # absence without the migration that widens this constraint. NULL is
+        # admitted without being listed, because `NULL IN (...)` evaluates to
+        # NULL and a CHECK passes unless it evaluates FALSE.
+        CheckConstraint(
+            column("customer_ref_absence_reason").in_(CUSTOMER_REF_ABSENCE_REASONS),
+            name="ck_audit_log_customer_ref_absence_reason",
+        ),
+        # Every row carries either a customer reference or a reason it has
+        # none. Never both, never neither.
+        #
+        # This is what makes the one-predicate search above trustworthy. A
+        # row with neither would be a NULL `customer_ref` whose class of
+        # absence went unrecorded, which is the exact defect this column was
+        # added to remove, silently reintroduced one code path at a time; a
+        # row with both would be a reason contradicting the reference sitting
+        # beside it, and nothing in the table would say which to believe.
+        # Written with the two `IS NULL` tests parenthesised: in PostgreSQL
+        # `IS` binds LOOSER than `=`, so the unparenthesised form parses as
+        # something else entirely rather than as this comparison.
+        #
+        # The cost, under this repo's fail-closed audit policy
+        # (docs/decisions/0006-audit-write-failure.md): a violation costs the
+        # entire audit row AND fails the tool call, including a call that
+        # otherwise succeeded. It can only fire on a future code change,
+        # since `_customer_ref` returns exactly one of the two by
+        # construction and `audit.append` takes both as required parameters.
+        # That is the same trade `ck_audit_log_refusal_reason` above already
+        # made, and the failure is loud and immediate rather than a
+        # regulator-facing table quietly filling with rows no query can
+        # classify.
+        #
+        # PRE-EXISTING ROWS WOULD VIOLATE THIS. Every row written before
+        # migration 3186c04c018c has NULL for both columns whenever its call
+        # had no customer, so adding this as an ordinary validated constraint
+        # would fail the migration outright on any database that has ever
+        # recorded one -- and no test would have caught it, since every test
+        # database is built by `alembic upgrade head` against an empty table
+        # (tests/conftest.py). That migration therefore creates it
+        # `NOT VALID`: PostgreSQL skips the scan of existing rows and still
+        # enforces the constraint on every INSERT and UPDATE from that point
+        # on, which on an append-only table is every row that will ever be
+        # written. The old rows keep the meaning this column's own comment
+        # gives them (NULL means the row predates the column) instead of
+        # being rewritten by a backfill, which on an append-only,
+        # regulator-facing table would be the only UPDATE it has ever taken.
+        # The trailing cost is that `pg_constraint.convalidated` stays false
+        # for this constraint: running `VALIDATE CONSTRAINT` later scans the
+        # whole table and fails on exactly those pre-migration rows, so it
+        # needs a decision about them first. SQLAlchemy's `CheckConstraint`
+        # cannot express `NOT VALID`, so a database built from this metadata
+        # rather than from the migrations gets a validated constraint -- no
+        # such path exists in this repo (tests run `alembic upgrade head`,
+        # tests/conftest.py), and on an empty table the two are the same
+        # thing.
+        CheckConstraint(
+            "(customer_ref IS NULL) = (customer_ref_absence_reason IS NOT NULL)",
+            name="ck_audit_log_customer_ref_xor_absence",
         ),
     )

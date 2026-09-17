@@ -18,13 +18,20 @@ that knows it refused and which of its refusals it made, so it files that
 decision and this module copies it onto the row. A future third refusal
 reason therefore changes that module and this one's vocabulary, not this
 module's logic.
+
+`customer_ref_absence_reason` is the opposite: DERIVED here, because this is
+the only place that sees the access token at all. It records which of three
+things left `customer_ref` NULL -- no token, no usable `sub`, or a `sub` that
+failed `CustomerRef` -- and never the subject that failed, for the reason
+`_customer_ref` gives below.
 """
 
 import logging
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 
+from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
@@ -33,6 +40,11 @@ from postern_core.domain.masking import FreeText, redaction_budget
 from postern_core.identity import CustomerRef
 from postern_core.store import audit
 from postern_core.store.engine import Database
+from postern_core.store.models import (
+    ABSENCE_NO_ACCESS_TOKEN,
+    ABSENCE_NO_STRING_SUBJECT,
+    ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
+)
 from pydantic import TypeAdapter, ValidationError
 
 from services.api import consent
@@ -134,8 +146,27 @@ def _scrub(value: Any) -> Any:
     return value
 
 
-def _customer_ref(subject: object) -> str | None:
-    """The token's `sub` claim, only when it conforms to `CustomerRef`.
+class _Subject(NamedTuple):
+    """What this call's access token yielded: a customer reference, or the
+    class of absence that stands in for one.
+
+    Exactly one field is ever non-None, which is the invariant
+    `ck_audit_log_customer_ref_xor_absence` (models.py) enforces at the
+    database: a row with neither is a NULL `customer_ref` whose cause went
+    unrecorded, a row with both is a reason contradicting the reference next
+    to it. Returning the pair from one function is what makes that structural
+    rather than a rule two call sites have to remember -- the raised and
+    returned branches of `on_call_tool` both write this same object's two
+    fields, so neither can fill one in and forget the other.
+    """
+
+    customer_ref: str | None
+    absence_reason: str | None
+
+
+def _customer_ref(token: AccessToken | None) -> _Subject:
+    """The token's `sub` claim, only when it conforms to `CustomerRef`, plus
+    which of three absences produced the NULL when it does not.
 
     Mirrors `services.api.server.token_customer_resolver` rather than
     inventing a second validation path: identity.py's own warning is that a
@@ -147,13 +178,40 @@ def _customer_ref(subject: object) -> str | None:
     documents. Storing `None` for a non-conforming subject, rather than
     raising, keeps this middleware's job (record the call) separate from the
     tool path's job (authorize the call).
+
+    That `None` used to be the END of the record, and it said three different
+    things at once: no access token at all, a token carrying no usable `sub`,
+    and the compromised-issuer case the paragraph above describes. An
+    investigator reading the audit table could not tell an attacker-minted
+    subject from somebody calling without logging in. The second return
+    value names which one happened, in the vocabulary
+    `CUSTOMER_REF_ABSENCE_REASONS` (models.py) holds and a CHECK constraint
+    closes, so the security case is one predicate on one column.
+
+    Takes the whole token, not the `sub` it holds, because the caller cannot
+    read the claim out without already having collapsed the first two cases:
+    `token.claims.get("sub")` answers None both for a token without the claim
+    and for no token at all. Doing the split here keeps all three classes in
+    the one function that names them.
+
+    What it never returns, on any branch, is the rejected string itself. The
+    `except` below discards `subject` and reports its class, and the
+    `ValidationError` is neither re-raised nor logged: `CustomerRef` sets
+    `hide_input_in_errors`, which scrubs `str()` and `repr()` of that
+    exception but leaves the raw value in its structured `.errors()` (see
+    `token_customer_resolver`'s own comment on that). The class of absence is
+    storable; the value that caused it is the PAN-, IBAN- or DNI-shaped
+    string this function exists to keep out of the table.
     """
+    if token is None:
+        return _Subject(None, ABSENCE_NO_ACCESS_TOKEN)
+    subject = token.claims.get("sub")
     if not isinstance(subject, str):
-        return None
+        return _Subject(None, ABSENCE_NO_STRING_SUBJECT)
     try:
-        return CustomerRef(value=subject).value
+        return _Subject(CustomerRef(value=subject).value, None)
     except ValidationError:
-        return None
+        return _Subject(None, ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF)
 
 
 def _elapsed_ms(started: float) -> int:
@@ -335,9 +393,9 @@ class AuditMiddleware(Middleware):
             if len(name) > _MAX_TOOL_NAME:
                 name = name[:_MAX_TOOL_NAME]
             arguments = _scrub(dict(context.message.arguments or {}))
-        token = get_access_token()
-        subject = token.claims.get("sub") if token is not None else None
-        customer = _customer_ref(subject)
+        # One call, two fields, exactly one of them non-None: see `_Subject`
+        # for why the pair is returned together rather than derived twice.
+        subject = _customer_ref(get_access_token())
         at = context.timestamp
         request_id = _request_id(context)
 
@@ -394,7 +452,8 @@ class AuditMiddleware(Middleware):
             try:
                 await self._write(
                     at,
-                    customer,
+                    subject.customer_ref,
+                    subject.absence_reason,
                     name,
                     arguments,
                     "raised",
@@ -422,7 +481,8 @@ class AuditMiddleware(Middleware):
         try:
             await self._write(
                 at,
-                customer,
+                subject.customer_ref,
+                subject.absence_reason,
                 name,
                 arguments,
                 "returned",
@@ -467,6 +527,16 @@ class AuditMiddleware(Middleware):
         self,
         at: datetime,
         customer: str | None,
+        # Required, no default, and passed straight from the `_Subject` the
+        # line above's `customer` came from: the two are one decision, made
+        # once per call by `_customer_ref`, and both branches of
+        # `on_call_tool` hand over the same object's two fields. A default
+        # would let a future branch write NULL next to a NULL `customer`,
+        # which `ck_audit_log_customer_ref_xor_absence` (models.py) rejects
+        # -- costing the audit row and, under the fail-closed policy, the
+        # call -- and would erase the difference between an anonymous call
+        # and an issuer-minted PAN at the one point where it is still known.
+        customer_ref_absence_reason: str | None,
         name: str,
         arguments: dict[str, Any],
         outcome: str,
@@ -494,6 +564,7 @@ class AuditMiddleware(Middleware):
                 session,
                 at=at,
                 customer_ref=customer,
+                customer_ref_absence_reason=customer_ref_absence_reason,
                 tool_name=name,
                 arguments=arguments,
                 outcome=outcome,

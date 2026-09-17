@@ -16,6 +16,18 @@ async def append(
     *,
     at: datetime,
     customer_ref: str | None,
+    # Required, and the one parameter here whose wrong value is rejected by
+    # the database rather than merely recorded: `ck_audit_log_customer_ref_xor
+    # _absence` (models.py) makes `customer_ref IS NULL` and this being
+    # non-NULL the same statement, so a caller that defaults this to None
+    # while passing no `customer_ref` loses the whole row and, under the
+    # fail-closed policy (docs/decisions/0006-audit-write-failure.md), the
+    # call with it. Only the caller knows WHICH absence it saw -- no token,
+    # no string subject, or a subject that failed `CustomerRef` -- and that
+    # third case is the compromised-issuer signal the column exists to make
+    # searchable, so a default that quietly filed it as one of the other two
+    # would be worse than no column at all.
+    customer_ref_absence_reason: str | None,
     tool_name: str,
     arguments: dict[str, Any],
     outcome: str,
@@ -56,6 +68,7 @@ async def append(
         AuditEntry(
             at=at,
             customer_ref=customer_ref,
+            customer_ref_absence_reason=customer_ref_absence_reason,
             tool_name=tool_name,
             arguments=arguments,
             outcome=outcome,

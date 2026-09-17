@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 import pytest_asyncio
 from postern_core.store import audit
 from postern_core.store.engine import Database
-from postern_core.store.models import AuditEntry
+from postern_core.store.models import ABSENCE_NO_ACCESS_TOKEN, AuditEntry
 from sqlalchemy import delete, select
 
 # `append()` commits for real, which rules out the rollback-based `session`
@@ -48,6 +48,13 @@ async def test_append_with_redaction_budget_exhausted_true_persists_true(
             s,
             at=datetime.now(UTC),
             customer_ref=None,
+            # Not a detail of these two tests, and not optional either:
+            # `ck_audit_log_customer_ref_xor_absence` (models.py) rejects a
+            # row that has neither a customer reference nor a reason it has
+            # none, so a NULL `customer_ref` here has to name its class of
+            # absence. `tests/test_audit_middleware.py` is where that column
+            # is actually exercised.
+            customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
             tool_name="probe",
             arguments={},
             outcome="returned",
@@ -70,6 +77,13 @@ async def test_append_with_redaction_budget_exhausted_false_persists_false(
             s,
             at=datetime.now(UTC),
             customer_ref=None,
+            # Not a detail of these two tests, and not optional either:
+            # `ck_audit_log_customer_ref_xor_absence` (models.py) rejects a
+            # row that has neither a customer reference nor a reason it has
+            # none, so a NULL `customer_ref` here has to name its class of
+            # absence. `tests/test_audit_middleware.py` is where that column
+            # is actually exercised.
+            customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
             tool_name="probe",
             arguments={},
             outcome="returned",
