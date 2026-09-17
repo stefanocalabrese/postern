@@ -16,6 +16,20 @@ Plus one the adversarial pass added: `create_app` refuses to start
 `StubTokenMinter` against a configuration that looks production-shaped,
 rather than silently minting fake bearer tokens no real backend accepts.
 
+Plan 3 Task 2 replaces that stub here. This process now builds one
+`ReadTokenMinter` over an `InternalTokenMinter` holding a READ key, and
+holds no write key and no write scope: `READ_SCOPES` has no `payments.svc`
+entry, so a write audience raises `KeyError` instead of minting. The guard
+below is left byte-identical, which has two consequences worth naming. Its
+docstring's "does not exist in this codebase yet" is stale as of this
+commit. And with no `StubTokenMinter` constructed in this module any more,
+it no longer gates a minter choice at all: it is now an unconditional
+refusal to start under a production-shaped configuration
+(`customer_jwks_uri` and `customer_token_issuer` both set) unless
+`allow_stub_token_minter` is on, which every deployment running real
+customer auth against this read key will trip. Whether that refusal still
+earns its place belongs to the task that removes the flag, not to this one.
+
 Task 6 adds the database: one `Database` per process, built unconditionally
 from `settings.database_url` (the constructor never connects --
 `create_async_engine` is lazy), handed to `AuditMiddleware` so every tool
@@ -29,11 +43,15 @@ read a customer from otherwise.
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx2
 from fastmcp.server.auth import AuthProvider
 from fastmcp.server.http import StarletteWithLifespan
-from postern_core.facade.client import BackendClient, StubTokenMinter
+from postern_core.auth.internal_jwt import InternalTokenMinter
+from postern_core.auth.keys import FileKeySource, GeneratedKeySource, KeySource
+from postern_core.auth.read_minter import ReadTokenMinter
+from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerResolver
 from postern_core.store.engine import Database
 from starlette.middleware import Middleware
@@ -82,6 +100,27 @@ def _refuse_stub_minter_in_production(settings: Settings) -> None:
             "customer authentication, or set "
             "POSTERN_ALLOW_STUB_TOKEN_MINTER=1 to override deliberately."
         )
+
+
+def _read_key_source(settings: Settings) -> KeySource:
+    """The READ signing key, from a PEM when a deployment names one.
+
+    A set `read_key_pem_path` is the Vault Agent shape: the sidecar renders
+    the private key to a file and this process reads it once at startup, so
+    `FileKeySource`'s public-key rejection fires before uvicorn serves rather
+    than at the first customer request. Unset means generate 2048 bits in
+    process, which `Settings.for_testing()` and the local docker-compose
+    stack both want: nothing verifies these tokens locally (the backend stub
+    reads `sub` out of the payload without checking the signature, by
+    design), so a generated key needs no secret on disk and no key rotation.
+
+    A process restart throws a generated key away, which is exactly why a
+    deployment must set the path: the JWKS Task 3 publishes would otherwise
+    change under every verifier on every restart.
+    """
+    if settings.read_key_pem_path is not None:
+        return FileKeySource(Path(settings.read_key_pem_path), kid=settings.read_key_kid)
+    return GeneratedKeySource(kid=settings.read_key_kid)
 
 
 def _backend_timeout(settings: Settings) -> httpx2.Timeout:
@@ -158,9 +197,21 @@ def create_app(
     settings = settings or Settings.from_env()
     _refuse_stub_minter_in_production(settings)
 
+    # Plan 3 Task 2: one minter, built over the READ key only. `BackendClient`
+    # calls a `TokenMinter` (`customer, audience -> str`); `ReadTokenMinter`
+    # is the adapter onto `InternalTokenMinter.mint`, whose signature is
+    # wider. `consent_id` and `client_id` from handoff §7.2 are not supplied
+    # yet: `client_id` is reachable only from `get_access_token()`, which
+    # `BackendClient.get_json` has no access to, and `consent_id` needs the
+    # tool layer to pass the `consents` row id, so both are façade-signature
+    # plumbing a later task owns rather than a value that could be guessed
+    # here.
+    read_key_source = _read_key_source(settings)
     backend = BackendClient(
         settings.backend_base_url,
-        StubTokenMinter(),
+        ReadTokenMinter(
+            InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
+        ),
         transport=transport,
         timeout=_backend_timeout(settings),
     )
@@ -226,6 +277,10 @@ def create_app(
     app.state.backend_client = backend
     app.state.postern_server = server
     app.state.postern_database = db
+    # The public half of the key the minter above signs with. Task 3's JWKS
+    # route serves it, and it is the only handle on that key outside the
+    # `BackendClient` the minter is buried in.
+    app.state.postern_read_key_source = read_key_source
     _close_resources_after_fastmcp_shutdown(app, backend, db)
     return app
 

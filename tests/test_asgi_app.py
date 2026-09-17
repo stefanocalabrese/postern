@@ -27,12 +27,15 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 
 import httpx2
 import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from fastmcp.server.http import StarletteWithLifespan
+from joserfc import jwt as jose_jwt
+from joserfc.jwk import KeySet, RSAKey
 from postern_core.identity import CustomerRef
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry, ConsentRecord
@@ -565,3 +568,76 @@ async def test_a_tool_call_reports_a_json_rpc_error_when_the_audit_database_is_u
     assert body["error"]["code"] == 0
     assert "127.0.0.1" in body["error"]["message"]  # leaks the connection target
     assert "postern:postern" not in body["error"]["message"]  # not the DSN's credentials
+
+
+# --- Plan 3 Task 2: the read key, and only the read key -------------------
+
+
+def _mint(app: StarletteWithLifespan, audience: str) -> str:
+    """The token the composed app would actually attach to a backend call.
+
+    Reaches into `BackendClient._minter` for the same reason
+    `test_backend_timeout_is_wired_from_settings_per_phase` reaches into
+    `_client.timeout`: the minter is what `create_app` chose, and there is
+    no public accessor for it. Driving a real `tools/call` instead would
+    prove only that a token was sent, since the `MockTransport` handler
+    above never reads the `Authorization` header.
+    """
+    return cast(str, app.state.backend_client._minter(TEST_CUSTOMER, audience))
+
+
+def test_the_backend_client_mints_a_real_read_token_signed_by_the_stashed_key() -> None:
+    """The fake `stub.read.<customer>` bearer is gone: what leaves this
+    process is an RS256 JWT that verifies against the key source Task 3's
+    JWKS route will publish, carrying the customer as `sub` and a read
+    scope derived from the audience."""
+    settings = Settings.for_testing()
+    app = create_app(settings)
+    token = _mint(app, "accounts.svc")
+    keyset = KeySet.import_key_set(app.state.postern_read_key_source.public_jwks())
+    claims = jose_jwt.decode(token, keyset, algorithms=["RS256"]).claims
+    assert claims["sub"] == TEST_CUSTOMER.value
+    assert claims["scope"] == "accounts:read"
+    assert claims["iss"] == settings.read_token_issuer
+    assert not token.startswith("stub.read.")
+
+
+def test_the_api_process_cannot_mint_a_payments_token() -> None:
+    """The key split is what stops this process signing a write token; this
+    is the second barrier, in claims rather than in key material. `KeyError`
+    from an unmapped audience beats a token minted with a guessed scope,
+    because Istio matches on the scope claim as well as on the signature.
+    """
+    app = create_app(Settings.for_testing())
+    with pytest.raises(KeyError):
+        _mint(app, "payments.svc")
+
+
+def test_create_app_stashes_the_read_key_source_under_the_configured_kid() -> None:
+    """Task 3 serves `app.state.postern_read_key_source`, and a verifier
+    selects the key by `kid`, so the published kid must be the one
+    `Settings` names rather than a constant baked into `create_app`."""
+    settings = Settings(backend_base_url="https://backend.test", read_key_kid="read-2")
+    app = create_app(settings)
+    entries = app.state.postern_read_key_source.public_jwks()["keys"]
+    assert [entry["kid"] for entry in entries] == ["read-2"]
+
+
+def test_a_configured_pem_path_signs_instead_of_a_generated_key(tmp_path: Path) -> None:
+    """The `FileKeySource` branch is the only one a real deployment takes
+    (a generated key is thrown away on restart, invalidating the JWKS every
+    verifier cached), so the token is checked against the PEM's own key
+    here, not against the app's stashed copy: verifying against the stash
+    would pass even if `read_key_pem_path` were ignored entirely.
+    """
+    key = RSAKey.generate_key(2048, parameters={"kid": "read-file", "use": "sig", "alg": "RS256"})
+    pem = tmp_path / "read.pem"
+    pem.write_bytes(key.as_pem(private=True))
+    settings = Settings(
+        backend_base_url="https://backend.test",
+        read_key_pem_path=str(pem),
+        read_key_kid="read-file",
+    )
+    app = create_app(settings)
+    claims = jose_jwt.decode(_mint(app, "cards.svc"), KeySet([key]), algorithms=["RS256"]).claims
+    assert claims["scope"] == "cards:read"
