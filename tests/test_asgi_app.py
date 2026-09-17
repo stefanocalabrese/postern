@@ -15,11 +15,10 @@ composition"), each proven here; full reasoning in
 4. `strict_headers` reachable from an environment variable --
    `test_create_app_wires_strict_headers_from_settings`.
 
-Plus the adversarial pass: `StubTokenMinter` refused under a
-production-shaped configuration, `create_app()` failing clearly on an
-incomplete environment, and full end-to-end proofs (a masked result, a
-header/body mismatch, an oversized body) driven through `httpx2.ASGITransport`
--- `httpx` is not installed in this project (docs/decisions/0001).
+Plus the adversarial pass: `create_app()` failing clearly on an incomplete
+environment, and full end-to-end proofs (a masked result, a header/body
+mismatch, an oversized body) driven through `httpx2.ASGITransport` --
+`httpx` is not installed in this project (docs/decisions/0001).
 """
 
 import asyncio
@@ -36,6 +35,7 @@ from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from fastmcp.server.http import StarletteWithLifespan
 from joserfc import jwt as jose_jwt
 from joserfc.jwk import KeySet, RSAKey
+from postern_core.auth.read_minter import ReadTokenMinter
 from postern_core.identity import CustomerRef
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry, ConsentRecord
@@ -147,7 +147,6 @@ def test_the_app_exposes_a_lifespan() -> None:
 def test_create_app_wires_strict_headers_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_required_env(monkeypatch)
     monkeypatch.setenv("POSTERN_STRICT_HEADERS", "1")
-    monkeypatch.setenv("POSTERN_ALLOW_STUB_TOKEN_MINTER", "1")
     app = create_app(resolver=_resolver)
     installed = _header_validation_middleware(app)
     assert installed.kwargs["strict"] is True
@@ -214,33 +213,24 @@ def test_backend_timeout_worst_case_total_is_bounded_at_ten_seconds(
     assert worst_case_total == 10.0
 
 
-# --- Adversarial pass: StubTokenMinter must not run in a production shape --
+# --- A production-shaped configuration starts, holding the real minter ----
 
 
-def test_create_app_refuses_stub_minter_against_a_production_shaped_configuration() -> None:
+def test_create_app_starts_under_a_production_shaped_configuration() -> None:
+    """`_refuse_stub_minter_in_production` raised on exactly this input until
+    this commit, reading a settings shape rather than which minter
+    `create_app` built. Plan 3 Task 2 replaced `StubTokenMinter` with
+    `ReadTokenMinter`, which turned that guard into a refusal to start the
+    genuine minter, so it is gone: both `customer_jwks_uri` and
+    `customer_token_issuer` set assembles an app, no flag involved.
+    """
     settings = Settings(
         backend_base_url="https://backend.test",
         customer_jwks_uri="https://issuer.test/.well-known/jwks.json",
         customer_token_issuer="https://issuer.test",  # noqa: S106
-    )
-    with pytest.raises(RuntimeError, match="StubTokenMinter"):
-        create_app(settings)
-
-
-def test_create_app_allows_stub_minter_when_customer_auth_is_unset() -> None:
-    app = create_app(Settings.for_testing())
-    assert callable(app)
-
-
-def test_create_app_allows_stub_minter_when_explicitly_overridden() -> None:
-    settings = Settings(
-        backend_base_url="https://backend.test",
-        customer_jwks_uri="https://issuer.test/.well-known/jwks.json",
-        customer_token_issuer="https://issuer.test",  # noqa: S106
-        allow_stub_token_minter=True,
     )
     app = create_app(settings)
-    assert callable(app)
+    assert isinstance(app.state.backend_client._minter, ReadTokenMinter)
 
 
 # --- Adversarial pass: Settings.from_env() failures must name the variable -
@@ -459,7 +449,6 @@ async def test_end_to_end_audit_row_is_written_for_a_real_call(
         settings = Settings(
             backend_base_url="https://backend.test",
             database_url=pg_url,
-            allow_stub_token_minter=True,
         )
         app = create_app(
             settings,

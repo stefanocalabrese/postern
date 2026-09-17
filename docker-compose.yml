@@ -11,13 +11,10 @@
 # 1. `Settings.from_env()` used to read `POSTERN_JWKS_URI`/`POSTERN_TOKEN_ISSUER`
 #    via a required `os.environ[...]`, which can only ever produce a `str`
 #    (even `""`) or a startup `KeyError` -- never `None`. `services/api/
-#    server.py::build_server` and `services/api/main.py::
-#    _refuse_stub_minter_in_production` both branch on `is None` to reach
-#    the documented no-auth path, so setting both to `""` (this file's
-#    original plan) reached neither: it produced two non-`None` empty
-#    strings, which `build_server` tried to build a `JWTVerifier` from and
-#    `_refuse_stub_minter_in_production` treated as "production-shaped",
-#    refusing to start `StubTokenMinter` outright. Fixed in
+#    server.py::build_server` branches on `is None` to reach the documented
+#    no-auth path, so setting both to `""` (this file's original plan) never
+#    reached it: it produced two non-`None` empty strings, which
+#    `build_server` tried to build a `JWTVerifier` from. Fixed in
 #    `services/api/settings.py`: `from_env()` now normalizes an absent or
 #    empty value to `None` for both.
 # 2. Even with that fixed, a *genuinely* auth-less stack (both left `""`,
@@ -31,16 +28,6 @@
 #    docs/decisions/0004-base-images.md). Proving a real masked `tools/call`
 #    response therefore needs genuine, if throwaway, customer JWT auth, not
 #    the empty-string shape the plan assumed would still be "no auth".
-#
-# `POSTERN_ALLOW_STUB_TOKEN_MINTER=1` is required as a consequence of point
-# 2: real `customer_jwks_uri`/`customer_token_issuer` values make this
-# configuration "production-shaped" by `_refuse_stub_minter_in_production`'s
-# own definition, which refuses `StubTokenMinter` by default. This is
-# exactly the scenario `Settings.allow_stub_token_minter`'s own docstring
-# names as the deliberate override for ("real customer auth already live,
-# backend still a controlled sandbox") -- acceptable only because this
-# stack binds to localhost, the backend is `backend-stub`, and the JWKS
-# keypair is generated fresh on every container start.
 services:
   db:
     image: postgres:17-alpine
@@ -82,7 +69,6 @@ services:
       POSTERN_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
       POSTERN_TOKEN_ISSUER: "https://postern-local-dev.invalid"
       POSTERN_AUDIENCE: "postern"
-      POSTERN_ALLOW_STUB_TOKEN_MINTER: "1"
       POSTERN_STRICT_HEADERS: "0"
     ports: ["8080:8080"]
     depends_on:

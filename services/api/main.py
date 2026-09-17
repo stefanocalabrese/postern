@@ -12,23 +12,22 @@ site below:
    into the `Middleware(...)` call below.
 4. `strict_headers`, sourced from `Settings` -- wired into the same call.
 
-Plus one the adversarial pass added: `create_app` refuses to start
-`StubTokenMinter` against a configuration that looks production-shaped,
-rather than silently minting fake bearer tokens no real backend accepts.
+Plan 3 Task 2 built the real minter here, replacing `StubTokenMinter` and
+its fake bearer token no backend accepts. This process now holds one
+`ReadTokenMinter` over an `InternalTokenMinter` carrying a READ key, and no
+write key and no write scope: `READ_SCOPES` has no `payments.svc` entry, so
+a write audience raises `KeyError` instead of minting.
 
-Plan 3 Task 2 replaces that stub here. This process now builds one
-`ReadTokenMinter` over an `InternalTokenMinter` holding a READ key, and
-holds no write key and no write scope: `READ_SCOPES` has no `payments.svc`
-entry, so a write audience raises `KeyError` instead of minting. The guard
-below is left byte-identical, which has two consequences worth naming. Its
-docstring's "does not exist in this codebase yet" is stale as of this
-commit. And with no `StubTokenMinter` constructed in this module any more,
-it no longer gates a minter choice at all: it is now an unconditional
-refusal to start under a production-shaped configuration
-(`customer_jwks_uri` and `customer_token_issuer` both set) unless
-`allow_stub_token_minter` is on, which every deployment running real
-customer auth against this read key will trip. Whether that refusal still
-earns its place belongs to the task that removes the flag, not to this one.
+`_refuse_stub_minter_in_production` and the `allow_stub_token_minter` flag
+that disarmed it are deleted with this commit. That guard read a settings
+shape (`customer_jwks_uri` and `customer_token_issuer` both set) and never
+which minter `create_app` built, so once the stub stopped being constructed
+here it refused exactly the deployments running the genuine minter.
+Measured before removal against that settings shape: no flag raised
+`RuntimeError` naming `StubTokenMinter`, and `POSTERN_ALLOW_STUB_TOKEN_MINTER=1`
+started the app with a `ReadTokenMinter`. Nothing checks production shape at
+startup now; `docs/decisions/0003-composition-root.md` and `0004-base-images.md`
+still describe the guard as live.
 
 Task 6 adds the database: one `Database` per process, built unconditionally
 from `settings.database_url` (the constructor never connects --
@@ -61,46 +60,6 @@ from services.api.jwks import jwks_route
 from services.api.middleware.audit import AuditMiddleware
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
-
-
-def _refuse_stub_minter_in_production(settings: Settings) -> None:
-    """`StubTokenMinter` mints a bearer token no real backend accepts
-    (its own docstring: "Never deploy this"). The Vault-backed
-    `InternalTokenMinter` meant to replace it is a later plan's deliverable
-    and does not exist in this codebase yet, so there is nothing else to
-    wire in its place today.
-
-    "Production-shaped" reuses the exact signal `build_server` already uses
-    to decide whether real customer-facing JWT auth is configured
-    (`customer_jwks_uri` and `customer_token_issuer` both set): that is the
-    only way this codebase currently distinguishes a real deployment from
-    `Settings.for_testing()` or the local no-auth docker-compose stack, and
-    `build_server` already fails closed on the half-configured version of
-    the same pair. Refusing to start here is the same fail-closed posture,
-    applied to the other authentication axis: this server has no business
-    accepting real customer tokens while minting fake ones for the backend.
-
-    `settings.allow_stub_token_minter` is the named, explicit override for a
-    deliberate early rollout (real customer auth already live, backend
-    still a controlled sandbox): raising unconditionally here would leave
-    the composition root permanently undeployable until the Vault-backed
-    minter exists, which contradicts this task's own goal of being "the
-    first time all the pieces are assembled into something uvicorn can
-    actually serve." The override must be set explicitly; the default stays
-    fail-closed.
-    """
-    if settings.allow_stub_token_minter:
-        return
-    if settings.customer_jwks_uri is not None and settings.customer_token_issuer is not None:
-        raise RuntimeError(
-            "create_app refuses to start with StubTokenMinter against a "
-            "production-shaped configuration (customer_jwks_uri and "
-            "customer_token_issuer are both set). StubTokenMinter mints a "
-            "fake bearer token no real backend accepts; wire the "
-            "Vault-backed InternalTokenMinter before deploying with real "
-            "customer authentication, or set "
-            "POSTERN_ALLOW_STUB_TOKEN_MINTER=1 to override deliberately."
-        )
 
 
 def _read_key_source(settings: Settings) -> KeySource:
@@ -196,7 +155,6 @@ def create_app(
     bank or real identity provider to call against in CI.
     """
     settings = settings or Settings.from_env()
-    _refuse_stub_minter_in_production(settings)
 
     # Plan 3 Task 2: one minter, built over the READ key only. `BackendClient`
     # calls a `TokenMinter` (`customer, audience -> str`); `ReadTokenMinter`
@@ -228,8 +186,8 @@ def create_app(
 
     # Consent is enforced against `AuthContext.token`, which only exists when
     # real customer authentication is configured. `has_real_customer_auth`
-    # reuses the exact signal `_refuse_stub_minter_in_production` already
-    # uses for "is this production-shaped": both jwks_uri and issuer set, or
+    # reuses the exact signal `build_server` builds its `JWTVerifier` from
+    # (`services/api/server.py:103-109`): both jwks_uri and issuer set, or
     # (Task 4) a test-injected `auth_override`. Passing `db` into
     # `build_server` regardless would deny every consent-gated call in the
     # documented no-auth path (`Settings.for_testing()`, the local

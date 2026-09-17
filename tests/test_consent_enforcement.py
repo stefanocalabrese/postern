@@ -89,7 +89,6 @@ def app_for(
         database_url=pg_url,
         customer_jwks_uri=None,
         customer_token_issuer=None,
-        allow_stub_token_minter=True,
     )
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
     return create_app(

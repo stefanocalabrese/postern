@@ -52,19 +52,6 @@ class Settings:
     # request body (a bulk import, say) must raise this deliberately, not
     # rely on the default silently being big enough.
     max_body_bytes: int = 1_048_576
-    # Task 12 adversarial pass: `StubTokenMinter` mints a fake bearer token
-    # no real backend accepts ("Never deploy this", client.py). The
-    # Vault-backed `InternalTokenMinter` meant to replace it does not exist
-    # in this codebase yet, so `create_app` refuses to start with the stub
-    # against a production-shaped configuration (real customer JWT auth
-    # configured) by default -- fail closed, matching this codebase's
-    # existing posture elsewhere. This flag is the explicit, named escape
-    # hatch for a deliberate early rollout (real customer auth already live,
-    # backend still a controlled sandbox) that must not be mistaken for
-    # silence: grep for it before any milestone that touches real customer
-    # money, and delete both the flag and the check it controls the day the
-    # real minter exists.
-    allow_stub_token_minter: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -73,9 +60,8 @@ class Settings:
         than at the first customer request.
 
         `POSTERN_JWKS_URI` and `POSTERN_TOKEN_ISSUER` are optional (Task 13
-        finding): `services/api/server.py::build_server` and
-        `services/api/main.py::_refuse_stub_minter_in_production` both branch
-        on `customer_jwks_uri is None` / `customer_token_issuer is None` to
+        finding): `services/api/server.py::build_server` branches on
+        `customer_jwks_uri is None` / `customer_token_issuer is None` to
         reach the documented no-auth path that `Settings.for_testing()` and
         the local docker-compose stack rely on
         (`test_build_server_stays_unauthenticated_when_neither_is_set`'s own
@@ -85,11 +71,10 @@ class Settings:
         unreachable through `from_env()` at all: unset raised `KeyError`
         before startup got anywhere, and setting either to `""` (the compose
         convention for "off") produced a non-`None` string, which
-        `build_server` treats as configured and `_refuse_stub_minter_in_production`
-        treats as "production-shaped", refusing to start with `StubTokenMinter`.
-        `os.environ.get(...) or None` collapses both "absent" and `""` to
-        `None`, matching what the rest of the codebase already assumes this
-        method can produce.
+        `build_server` treats as configured, building a `JWTVerifier` over
+        two empty strings. `os.environ.get(...) or None` collapses both
+        "absent" and `""` to `None`, matching what the rest of the codebase
+        already assumes this method can produce.
         """
         return cls(
             backend_base_url=os.environ["POSTERN_BACKEND_BASE_URL"],
@@ -124,7 +109,6 @@ class Settings:
                 os.environ.get("POSTERN_BACKEND_POOL_TIMEOUT_SECONDS", "1.0")
             ),
             max_body_bytes=int(os.environ.get("POSTERN_MAX_BODY_BYTES", str(1_048_576))),
-            allow_stub_token_minter=os.environ.get("POSTERN_ALLOW_STUB_TOKEN_MINTER") == "1",
         )
 
     @classmethod
