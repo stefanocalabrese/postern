@@ -57,6 +57,7 @@ from postern_core.store.engine import Database
 from starlette.middleware import Middleware
 
 from services.api.asgi.header_validation import HeaderBodyValidation
+from services.api.jwks import jwks_route
 from services.api.middleware.audit import AuditMiddleware
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
@@ -282,6 +283,28 @@ def create_app(
     # `BackendClient` the minter is buried in.
     app.state.postern_read_key_source = read_key_source
     _close_resources_after_fastmcp_shutdown(app, backend, db)
+    # Plan 3 Task 3: the public half of that same key, appended to the router
+    # of the object this function returns rather than served from a parent
+    # Starlette app mounting this one. `StarletteWithLifespan.lifespan` is a
+    # property returning `self.router.lifespan_context`
+    # (`fastmcp/server/http.py:348-351`), and the documented parent shape,
+    # `Starlette(routes=[Mount(path, app)], lifespan=app.lifespan)`,
+    # evaluates that property once and stores the value it read into its own
+    # router (`starlette/routing.py:607`). A parent built before the call
+    # above writes the wrapped context back therefore keeps FastMCP's
+    # session manager working and every request answering normally while
+    # silently dropping `backend.aclose()` and `db.close()`, with no
+    # exception and no failing test. Appending here runs after the wrapper
+    # and leaves `app.router.lifespan_context` untouched;
+    # `tests/test_asgi_app.py` asserts both shutdown hooks still fire
+    # exactly once. Order is safe because FastMCP built exactly one route
+    # (`/mcp`, POST and DELETE under `stateless_http=True`) and no catch-all
+    # mount, so nothing shadows this path. The route is unauthenticated by
+    # construction, which is what a gateway fetching a key set needs:
+    # `RequireAuthMiddleware` wraps the `/mcp` endpoint object itself
+    # (`fastmcp/server/http.py:621-629`), not the app, and
+    # `HeaderBodyValidation` returns early on any non-POST.
+    app.router.routes.append(jwks_route(read_key_source))
     return app
 
 
