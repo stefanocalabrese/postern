@@ -105,9 +105,9 @@ Istio *validates* the JWT; the domain services must *enforce* on it. If any serv
 **Do:**
 - Audit every domain service handler reachable from the MCP façade. Produce a list: enforces on `sub` / does not.
 - For each that does not, the fix is in that service, not in the MCP server. Raise with the owning team — this is likely the largest cross-team item in the programme.
-- Add a contract test per domain service: a token for customer A requesting customer B's account returns 403, not 200.
+- Add a contract test per domain service asserting both halves: customer A's token gets 404 and no account data for B's account, and 200 with A's own data for A's own account. 404, not 403: a 403 confirms B's account exists, handing a guessed identifier an enumeration oracle (A5), so a foreign account and an invented one must return the same status and the same body. A status-only test also passes against a service that 404s its own customers.
 
-**Acceptance:** an automated test suite, run in the backend services' CI, covering every MCP-reachable endpoint with a cross-customer request. Zero passes.
+**Acceptance:** an automated test suite, run in the backend services' CI, covering every MCP-reachable endpoint with a cross-customer request and a same-customer control. Zero cross-customer reads return data; every control read still returns its own.
 
 **Dependency:** backend service teams. **Start the conversation on day one.**
 

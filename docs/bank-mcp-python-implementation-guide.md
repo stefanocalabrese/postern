@@ -383,7 +383,7 @@ There is **no** `submit_payment` tool. Execution lives in `services/confirm/exec
 | `test_masking_golden.py` | No tool output matches a PAN or IBAN regex, across every tool against fixtures |
 | `test_header_body_mismatch.py` | Mismatch → 400 + `-32020` |
 | `test_no_write_from_api.py` | The API service's minter cannot produce a write-audience token |
-| `test_cross_customer.py` | Customer A's token requesting B's account → 403 (ZT-2) |
+| `test_cross_customer.py` | Customer A's token requesting B's account → 404, byte-identical to a nonexistent account ref so the refusal does not confirm B's account exists; A's own account still returns A's data (ZT-2) |
 
 Use FastMCP's in-process `Client` against the server object for tool tests — no network, fast. `respx` mocks the backend; `testcontainers` gives real Postgres. `RSAKeyPair.generate()` and `StaticTokenVerifier` cover auth fixtures without external infrastructure.
 
