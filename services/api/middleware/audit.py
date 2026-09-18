@@ -84,7 +84,7 @@ import time
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
 from fastmcp.server.auth import AccessToken
@@ -445,19 +445,20 @@ class _PendingEntry:
     leaves a durable `reaching` row with the flag still False, so a caller
     that catches the exception and touches again writes a SECOND `reaching`
     row under the same `call_id`. That is precisely the pairing break this
-    guard exists to prevent, arrived at through the guard. No tool swallows
-    that exception today, so nothing in the suite reaches this window; it is
-    fixed rather than documented because the first tool that does swallow it
-    would not announce itself.
+    guard exists to prevent, arrived at through the guard.
 
-    The two failure shapes that remain are therefore different, and both are
-    correct. A write that never commits leaves `written` False, so a second
-    toucher retries and fails too, rather than reaching the backend on the
-    strength of a row that does not exist
-    (`test_a_second_touch_after_a_failed_entry_write_fails_too`). A write
-    that commits and then raises leaves `written` True, so a second toucher
-    returns quietly -- the row it needed is already durable, and the
-    exception the first toucher saw has already stopped that first request.
+    The two failure shapes that remain are therefore different, both are
+    correct, and both are now measured. A write that never commits leaves
+    `written` False, so a second toucher retries and fails too, rather than
+    reaching the backend on the strength of a row that does not exist
+    (`tests/test_audit_entry_row.py::test_a_second_touch_after_a_failed
+    _entry_write_fails_too`). A write that commits and then raises leaves
+    `written` True, so a second toucher returns quietly -- the row it needed
+    is already durable, and the exception the first toucher saw has already
+    stopped that first request (`::test_an_entry_write_that_commits_then
+    _raises_leaves_the_row_and_the_flag`, which builds a store whose sessions
+    commit for real and raise on exit, and fails if this line moves out of
+    the block).
     """
 
     db: Database
@@ -505,6 +506,29 @@ class _PendingEntry:
             await audit.append(
                 session,
                 at=self.at,
+                # THE LAST READING BEFORE THE TOUCH, and the only instant on
+                # this row that is not the call's arrival time. `self.at` is
+                # `context.timestamp`, read when the call reached the
+                # middleware; everything between the two -- the consent
+                # lookup, argument validation, whatever the tool body does
+                # before its first request -- is invisible to a reader with
+                # only one of them.
+                #
+                # Read HERE, one statement before the INSERT, rather than
+                # when `record` was entered or when the commit returns: it
+                # is the closest reading to the request that this row can
+                # carry and still be durable before the request is made. It
+                # therefore precedes the request by the INSERT, the commit
+                # and the session exit, and is early rather than late --
+                # `AuditEntry.reaching_at` (models.py) states that bound and
+                # why the error direction matches `outcome='reaching'`'s own.
+                #
+                # `datetime.now(UTC)`, a wall clock, where `_elapsed_ms`
+                # refuses one: that function measures an interval and a
+                # stepping clock would put a negative number in the table,
+                # while this is an instant that has to be comparable with
+                # `at`, itself a wall-clock reading from fastmcp.
+                reaching_at=datetime.now(UTC),
                 customer_ref=self.subject.customer_ref,
                 customer_ref_absence_reason=self.subject.absence_reason,
                 tool_name=self.tool_name,
@@ -541,14 +565,20 @@ class _PendingEntry:
                 # covers). Writing the stronger claim would make this
                 # comment false for one tool in five.
                 #
-                # THAT TOOL IS DESCRIBED HERE AND PINNED NOWHERE. No test
-                # drives `start_session` through this write:
-                # `tests/test_bootstrap.py:31` builds its `BackendClient`
-                # with `before_backend_request=None`, so the one ungated
-                # tool that reaches the backend is also the one whose entry
-                # row nothing exercises. A reader should not take the
-                # paragraph above as covered behaviour -- it is read off the
-                # registration and the facade call, not off a measurement.
+                # THAT TOOL IS NOW MEASURED, not just described.
+                # `tests/test_audit_entry_row.py::test_the_ungated_tool
+                # _writes_an_entry_row_and_its_refusal_reason_is_null` drives
+                # `start_session` over real HTTP, with a real token, for a
+                # customer consented to nothing, and reads the entry row back
+                # out of Postgres: the row exists, it carries NULL here, and
+                # the SAME customer's `cards.list` in the same test is
+                # refused with `domain_not_consented`. That second call is
+                # what makes the NULL mean something -- it rules out the
+                # stronger reading, since a check that ran for this customer
+                # refuses. `tests/test_bootstrap.py:31` still builds its
+                # client with `before_backend_request=None`, which is why
+                # that file's tools never write an entry row and this one had
+                # to be pinned elsewhere.
                 refusal_reason=None,
                 call_id=self.call_id,
             )
@@ -978,6 +1008,15 @@ class AuditMiddleware(Middleware):
             await audit.append(
                 session,
                 at=at,
+                # NULL, written as a literal rather than taken as a
+                # parameter, because no branch that reaches this method has a
+                # touch instant to record: this is the completion write, and
+                # the touch is on the entry row or did not happen. Copying
+                # the entry row's value here would store one fact twice on
+                # rows that are free to disagree, and
+                # `ck_audit_log_reaching_at_matches_outcome` (models.py)
+                # rejects it outright -- at the cost of the row and the call.
+                reaching_at=None,
                 customer_ref=customer,
                 customer_ref_absence_reason=customer_ref_absence_reason,
                 tool_name=name,

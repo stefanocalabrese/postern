@@ -53,6 +53,7 @@ async def test_append_with_redaction_budget_exhausted_true_persists_true(
         await audit.append(
             s,
             at=datetime.now(UTC),
+            reaching_at=None,
             customer_ref=None,
             # Not a detail of these two tests, and not optional either:
             # `ck_audit_log_customer_ref_xor_absence` (models.py) rejects a
@@ -83,6 +84,7 @@ async def test_append_with_redaction_budget_exhausted_false_persists_false(
         await audit.append(
             s,
             at=datetime.now(UTC),
+            reaching_at=None,
             customer_ref=None,
             # Not a detail of these two tests, and not optional either:
             # `ck_audit_log_customer_ref_xor_absence` (models.py) rejects a

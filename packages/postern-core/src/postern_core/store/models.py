@@ -118,6 +118,17 @@ CUSTOMER_REF_ABSENCE_REASONS: tuple[str, ...] = (
 # A `reaching` row therefore does NOT assert that the backend answered, that
 # it was even connected to, or that the data came back. It asserts that this
 # process was about to ask for it and had committed to saying so first.
+#
+# THAT FALSE POSITIVE HAS A MEASURED SHAPE, not merely a licensed direction.
+# `tests/test_audit_entry_row.py::test_a_commit_that_then_raises_records_a
+# _touch_that_never_happened` drives a call whose entry row COMMITS and whose
+# session close then raises: the request is never issued, the backend
+# transport records no path, and this table ends up holding `reaching` plus
+# `raised` for a call that reached nothing. Nothing in the pair marks it --
+# a `raised` completion row next to a `reaching` row is also what a call that
+# WAS served and then failed looks like, since `detail` reads `ToolError` for
+# both. The two are separated by the backend's own logs, which is what the
+# paragraph above means by resolvable.
 OUTCOME_REACHING = "reaching"
 OUTCOME_RETURNED = "returned"
 OUTCOME_RAISED = "raised"
@@ -154,23 +165,89 @@ class AuditEntry(Base):
     # of a call's rows, so the pair shares one timestamp and a reader can see
     # at a glance that they belong together.
     #
-    # WHAT THAT MEANS IS NOT RECORDED HERE, and the `reaching` row makes the
-    # omission worth naming: that row's whole point is the instant it becomes
-    # durable, which is immediately before the backend is reached, and this
-    # column does not carry that instant. On a call where the consent lookup
-    # took thirteen seconds (`services/api/settings.py` derives that ceiling)
-    # the table cannot say when the operator actually reached for the
-    # customer's data -- only when the request that led there arrived. The
-    # gap between the two is bounded by the request deadline and by nothing
-    # in this table.
+    # ONE MEANING ON EVERY ROW OF THIS TABLE, which is a decision and not the
+    # only shape that was available. The instant the operator actually
+    # reached the customer's data is a different fact, it was missing
+    # entirely until migration 9a7d4e51c6f8, and this column was the obvious
+    # place to put it: redefine `at` on an `outcome='reaching'` row to mean
+    # the touch, leave it meaning arrival everywhere else, and no migration
+    # is needed at all.
     #
-    # Recording the write instant instead, or as a second column, was
-    # considered and not done: it would make the pair's two `at` values
-    # differ, which reads as two events rather than one call, and nothing in
-    # this repository has asked to measure arrival-to-touch latency.
-    # `duration_ms` on the completion row is the one interval this table does
-    # measure, and its own comment says exactly which one.
+    # Rejected, and the reason is this column's own `NOT NULL`. Every dated
+    # boundary this table carries is a NULL: `duration_ms`,
+    # `customer_ref_absence_reason` and `call_id` each say "NULL means this
+    # row predates the column", and `duration_ms`'s SECOND meaning is told
+    # from its first by `outcome`. (`request_id` is NOT one of them, though
+    # the list it sits in elsewhere implies it: its NULL is a live state,
+    # recording that no MCP request context was established.) `at` has
+    # neither -- no NULL to carry the reading, and no companion column that
+    # dates it, since `call_id` arrived in the same commit that created the
+    # entry row. A row written under the old meaning and one written under
+    # the new would be the same bytes, on an append-only, regulator-facing
+    # table, distinguishable by nothing in it.
+    #
+    # THE DECIDING ARGUMENT IS SIMPLER AND IS NOT ABOUT MIGRATIONS AT ALL: a
+    # request cancelled after the touch writes NO completion row
+    # (`tests/test_request_deadline.py` measures exactly that, and it is the
+    # shape this pair of rows exists for). Arrival would then survive only on
+    # a row that is never written, so redefining the entry row's `at` to mean
+    # the touch would not relocate the arrival instant, it would delete it --
+    # on precisely the calls where an investigator needs both. `reaching_at`
+    # below carries the touch instead, so this column keeps saying exactly
+    # one thing, both instants sit on the row that is guaranteed to exist,
+    # and the pair keeps sharing the timestamp that shows they are one call.
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # WHEN THE OPERATOR WAS ABOUT TO REACH THE BACKEND, on the one row shape
+    # that describes a touch. Non-NULL exactly when `outcome='reaching'`, and
+    # `ck_audit_log_reaching_at_matches_outcome` below is what makes that a
+    # property of the table rather than of the two Python call sites.
+    #
+    # THE FIRST BACKEND REQUEST OF THE CALL, not each one. A tool that
+    # issues several gets ONE entry row, because `_PendingEntry.record`
+    # (`services/api/middleware/audit.py`) writes at most once per call, so
+    # this instant dates the moment the operator first reached for this
+    # customer's data and says nothing about any request after it. No facade
+    # function issues more than one today; the guard is what keeps that from
+    # being the reason.
+    #
+    # Read by `services/api/middleware/audit.py`'s `_PendingEntry
+    # ._write_entry_row` immediately before the INSERT, so it PRECEDES the
+    # request it describes by the INSERT, the commit and the session exit --
+    # it errs early, never late, which is the direction `OUTCOME_REACHING`
+    # above already commits this row shape to. It is not the instant the row
+    # became durable and it is not the instant the socket opened; it is the
+    # last reading taken before either.
+    #
+    # A WALL CLOCK, deliberately, where `duration_ms` refuses one:
+    # `_elapsed_ms` measures an INTERVAL and uses `time.monotonic()` so an
+    # NTP correction cannot write a negative number into this table. What is
+    # wanted here is an INSTANT comparable with `at`, and `at` is itself a
+    # wall-clock reading (`MiddlewareContext.timestamp`, `datetime.now(
+    # timezone.utc)`), so a monotonic value would be comparable with nothing.
+    # The cost is inherited rather than introduced: a clock step between the
+    # two readings makes `reaching_at - at` wrong by the step, and nothing in
+    # the row marks that. `duration_ms` on the completion row is the interval
+    # this table measures with a clock that cannot step.
+    #
+    # NOT COPIED ONTO THE COMPLETION ROW, even though the middleware holds
+    # the value there. That would be one fact stored twice and free to
+    # disagree with itself -- the reasoning `customer_ref_absence_reason`
+    # below spells out for its own missing fourth value -- and a call that
+    # touched nothing would have nothing to copy.
+    #
+    # NULL therefore means one of two things, told apart by `outcome` exactly
+    # as `duration_ms`'s two NULLs are: on a `returned` or `raised` row it is
+    # structural, there is no touch on that row to record; on a `reaching`
+    # row it means the row predates migration 9a7d4e51c6f8. Nothing the
+    # application wrote is in that second population, but it is not a
+    # hypothetical one either: a hand-seeded `reaching` row from an earlier
+    # revision's verification run survives on a Docker volume on the machine
+    # this was written on, one DELETE and one `alembic upgrade head` from
+    # becoming such a row and from failing a later `VALIDATE CONSTRAINT`.
+    # The DELETE comes first and is not optional -- an `outcome='invented'`
+    # row beside it stops that upgrade a revision early. That migration's
+    # docstring carries the measurement and its limits.
+    reaching_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 128, same reasoning as `ConsentRecord.customer_ref` above: `_OPAQUE`'s
     # current maximum is 65 characters, and a failed insert here means no
     # audit row exists for that call at all, on a regulator-facing,
@@ -532,6 +609,40 @@ class AuditEntry(Base):
         CheckConstraint(
             "call_id IS NOT NULL",
             name="ck_audit_log_call_id_present",
+        ),
+        # A touch instant sits on exactly the rows that describe a touch.
+        # Both halves are enforced and each rules out a different false row:
+        # a `reaching` row without one cannot answer the question the column
+        # was added for, and a `returned` or `raised` row with one would hold
+        # a second copy of a fact its partner row already carries, free to
+        # disagree with it.
+        #
+        # An equality of two predicates, the shape and the parenthesisation
+        # care `ck_audit_log_customer_ref_xor_absence` below explains. Unlike
+        # the `IN` constraints above this one admits nothing by NULL: both
+        # sides are TRUE or FALSE on every row, since `outcome` is NOT NULL
+        # and `IS NOT NULL` is never itself NULL.
+        #
+        # Built from `OUTCOME_REACHING` rather than from a literal, for the
+        # reason the top of this module gives: the constant and the
+        # constraint that depends on it cannot drift apart. Migration
+        # 9a7d4e51c6f8 hardcodes its own copy, deliberately, exactly as the
+        # three revisions before it do.
+        #
+        # Created `NOT VALID` there, like the two constraints above it: every
+        # row that predates that revision has NULL here, and the `reaching`
+        # ones among them would fail. Same trailing cost -- `convalidated`
+        # stays false, and a later `VALIDATE CONSTRAINT` scans the table and
+        # fails on exactly those rows.
+        #
+        # Under the fail-closed policy
+        # (docs/decisions/0006-audit-write-failure.md) a violation costs the
+        # row and the call. Nothing an agent sends reaches either column, so
+        # only a code change that writes one without the other can trigger
+        # it, which is the failure this exists for.
+        CheckConstraint(
+            f"(outcome = '{OUTCOME_REACHING}') = (reaching_at IS NOT NULL)",
+            name="ck_audit_log_reaching_at_matches_outcome",
         ),
         # Same enforcement, same reasoning, for the absence vocabulary: every
         # value is chosen by `services/api/middleware/audit.py`'s

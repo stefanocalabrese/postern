@@ -21,25 +21,40 @@ has a NULL `customer_ref` and `customer_ref_absence_reason='no_access_token'`.
 That is not an accident of the harness being ignored: it exercises
 `ck_audit_log_customer_ref_xor_absence` on the entry row, which is a row
 shape that constraint had never seen before this change.
+
+ONE TEST BREAKS THAT RULE AND HAS TO. `start_session` is the only registered
+tool with no consent check, and what its entry row's NULL `refusal_reason`
+means is that no check RAN -- a claim that is only worth anything if the
+check would have refused had one run. The in-process transport cannot show
+that: with no token `create_app` installs no real check at all, and a real
+one could not file its decision anyway, since `get_http_request()` raises
+there. That test therefore goes over real HTTP with a real signed token,
+reusing the harness `tests/test_audit_refusal_reason.py` already owns rather
+than copying a third one.
 """
 
 import asyncio
 import logging
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx2
 import pytest
 import pytest_asyncio
 from fastmcp import Client, FastMCP
+from fastmcp.server.auth.providers.jwt import RSAKeyPair
 from mcp.shared.exceptions import MCPError
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef
 from postern_core.store.engine import Database
 from postern_core.store.models import (
     ABSENCE_NO_ACCESS_TOKEN,
+    REFUSAL_DOMAIN_NOT_CONSENTED,
     AuditEntry,
 )
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from services.api.main import create_app
 from services.api.middleware import audit as audit_middleware
@@ -52,11 +67,29 @@ from services.api.settings import Settings
 # be free to drift from `_IBAN_SCAN_BUDGET` without anything noticing.
 from tests.test_audit_middleware import _EXHAUSTING_MEMO
 
+# The real-HTTP harness, imported rather than copied a third time: it mints a
+# token, builds the whole app through `create_app` with a mocked backend
+# transport, and sends one `tools/call` per freshly built app (the lifespan
+# closes the backend client, so a second call on the same app dies inside the
+# tool). `tests/test_audit_refusal_reason.py` owns it and documents every one
+# of those choices; what this file adds is a different question asked through
+# it, not a different harness.
+from tests.test_audit_refusal_reason import call, token_for
+
 # Nothing listens on port 1, so asyncpg's connect is refused immediately.
 # Same address and same reason as `tests/test_consent_check_failure_mode.py`.
 REFUSED_URL = "postgresql+asyncpg://postern:postern@127.0.0.1:1/postern"
 
 CUSTOMER = CustomerRef(value="cust_7f3a")
+
+# How long `waits_then_requests` below waits before it reaches the backend,
+# and the floor the assertion uses is half of it: the two instants being
+# compared are both wall-clock readings taken on this machine, and the test
+# asserts that they are FAR APART rather than pinning the sleep's own
+# accuracy. A `reaching_at` copied from `at` -- the failure this test is
+# written against -- differs by well under a millisecond, not by a tenth of a
+# second.
+_ARRIVAL_TO_TOUCH_DELAY = 0.2
 
 
 def _minter(customer: CustomerRef, audience: str) -> str:
@@ -84,9 +117,10 @@ class _Recorder:
 
 
 def _server(audit_db: Database, backend: BackendClient) -> FastMCP:
-    """A server with the audit middleware and four tools: one that makes a
+    """A server with the audit middleware and five tools: one that makes a
     single backend request, one that makes two in sequence, one that makes
-    two concurrently, and one that reaches no backend at all."""
+    two concurrently, one that reaches no backend at all, and one that waits
+    a measurable while before reaching it."""
     mcp = FastMCP(name="entry-row-test")
     mcp.add_middleware(AuditMiddleware(audit_db))
 
@@ -111,6 +145,18 @@ def _server(audit_db: Database, backend: BackendClient) -> FastMCP:
 
     @mcp.tool
     async def no_request() -> str:
+        return "ok"
+
+    @mcp.tool
+    async def waits_then_requests() -> str:
+        # The gap between a call ARRIVING and the operator REACHING for the
+        # customer's data, made large enough to measure. In production it is
+        # the consent lookup and whatever else runs first, bounded only by
+        # `Settings.request_deadline_seconds`; here it is one sleep, because
+        # the point is that the table records two different instants, not
+        # how far apart they happen to be.
+        await asyncio.sleep(_ARRIVAL_TO_TOUCH_DELAY)
+        await backend.get_json("/accounts", customer=CUSTOMER)
         return "ok"
 
     return mcp
@@ -151,19 +197,23 @@ async def test_a_tool_that_reaches_the_backend_writes_an_entry_row_first(
     same subject as the completion row -- everything an investigator reads to
     know WHAT was touched, available before it was.
 
-    The three fields that differ are the three that cannot be known yet:
-    `detail` (nothing has gone wrong), `duration_ms` (the tool has not
-    finished) and, on the completion row only, the outcome itself.
-    `refusal_reason` is NULL on both. On the entry row that means "consent
-    did NOT REFUSE this call", never "consent allowed it", and this file is
-    where the distinction is sharpest: every tool `_server` registers is
-    declared without `auth=`, so no consent check runs for any of them and
-    the stronger reading would be false for all four. It is also false in
-    production for one real tool -- `start_session` carries no `auth=`
-    either (`services/api/tools/bootstrap.py:75`) and still reaches the
-    backend. NULL covers all three of the states
-    `AuditEntry.refusal_reason` documents, and "no check ran" is one of
-    them.
+    The fields that differ are the ones that cannot be known yet, plus the
+    one only an entry row has: `detail` (nothing has gone wrong),
+    `duration_ms` (the tool has not finished), the outcome itself, and
+    `reaching_at`, which carries the instant this row's own write was about
+    to be followed by a backend request and is therefore NULL on the
+    completion row. `refusal_reason` is NULL on both. On the entry row that
+    means "consent did NOT REFUSE this call", never "consent allowed it",
+    and this file is where the distinction is sharpest: every tool `_server`
+    registers is declared without `auth=`, so no consent check runs for any
+    of them and the stronger reading would be false for all four. It is also
+    false in production for one real tool -- `start_session` carries no
+    `auth=` either (`services/api/tools/bootstrap.py:75`) and still reaches
+    the backend, which
+    `test_the_ungated_tool_writes_an_entry_row_and_its_refusal_reason_is_null`
+    at the bottom of this file now measures. NULL covers all three of the
+    states `AuditEntry.refusal_reason` documents, and "no check ran" is one
+    of them.
     """
     recorder = _Recorder()
     async with Client(transport=_server(database, _backend(recorder, database))) as client:
@@ -178,6 +228,17 @@ async def test_a_tool_that_reaches_the_backend_writes_an_entry_row_first(
 
     assert entry.tool_name == completion.tool_name == "one_request"
     assert entry.arguments == completion.arguments == {"memo": "hello"}
+    # THE SHARED `at` SURVIVED A CHANGE THAT COULD HAVE ENDED IT, and the
+    # assertion is here rather than deleted because of what it now means.
+    # Until `reaching_at` existed, this equality was the whole reason the
+    # table could not say when the operator reached the backend: both rows
+    # carried the arrival instant and nothing carried the touch. The cheap
+    # fix was to redefine this column per row shape, which would have made
+    # this line false and made one NOT NULL column on a regulator-facing
+    # table mean arrival on some rows and a touch on others. The touch got
+    # its own column instead, so `at` still means exactly one thing on every
+    # row, and the pair still shares the timestamp a reader uses to see they
+    # belong to one call.
     assert entry.at == completion.at
     assert entry.customer_ref is None
     assert entry.customer_ref_absence_reason == ABSENCE_NO_ACCESS_TOKEN
@@ -186,6 +247,55 @@ async def test_a_tool_that_reaches_the_backend_writes_an_entry_row_first(
     assert entry.duration_ms is None, "a row written before the tool finished has no duration"
     assert entry.refusal_reason is None
     assert isinstance(completion.duration_ms, int)
+    assert entry.reaching_at is not None
+    assert entry.reaching_at >= entry.at
+    assert completion.reaching_at is None, (
+        "a completion row carries no touch instant: the entry row holds it, and "
+        "the same fact on both rows would be free to disagree with itself"
+    )
+
+
+async def test_the_entry_row_records_when_the_backend_was_reached_not_when_the_call_arrived(
+    database: Database, session: AsyncSession, clean_audit_log: None
+) -> None:
+    """The question this table could not answer until `reaching_at` existed.
+
+    `at` is the ARRIVAL instant, on both of a call's rows: the middleware
+    reads `context.timestamp` once and passes it to both writes. So the two
+    rows shared one number, and the instant the operator actually reached
+    for the customer's data was in none of them -- the gap between the two
+    bounded only by `Settings.request_deadline_seconds`, since everything
+    that runs before the first backend request (the consent lookup, argument
+    validation, whatever a tool body does first) sits inside it.
+
+    The tool here sleeps before its request, which is what makes this
+    discriminating rather than merely green: a `reaching_at` copied from
+    `at`, or an `at` reused as the touch instant, differs by microseconds
+    against the tenth of a second asserted below.
+
+    The inequality's direction is pinned in the sibling test above, with the
+    caveat this file is downstream of: the entry row is written after the
+    call arrived and before the request is issued, so the ORDER OF EVENTS
+    puts the touch second, but both numbers are wall-clock readings and
+    `AuditEntry.reaching_at` (models.py) grants that a clock step between
+    them breaks the arithmetic. An `at` later than `reaching_at` in this
+    table is therefore a clock artefact rather than an impossibility, and a
+    failure of that assertion here would be measuring this machine's clock,
+    not this code.
+    """
+    recorder = _Recorder()
+    async with Client(transport=_server(database, _backend(recorder, database))) as client:
+        await client.call_tool("waits_then_requests")
+
+    entry, completion = await _rows(session)
+    assert recorder.paths == ["/accounts"]
+    assert (entry.outcome, completion.outcome) == ("reaching", "returned")
+    assert entry.reaching_at is not None
+    assert entry.reaching_at - entry.at >= timedelta(seconds=_ARRIVAL_TO_TOUCH_DELAY / 2), (
+        f"the touch instant is indistinguishable from the arrival instant: "
+        f"at={entry.at}, reaching_at={entry.reaching_at}"
+    )
+    assert completion.reaching_at is None
 
 
 async def test_a_tool_that_reaches_no_backend_writes_only_a_completion_row(
@@ -447,3 +557,265 @@ def test_create_app_wires_the_entry_write_into_the_backend_client() -> None:
     """
     app = create_app(Settings.for_testing())
     assert app.state.backend_client._before_backend_request is record_data_touch
+
+
+# -- The one registered tool with no consent check ---------------------------
+
+
+@pytest.fixture(scope="session")
+def key_pair() -> RSAKeyPair:
+    """Session-scoped, like the identical fixture in
+    `tests/test_audit_refusal_reason.py`: generating an RSA key pair is the
+    slow part of the HTTP harness and nothing here depends on a fresh one."""
+    return RSAKeyPair.generate()
+
+
+# A customer with no `consents` row of any kind, and a different reference
+# from `CUSTOMER` above, which other test modules seed. Consenting to nothing
+# is the whole point: it is what makes the consent check REFUSE the gated
+# tool in the same breath as the ungated one succeeds.
+UNCONSENTED_CUSTOMER = "cust_4b2e"
+
+
+async def test_the_ungated_tool_writes_an_entry_row_and_its_refusal_reason_is_null(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    session: AsyncSession,
+) -> None:
+    """`start_session` is the exception every claim about the entry row has
+    to survive, and until this test nothing exercised it.
+
+    It is the only one of the five registered tools declared without `auth=`
+    (`services/api/tools/bootstrap.py:75`; the other four carry `auth=check`
+    at `services/api/tools/accounts.py:26` and `:35`,
+    `services/api/tools/transactions.py:28` and
+    `services/api/tools/cards.py:24`), and it reaches the operator's backend
+    anyway, through `accounts_facade.list_accounts`. So it is the one
+    ungated tool that writes an entry row -- and `services/api/middleware/audit.py` names
+    it as the reason that row's NULL `refusal_reason` may only be read as
+    "consent did not refuse this call", never "consent allowed it".
+
+    THE SECOND CALL IS WHAT MAKES THE FIRST ONE MEAN ANYTHING. A NULL
+    `refusal_reason` on a row is the same NULL whether no check ran or a
+    check ran and allowed the call, so this test puts both tools in front of
+    the same customer, in the same consent state, over the same harness:
+    `cards.list` is REFUSED for want of consent and records
+    `domain_not_consented`, while `start_session` is not refused, reaches
+    the backend and writes its entry row. Had `start_session`'s NULL meant
+    "the check allowed it", it would be an allowance for a customer whose
+    very next call, to a gated tool, this same test watches being denied.
+
+    Over real HTTP with a real signed token, not the in-process transport
+    this file otherwise uses, and the reason is that the in-process path
+    cannot produce the contrast at all. `create_app` only hands
+    `build_server` a database to check consent against when real customer
+    auth is configured, so without a token the gated tools get
+    `_no_consent_required` and nothing is ever refused; and even with a real
+    check installed, `get_http_request()` raises under that transport, so
+    `services/api/consent.py`'s `_refuse` returns without filing and the row
+    would read NULL whatever the check decided. Either way both halves of
+    the comparison would be NULL for reasons that have nothing to do with
+    which tool was called. `audit_server` is requested for its clear-the-
+    table-before-and-after behaviour only (`tests/conftest.py`), exactly as
+    `tests/test_audit_refusal_reason.py` requests it; the calls below go
+    through an app `create_app` assembles.
+    """
+    token = token_for(key_pair, UNCONSENTED_CUSTOMER)
+    await call(pg_url, key_pair, token, "start_session")
+    await call(pg_url, key_pair, token, "cards.list")
+
+    # The row SHAPE first, with its own message, because the unpack below
+    # would otherwise be this test's real guard and would report a bare
+    # `ValueError` when it fires. The regression this test exists against --
+    # `cards.list` stops being refused -- produces four rows, not three: an
+    # allowed `cards.list` runs, reaches the backend and writes its own
+    # `reaching`/`returned` pair.
+    rows = await _rows(session)
+    shape = [(row.tool_name, row.outcome) for row in rows]
+    assert shape == [
+        ("start_session", "reaching"),
+        ("start_session", "returned"),
+        ("cards.list", "raised"),
+    ], (
+        "the ungated tool's NULL refusal_reason proves nothing unless the gated "
+        f"tool was refused for this same customer; rows were {shape}"
+    )
+    entry, completion, refused = rows
+
+    assert (entry.tool_name, entry.outcome) == ("start_session", "reaching")
+    assert (completion.tool_name, completion.outcome) == ("start_session", "returned")
+    assert entry.call_id is not None
+    assert entry.call_id == completion.call_id
+    assert entry.customer_ref == completion.customer_ref == UNCONSENTED_CUSTOMER
+    assert entry.reaching_at is not None, "the ungated tool's touch instant is recorded too"
+    assert entry.refusal_reason is None
+    assert completion.refusal_reason is None
+
+    assert (refused.tool_name, refused.outcome, refused.detail) == (
+        "cards.list",
+        "raised",
+        "NotFoundError",
+    )
+    assert refused.refusal_reason == REFUSAL_DOMAIN_NOT_CONSENTED, (
+        "the gated tool was refused but the reason was not recorded, so the "
+        "row cannot say the refusal was about consent rather than a name "
+        "nobody registered"
+    )
+    assert refused.reaching_at is None, "a refused call touches nothing"
+
+
+# -- The window where the commit succeeds and the session exit raises --------
+#
+# `_PendingEntry.record` commits the row and sets `written` on the next line,
+# INSIDE the session block. The class docstring in
+# `services/api/middleware/audit.py` says why that placement is load-bearing
+# and describes both failure shapes around it; until these two tests, only one
+# of them was reachable from the suite
+# (`test_a_second_touch_after_a_failed_entry_write_fails_too` covers the write
+# that never commits). This is the other: `AsyncSession.__aexit__` closes the
+# session and can raise on its own, AFTER the commit has already made the row
+# durable.
+
+_CLOSE_FAILURE = "session close failed after the commit succeeded"
+
+
+class _StoreWhoseSessionCloseRaises(Database):
+    """A store whose sessions commit for real and then raise on exit.
+
+    Subclasses `Database` and takes the ENGINE the `database` fixture already
+    built rather than calling `Database.__init__`, which would open a second
+    engine against the same container that this class would then have to own
+    and close. Everything `_PendingEntry` touches is `sessionmaker`, and the
+    sessions it hands out are ordinary `AsyncSession` objects against that
+    real engine: the INSERT and the COMMIT are real, which is the whole point
+    -- the row has to be genuinely durable before the exception is raised, or
+    the test would be about something else.
+
+    `exits_that_raise` bounds how many session exits fail, because the two
+    tests below need different shapes: one session for the entry write alone,
+    or one failing entry write followed by a completion write that must
+    succeed so the row it produces can be read.
+    """
+
+    def __init__(self, engine: AsyncEngine, *, exits_that_raise: int) -> None:
+        self.engine = engine
+        self.exits_left_to_raise = exits_that_raise
+        store = self
+
+        class _SessionThatRaisesOnClose(AsyncSession):
+            async def __aexit__(self, type_: Any, value: Any, traceback: Any) -> None:
+                # The real close FIRST, so this fails the way a genuine
+                # close failure does -- after the session has done whatever
+                # it does on exit -- rather than by skipping it.
+                await super().__aexit__(type_, value, traceback)
+                if store.exits_left_to_raise > 0:
+                    store.exits_left_to_raise -= 1
+                    raise RuntimeError(_CLOSE_FAILURE)
+
+        self.sessionmaker = async_sessionmaker[AsyncSession](
+            engine, expire_on_commit=False, class_=_SessionThatRaisesOnClose
+        )
+
+
+def _pending_entry_against(store: Database) -> audit_middleware._PendingEntry:
+    """One call's entry row, bound directly rather than through a tool call.
+
+    `AuditMiddleware.on_call_tool` builds this object and puts it on a
+    `ContextVar` that only the façade hook reads, so a test driven through a
+    tool cannot see the `written` flag at all -- and that flag is half of
+    what the window below is about. The fields are the ones the middleware
+    would have derived from a call with no access token, which is what every
+    in-process call in this file produces.
+    """
+    return audit_middleware._PendingEntry(
+        db=store,
+        at=datetime.now(UTC),
+        subject=audit_middleware._Subject(None, ABSENCE_NO_ACCESS_TOKEN),
+        tool_name="one_request",
+        arguments={},
+        redaction_budget_exhausted=False,
+        request_id=None,
+        call_id=str(uuid.uuid4()),
+    )
+
+
+async def test_an_entry_write_that_commits_then_raises_leaves_the_row_and_the_flag(
+    database: Database, session: AsyncSession, clean_audit_log: None
+) -> None:
+    """The window `written = True` is placed inside the session block for.
+
+    The commit succeeds, the session exit then raises, and the exception
+    reaches the caller -- so this first touch is stopped, exactly as a failed
+    write would stop it. What must NOT happen is the second touch writing a
+    second `reaching` row under the same `call_id`: the row it needs is
+    already durable, and a pair of entry rows for one call is the pairing
+    break the guard exists to prevent, arrived at through the guard.
+
+    Set after the block instead -- the placement the middleware's class
+    docstring warns about -- the flag would still be False here, and the
+    second `record()` would insert again. Both halves are asserted for that
+    reason: the flag, and the row count after touching twice.
+    """
+    store = _StoreWhoseSessionCloseRaises(database.engine, exits_that_raise=1)
+    pending = _pending_entry_against(store)
+
+    with pytest.raises(RuntimeError, match=_CLOSE_FAILURE):
+        await pending.record()
+
+    assert pending.written is True, (
+        "the commit succeeded, so the flag must be set: a second toucher that "
+        "finds it False writes a duplicate reaching row for one call"
+    )
+    assert [(row.outcome, row.call_id) for row in await _rows(session)] == [
+        ("reaching", pending.call_id)
+    ], "the row was committed before the exception and must be durable"
+
+    # The second touch, which is what the flag is read for. It returns
+    # quietly -- no exception, no write -- because the row it needed exists.
+    await pending.record()
+    assert [(row.outcome, row.call_id) for row in await _rows(session)] == [
+        ("reaching", pending.call_id)
+    ], "a second touch wrote a duplicate reaching row under the same call_id"
+
+
+async def test_a_commit_that_then_raises_records_a_touch_that_never_happened(
+    database: Database, session: AsyncSession, clean_audit_log: None
+) -> None:
+    """The same window driven through a real tool call, where nothing
+    swallows the exception -- and the false positive that follows, made
+    concrete.
+
+    The entry row commits, the session exit raises, `get_json` therefore
+    never issues its request, and the tool fails. The table ends up holding
+    `reaching` + `raised` for a call that did not touch the customer's data
+    at all. `OUTCOME_REACHING` in `postern_core/store/models.py` licenses
+    exactly this direction -- a row claiming a touch a later failure
+    prevented is a false positive an investigator can resolve against the
+    backend's own logs, where the reverse leaves nothing to resolve -- and
+    this is the shape that licence is written for, rather than a hypothetical
+    one.
+
+    `recorder.paths` is the decisive assertion: the JSON-RPC envelope reports
+    a failed call either way, and only the backend transport can say whether
+    the customer's data was reached.
+    """
+    store = _StoreWhoseSessionCloseRaises(database.engine, exits_that_raise=1)
+    recorder = _Recorder()
+    async with Client(transport=_server(store, _backend(recorder, store))) as client:
+        result = await client.call_tool("one_request", raise_on_error=False)
+
+    assert result.is_error is True
+    assert recorder.paths == [], "the backend was reached after the entry write failed"
+
+    entry, completion = await _rows(session)
+    assert (entry.outcome, completion.outcome) == ("reaching", "raised")
+    assert entry.call_id == completion.call_id
+    assert entry.reaching_at is not None
+    # `ToolError`, not `RuntimeError`: FastMCP wraps whatever a tool body
+    # raises before this middleware reads the type
+    # (`fastmcp/server/server.py:1555`), so nothing in the row names the
+    # session close as the cause. The ERROR line
+    # `test_an_entry_write_failure_is_logged_for_the_operator` pins is what
+    # does.
+    assert completion.detail == "ToolError"

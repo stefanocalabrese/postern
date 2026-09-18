@@ -20,6 +20,7 @@ from postern_core.store.models import (
     ABSENCE_NO_STRING_SUBJECT,
     ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
     CUSTOMER_REF_ABSENCE_REASONS,
+    OUTCOME_REACHING,
     OUTCOMES,
     REFUSAL_REASONS,
     AuditEntry,
@@ -448,6 +449,7 @@ async def test_the_database_refuses_an_absence_reason_outside_the_documented_set
             await store_audit.append(
                 own_session,
                 at=datetime.now(UTC),
+                reaching_at=None,
                 customer_ref=None,
                 customer_ref_absence_reason="a_class_nobody_declared",
                 tool_name="ok_tool",
@@ -476,6 +478,7 @@ async def test_every_documented_absence_reason_is_accepted_by_that_constraint(
         await store_audit.append(
             session,
             at=datetime.now(UTC),
+            reaching_at=None,
             customer_ref=None,
             customer_ref_absence_reason=reason,
             tool_name="ok_tool",
@@ -523,6 +526,7 @@ async def test_the_database_refuses_an_outcome_outside_the_documented_set(
             await store_audit.append(
                 own_session,
                 at=datetime.now(UTC),
+                reaching_at=None,
                 customer_ref=None,
                 customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
                 tool_name="ok_tool",
@@ -550,11 +554,19 @@ async def test_every_documented_outcome_is_accepted_by_that_constraint(
     different call site than the other two (`_PendingEntry`, not `_write`),
     so a migration that constrained `outcome` to the pair it had before
     2026-09-18 would break only the entry row, and only on calls that
-    actually reach the backend."""
+    actually reach the backend.
+
+    `reaching_at` now has to follow the outcome rather than being NULL on
+    every row here: `ck_audit_log_reaching_at_matches_outcome` (models.py)
+    makes a `reaching` row without a touch instant, and a completion row
+    with one, equally invalid -- so a loop that wrote NULL throughout would
+    fail on the first value for a reason that has nothing to do with the
+    vocabulary this test is about."""
     for outcome in OUTCOMES:
         await store_audit.append(
             session,
             at=datetime.now(UTC),
+            reaching_at=datetime.now(UTC) if outcome == OUTCOME_REACHING else None,
             customer_ref=None,
             customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
             tool_name="ok_tool",
@@ -611,6 +623,99 @@ async def test_the_database_refuses_a_row_with_no_call_id(database: Database) ->
             await own_session.commit()
 
 
+async def test_the_database_refuses_a_reaching_row_with_no_touch_instant(
+    database: Database,
+) -> None:
+    """Half of `ck_audit_log_reaching_at_matches_outcome` (models.py,
+    migration 9a7d4e51c6f8), and the half the column exists for: an entry
+    row that says a touch happened without saying when cannot answer the one
+    question it was added to answer.
+
+    WHAT THIS COVERS IS THE CONSTRAINT GOING MISSING, not the constraint
+    being wrong. An INVERTED constraint is already caught loudly -- every
+    entry-row test in `tests/test_audit_entry_row.py` writes a `reaching`
+    row and would fail on the spot. A constraint that is dropped, or
+    recreated by a later migration with one half lost, breaks nothing: the
+    application keeps writing correct rows, all of those tests stay green,
+    and `make migrations` stays green too, because `alembic check` never
+    compares CHECK constraints at all (measured 2026-09-18 by inverting this
+    one in `models.py` and re-running it). Without this test,
+    `AuditEntry.reaching_at`'s claim that presence is a property of the
+    TABLE rather than of two Python call sites would become false with no
+    signal anywhere.
+
+    It pins the MIGRATION's text rather than the model's, which is the part
+    the drift gate cannot reach: every test database here is built by
+    `alembic upgrade head` (tests/conftest.py), so what this row meets is
+    the `NOT VALID` constraint 9a7d4e51c6f8 wrote, not the
+    `CheckConstraint` in `models.py`.
+
+    Written through the real `append`, unlike the `call_id` test above,
+    because `append` accepts this row without complaint: `reaching_at` is
+    typed `datetime | None` and no Python check pairs it with `outcome`, so
+    the database is the only thing standing between this call and the row.
+    Its own session, for the reason its siblings give: a violated constraint
+    aborts the transaction it lands in. `match=` names the constraint so
+    that a row rejected by some other one later does not pass this test for
+    a reason it was not written for."""
+    async with database.sessionmaker() as own_session:
+        with pytest.raises(IntegrityError, match="ck_audit_log_reaching_at_matches_outcome"):
+            await store_audit.append(
+                own_session,
+                at=datetime.now(UTC),
+                reaching_at=None,
+                customer_ref=None,
+                customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
+                tool_name="ok_tool",
+                arguments={},
+                outcome=OUTCOME_REACHING,
+                detail=None,
+                redaction_budget_exhausted=False,
+                duration_ms=None,
+                request_id=None,
+                refusal_reason=None,
+                call_id=PROBE_CALL_ID,
+            )
+
+
+async def test_the_database_refuses_a_completion_row_carrying_a_touch_instant(
+    database: Database,
+) -> None:
+    """The other half, and the one a reader is likeliest to think decorative.
+
+    `AuditMiddleware._write` holds the entry row's instant in memory while
+    it writes the completion row, so copying it across is one line away at
+    all times. The result would be one fact stored on two rows, free to
+    disagree, on a table where the pair is joined by `call_id` and read by
+    someone reconstructing what happened. The constraint makes that write
+    fail instead, at the cost the fail-closed policy sets
+    (docs/decisions/0006-audit-write-failure.md): the row, and the call.
+
+    The accepted shapes are covered by
+    `test_every_documented_outcome_is_accepted_by_that_constraint` above,
+    which writes a `reaching` row with an instant and the other two
+    without -- a constraint rejecting everything would pass both halves of
+    this pair otherwise."""
+    async with database.sessionmaker() as own_session:
+        with pytest.raises(IntegrityError, match="ck_audit_log_reaching_at_matches_outcome"):
+            await store_audit.append(
+                own_session,
+                at=datetime.now(UTC),
+                reaching_at=datetime.now(UTC),
+                customer_ref=None,
+                customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
+                tool_name="ok_tool",
+                arguments={},
+                outcome="returned",
+                detail=None,
+                redaction_budget_exhausted=False,
+                duration_ms=0,
+                request_id=None,
+                refusal_reason=None,
+                call_id=PROBE_CALL_ID,
+            )
+
+
 async def test_the_database_refuses_a_row_with_neither_a_reference_nor_a_reason(
     database: Database,
 ) -> None:
@@ -629,6 +734,7 @@ async def test_the_database_refuses_a_row_with_neither_a_reference_nor_a_reason(
             await store_audit.append(
                 own_session,
                 at=datetime.now(UTC),
+                reaching_at=None,
                 customer_ref=None,
                 customer_ref_absence_reason=None,
                 tool_name="ok_tool",
@@ -657,6 +763,7 @@ async def test_the_database_refuses_a_row_with_both_a_reference_and_a_reason(
             await store_audit.append(
                 own_session,
                 at=datetime.now(UTC),
+                reaching_at=None,
                 customer_ref="cust_7f3a",
                 customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
                 tool_name="ok_tool",
@@ -1699,6 +1806,7 @@ async def test_the_database_refuses_a_reason_outside_the_documented_set(
             await store_audit.append(
                 own_session,
                 at=datetime.now(UTC),
+                reaching_at=None,
                 customer_ref=None,
                 # A documented value, so the only constraint this row can
                 # violate is the refusal vocabulary one under test:
@@ -1731,6 +1839,7 @@ async def test_both_documented_reasons_are_accepted_by_that_constraint(
         await store_audit.append(
             session,
             at=datetime.now(UTC),
+            reaching_at=None,
             customer_ref=None,
             customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
             tool_name="cards.list",

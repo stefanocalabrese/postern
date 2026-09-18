@@ -78,10 +78,23 @@ async def append(
     # one call into two unpairable orphans. Typed `str`, so mypy refuses a
     # caller that passes None rather than leaving the guarantee to a comment.
     call_id: str,
+    # Required and `datetime | None`, the shape `duration_ms` above has and
+    # for the mirror-image reason: `AuditEntry.reaching_at` belongs to the
+    # entry row exactly as `duration_ms` belongs to the completion row, and
+    # `ck_audit_log_reaching_at_matches_outcome` (models.py) rejects either
+    # one written on the wrong row shape -- which under the fail-closed
+    # policy (docs/decisions/0006-audit-write-failure.md) costs the row and
+    # the call. A default would let a future caller file an entry row that
+    # says a touch happened without saying when, which is the hole the column
+    # was added to close, or stamp a completion row with a copy of its
+    # partner's instant. The caller passing None is writing that decision
+    # down rather than inheriting it.
+    reaching_at: datetime | None,
 ) -> None:
     session.add(
         AuditEntry(
             at=at,
+            reaching_at=reaching_at,
             customer_ref=customer_ref,
             customer_ref_absence_reason=customer_ref_absence_reason,
             tool_name=tool_name,
