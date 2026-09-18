@@ -65,6 +65,56 @@ class Settings:
     # request body (a bulk import, say) must raise this deliberately, not
     # rely on the default silently being big enough.
     max_body_bytes: int = 1_048_576
+    # A wall-clock bound on the whole HTTP request, enforced by
+    # `services/api/asgi/request_deadline.py`. Every other number in this
+    # file bounds ONE wait on a socket that eventually says something; this
+    # one exists because a path silent in both directions produces no such
+    # event, and `docs/verification/2026-09-17-query-stall-deadline.md`
+    # measured a request against one as not returned at its 60-second cap, on
+    # two separate paths. That is a cap, not a bound: whether either request
+    # ever returns was not determined.
+    #
+    # 88.0 is derived, not chosen, and every term is a number already in this
+    # repository. Per DATABASE OPERATION, from `Database.__init__`'s own
+    # arithmetic (`postern_core/store/engine.py`): 1.0 pool + 2.0 connect +
+    # 3.0 statement = 6.0s when the checkout opens a connection, and 1.0 +
+    # 3x3.0 + 3.0 = 13.0s on a recycled one, where `pool_pre_ping=True` makes
+    # the check three statements (BEGIN, the ping, ROLLBACK) that each inherit
+    # `command_timeout`. Per BACKEND REQUEST, from the four fields above:
+    # 1.0 pool + 2.0 connect + 2.0 write + 5.0 read = 10.0s. Operations per
+    # `tools/call`: the audit write is always one, and the consent lookup is
+    # one when it succeeds -- `services/api/consent.py` caches a successful
+    # answer on `request.state` -- but a lookup that RAISES is never cached,
+    # and that module measures FIVE evaluations for one `tools/call` carrying
+    # arguments. The ceiling is therefore the arrangement where the first four
+    # evaluations burn 13.0s each and the fifth still succeeds:
+    # 5x13.0 + 10.0 + 13.0 = 88.0s.
+    #
+    # That number is uncomfortably large and is written here rather than
+    # quietly rounded down. It is longer than any consumer AI client will
+    # wait, so in practice the client gives up first; what this deadline
+    # returns is the WORKER, not a timely answer. Two more honest readings of
+    # it: the realistic success ceiling is 13.0 + 10.0 + 13.0 = 36.0s and the
+    # realistic denial ceiling (every lookup raising, the backend never
+    # reached) is 5x13.0 + 13.0 = 78.0s, while a healthy call was measured at
+    # 0.10s end to end in the verification record above. And the reason to sit
+    # AT the ceiling rather than below it is a property, not caution: a
+    # deadline above every individually-bounded sum can only fire once some
+    # wait has already escaped its own deadline, which keeps this from
+    # preempting requests the store and the backend would still have served --
+    # and, because a cancelled request loses its audit row
+    # (`request_deadline.py`, and `docs/decisions/0006-audit-write-failure.md`),
+    # every second shaved off this value buys back latency by trading away
+    # audit rows for calls that were merely slow.
+    #
+    # Lowering it honestly means lowering the terms it is built from, which is
+    # a change to the store and backend budgets above, not to this line.
+    #
+    # Zero and negative are REFUSED by `RequestDeadline.__init__`, so a
+    # `POSTERN_REQUEST_DEADLINE_SECONDS=0` reached for as an off switch fails
+    # at startup instead of 504-ing every request. There is no off switch;
+    # raise the number instead.
+    request_deadline_seconds: float = 88.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -131,6 +181,9 @@ class Settings:
                 os.environ.get("POSTERN_DATABASE_POOL_TIMEOUT_SECONDS", "1.0")
             ),
             max_body_bytes=int(os.environ.get("POSTERN_MAX_BODY_BYTES", str(1_048_576))),
+            request_deadline_seconds=float(
+                os.environ.get("POSTERN_REQUEST_DEADLINE_SECONDS", "88.0")
+            ),
         )
 
     @classmethod

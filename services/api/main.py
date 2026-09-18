@@ -56,6 +56,7 @@ from postern_core.store.engine import Database
 from starlette.middleware import Middleware
 
 from services.api.asgi.header_validation import HeaderBodyValidation
+from services.api.asgi.request_deadline import RequestDeadline
 from services.api.jwks import jwks_route
 from services.api.middleware.audit import AuditMiddleware
 from services.api.server import build_server, token_customer_resolver
@@ -234,11 +235,25 @@ def create_app(
         stateless_http=True,
         json_response=True,
         middleware=[
+            # FIRST, and that means OUTERMOST: Starlette wraps
+            # `user_middleware` in reverse
+            # (`starlette/applications.py::build_middleware_stack`), so entry
+            # zero is the last one applied and therefore the first one a
+            # request reaches. That position is the point. Inside
+            # `HeaderBodyValidation` this would not cover that middleware's
+            # own `_drain`, which awaits `receive()` with no deadline while it
+            # buffers up to `max_body_bytes` -- a body that arrives one byte
+            # at a time parks a worker there, before any store or backend
+            # timeout is reachable. The cost of being outermost is that the
+            # body is unparsed, so an expiry cannot echo the JSON-RPC id.
+            # `services/api/asgi/request_deadline.py` carries the rest,
+            # including the two things this control does NOT do.
+            Middleware(RequestDeadline, seconds=settings.request_deadline_seconds),
             Middleware(
                 HeaderBodyValidation,
                 strict=settings.strict_headers,
                 max_body_bytes=settings.max_body_bytes,
-            )
+            ),
         ],
     )
     # Exposed on `app.state` (Starlette's own convention for app-scoped
