@@ -540,6 +540,120 @@ class AuditEntry(Base):
     # deliberately, with the write cost in view, rather than inherit one
     # nobody sized.
     call_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # WHICH OAUTH CLIENT made this call: `AccessToken.client_id` (fastmcp
+    # 4.0.3, `fastmcp/server/auth/auth.py`, a required `str` field inherited
+    # from `mcp.server.auth.provider.AccessToken`), copied onto BOTH rows of
+    # the call by `services/api/middleware/audit.py` from one token read.
+    #
+    # The column exists because capo's 2026-09-18 ruling -- this table records
+    # the customer data the operator TOUCHED, not the calls it served -- left
+    # the table unable to name the party that did the touching. `customer_ref`
+    # says WHOSE data, `tool_name` says WHAT was asked for, and nothing said
+    # WHO asked. Under CLAUDE.md's agent-to-server layer that party is an
+    # OAuth 2.1 client registered through CIMD, and the design handoff's own
+    # controls are per-client (§"Allowlist clients": "a known set, each with
+    # its own client ID, rate limits, and kill switch"), so a per-client
+    # control with no per-client record is a control nobody can audit after
+    # the fact.
+    #
+    # NULLABLE, and the absence is a live path rather than a legacy one.
+    # `get_access_token()` returns None for every call arriving over the
+    # in-process `fastmcp.Client(transport=server)` transport -- the absence
+    # `ABSENCE_NO_ACCESS_TOKEN` at the top of this module already names, and
+    # the transport all but one test in `tests/test_audit_entry_row.py` calls
+    # through (the exception monkeypatches a token in, to pin this column on
+    # both rows of one call). `NOT
+    # NULL` would turn that call into a failed INSERT, which under
+    # docs/decisions/0006-audit-write-failure.md costs the audit row and the
+    # tool call with it: the column would fail closed on a path that is
+    # working as designed.
+    #
+    # NULL THEREFORE HAS TWO MEANINGS, told apart by a sibling column rather
+    # than by this one, the way `duration_ms`'s two are told apart by
+    # `outcome`. On a row written since this column existed, NULL means "this
+    # call carried no access token", and that row also carries
+    # `customer_ref_absence_reason = 'no_access_token'`, because both values
+    # come from the same single `get_access_token()` return in
+    # `AuditMiddleware.on_call_tool`. On an older row it means the row
+    # predates the column.
+    #
+    # THAT PAIRING IS NOT ENFORCED BY A CHECK CONSTRAINT, deliberately, and
+    # the biconditional it would express (`client_id IS NULL` = `customer_ref
+    # _absence_reason = 'no_access_token'`) is true of every row this
+    # application writes. It is left unenforced because it is a fact about
+    # ONE code path rather than about the data: the other two absence values
+    # and a non-NULL `customer_ref` all require a token to exist, so the
+    # equivalence holds only while `_customer_ref` and `_client_id` are fed
+    # the same token object. A second writer with its own token source -- a
+    # provider that yields a token carrying no client id, say -- would be
+    # filing an honest row that this constraint would reject, and under the
+    # fail-closed policy the rejection costs the row and the call. Nothing
+    # queries this column yet, so no reader depends on the pairing today; the
+    # constraints above exist for CLOSED VOCABULARIES and for structural
+    # pairings this codebase writes on purpose, and this is neither.
+    #
+    # `String(512)` AND NOT `Text`, which is the reverse of the choice
+    # `detail` above makes, because the value is truncatable and `detail`'s
+    # three-value vocabulary is not. A CIMD client id is a URL and this
+    # repository sets no bound on its length, so the width is a decision
+    # about two costs, both measured:
+    #
+    #   * TOO NARROW loses identity. `services/api/middleware/audit.py`
+    #     clamps to this width and marks a clipped value with `_TRUNCATED`
+    #     (U+2026), so a clipped id says it was clipped -- but a URL's
+    #     discriminating part is at its END (`https://host/clients/a` versus
+    #     `.../b`), where `tool_name`'s and `request_id`'s are at the front,
+    #     so a prefix clip costs more here than on either of those columns.
+    #   * TOO WIDE spends the call's shared redaction allowance. The
+    #     middleware scrubs this value inside the same `redaction_budget()`
+    #     scope as `tool_name` and `arguments`, and the worst-case checksum
+    #     cost scales at 4.33 per character (measured on this repository's
+    #     own adversarial shape, 128-character maximum-density tokens, at
+    #     every length from 256 to 16,384). At 512 characters the worst case
+    #     is 2,220 checksums, 2.22% of `_IBAN_SCAN_BUDGET`'s 100,000. An
+    #     unbounded `Text` column has no such ceiling: the same shape
+    #     consumes the ENTIRE call allowance at 23,100 characters (measured:
+    #     100,061 checksums), which would let an issuer-minted client id
+    #     starve the scrubbing of the arguments recorded beside it.
+    #
+    # 512 is four times `request_id`'s and `customer_ref`'s 128 for the URL
+    # shape, and the headroom is the lesson migration 1c64b7ed3f4b already
+    # charged this repository for: it widened both `customer_ref` columns
+    # from 64 to 128 because someone had matched the width to the
+    # then-current bound.
+    #
+    # SCRUBBED BEFORE IT IS WRITTEN, unlike every other issuer-supplied value
+    # on this row, and the reason is a fallback in the verifier rather than a
+    # general distrust of the issuer. fastmcp 4.0.3's
+    # `JWTVerifier.load_access_token` fills this field with
+    # `claims.get("client_id") or claims.get("azp") or claims.get("sub") or
+    # "unknown"`, so a token carrying neither `client_id` nor `azp` puts its
+    # RAW `sub` here -- the same string `customer_ref_absence_reason`'s
+    # `subject_not_a_customer_ref` exists to keep out of this table, and the
+    # PAN-, IBAN- or DNI-shaped value identity.py warns a compromised issuer
+    # can mint. Without the scrub this column would be the bypass around that
+    # control. `services/api/middleware/audit.py:_client_id` carries the
+    # measurement.
+    #
+    # THE SCRUB COSTS THIS COLUMN TWO KINDS OF FIDELITY, both measured, and
+    # both accepted for the reason above rather than overlooked. A PAN- or
+    # IBAN-shaped id collapses to a fixed mask, so two issuers whose ids end
+    # in the same four digits record the same value. And any alphanumeric RUN
+    # longer than `masking._IBAN_SCAN_MAX_TOKEN` (128) is bare-masked to
+    # `••••`: a run of 128 survives intact, a run of 129 does not, so an id
+    # carrying one long opaque segment loses that segment while its scheme,
+    # host and other path segments survive (`https://client.test/` plus 200
+    # of one letter records as `https://client.test/••••`). An id that is one
+    # 600-character run records `••••…` and names nobody. A CIMD URL built
+    # from ordinary path segments is untouched at any length. Width 128 would
+    # have made the bare mask unreachable, and was rejected: it would clip
+    # every ordinary URL past 128 characters instead, which trades a rare
+    # total loss for a routine partial one.
+    #
+    # NO INDEX, for the reason `call_id` above gives: nothing in this
+    # repository queries this column, and whoever writes the first per-client
+    # query should size the index with the write cost in view.
+    client_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
     __table_args__ = (
         Index("ix_audit_log_customer_at", "customer_ref", "at"),

@@ -90,6 +90,19 @@ async def append(
     # partner's instant. The caller passing None is writing that decision
     # down rather than inheriting it.
     reaching_at: datetime | None,
+    # Required and `str | None`, the shape `request_id` above has and for the
+    # same reason applied to a different absence: NULL on
+    # `AuditEntry.client_id` must mean "this call carried no access token",
+    # never "a caller forgot the argument". Only the caller has seen
+    # `get_access_token()`, and it has to pass the SAME value to both of a
+    # call's two rows -- `services/api/middleware/audit.py` reads the token
+    # once and carries the result on `_PendingEntry` precisely so the entry
+    # row and the completion row cannot disagree about who made the call. A
+    # default would let a future caller file a row that answers "no client"
+    # for a call that had one, on the column that names the party the
+    # per-client controls in the design handoff (§"Allowlist clients") act
+    # on.
+    client_id: str | None,
 ) -> None:
     session.add(
         AuditEntry(
@@ -106,6 +119,7 @@ async def append(
             request_id=request_id,
             refusal_reason=refusal_reason,
             call_id=call_id,
+            client_id=client_id,
         )
     )
     await session.commit()

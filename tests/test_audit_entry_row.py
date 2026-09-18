@@ -43,6 +43,7 @@ import httpx2
 import pytest
 import pytest_asyncio
 from fastmcp import Client, FastMCP
+from fastmcp.server.auth import AccessToken
 from fastmcp.server.auth.providers.jwt import RSAKeyPair
 from mcp.shared.exceptions import MCPError
 from postern_core.facade.client import BackendClient
@@ -296,6 +297,89 @@ async def test_the_entry_row_records_when_the_backend_was_reached_not_when_the_c
         f"at={entry.at}, reaching_at={entry.reaching_at}"
     )
     assert completion.reaching_at is None
+
+
+async def test_both_rows_of_one_call_name_the_same_oauth_client(
+    database: Database,
+    session: AsyncSession,
+    clean_audit_log: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`client_id` on BOTH row shapes, carrying one value.
+
+    The pairing is the property, not the presence. `AuditMiddleware
+    .on_call_tool` reads `get_access_token()` ONCE and puts the derived id on
+    the `_PendingEntry` that both writes read from, so the entry row written
+    before the backend was reached and the completion row written after it
+    name the same client by construction. Two separate reads would make the
+    agreement depend on both landing in the same `ContextVar` context, and a
+    pair that named two different callers for one `call_id` would be a
+    regulator-facing table contradicting itself on the one question this
+    column was added to answer.
+
+    The token has to be monkeypatched here for the reason this file's module
+    docstring gives: `Client(transport=server)` accepts no auth argument, so
+    every other call in this file carries no token at all. That absence is
+    the subject of the test immediately below, which is the other half of
+    this one -- without it, a `client_id` that was always NULL would pass
+    every pairing assertion here.
+
+    `sub` is a real `CustomerRef` so the row satisfies
+    `ck_audit_log_customer_ref_xor_absence`, and the client id is a
+    CIMD-shaped URL rather than an opaque string, because that is the shape
+    `AuditEntry.client_id`'s 512-character width was chosen for.
+    """
+    client_id = "https://claude.ai/.well-known/oauth-client-metadata"
+    token = AccessToken(
+        token="t",  # noqa: S106
+        client_id=client_id,
+        scopes=[],
+        claims={"sub": CUSTOMER.value},
+    )
+    monkeypatch.setattr("services.api.middleware.audit.get_access_token", lambda: token)
+
+    recorder = _Recorder()
+    async with Client(transport=_server(database, _backend(recorder, database))) as client:
+        await client.call_tool("one_request", {"memo": "hello"})
+
+    entry, completion = await _rows(session)
+    assert recorder.paths == ["/accounts"]
+    assert (entry.outcome, completion.outcome) == ("reaching", "returned")
+    assert entry.call_id == completion.call_id
+    assert entry.client_id == client_id
+    assert completion.client_id == client_id
+
+
+async def test_a_call_with_no_access_token_names_no_client_on_either_row(
+    database: Database, session: AsyncSession, clean_audit_log: None
+) -> None:
+    """NULL is a live answer on this column, not only a pre-migration one.
+
+    `get_access_token()` returns None for every call over the in-process
+    `Client(transport=server)` transport, which is a working path and not a
+    degraded one, so `AuditEntry.client_id` is nullable rather than `NOT
+    NULL`: the INSERT would otherwise fail, and under
+    docs/decisions/0006-audit-write-failure.md a failed audit write takes the
+    tool call with it. The column would then fail closed on a transport the
+    test suite above it runs entirely on.
+
+    The absence is corroborated on the same rows rather than asserted alone.
+    `customer_ref_absence_reason` reads `no_access_token` on both, which is
+    the same fact arriving through `_customer_ref` instead of `_client_id`,
+    and the two agree because one `get_access_token()` call feeds both --
+    the equivalence `AuditEntry.client_id` documents and deliberately does
+    not enforce with a CHECK constraint.
+    """
+    recorder = _Recorder()
+    async with Client(transport=_server(database, _backend(recorder, database))) as client:
+        await client.call_tool("one_request", {"memo": "hello"})
+
+    entry, completion = await _rows(session)
+    assert (entry.outcome, completion.outcome) == ("reaching", "returned")
+    assert entry.client_id is None
+    assert completion.client_id is None
+    assert entry.customer_ref_absence_reason == ABSENCE_NO_ACCESS_TOKEN
+    assert completion.customer_ref_absence_reason == ABSENCE_NO_ACCESS_TOKEN
 
 
 async def test_a_tool_that_reaches_no_backend_writes_only_a_completion_row(
@@ -737,6 +821,11 @@ def _pending_entry_against(store: Database) -> audit_middleware._PendingEntry:
         redaction_budget_exhausted=False,
         request_id=None,
         call_id=str(uuid.uuid4()),
+        # None for the same reason the subject beside it is a
+        # `no_access_token` absence: `_client_id` returns None whenever
+        # `get_access_token()` does, and this helper stands in for a call
+        # with no token.
+        client_id=None,
     )
 
 

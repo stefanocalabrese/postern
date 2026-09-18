@@ -31,11 +31,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.middleware import audit as audit_middleware
 from services.api.middleware.audit import (
+    _MAX_CLIENT_ID,
     _MAX_REQUEST_ID,
     _MAX_TOOL_NAME,
     _TRUNCATED,
     AuditMiddleware,
     _clamp,
+    _client_id,
     _request_id,
     _scrub,
 )
@@ -461,6 +463,7 @@ async def test_the_database_refuses_an_absence_reason_outside_the_documented_set
                 request_id=None,
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
+                client_id=None,
             )
 
 
@@ -490,6 +493,7 @@ async def test_every_documented_absence_reason_is_accepted_by_that_constraint(
             request_id=None,
             refusal_reason=None,
             call_id=PROBE_CALL_ID,
+            client_id=None,
         )
     assert [e.customer_ref_absence_reason for e in await rows(session)] == list(
         CUSTOMER_REF_ABSENCE_REASONS
@@ -538,6 +542,7 @@ async def test_the_database_refuses_an_outcome_outside_the_documented_set(
                 request_id=None,
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
+                client_id=None,
             )
 
 
@@ -578,6 +583,7 @@ async def test_every_documented_outcome_is_accepted_by_that_constraint(
             request_id=None,
             refusal_reason=None,
             call_id=PROBE_CALL_ID,
+            client_id=None,
         )
     assert [e.outcome for e in await rows(session)] == list(OUTCOMES)
 
@@ -675,6 +681,7 @@ async def test_the_database_refuses_a_reaching_row_with_no_touch_instant(
                 request_id=None,
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
+                client_id=None,
             )
 
 
@@ -713,6 +720,7 @@ async def test_the_database_refuses_a_completion_row_carrying_a_touch_instant(
                 request_id=None,
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
+                client_id=None,
             )
 
 
@@ -746,6 +754,7 @@ async def test_the_database_refuses_a_row_with_neither_a_reference_nor_a_reason(
                 request_id=None,
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
+                client_id=None,
             )
 
 
@@ -775,6 +784,7 @@ async def test_the_database_refuses_a_row_with_both_a_reference_and_a_reason(
                 request_id=None,
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
+                client_id=None,
             )
 
 
@@ -1285,6 +1295,140 @@ async def test_the_name_is_scrubbed_before_the_arguments_so_their_exhaustion_doe
     assert entry.redaction_budget_exhausted is True
 
 
+# -- `client_id`: WHICH OAuth client made the call --------------------------
+#
+# The column answers a question the table could not: `customer_ref` says
+# whose data was touched, `tool_name` says what was asked for, and nothing
+# said who asked. `services/api/middleware/audit.py:_client_id` derives it,
+# clamps it to `_MAX_CLIENT_ID` and scrubs it in `on_call_tool`'s shared
+# redaction scope; `AuditEntry.client_id` (models.py) carries the width and
+# nullability reasoning. `tests/test_audit_entry_row.py` owns the other half
+# of the coverage -- that BOTH rows of a two-row call carry the same value,
+# and that both carry NULL when no token was presented -- because that file
+# is where a call writes two rows at all.
+
+
+def _token_for_client(client_id: str) -> AccessToken:
+    return AccessToken(token="t", client_id=client_id, scopes=[], claims={})  # noqa: S106
+
+
+async def test_a_pan_shaped_client_id_does_not_reach_the_audit_row(
+    audit_server: FastMCP, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason `client_id` is scrubbed at all, in the exact shape that
+    produces it.
+
+    This is not a general distrust of the issuer. fastmcp 4.0.3's
+    `JWTVerifier.load_access_token` fills `AccessToken.client_id` with
+    `claims.get("client_id") or claims.get("azp") or claims.get("sub") or
+    "unknown"`, so a verified token carrying neither `client_id` nor `azp`
+    puts its RAW `sub` in that field -- which is what the token below is,
+    with the same value in both places exactly as that fallback would leave
+    it.
+
+    `test_a_pan_shaped_token_subject_does_not_reach_customer_ref` above
+    already pins that `_customer_ref` refuses this string for `customer_ref`
+    and files `subject_not_a_customer_ref` instead. Without this scrub the
+    new column would carry the refused value into the same row, one column
+    over: a bypass of that control rather than a second opinion on it.
+    """
+    raw_pan = "4111111111114417"
+    monkeypatch.setattr(
+        "services.api.middleware.audit.get_access_token", lambda: _token_for_client(raw_pan)
+    )
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1})
+    entry = (await rows(session))[0]
+    assert raw_pan not in (entry.client_id or "")
+    assert entry.client_id == "•••• 4417"
+    assert entry.customer_ref_absence_reason == ABSENCE_NO_STRING_SUBJECT
+
+
+async def test_the_client_id_is_scrubbed_before_the_arguments_so_their_exhaustion_spares_it(
+    audit_server: FastMCP, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering half, and the same argument
+    `test_the_name_is_scrubbed_before_the_arguments_so_their_exhaustion_does
+    _not_bare_mask_it` makes for the tool name, applied to the field that
+    says WHO instead of WHAT.
+
+    `_client_id` runs inside `on_call_tool`'s one `redaction_budget()` scope,
+    before `_scrub` walks the arguments. `_EXHAUSTING_MEMO` is already proven
+    elsewhere in this file to exhaust the whole call's checksum allowance on
+    its own, so with the order reversed `_redact_iban_match`'s
+    `budget.exhausted` branch would bare-mask this IBAN-shaped client id to
+    `••••` and the row would name nobody. Going first, its own worst case
+    (2,220 checksums of 100,000 at the full 512 characters, measured) cannot
+    be dented by anything the arguments go on to spend.
+    """
+    monkeypatch.setattr(
+        "services.api.middleware.audit.get_access_token",
+        lambda: _token_for_client("ES9121000418450200051332"),
+    )
+    async with Client(transport=audit_server) as c:
+        await c.call_tool("ok_tool", {"amount": 1, "memo": _EXHAUSTING_MEMO})
+    entry = (await rows(session))[0]
+    assert entry.client_id == "ES•• •••• 1332"
+    assert entry.redaction_budget_exhausted is True
+
+
+def test_an_over_length_client_id_is_clipped_to_the_column_and_says_so() -> None:
+    """`_MAX_CLIENT_ID` is `AuditEntry.client_id`'s own width, so an id over
+    it must come back at exactly that width and must announce the cut.
+
+    The shape is a realistic CIMD URL made of ordinary path segments, not a
+    run of one letter, and that is load-bearing rather than decorative:
+    `_scrub` bare-masks any alphanumeric run longer than 128 characters, so a
+    single-run id of this length records `••••…` and never reaches the
+    column's width at all (`_client_id`'s docstring carries that measurement
+    and why 128 was rejected as the width). For an id built of segments the
+    scrub is the identity, which is what lets this assert the exact stored
+    value rather than only its length.
+
+    Without the clamp this value reaches the INSERT and raises
+    `asyncpg.exceptions.StringDataRightTruncationError`, which under
+    docs/decisions/0006-audit-write-failure.md costs the audit row and the
+    tool call.
+    """
+    raw = "https://mcp.example-bank.es/.well-known/oauth-client/" + "/".join(
+        ["tenant-segment"] * 40
+    )
+    assert len(raw) > _MAX_CLIENT_ID
+
+    recorded = _client_id(_token_for_client(raw))
+
+    assert recorded is not None
+    assert len(recorded) == _MAX_CLIENT_ID
+    assert recorded.endswith(_TRUNCATED)
+    assert recorded == raw[: _MAX_CLIENT_ID - 1] + _TRUNCATED
+
+
+def test_ordinary_client_ids_gain_no_sentinel() -> None:
+    """The no-false-positive half, at the boundary and below it: an id of
+    exactly `_MAX_CLIENT_ID` characters fits and must come back identical, so
+    must one character under it, and so must a real CIMD URL. A marker on any
+    of those would be the row lying about itself.
+
+    The two long values are built from short path segments for the reason the
+    test above gives -- `_scrub` bare-masks any alphanumeric run over 128
+    characters, so `"d" * 512` would come back `••••` and this test would be
+    measuring the mask rather than the absence of a clip.
+
+    `_client_id(None)` is checked in the same place because it is the same
+    question asked of the absent case: no token means no client id, and NULL
+    on that column is a live state (`AuditEntry.client_id`), not a clip.
+    """
+    segments = "abc/" * _MAX_CLIENT_ID
+    for value in (
+        "https://claude.ai/.well-known/oauth-client-metadata",
+        segments[: _MAX_CLIENT_ID - 1],
+        segments[:_MAX_CLIENT_ID],
+    ):
+        assert _client_id(_token_for_client(value)) == value
+
+    assert _client_id(None) is None
+
+
 # -- The audit-write-failure policy: docs/decisions/0006-audit-write-failure.md --
 #
 # `_write` raises when the audit store itself is unavailable (connection
@@ -1593,7 +1737,13 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
     all, and the `customer_ref`/`customer_ref_absence_reason` pair that
     `ck_audit_log_customer_ref_xor_absence` (models.py) requires -- this call
     runs outside any request, so `get_access_token()` answers None and the
-    row records `no_access_token` rather than a second bare NULL."""
+    row records `no_access_token` rather than a second bare NULL.
+
+    `client_id` is None on the same row and for the same single reason: one
+    `get_access_token()` read in `on_call_tool` feeds both it and the
+    absence reason above, so the pair `AuditEntry.client_id` (models.py)
+    describes -- a NULL client id beside `no_access_token` -- is visible here
+    at the `_write` boundary rather than only in the stored row."""
     middleware = AuditMiddleware(db=None)  # type: ignore[arg-type]
     tool_error = ToolError("Error calling tool 'boom_tool': internal detail")
     written: list[dict[str, object]] = []
@@ -1614,6 +1764,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
         request_id: object,
         refusal_reason: object,
         call_id: object,
+        client_id: object,
     ) -> None:
         written.append(
             {
@@ -1624,6 +1775,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
                 "customer_ref": customer,
                 "customer_ref_absence_reason": customer_ref_absence_reason,
                 "call_id": call_id,
+                "client_id": client_id,
             }
         )
         if audit_write_raises:
@@ -1643,6 +1795,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
     assert written[0]["refusal_reason"] is None
     assert written[0]["customer_ref"] is None
     assert written[0]["customer_ref_absence_reason"] == ABSENCE_NO_ACCESS_TOKEN
+    assert written[0]["client_id"] is None
 
 
 async def test_the_request_id_is_recorded_and_differs_per_client_request(
@@ -1823,6 +1976,7 @@ async def test_the_database_refuses_a_reason_outside_the_documented_set(
                 request_id=None,
                 refusal_reason="reason_nobody_declared",
                 call_id=PROBE_CALL_ID,
+                client_id=None,
             )
 
 
@@ -1851,5 +2005,6 @@ async def test_both_documented_reasons_are_accepted_by_that_constraint(
             request_id=None,
             refusal_reason=reason,
             call_id=PROBE_CALL_ID,
+            client_id=None,
         )
     assert [e.refusal_reason for e in await rows(session)] == list(REFUSAL_REASONS)

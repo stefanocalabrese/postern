@@ -202,6 +202,22 @@ _MAX_TOOL_NAME = 64
 # prefix rather than the whole string -- exactly as with `tool_name`.
 _MAX_REQUEST_ID = 128
 
+# `client_id` is `String(512)` (models.py), and that column's own comment
+# carries the width decision and the two measured costs behind it. What
+# belongs here is the same failure this file's other two bounds exist to
+# avoid: a value wider than the column raises
+# `asyncpg.exceptions.StringDataRightTruncationError` at the INSERT, which
+# under docs/decisions/0006-audit-write-failure.md costs the whole audit row
+# and the tool call.
+#
+# The value is NOT agent-chosen, which is the difference from `_MAX_TOOL_NAME`
+# and `_MAX_REQUEST_ID` above: it comes off an `AccessToken` this server
+# already verified against its configured JWKS and issuer, so producing an
+# over-length one takes the issuer's signing key, not a crafted `tools/call`.
+# That lowers the likelihood and changes nothing about the consequence, which
+# is why the bound is here at all.
+_MAX_CLIENT_ID = 512
+
 
 def _clamp(value: str, limit: int) -> str:
     """`value` cut to fit `limit` characters, carrying `_TRUNCATED` when, and
@@ -337,6 +353,108 @@ def _customer_ref(token: AccessToken | None) -> _Subject:
         return _Subject(None, ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF)
 
 
+def _client_id(token: AccessToken | None) -> str | None:
+    """Which OAuth client made this call, scrubbed and clamped to
+    `_MAX_CLIENT_ID`, or None when the call carried no access token.
+
+    MUST BE CALLED INSIDE `on_call_tool`'s `with redaction_budget()` BLOCK,
+    and never inside a second one of its own. The scrub below spends from
+    whichever `_ScanBudget` is ambient, and the one allowance-per-call
+    invariant that block holds is exactly what a private scope would
+    reintroduce a hole in -- the same hole the tool NAME's own scrub was
+    moved into that block to close.
+
+    None means "no access token on this call", which is a live state and not
+    a failure: `get_access_token()` returns None for every call arriving over
+    the in-process `fastmcp.Client(transport=server)` transport, and
+    `_customer_ref` above reports the same absence as
+    `ABSENCE_NO_ACCESS_TOKEN`. Both values come from the one token this
+    middleware reads per call, so the two can never contradict each other.
+
+    SCRUBBED, unlike anything else that reaches this row from a verified
+    token, and the reason is one fallback rather than a general distrust of
+    the issuer. fastmcp 4.0.3's `JWTVerifier.load_access_token` fills
+    `AccessToken.client_id` with
+
+        claims.get("client_id") or claims.get("azp") or claims.get("sub")
+            or "unknown"
+
+    so a token that carries neither `client_id` nor `azp` puts its RAW `sub`
+    in this field. `_customer_ref` above refuses to put that same string in
+    `customer_ref` and stores `subject_not_a_customer_ref` instead, because
+    identity.py's warning is that an issuer under attacker control can mint a
+    `sub` shaped like a bare PAN, IBAN or DNI. Writing this field unscrubbed
+    would carry that value into the same long-lived table through the column
+    next to the one that refused it, which is a bypass, not a second opinion.
+
+    The cost of scrubbing is the one `tool_name` already pays and is worth
+    repeating because this column is an identity: a PAN- or IBAN-shaped
+    client id collapses to a fixed mask, so two distinct issuers whose ids
+    share a last four digits record the same value. Bounded by the same
+    accepted trade -- a raw PAN in a regulator-facing table is worse -- and
+    by nothing in this repository querying the column yet.
+
+    A SECOND COST LANDS ON THIS COLUMN AND NOT ON `tool_name`, because this
+    one is allowed to be longer than 128 characters and that one is not.
+    `_scrub` bare-masks any alphanumeric RUN longer than
+    `masking._IBAN_SCAN_MAX_TOKEN` (128) to `••••` without spending a
+    checksum on it. Measured directly: a run of 128 comes back unchanged, a
+    run of 129 comes back as `••••`, and
+    `https://client.test/<200 b's>` is recorded as
+    `https://client.test/••••`. So a client id carrying one long opaque
+    segment -- a base64 tenant token in a path, say -- loses THAT SEGMENT,
+    while its scheme, host and every other path segment survive, because a
+    URL's separators split it into runs that are individually short. A
+    CIMD-shaped id made of ordinary segments is unaffected at any length:
+    a 652-character one clips to exactly `_MAX_CLIENT_ID` characters and its
+    scrub is the identity (measured).
+
+    CLIPPING FIRST DOES NOT RESCUE THAT CASE, and saying so matters because
+    the ordering below invites the opposite reading. The slice happens before
+    the scan, but it cuts to `_MAX_CLIENT_ID` (512), which is four times the
+    128 that triggers the bare mask, so a client id that is ONE run of 600
+    characters is clipped to 511 and still masked: it records `••••…`
+    (measured), five characters, naming nobody. The width that would prevent
+    it is 128 itself, and that was rejected -- it would clip every ordinary
+    CIMD URL past 128 characters instead, trading a rare total loss for a
+    routine partial one. What clipping first DOES buy is the checksum bound:
+    the scan never sees more than `_MAX_CLIENT_ID` characters, which is where
+    the 2,220 figure above comes from.
+
+    THE MARKER GOES ON AFTER THE SCRUB, not before, for the reason
+    `on_call_tool` spells out for the tool name: `_scrub` reaches
+    `masking._strip_invisible`, which deletes characters outright, so a
+    marker chosen for being unstrippable today would still depend on a
+    function in another package. Reserving `len(_TRUNCATED)` off the slice up
+    front and appending afterwards puts it somewhere nothing can touch. For
+    an id at or under `_MAX_CLIENT_ID` the marker is the empty string, so the
+    slice is a no-op and the whole expression reduces to `_scrub(raw)`: an id
+    the scrub does not touch comes back character for character, with no
+    marker, which is what keeps a real 512-character id from reading like a
+    clipped 600-character one. The trailing `_clamp` is the same fail-safe
+    the name carries:
+    `_scrub` never lengthens a value in characters and `VARCHAR(512)` counts
+    characters, so it cannot fire today, and if a future change to either
+    makes it fire the value still says it was clipped.
+
+    Worst-case cost of the scrub, measured on this repository's own
+    adversarial shape (128-character maximum-density letter-letter-digit
+    -digit tokens, the shape `_IBAN_SCAN_BUDGET` was sized against): 2,220
+    checksums at the full 512 characters, 2.22% of the 100,000-checksum
+    allowance. A realistic CIMD id spends ZERO -- measured on
+    `https://claude.ai/.well-known/oauth-client-metadata` (51 characters) and
+    on a 96-character tenant-scoped URL, neither of which contains a
+    letter-letter-digit-digit opener at all. That bound is what lets
+    `on_call_tool` scrub this value before the unbounded arguments without
+    starving them.
+    """
+    if token is None:
+        return None
+    raw = token.client_id
+    marker = _TRUNCATED if len(raw) > _MAX_CLIENT_ID else ""
+    return _clamp(_scrub(raw[: _MAX_CLIENT_ID - len(marker)]) + marker, _MAX_CLIENT_ID)
+
+
 def _elapsed_ms(started: float) -> int:
     """Whole milliseconds since `started`, a `time.monotonic()` reading.
 
@@ -469,6 +587,13 @@ class _PendingEntry:
     redaction_budget_exhausted: bool
     request_id: str | None
     call_id: str
+    # Carried here rather than read again in `_write_entry_row`, for the
+    # reason `call_id` beside it is: both rows of one call must name the SAME
+    # OAuth client, and `get_access_token()` is a `ContextVar` read from a
+    # frame the façade reaches, not a constant. Reading it twice would make
+    # the pair's agreement an accident of the two reads landing in the same
+    # context. One read in `on_call_tool`, one value, both rows.
+    client_id: str | None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     written: bool = False
 
@@ -581,6 +706,13 @@ class _PendingEntry:
                 # to be pinned elsewhere.
                 refusal_reason=None,
                 call_id=self.call_id,
+                # The same value the completion row will carry, scrubbed and
+                # clamped once in `on_call_tool` rather than derived here:
+                # this row exists to say a touch happened, and "which client
+                # touched it" has to match the row that says how the touch
+                # ended, or the pair names two different callers for one
+                # call.
+                client_id=self.client_id,
             )
             # INSIDE the session block, on the line after the commit: see
             # the class docstring for the duplicate row the other placement
@@ -670,6 +802,17 @@ class AuditMiddleware(Middleware):
         context: MiddlewareContext[CallToolRequestParams],
         call_next: CallNext[CallToolRequestParams, ToolResult],
     ) -> ToolResult:
+        # READ ONCE, HERE, and handed to both readers below. `_client_id`
+        # runs inside the redaction scope and `_customer_ref` runs after it,
+        # so the two cannot share a call unless the token itself is hoisted
+        # out of both. That is not a tidiness point: the two columns they
+        # fill are joined by a claim `AuditEntry.client_id` (models.py)
+        # spells out -- a NULL client id and
+        # `customer_ref_absence_reason = 'no_access_token'` are the same
+        # fact -- and two separate `get_access_token()` reads would make that
+        # agreement depend on both landing in the same context rather than on
+        # there being one value.
+        access_token = get_access_token()
         # One allowance for the WHOLE tree, not one per string `_scrub`
         # happens to visit: without this, `FreeText` gives every string it
         # validates its own fresh checksum budget (masking.py's
@@ -796,10 +939,27 @@ class AuditMiddleware(Middleware):
             # carries a marker and grew anyway has the old marker cut off with
             # the overflow and a new one appended, never two.
             name = _clamp(name, _MAX_TOOL_NAME)
+            # IN THIS SCOPE, AND BEFORE THE ARGUMENTS, for both of the
+            # reasons the name above is. Sharing the scope keeps one
+            # allowance per call, which is the invariant the name's own
+            # paragraph exists to defend; going first keeps the arguments
+            # from being able to starve it. The starvation is the same shape
+            # too: an agent that pads its arguments to exhaust the allowance
+            # would otherwise get an IBAN-shaped client id bare-masked to
+            # `••••` by `_redact_iban_match`'s `budget.exhausted` branch, and
+            # destroying WHO called is the same class of loss as destroying
+            # WHAT was called.
+            #
+            # It cannot starve them in return: `_client_id` is clamped to
+            # `_MAX_CLIENT_ID` (512) before it is scanned, and its measured
+            # worst case at that width is 2,220 checksums of the 100,000
+            # allowance, 2.22%. A realistic CIMD id spends zero. Both numbers
+            # are derived in `_client_id`'s own docstring.
+            client_id = _client_id(access_token)
             arguments = _scrub(dict(context.message.arguments or {}))
         # One call, two fields, exactly one of them non-None: see `_Subject`
         # for why the pair is returned together rather than derived twice.
-        subject = _customer_ref(get_access_token())
+        subject = _customer_ref(access_token)
         at = context.timestamp
         request_id = _request_id(context)
 
@@ -826,6 +986,7 @@ class AuditMiddleware(Middleware):
             redaction_budget_exhausted=scope.exhausted,
             request_id=request_id,
             call_id=str(uuid.uuid4()),
+            client_id=client_id,
         )
         token = _pending_entry.set(pending)
         try:
@@ -897,6 +1058,11 @@ class AuditMiddleware(Middleware):
                     # request, or it reaches no backend at all -- and reads
                     # as exactly that: nothing was touched.
                     pending.call_id,
+                    # Off the same object, for the same reason: a call that
+                    # failed is one an investigator asks WHO made, and the
+                    # answer has to be the one the entry row gave if there
+                    # was one.
+                    pending.client_id,
                 )
             except Exception as audit_exc:
                 logger.error(
@@ -942,6 +1108,9 @@ class AuditMiddleware(Middleware):
                 # partner means the tool answered without reaching the
                 # backend.
                 pending.call_id,
+                # The same client the entry row named, read once for this
+                # call in the redaction scope above.
+                pending.client_id,
             )
         except Exception as audit_exc:
             # Fail closed here too, and deliberately rather than by
@@ -1003,6 +1172,14 @@ class AuditMiddleware(Middleware):
         # unconditionally, and a NULL here would orphan this row from the
         # entry row that shares its call.
         call_id: str,
+        # Required, no default, and `str | None` rather than `call_id`'s
+        # `str`: None is a real answer here (no access token on this call)
+        # where it never is above. It comes off the same `_PendingEntry`, so
+        # this row names the client the entry row named, whether or not that
+        # entry row was ever written. A default would answer "no client" for
+        # a call that had one, which on a regulator-facing table is a false
+        # statement rather than a gap.
+        client_id: str | None,
     ) -> None:
         async with self.db.sessionmaker() as session:
             await audit.append(
@@ -1028,4 +1205,5 @@ class AuditMiddleware(Middleware):
                 request_id=request_id,
                 refusal_reason=refusal_reason,
                 call_id=call_id,
+                client_id=client_id,
             )
