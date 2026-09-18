@@ -4,7 +4,7 @@
 
 **Audience:** a Claude Code session implementing this, with access to the codebase and AWS accounts.
 
-**Status:** assessment complete, ZT-1 to ZT-8 defined, none implemented. Three of the seven §6.1 CI gates are live and blocking in `make ci` (golden masking, header/body mismatch, import-linter on `services/api`); the other four are not.
+**Status:** assessment complete, ZT-1 to ZT-8 defined, none implemented. Three of the seven §6.1 CI gates are live and blocking in `make ci`: golden masking, header/body mismatch, and import-linter, whose `.importlinter` now carries three contracts (neither service may import the other, and `postern_core.facade` may not import `postern_core.store`). A fourth, cross-customer contract tests, runs in `make ci` against this repo's stub backend only (`tests/test_stub_subject_scoping.py` against `stub/backend.py`); the per-domain-service suite §6.1 asks for is owed by the teams that own those services. The remaining three are not built.
 
 **Two kinds of content:** §1 to §7 specify the product. The threat model, the eight work items, their acceptance criteria and the §5 residual risks hold for any operator deploying this. §8 and the **Dependency:** lines under ZT-2 and ZT-1 record something else: what one deployment has asked of which named team, and what has not come back. A second operator inherits the first kind and replaces the second with the teams and the answers of its own organization.
 
