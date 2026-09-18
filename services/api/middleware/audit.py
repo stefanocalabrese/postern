@@ -112,6 +112,43 @@ logger = logging.getLogger(__name__)
 
 _FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
 
+# The marker a clamped value carries, so the VALUE announces its own
+# alteration -- the way a masked value already announces itself by containing
+# `_MASK`. Chosen over a `truncated: bool` column and over a second column
+# holding the untruncated name: both are schema changes, and both put the fact
+# somewhere a reader of the value alone never sees it. A `SELECT tool_name`,
+# a value copy-pasted out of a report, a value quoted in a regulator's
+# question -- none of those carry a sibling column unless whoever wrote the
+# query already knew to ask for it, which is exactly the person who does not
+# need telling.
+#
+# U+2026 HORIZONTAL ELLIPSIS, one character:
+#
+#   * It needs no documentation to read. `xxx…` says "there was more here",
+#     which is the whole content of the signal.
+#   * It survives both transforms this module applies to a name. Its Unicode
+#     category is `Po`, so `masking._strip_invisible` does not remove it --
+#     that function strips `Cf`, `Mn`, `_BLANK_RENDERING_CHARACTERS` and
+#     `_DEFAULT_IGNORABLE_UNASSIGNED`, whose lowest member is U+2065, above
+#     U+2026 -- and it is neither a digit nor a letter, so it can neither
+#     extend a `\d{12,}` PAN run nor sit inside an IBAN token. Verified by
+#     running both: `_scrub("accounts.list…")` and `_strip_invisible("…")`
+#     are each the identity. An invisible or format character (U+200B, say)
+#     would have been stripped and the marker would have vanished without a
+#     trace, which is the precise failure this constant exists to end.
+#   * It cannot be misread as masking: `_MASK` is `••••`, four of U+2022
+#     BULLET, a different character and never one of them alone.
+#   * One character costs one character of the clipped value's own content,
+#     the least any in-value marker can cost.
+#
+# What it does NOT claim: a JSON-RPC id is an arbitrary client-chosen JSON
+# value, so a client can put U+2026 at the end of a 128-character id on
+# purpose and make that one row ambiguous. No in-value marker can close that;
+# a column could. A registered tool name cannot reach the ambiguity at all --
+# U+2026 is not a Python identifier character, so no `@server.tool` function
+# name contains one.
+_TRUNCATED = "…"
+
 # `tool_name` is `String(64)` (models.py); `context.message.name` is
 # arbitrary agent-controlled text with no length limit of its own. A name
 # over 64 characters reaches `on_call_tool` fine but blows up the INSERT
@@ -123,9 +160,11 @@ _FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
 # Accepted trade, not a full fix: two distinct oversized names that share
 # the same first 64 characters collapse to the same recorded value, so an
 # abuse-detection reader cannot tell one probe repeated 500 times from 500
-# distinct probes, and nothing marks a row as truncated, so a genuine
-# 64-character name is indistinguishable from a clipped 200-character one.
-# Losing the row entirely, the alternative, is worse.
+# distinct probes. What that reader CAN now tell is that the value is a
+# prefix at all: a clipped name is cut to 63 characters and ends in
+# `_TRUNCATED`, so a genuine 64-character name no longer reads the same as a
+# clipped 200-character one. Losing the row entirely, the alternative to
+# clamping, is worse than either.
 #
 # A second, unrelated collision lands on this same field: `_scrub` masks a
 # PAN- or IBAN-shaped tool name to a fixed form (`•••• NNNN` for a PAN,
@@ -157,10 +196,35 @@ _MAX_TOOL_NAME = 64
 # the INSERT and raises `asyncpg.exceptions.StringDataRightTruncationError`,
 # which under this module's fail-closed policy costs the entire audit row
 # and replaces the tool's own error. Clamped before the write. A truncated
-# id still correlates with a client-side log whose id shares those first 128
-# characters, which is the whole use for this column; nothing marks the row
-# as truncated, exactly as with `tool_name`.
+# id still correlates with a client-side log whose id shares those first 127
+# characters, which is the whole use for this column, and it ends in
+# `_TRUNCATED` so the investigator doing that correlation knows to match a
+# prefix rather than the whole string -- exactly as with `tool_name`.
 _MAX_REQUEST_ID = 128
+
+
+def _clamp(value: str, limit: int) -> str:
+    """`value` cut to fit `limit` characters, carrying `_TRUNCATED` when, and
+    only when, something was cut.
+
+    The cut is to `limit - len(_TRUNCATED)`, not to `limit`: appending the
+    marker to a value already cut to the column width would write
+    `limit + 1` characters, which is the `StringDataRightTruncationError`
+    the clamp exists to avoid, and under
+    `docs/decisions/0006-audit-write-failure.md` a failed audit write takes
+    the tool call with it. The returned length is therefore at most exactly
+    `limit`.
+
+    A value already within `limit` comes back unchanged -- the same string,
+    character for character, marker or no marker. That is the invariant that
+    matters most: every real tool name in this codebase (`ok_tool`,
+    `transactions.list`) is far under 64 characters, and a marker on one of
+    those would be the row lying about itself, which is worse than the
+    silence this function replaces.
+    """
+    if len(value) <= limit:
+        return value
+    return value[: limit - len(_TRUNCATED)] + _TRUNCATED
 
 
 def _scrub(value: Any) -> Any:
@@ -340,7 +404,7 @@ def _request_id(context: MiddlewareContext[CallToolRequestParams]) -> str | None
         request_id = fastmcp_context.request_id
     except Exception:
         return None
-    return str(request_id)[:_MAX_REQUEST_ID]
+    return _clamp(str(request_id), _MAX_REQUEST_ID)
 
 
 @dataclass
@@ -640,7 +704,26 @@ class AuditMiddleware(Middleware):
         # shape's accident, is the point. Losing argument detail degrades a
         # row; losing the name degrades the row's identity.
         with redaction_budget() as scope:
-            name = _scrub(context.message.name[:_MAX_TOOL_NAME])
+            # `_clamp` is not called on the raw name here, and the ordering is
+            # deliberate: it would put `_TRUNCATED` into the string BEFORE
+            # `_scrub` runs, and `_scrub` is free to alter what it is handed
+            # (`masking._strip_invisible` deletes characters outright). A
+            # marker chosen for being unstrippable today is still a marker
+            # whose survival depends on a function in another package that
+            # this module does not own. So the marker goes on AFTER scrubbing,
+            # where nothing can touch it, and the clip budget is reserved up
+            # front by taking `len(marker)` off the slice.
+            #
+            # `marker` is empty for every name at or under 64 characters, so
+            # the slice is `[:_MAX_TOOL_NAME]` and the expression is what it
+            # was before this marker existed -- an ordinary name comes back
+            # character-for-character identical, which is the point. The scan
+            # stays bounded by 64 characters either way, so the 223-checksum
+            # worst case measured above still holds as an upper bound (the
+            # clipped path now scans 63).
+            raw_name = context.message.name
+            marker = _TRUNCATED if len(raw_name) > _MAX_TOOL_NAME else ""
+            name = _scrub(raw_name[: _MAX_TOOL_NAME - len(marker)]) + marker
             # `_scrub`'s two substitutions never lengthen a match: the
             # shortest possible PAN run (12 digits) becomes `"•••• " +` its
             # last four (9 characters), and the shortest possible IBAN match
@@ -672,9 +755,17 @@ class AuditMiddleware(Middleware):
             # docstring), so this second clamp is kept as a cheap fail-safe
             # against a future change to `_scrub`'s substitution lengths --
             # or to the column's own type -- not because today's masking
-            # can trigger it.
-            if len(name) > _MAX_TOOL_NAME:
-                name = name[:_MAX_TOOL_NAME]
+            # can trigger it. It cannot fire today in either direction:
+            # `_scrub` never lengthens, so the clipped path is at most
+            # 63 + 1 = 64 and the unclipped path at most 64.
+            #
+            # `_clamp` rather than a bare slice, so that if it ever DOES fire
+            # the value still says so. Two cases, both handled: a name the
+            # first clamp did not touch that a future `_scrub` grows past 64
+            # gets cut here and gains its marker here; a name that already
+            # carries a marker and grew anyway has the old marker cut off with
+            # the overflow and a new one appended, never two.
+            name = _clamp(name, _MAX_TOOL_NAME)
             arguments = _scrub(dict(context.message.arguments or {}))
         # One call, two fields, exactly one of them non-None: see `_Subject`
         # for why the pair is returned together rather than derived twice.

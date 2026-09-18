@@ -29,7 +29,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.middleware import audit as audit_middleware
-from services.api.middleware.audit import _MAX_TOOL_NAME, AuditMiddleware, _scrub
+from services.api.middleware.audit import (
+    _MAX_REQUEST_ID,
+    _MAX_TOOL_NAME,
+    _TRUNCATED,
+    AuditMiddleware,
+    _clamp,
+    _request_id,
+    _scrub,
+)
 
 
 async def rows(session: AsyncSession) -> list[AuditEntry]:
@@ -137,7 +145,7 @@ async def test_an_oversized_tool_name_still_produces_exactly_one_audit_row(
     assert result.is_error is True
     entries = await rows(session)
     assert len(entries) == 1
-    assert entries[0].tool_name == long_name[:64]
+    assert entries[0].tool_name == ("x" * 63) + _TRUNCATED
     assert entries[0].outcome == "raised"
 
 
@@ -932,8 +940,213 @@ async def test_an_oversized_tool_name_still_produces_exactly_one_audit_row_after
     assert result.is_error is True
     entries = await rows(session)
     assert len(entries) == 1
-    assert entries[0].tool_name == long_name[:64]
+    assert entries[0].tool_name == ("y" * 63) + _TRUNCATED
     assert entries[0].outcome == "raised"
+
+
+# -- A clipped value carries its own clipping --------------------------------
+#
+# The owner ruled for a sentinel inside the value over a `truncated: bool`
+# column and over a second column holding the full string: the value has to
+# announce its own alteration the way a masked value already does by
+# containing `_MASK`. `_TRUNCATED` (U+2026 HORIZONTAL ELLIPSIS) is that
+# sentinel. Two ways it can go wrong, one section each below: a written value
+# one character too wide for its column, which under
+# `docs/decisions/0006-audit-write-failure.md` costs the row and the tool call
+# with it; and a sentinel on a value nothing was cut from, which makes the row
+# lie about itself.
+
+
+def test_clamp_marks_a_value_only_when_it_actually_cuts_one() -> None:
+    """The no-false-positive invariant, at the boundary where an off-by-one
+    lands: `limit - 1` and `limit` characters come back as the identical
+    string, `limit + 1` comes back marked. `_TRUNCATED` is checked with
+    `not in`, not by comparing the tail, so a marker appearing anywhere in an
+    untouched value fails this too."""
+    for limit in (8, _MAX_TOOL_NAME, _MAX_REQUEST_ID):
+        for length in (0, 1, limit - 1, limit):
+            value = "a" * length
+            assert _clamp(value, limit) == value
+            assert _TRUNCATED not in _clamp(value, limit)
+
+        over = "a" * (limit + 1)
+        assert _clamp(over, limit) == ("a" * (limit - len(_TRUNCATED))) + _TRUNCATED
+        assert len(_clamp(over, limit)) == limit
+
+
+def test_clamp_never_returns_more_characters_than_the_limit() -> None:
+    """The column-width invariant, swept rather than spot-checked: writing
+    `limit + 1` characters raises
+    `asyncpg.exceptions.StringDataRightTruncationError` at the INSERT, which
+    this module's fail-closed policy turns into a lost row. Every length from
+    0 to `_MAX_REQUEST_ID + 10`, against both real limits."""
+    for limit in (_MAX_TOOL_NAME, _MAX_REQUEST_ID):
+        for length in range(_MAX_REQUEST_ID + 11):
+            assert len(_clamp("b" * length, limit)) <= limit
+
+
+def test_the_sentinel_survives_scrub_and_is_not_the_mask() -> None:
+    """Why U+2026 and not a zero-width or format character. `_scrub` runs
+    `_strip_invisible`, which deletes `Cf`, `Mn`,
+    `_BLANK_RENDERING_CHARACTERS` and `_DEFAULT_IGNORABLE_UNASSIGNED`
+    outright -- a marker drawn from any of those would be removed and the
+    truncation would go back to being silent, which is the exact failure the
+    sentinel exists to end. U+2026 is category `Po` and survives; U+200B ZERO
+    WIDTH SPACE is shown below failing the same call, so this states a
+    difference rather than a bare assertion.
+
+    The last two lines pin the other half of the choice: a reader must not
+    take a clipped value for a redacted one, so the sentinel shares no
+    character with `_MASK` (`••••`, U+2022 BULLET)."""
+    assert _scrub(_TRUNCATED) == _TRUNCATED
+    assert _scrub("accounts.list" + _TRUNCATED) == "accounts.list" + _TRUNCATED
+    assert _scrub("tool_4111111111114417" + _TRUNCATED) == "tool_•••• 4417" + _TRUNCATED
+    assert _scrub("\u200b") == ""
+
+    assert _TRUNCATED not in _MASK
+    assert _MASK not in _TRUNCATED
+
+
+async def test_a_clipped_tool_name_is_marked_and_fills_the_column_exactly(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """End to end, through the real middleware and the real `String(64)`
+    column (models.py): a 200-character name is recorded as 63 characters of
+    its own content plus the sentinel, which is exactly 64 and not one
+    character more."""
+    long_name = "n" * 200
+    async with Client(transport=audit_server) as c:
+        await c.call_tool(long_name, {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert entry.tool_name == ("n" * 63) + _TRUNCATED
+    assert entry.tool_name.endswith(_TRUNCATED)
+    assert len(entry.tool_name) == _MAX_TOOL_NAME
+
+
+async def test_a_tool_name_exactly_at_the_column_width_is_recorded_unmarked(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """The boundary the whole design turns on: 64 characters is the longest
+    name that fits, so nothing is cut and nothing may be marked. An
+    implementation that slices to `_MAX_TOOL_NAME - len(_TRUNCATED)`
+    unconditionally passes every over-length test above and fails this one."""
+    exact_name = "e" * _MAX_TOOL_NAME
+    async with Client(transport=audit_server) as c:
+        await c.call_tool(exact_name, {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert entry.tool_name == exact_name
+    assert _TRUNCATED not in entry.tool_name
+    assert len(entry.tool_name) == _MAX_TOOL_NAME
+
+
+async def test_ordinary_tool_names_gain_no_sentinel(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """The regression that would matter most in practice: every real tool
+    name in this codebase is far under 64 characters and must reach
+    `audit_log.tool_name` character-for-character, sentinel-free. Three
+    shapes, including the dotted and underscored forms this server actually
+    registers."""
+    for name in ("ok_tool", "accounts.list", "transactions.list"):
+        async with Client(transport=audit_server) as c:
+            await c.call_tool(name, {}, raise_on_error=False)
+    recorded = [e.tool_name for e in await rows(session)]
+    assert recorded == ["ok_tool", "accounts.list", "transactions.list"]
+    assert all(_TRUNCATED not in value for value in recorded)
+
+
+async def test_the_first_clamp_reserves_the_sentinels_own_character(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """That 63 is the first clamp's slice, and not 64 rescued afterwards by
+    the fail-safe.
+
+    On a name of repeated characters the two are indistinguishable -- slicing
+    to 64 and appending gives 65, which the fail-safe cuts back to the same
+    63 + sentinel -- so this uses a name scrubbing SHORTENS: a 16-digit PAN
+    followed by 200 'b's. The recorded value then lands at 57 characters, the
+    fail-safe never fires, and the slice width shows up directly as the
+    number of 'b's that survive: 63 - len("4111111111114417 ") = 46 for the
+    reserved slice, 47 for a slice of 64.
+
+    Also the only test here that proves the PAN in an over-length name is
+    still masked. Clipping and masking run on the same value in the same
+    expression, and an ordering slip that dropped one of them would leave a
+    raw PAN in `audit_log`."""
+    long_name = "4111111111114417 " + ("b" * 200)
+    async with Client(transport=audit_server) as c:
+        await c.call_tool(long_name, {}, raise_on_error=False)
+    entry = (await rows(session))[0]
+    assert "4111111111114417" not in entry.tool_name
+    assert entry.tool_name == "•••• 4417 " + ("b" * 46) + _TRUNCATED
+    assert entry.tool_name.count("b") == 46
+    assert len(entry.tool_name) <= _MAX_TOOL_NAME
+
+
+async def test_the_defensive_clamp_marks_the_name_when_a_lengthening_scrub_fires_it(
+    audit_server: FastMCP,
+    database: Database,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second clamp in `on_call_tool` exists, in its own comment's words,
+    "not because today's masking can trigger it" but against a future `_scrub`
+    whose substitutions lengthen a value. Monkeypatching `_scrub` into exactly
+    that future function -- one that doubles every string handed to it -- is
+    the only way to observe the branch.
+
+    What it must still do is what it always did, keep the write inside
+    `String(64)`, plus what the sentinel ruling adds: a value it cuts is a
+    value that was altered, so it leaves the same marker the first clamp
+    would have. A bare `name[:_MAX_TOOL_NAME]` here passes the width half and
+    fails the marker half.
+
+    The name is 40 characters, comfortably under the first clamp, so the
+    marker on the row provably came from the fail-safe and not from the
+    ordinary path."""
+    monkeypatch.setattr(
+        audit_middleware,
+        "_scrub",
+        lambda value: value * 2 if isinstance(value, str) else value,
+    )
+    middleware = AuditMiddleware(database)
+
+    async def call_next(context: object) -> ToolResult:
+        return ToolResult(content=[])
+
+    short_name = "z" * 40  # 40 <= _MAX_TOOL_NAME, so the FIRST clamp cannot fire
+    await middleware.on_call_tool(_DirectContext(short_name), call_next)  # type: ignore[arg-type]
+
+    entry = (await rows(session))[0]
+    assert entry.tool_name == ("z" * 63) + _TRUNCATED
+    assert len(entry.tool_name) == _MAX_TOOL_NAME
+
+
+def test_a_clipped_request_id_is_marked_and_fits_the_column() -> None:
+    """`request_id` is `String(128)` (models.py) and the JSON-RPC id is chosen
+    by the client, which makes it as agent-controlled as the tool name.
+    Driven through `_request_id` directly rather than a client call: the
+    in-process `Client` mints its own ids and offers no way to send a
+    300-character one."""
+    long_id = "9" * 300
+    context = _DirectContext("ok_tool", fastmcp_context=SimpleNamespace(request_id=long_id))  # type: ignore[arg-type]
+    recorded = _request_id(context)  # type: ignore[arg-type]
+    assert recorded is not None
+    assert recorded == ("9" * 127) + _TRUNCATED
+    assert len(recorded) == _MAX_REQUEST_ID
+
+
+def test_ordinary_request_ids_gain_no_sentinel() -> None:
+    """The no-false-positive half for `request_id`, at the boundary and below
+    it: a 128-character id fits exactly and must come back identical, and so
+    must an ordinary short one. `str()` is still applied -- a JSON-RPC id may
+    be a number -- so the integer case is checked too."""
+    for value in ("7", "req-0001", "8" * (_MAX_REQUEST_ID - 1), "8" * _MAX_REQUEST_ID):
+        context = _DirectContext("ok_tool", fastmcp_context=SimpleNamespace(request_id=value))  # type: ignore[arg-type]
+        assert _request_id(context) == value  # type: ignore[arg-type]
+
+    numeric = _DirectContext("ok_tool", fastmcp_context=SimpleNamespace(request_id=42))  # type: ignore[arg-type]
+    assert _request_id(numeric) == "42"  # type: ignore[arg-type]
 
 
 async def test_the_name_is_scrubbed_before_the_arguments_so_their_exhaustion_does_not_bare_mask_it(
