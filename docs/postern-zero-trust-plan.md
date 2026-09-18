@@ -6,6 +6,10 @@
 
 **Status:** assessment complete, ZT-1 to ZT-8 defined, none implemented. Three of the seven §6.1 CI gates are live and blocking in `make ci` (golden masking, header/body mismatch, import-linter on `services/api`); the other four are not.
 
+**Two kinds of content:** §1 to §7 specify the product. The threat model, the eight work items, their acceptance criteria and the §5 residual risks hold for any operator deploying this. §8 and the **Dependency:** lines under ZT-2 and ZT-1 record something else: what one deployment has asked of which named team, and what has not come back. A second operator inherits the first kind and replaces the second with the teams and the answers of its own organization.
+
+**Why both are still in one file:** relocating §8 and the dependency lines into a separate status document was considered and deferred. `docs/superpowers/plans/postern-foundation-and-read-surface-2026-09-12.md` cites §8 by section number in two places; `docs/verification/2026-09-16-zt2-coverage.md` and `docs/verification/2026-09-16-redaction-budget-exhausted.md` cite this file by line number and quote ZT-2's §4 wording verbatim. Those are dated records, never edited after the fact, and the rename on 17 September 2026 already broke their path citations once. Relabelling leaves every section number and every quoted sentence where it stands, and shifts line numbers by the length of this preamble. The deferral has a price, stated here rather than left to be found: product specification and one deployment's status still share a document, and a reader has to apply the labels above to tell them apart.
+
 ---
 
 ## 0. How to use this document
@@ -100,16 +104,16 @@ Ranked by severity. Detail and acceptance criteria in §4.
 ### ZT-2 — Verify and enforce subject scoping in domain services
 **Severity: critical. Do this before anything else.**
 
-Istio *validates* the JWT; the domain services must *enforce* on it. If any service scopes a query by an account ID taken from the request body rather than by the token `sub`, the entire authorization layer is decorative and A5 is live.
+Istio *validates* the JWT; the domain services must *enforce* on it. If any service scopes a query by an account ID taken from the request body rather than by the token `sub`, the entire authorization layer is decorative and A5 is live. That test is the control, and it is the same test wherever this is deployed: whether authorization exists at all is settled in the handler, not at the gateway.
 
 **Do:**
 - Audit every domain service handler reachable from the MCP façade. Produce a list: enforces on `sub` / does not.
-- For each that does not, the fix is in that service, not in the MCP server. Raise with the owning team — this is likely the largest cross-team item in the programme.
+- For each that does not, the fix is in that service, not in the MCP server: a façade cannot re-scope a query it did not write. Raise it with the team that owns the service. Sizing it as the largest cross-team item in the programme is this deployment's estimate, not a property of the control.
 - Add a contract test per domain service asserting both halves: customer A's token gets 404 and no account data for B's account, and 200 with A's own data for A's own account. 404, not 403: a 403 confirms B's account exists, handing a guessed identifier an enumeration oracle (A5), so a foreign account and an invented one must return the same status and the same body. A status-only test also passes against a service that 404s its own customers.
 
 **Acceptance:** an automated test suite, run in the backend services' CI, covering every MCP-reachable endpoint with a cross-customer request and a same-customer control. Zero cross-customer reads return data; every control read still returns its own.
 
-**Dependency:** backend service teams. **Start the conversation on day one.**
+**Dependency, a fact about this deployment only:** the backend service teams own the answer and have not given it; §8 carries the row. **Start the conversation on day one.** The teams named here belong to one organization; the control and the acceptance criterion above do not.
 
 ---
 
@@ -249,7 +253,7 @@ A client may paraphrase a balance incorrectly and a customer may act on it.
 **Open:** conduct-risk position on erroneous rendering by a third-party client. **Needs a decision from the conduct/compliance function — this is not an engineering call.**
 
 ### 5.4 Regulatory treatment is unsettled
-Whether consumer AI agents acting for an operator's own customers constitute an account information service has not been tested (handoff §1, open question 2).
+Whether consumer AI agents acting for a bank's own customers constitute an account information service has not been tested (handoff §1, open question 2). The subject is a bank, not an operator generally: account information service is a PSD2 term and PSD2 binds ASPSPs, so the claim does not reach an operator outside that perimeter.
 
 **Bounding:** design as reading (a); do not market to third-party organizations; keep the dedicated-interface option open by using Open Banking-shaped contracts.
 
@@ -303,6 +307,8 @@ The per-operation audit chain (§9) is the core artifact: tool call and argument
 ---
 
 ## 8. Open dependencies on other teams
+
+Deployment status, not specification: every row below is a question one deployment has put to a team inside one organization, and the teams are that organization's. Nothing here states a control. A different operator replaces this table wholesale and keeps §1 to §7.
 
 | Team | Question |
 |---|---|

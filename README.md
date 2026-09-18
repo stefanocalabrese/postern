@@ -17,16 +17,26 @@ first-party case.
 
 ## Status
 
-Skeleton. Tasks 0 and 1 of a 15-task plan are done. There are no tools yet, no
-database, no authentication, and no backend calls.
+`make ci` exits 0 on 836 tests, measured 18 September 2026.
 
-What exists: a uv workspace, a six-gate `make ci`, an import-linter contract that
-blocks the read path from importing the write path, and one decision record.
+Five read tools are registered: `start_session`, `accounts.list`,
+`accounts.get_balance`, `transactions.list` and `cards.list`. Every one but
+`start_session` is gated by a Postgres-backed consent check, which filters the
+catalogue and refuses the call, because filtering `tools/list` alone leaves a
+hidden tool callable by name. Every tool call writes a row to an append-only
+`audit_log`, and a failed audit write fails the call
+(`docs/decisions/0006-audit-write-failure.md`). Six migrations build the two
+tables. Customer tokens are verified against a configured JWKS and issuer.
+The read/write signing-key split is real: each service holds one key and
+publishes only that key at `/.well-known/jwks.json`, and two import-linter
+contracts hold the two services apart in both directions. Calls to Postgres
+are bounded by connect, command and pool timeouts.
 
-Do not read the green gates as working software. `docs/superpowers/plans/postern-foundation-and-read-surface-2026-09-12.md`
-has a section named "What this plan deliberately does not establish" listing the
-seven things that are still absent, including any real authentication and the Vault
-read/write key split.
+Still absent: every payments tool, the approval callback (`services/confirm`
+today publishes its JWKS and nothing else), the RFC 8628 device grant and the
+QR flow the diagram below shows, and Vault itself. `KeySource` is the seam
+Vault lands behind; a signing key today comes from a PEM on disk or is
+generated in process.
 
 ## The design in one paragraph
 
