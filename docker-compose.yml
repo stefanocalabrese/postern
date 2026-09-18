@@ -76,3 +76,18 @@ services:
         condition: service_started
       db:
         condition: service_healthy
+
+  # Plan 3 Task 6: the write path, brought up alongside `api` to verify the
+  # read/write key split against a running stack rather than only in-process.
+  # Deliberately minimal, matching what `services/confirm/main.py` actually
+  # is today (a composition root publishing the write JWKS, not the approval
+  # callback): no backend, no database, no `depends_on`. `POSTERN_WRITE_KEY_
+  # PEM_PATH` is left unset on purpose, the same way `api` above never sets a
+  # read PEM path, so both processes generate an ephemeral RSA key in
+  # process and publish whatever they generated -- see docs/verification/
+  # 2026-09-18-key-split.md for what that does and does not prove.
+  confirm:
+    build:
+      context: .
+      target: confirm
+    ports: ["8082:8080"]
