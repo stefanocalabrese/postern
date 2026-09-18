@@ -20,6 +20,7 @@ from postern_core.store.models import (
     ABSENCE_NO_STRING_SUBJECT,
     ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
     CUSTOMER_REF_ABSENCE_REASONS,
+    OUTCOMES,
     REFUSAL_REASONS,
     AuditEntry,
 )
@@ -160,6 +161,10 @@ async def test_a_nul_byte_in_an_argument_still_produces_exactly_one_audit_row(
 # into two runs too short to match, so redaction finds nothing -- stripping
 # the NUL *after* that failed match reassembles the full PAN. Only stripping
 # before validation keeps the run contiguous when `FreeText` sees it.
+
+# See `tests/test_store_audit.py`: `audit.append` requires a correlation key,
+# and the constraint probes below write rows with no partner to pair with.
+PROBE_CALL_ID = "probe-call-id"
 
 _PAN = "4111111111114417"
 _PAN_SPLIT_BY_NUL = _PAN[:8] + "\x00" + _PAN[8:]
@@ -445,6 +450,7 @@ async def test_the_database_refuses_an_absence_reason_outside_the_documented_set
                 duration_ms=0,
                 request_id=None,
                 refusal_reason=None,
+                call_id=PROBE_CALL_ID,
             )
 
 
@@ -472,10 +478,129 @@ async def test_every_documented_absence_reason_is_accepted_by_that_constraint(
             duration_ms=0,
             request_id=None,
             refusal_reason=None,
+            call_id=PROBE_CALL_ID,
         )
     assert [e.customer_ref_absence_reason for e in await rows(session)] == list(
         CUSTOMER_REF_ABSENCE_REASONS
     )
+
+
+async def test_the_database_refuses_an_outcome_outside_the_documented_set(
+    database: Database,
+) -> None:
+    """`ck_audit_log_outcome` (models.py, migration 71a4c0d9e3b2), the same
+    enforcement its two neighbours have had since the revisions that added
+    them.
+
+    `outcome` went five revisions without one, which is why this test is
+    newer than the column by a long way: a third value arrived on 2026-09-18
+    (`reaching`), and a vocabulary that grows is exactly the one where a
+    fourth value misspelled into the column needs no migration, no review,
+    and shows up as rows every query filtering on the documented values
+    silently misses.
+
+    Asserted against the real Postgres, on its own session, for both reasons
+    `test_the_database_refuses_a_reason_outside_the_documented_set` gives: a
+    constraint living only in SQLAlchemy metadata enforces nothing, and a
+    violation aborts the transaction it lands in.
+
+    `match=` on the constraint NAME, which its three older siblings do not
+    do: they argue in a comment that no other constraint on the row can
+    fire, and that argument is only as durable as the next column added to
+    this table. Naming it makes the test fail if some other constraint
+    starts catching this row first, rather than passing for a reason it was
+    not written for."""
+    async with database.sessionmaker() as own_session:
+        with pytest.raises(IntegrityError, match="ck_audit_log_outcome"):
+            await store_audit.append(
+                own_session,
+                at=datetime.now(UTC),
+                customer_ref=None,
+                customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
+                tool_name="ok_tool",
+                arguments={},
+                outcome="invented",
+                detail=None,
+                redaction_budget_exhausted=False,
+                duration_ms=0,
+                request_id=None,
+                refusal_reason=None,
+                call_id=PROBE_CALL_ID,
+            )
+
+
+async def test_every_documented_outcome_is_accepted_by_that_constraint(
+    audit_server: FastMCP, session: AsyncSession
+) -> None:
+    """The companion, for the reason its two siblings give: a constraint
+    rejecting everything would pass the test above too. Each value in
+    `OUTCOMES` goes through the real `append` and is read back, so a
+    migration listing fewer values than the code can write fails here rather
+    than in production, where the cost is the row and the call with it.
+
+    `reaching` is the one this matters most for: it is written from a
+    different call site than the other two (`_PendingEntry`, not `_write`),
+    so a migration that constrained `outcome` to the pair it had before
+    2026-09-18 would break only the entry row, and only on calls that
+    actually reach the backend."""
+    for outcome in OUTCOMES:
+        await store_audit.append(
+            session,
+            at=datetime.now(UTC),
+            customer_ref=None,
+            customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
+            tool_name="ok_tool",
+            arguments={},
+            outcome=outcome,
+            detail=None,
+            redaction_budget_exhausted=False,
+            duration_ms=0,
+            request_id=None,
+            refusal_reason=None,
+            call_id=PROBE_CALL_ID,
+        )
+    assert [e.outcome for e in await rows(session)] == list(OUTCOMES)
+
+
+async def test_the_database_refuses_a_row_with_no_call_id(database: Database) -> None:
+    """`ck_audit_log_call_id_present` (models.py, migration 71a4c0d9e3b2).
+
+    Written through `AuditEntry` directly rather than through `append`, and
+    that is the whole point rather than a shortcut: `append` types `call_id`
+    as `str`, so the Python signature already refuses None and mypy enforces
+    it. What this test asks is the different question -- whether the
+    DATABASE refuses it too, for a writer that bypasses `append`, which is
+    the only reason the constraint exists. Before it, the non-absence of a
+    correlation key was a property of one function's type hints.
+
+    The constraint is created `NOT VALID` because every row written before
+    that migration has NULL here, in a column that did not exist. `NOT
+    VALID` skips those rows and still enforces on every INSERT, which on an
+    append-only table is every row that will ever be written -- and this is
+    what proves the second half against a real Postgres rather than against
+    the migration's own docstring.
+
+    `match=` names the constraint for the reason the outcome test above
+    gives: this row satisfies every other constraint on the table today, and
+    that is a fact about today."""
+    async with database.sessionmaker() as own_session:
+        with pytest.raises(IntegrityError, match="ck_audit_log_call_id_present"):
+            own_session.add(
+                AuditEntry(
+                    at=datetime.now(UTC),
+                    customer_ref=None,
+                    customer_ref_absence_reason=ABSENCE_NO_ACCESS_TOKEN,
+                    tool_name="ok_tool",
+                    arguments={},
+                    outcome="returned",
+                    detail=None,
+                    redaction_budget_exhausted=False,
+                    duration_ms=0,
+                    request_id=None,
+                    refusal_reason=None,
+                )
+            )
+            await own_session.commit()
 
 
 async def test_the_database_refuses_a_row_with_neither_a_reference_nor_a_reason(
@@ -506,6 +631,7 @@ async def test_the_database_refuses_a_row_with_neither_a_reference_nor_a_reason(
                 duration_ms=0,
                 request_id=None,
                 refusal_reason=None,
+                call_id=PROBE_CALL_ID,
             )
 
 
@@ -533,6 +659,7 @@ async def test_the_database_refuses_a_row_with_both_a_reference_and_a_reason(
                 duration_ms=0,
                 request_id=None,
                 refusal_reason=None,
+                call_id=PROBE_CALL_ID,
             )
 
 
@@ -1166,6 +1293,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
         duration_ms: object,
         request_id: object,
         refusal_reason: object,
+        call_id: object,
     ) -> None:
         written.append(
             {
@@ -1175,6 +1303,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
                 "refusal_reason": refusal_reason,
                 "customer_ref": customer,
                 "customer_ref_absence_reason": customer_ref_absence_reason,
+                "call_id": call_id,
             }
         )
         if audit_write_raises:
@@ -1372,6 +1501,7 @@ async def test_the_database_refuses_a_reason_outside_the_documented_set(
                 duration_ms=0,
                 request_id=None,
                 refusal_reason="reason_nobody_declared",
+                call_id=PROBE_CALL_ID,
             )
 
 
@@ -1398,5 +1528,6 @@ async def test_both_documented_reasons_are_accepted_by_that_constraint(
             duration_ms=0,
             request_id=None,
             refusal_reason=reason,
+            call_id=PROBE_CALL_ID,
         )
     assert [e.refusal_reason for e in await rows(session)] == list(REFUSAL_REASONS)

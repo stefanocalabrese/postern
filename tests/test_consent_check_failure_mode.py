@@ -237,6 +237,7 @@ def _app(
             )
         ),
         transport=httpx2.MockTransport(backend_handler),
+        before_backend_request=None,
     )
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
     server = build_server(

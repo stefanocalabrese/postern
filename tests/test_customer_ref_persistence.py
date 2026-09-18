@@ -30,6 +30,10 @@ from sqlalchemy import delete, select
 # re-derive the bound.
 MAX_REF = CustomerRef(value="cust_" + "a" * 60).value
 
+# See `tests/test_store_audit.py`: `audit.append` requires a correlation key,
+# and a probe row with no partner still has to carry one.
+PROBE_CALL_ID = "probe-call-id"
+
 
 @pytest_asyncio.fixture
 async def clean_max_length_rows(database: Database) -> AsyncIterator[None]:
@@ -66,6 +70,7 @@ async def test_a_maximum_length_customer_ref_round_trips_through_audit_log(
             duration_ms=0,
             request_id=None,
             refusal_reason=None,
+            call_id=PROBE_CALL_ID,
         )
     async with database.sessionmaker() as s:
         row = (

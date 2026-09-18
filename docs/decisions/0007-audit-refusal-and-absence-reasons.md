@@ -42,7 +42,7 @@ every call this repo's own tests make through it produces one.
 Neither column can be derived from the other.
 `refusal_reason = 'no_customer_ref'` is written for all three absences
 alike, and only on calls a consent check actually refused
-(`packages/postern-core/src/postern_core/store/models.py:251-254`).
+(`packages/postern-core/src/postern_core/store/models.py:314-317`).
 
 ## Decision
 
@@ -83,7 +83,7 @@ and the split follows what each module can see.
 and which of its two refusals it made; `auth=` answers a bare bool, and the
 exception the middleware sees is `NotFoundError` either way. So `_refuse`
 (`consent.py:110`) files the decision on `request.state` under
-`postern_consent_refusals`, and `services/api/middleware/audit.py:436` reads
+`postern_consent_refusals`, and `services/api/middleware/audit.py:725` reads
 it back with `consent.refusal_for` after `call_next` raises. The rejected
 alternative was inferring the reason in the middleware from the exception
 type or its message: the type is identical for a denial and a typo, a
@@ -94,7 +94,7 @@ Both directions fail toward NULL on purpose. `_refuse` never raises: when
 `get_http_request()` raises, it returns and `check` still answers False
 (`consent.py:135-138`), so the worst outcome is a denial under-reported as
 NULL, never a tool call that went through because its bookkeeping failed.
-`refusal_for` returns None on a lookup miss, and `audit.py:436` keys the
+`refusal_for` returns None on a lookup miss, and `audit.py:725` keys the
 lookup on the RAW requested name rather than the scrubbed, clamped `name`
 about to be written, since neither a masked nor a truncated name can be a
 registered tool: the lookup can only miss, and a miss under-reports a
@@ -102,7 +102,7 @@ refusal instead of inventing one.
 
 `customer_ref_absence_reason` goes the other way because `AuditMiddleware`
 is the only place that sees the access token at all. `_customer_ref`
-(`audit.py:167`) takes the whole token rather than the `sub` it holds:
+(`audit.py:226`) takes the whole token rather than the `sub` it holds:
 `token.claims.get("sub")` answers None both for a token without the claim
 and for no token at all, so a caller that reads the claim first has already
 collapsed two of the three classes.
@@ -127,7 +127,7 @@ writing a consent refusal into a regulator-facing table where none happened.
 
 The row it would corrupt is the raised-path row, and the successful row is
 guarded by different code. The returned path writes NULL as a literal
-constant (`audit.py:482`), so `outcome='returned'` implies no refusal by
+constant (`audit.py:778`), so `outcome='returned'` implies no refusal by
 construction, whatever the consent module left on the request;
 `tests/test_audit_refusal_reason.py:328` covers that. The raised path is the
 one that looks a refusal up, and only the keying keeps it honest:
@@ -163,7 +163,7 @@ the refusal it documents, in the longest-lived table this system has.
 The exception is not a safe carrier for it either. `CustomerRef` sets
 `hide_input_in_errors` (`identity.py:36`), which scrubs `str()` and `repr()`
 of the `ValidationError` and leaves the raw value in its structured
-`.errors()`; `audit.py:213-214` discards that exception without logging or
+`.errors()`; `audit.py:272-273` discards that exception without logging or
 re-raising it.
 
 `tests/test_audit_middleware.py:308` proves the property against the stored
@@ -199,7 +199,7 @@ It is raw SQL because `op.create_check_constraint` has no `NOT VALID`, and
 the parentheses around the two null tests are load-bearing: in PostgreSQL
 `IS` binds looser than `=`, so the unparenthesised form parses as something
 other than this comparison. SQLAlchemy's `CheckConstraint` cannot express
-`NOT VALID` either, so a database built from `store/models.py:383-386`
+`NOT VALID` either, so a database built from `store/models.py:544-547`
 instead of from the migrations gets a validated constraint. No such path
 exists in this repo, and on an empty table the two are the same thing.
 
@@ -219,15 +219,24 @@ tidy-up for someone to run blind.
 
 `append` (`packages/postern-core/src/postern_core/store/audit.py:14`) takes
 both new values as keyword-only parameters with no default, and
-`AuditMiddleware._write` (`services/api/middleware/audit.py:526`) does the
-same. `_write` is the only call site of `append` outside tests, and it is
-reached from both branches of `on_call_tool` (`audit.py:453` and `:482`),
-each of which already holds a real answer.
+`AuditMiddleware._write` (`services/api/middleware/audit.py:827`) does the
+same. `_write` is reached from both branches of `on_call_tool`
+(`audit.py:742` and `:778`), each of which already holds a real answer.
+
+`_write` was the only call site of `append` outside tests when this record
+was written, and stopped being so on 18 September 2026:
+`_PendingEntry._write_entry_row` (`audit.py:436`) is the second, writing the
+`outcome='reaching'` row before the operator's backend is reached. It is
+held to the same rule. Nothing else in that change weakens this section --
+the new `call_id` parameter is required on `append` too -- but "the only
+call site" is no longer a thing a reader can rely on when reasoning about
+what reaches this table.
 
 This record states it once as a rule, because the repo has now refused the
-same optional-parameter seam five times, once per column added to this table
+same optional-parameter seam six times, once per column added to this table
 since the original schema: `redaction_budget_exhausted`, `duration_ms`,
-`request_id`, `refusal_reason`, `customer_ref_absence_reason`. On
+`request_id`, `refusal_reason`, `customer_ref_absence_reason`, and (18
+September 2026) `call_id`. On
 `audit_log`, a parameter whose NULL already carries a meaning gets no
 default. NULL on `duration_ms` means "this row predates the column"; NULL on
 `refusal_reason` means "this call was not refused"; NULL on
@@ -236,7 +245,7 @@ the equivalence constraint outright. A default lets a future branch make one
 of those statements without having established it, in the table this system
 exists to keep complete.
 
-`_customer_ref` returns both fields as one `_Subject` (`audit.py:149`) with
+`_customer_ref` returns both fields as one `_Subject` (`audit.py:208`) with
 exactly one populated, so the pair is decided once per call instead of being
 a rule two branches have to remember.
 
@@ -282,5 +291,5 @@ counting consent denials on this column is a lower bound.
 - **No index on either column.** The searches these columns exist for
   (`WHERE customer_ref_absence_reason = 'subject_not_a_customer_ref'`,
   `WHERE refusal_reason IS NOT NULL`) run against a table carrying one
-  index today, `ix_audit_log_customer_at` (`store/models.py:302`). Nobody
+  index today, `ix_audit_log_customer_at` (`store/models.py:418`). Nobody
   has measured a query that needs a second one.

@@ -30,6 +30,7 @@ def _ok_client() -> BackendClient:
         "https://backend.test",
         StubTokenMinter(),
         transport=_transport(lambda r: httpx2.Response(200)),
+        before_backend_request=None,
     )
 
 
@@ -37,7 +38,12 @@ async def test_get_json_returns_the_decoded_body() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(200, json={"accounts": []})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     assert await client.get_json("/accounts", customer=CUSTOMER) == {"accounts": []}
     await client.aclose()
 
@@ -49,7 +55,12 @@ async def test_get_json_attaches_a_bearer_token() -> None:
         seen.append(request.headers["authorization"])
         return httpx2.Response(200, json={})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     with pytest.warns(RuntimeWarning, match="StubTokenMinter"):
         await client.get_json("/accounts", customer=CUSTOMER)
     assert seen == ["Bearer stub.read.cust_7f3a"]
@@ -63,7 +74,12 @@ async def test_query_parameters_are_forwarded() -> None:
         seen.append(str(request.url))
         return httpx2.Response(200, json={})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     await client.get_json("/transactions", customer=CUSTOMER, params={"days": 30})
     assert seen == ["https://backend.test/transactions?days=30"]
     await client.aclose()
@@ -73,7 +89,12 @@ async def test_a_404_becomes_an_actionable_backend_error() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(404, json={"detail": "no such account"})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     with pytest.raises(BackendError) as excinfo:
         await client.get_json("/accounts/acc_missing", customer=CUSTOMER)
     assert excinfo.value.status == 404
@@ -110,7 +131,12 @@ async def test_a_backend_error_detail_containing_a_pan_is_scrubbed() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(400, json={"detail": f"duplicate card {_TEST_PAN} on file"})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     with pytest.raises(BackendError) as excinfo:
         await client.get_json("/cards", customer=CUSTOMER)
     assert _TEST_PAN not in excinfo.value.detail
@@ -123,7 +149,12 @@ async def test_a_backend_error_detail_containing_an_iban_is_scrubbed() -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(400, json={"detail": f"transfer to {_TEST_IBAN} rejected"})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     with pytest.raises(BackendError) as excinfo:
         await client.get_json("/transactions", customer=CUSTOMER)
     assert _TEST_IBAN not in excinfo.value.detail
@@ -140,7 +171,12 @@ async def test_a_backend_error_json_body_with_no_detail_key_is_scrubbed() -> Non
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(400, json={"pan": _TEST_PAN, "reason": "duplicate"})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     with pytest.raises(BackendError) as excinfo:
         await client.get_json("/cards", customer=CUSTOMER)
     assert _TEST_PAN not in excinfo.value.detail
@@ -159,7 +195,12 @@ async def test_a_non_json_backend_error_body_containing_an_iban_is_scrubbed() ->
             headers={"content-type": "text/plain"},
         )
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     with pytest.raises(BackendError) as excinfo:
         await client.get_json("/accounts", customer=CUSTOMER)
     assert _TEST_IBAN not in excinfo.value.detail
@@ -177,7 +218,12 @@ async def test_detail_is_scrubbed_before_the_200_char_truncation_not_after() -> 
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(400, json={"detail": f"{padding} {_TEST_PAN}"})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     with pytest.raises(BackendError) as excinfo:
         await client.get_json("/cards", customer=CUSTOMER)
     assert _TEST_PAN not in excinfo.value.detail
@@ -228,7 +274,12 @@ async def test_a_rejected_path_never_reaches_the_transport_or_mints_a_token() ->
         called.append(request)
         return httpx2.Response(200, json={})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     with pytest.raises(ValueError):
         await client.get_json("https://evil.example/steal", customer=CUSTOMER)
     assert called == []
@@ -250,7 +301,12 @@ async def test_the_client_does_not_follow_a_redirect_to_another_host() -> None:
             return httpx2.Response(302, headers={"Location": "https://evil.example/steal"}, json={})
         return httpx2.Response(200, json={"stolen": True})
 
-    client = BackendClient("https://backend.test", StubTokenMinter(), transport=_transport(handler))
+    client = BackendClient(
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
     result = await client.get_json("/accounts", customer=CUSTOMER)
     assert hosts_seen == ["backend.test"]
     assert result == {}

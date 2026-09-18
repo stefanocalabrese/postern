@@ -415,16 +415,24 @@ async def test_end_to_end_body_over_max_body_bytes_returns_413() -> None:
 # --- Adversarial pass: consent and audit running together, for real --------
 
 
-async def test_end_to_end_audit_row_is_written_for_a_real_call(
+async def test_end_to_end_audit_rows_are_written_for_a_real_call(
     pg_url: str, database: Database
 ) -> None:
     """The first time consent and audit run together through the composed
     app: a real JWT (`auth_override`), a seeded consent row, a real
-    `tools/call` over `httpx2.ASGITransport`, and the resulting row read
+    `tools/call` over `httpx2.ASGITransport`, and the resulting rows read
     back from Postgres through a second, independent connection -- the same
     `database` fixture `AuditMiddleware` itself writes through, per
     `test_consent_enforcement.py`'s own finding that a rolled-back session
     is invisible to the app's own connection.
+
+    TWO rows since 2026-09-18, and this is also what pins that `create_app`
+    wires the entry write at all. `BackendClient(before_backend_request=...)`
+    is required but accepts `None` (`postern_core/facade/client.py` says
+    why), so a composition root that switched to `None` would keep serving
+    every call and silently reach the backend with nothing recorded first.
+    Here the `reaching` row can only exist if this app built that wiring
+    itself: nothing in this test constructs a `BackendClient`.
     """
     key_pair = RSAKeyPair.generate()
     issuer = "https://postern-audit-e2e.invalid"
@@ -482,15 +490,24 @@ async def test_end_to_end_audit_row_is_written_for_a_real_call(
             rows = (
                 (
                     await session.execute(
-                        select(AuditEntry).where(AuditEntry.customer_ref == customer)
+                        select(AuditEntry)
+                        .where(AuditEntry.customer_ref == customer)
+                        # Explicit, now that there are two rows: a bare
+                        # SELECT has no order, and the assertion below is
+                        # about which row was written FIRST.
+                        .order_by(AuditEntry.id)
                     )
                 )
                 .scalars()
                 .all()
             )
         assert [(r.tool_name, r.outcome, r.customer_ref) for r in rows] == [
-            ("accounts.list", "returned", customer)
+            ("accounts.list", "reaching", customer),
+            ("accounts.list", "returned", customer),
         ]
+        assert rows[0].call_id is not None and rows[0].call_id == rows[1].call_id, (
+            "the entry row and the completion row of one call must be joinable"
+        )
     finally:
         async with database.sessionmaker() as session:
             await session.execute(
@@ -503,37 +520,59 @@ async def test_end_to_end_audit_row_is_written_for_a_real_call(
 # --- Adversarial pass: the audit database is unreachable at startup --------
 
 
-async def test_a_tool_call_reports_a_json_rpc_error_when_the_audit_database_is_unreachable() -> (
-    None
-):
+async def test_a_tool_call_fails_closed_when_the_audit_database_is_unreachable() -> None:
     """`create_async_engine` is lazy (`Database.__init__` never connects), so
     `create_app` succeeds even when `database_url` names an address that
-    will never resolve; only the first request that reaches
-    `AuditMiddleware`'s write discovers it.
+    will never resolve; only the first request that needs it discovers that.
 
-    Measured: the backend call itself succeeds (the `MockTransport` handler
-    runs and returns data), but the audit write's connection failure is
-    never caught by `AuditMiddleware.on_call_tool`'s own `try`/`except`
-    (which wraps only `call_next`, not the second, unconditional `_write`
-    call after it), so it propagates out of the whole tool dispatch.
-    FastMCP reports it as a top-level JSON-RPC `error` (`code: 0`, a generic
-    internal-error code, not a masking- or consent-specific one), still
-    inside an HTTP 200 envelope rather than the request's connection being
-    torn down or an ASGI 5xx being raised. The message embeds the raw
-    connection target (`127.0.0.1`, `1`), an internal-infrastructure
-    disclosure to the MCP client -- but not the database credentials
-    themselves, since asyncpg's own `ConnectionRefusedError` carries no DSN,
-    only the address it tried and failed to reach. A DNS-resolution failure
-    (an unresolvable host, tried first and reverted here for a
-    deterministic, environment-independent port) is even less specific: the
-    message it produces carries no connection target at all, only
-    `"nodename nor servname provided, or not known"`.
+    WHICH WRITE DISCOVERS IT CHANGED ON 2026-09-18, and so did the envelope
+    the client gets. Before, the backend call succeeded (the `MockTransport`
+    handler ran and returned data) and the connection failure surfaced from
+    the completion write, after `AuditMiddleware.on_call_tool`'s `try`/`except`
+    -- which wraps only `call_next` -- so it propagated out of the whole tool
+    dispatch and FastMCP reported it as a top-level JSON-RPC `error` with
+    `code: 0`, `"result"` absent.
+
+    The audit middleware now commits an entry row before the backend is
+    reached, from inside the tool body
+    (`postern_core.facade.client.BackendClient`'s `before_backend_request`
+    hook), so the same failure is raised INSIDE the tool and comes back as a
+    tool error: HTTP 200, `result.isError` true, no top-level `"error"` key.
+    That is the shape this test now pins.
+
+    WHAT IS DISCLOSED IS UNCHANGED, which is the reason this stayed a change
+    of envelope rather than a regression to fix here. Either way the message
+    embeds the raw connection target (`127.0.0.1`, `1`), an
+    internal-infrastructure disclosure to the MCP client, and either way it
+    is not the database credentials, since asyncpg's own
+    `ConnectionRefusedError` carries no DSN, only the address it tried.
+    Wrapping the store exception in a quiet one of our own was considered
+    and not done, on the disclosure argument alone. It would keep the address
+    off the wire on this path and do nothing on the completion-write path,
+    where the raw exception escapes `on_call_tool` carrying the same address
+    into a JSON-RPC error. It buys nothing in `audit_log.detail`, which
+    records `ToolError` for every exception raised inside a tool body and so
+    cannot separate this cause from any other. ADR 0006's amendment of 18
+    September 2026 records both halves, and corrects its own `-32603` claim
+    against this test, which is the measurement for it.
+
+    The property the change is FOR is the one asserted last: the backend is
+    never reached. An audit outage used to mean customer data touched with
+    nothing recorded, and now means nothing touched at all.
     """
     settings = Settings(
         backend_base_url="https://backend.test",
         database_url="postgresql+asyncpg://postern:postern@127.0.0.1:1/postern",
     )
-    app = create_app(settings, resolver=_resolver, transport=httpx2.MockTransport(_handler))
+    reached: list[str] = []
+
+    def recording_handler(request: httpx2.Request) -> httpx2.Response:
+        reached.append(request.url.path)
+        return _handler(request)
+
+    app = create_app(
+        settings, resolver=_resolver, transport=httpx2.MockTransport(recording_handler)
+    )
     async with _drive_lifespan(app):
         transport = httpx2.ASGITransport(app=app)
         async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -553,10 +592,12 @@ async def test_a_tool_call_reports_a_json_rpc_error_when_the_audit_database_is_u
             )
     assert response.status_code == 200  # never surfaces as a real HTTP failure
     body = response.json()
-    assert "result" not in body
-    assert body["error"]["code"] == 0
-    assert "127.0.0.1" in body["error"]["message"]  # leaks the connection target
-    assert "postern:postern" not in body["error"]["message"]  # not the DSN's credentials
+    assert "error" not in body  # a tool error now, not a JSON-RPC protocol error
+    assert body["result"]["isError"] is True
+    message = body["result"]["content"][0]["text"]
+    assert "127.0.0.1" in message  # leaks the connection target
+    assert "postern:postern" not in message  # not the DSN's credentials
+    assert reached == [], "an unrecordable call must not reach the operator's backend"
 
 
 # --- Plan 3 Task 2: the read key, and only the read key -------------------

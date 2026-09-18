@@ -59,28 +59,36 @@ was not determined.
 WHAT IT DOES NOT DO, stated plainly because this part reads as safe and is
 not:
 
-  - **It can leave a tool call with NO ROW IN `audit_log`.**
-    `docs/decisions/0006-audit-write-failure.md` makes auditing fail-closed --
-    one row per tool call, and a call that cannot be audited does not succeed.
-    `services/api/middleware/audit.py` is FastMCP middleware running INSIDE
-    the server, so this middleware is outside it and cancelling the request
-    cancels the audit write too. Measured, 2026-09-18, in
-    `tests/test_request_deadline.py::test_a_deadline_during_the_audit_write_
-    leaves_the_call_unaudited`: with the audit store on a silent path, the
-    consent check passes, the tool body runs, the operator's backend serves
-    the customer's accounts, the deadline fires, the client gets a 504 -- and
-    `audit_log` holds ZERO rows for that call. Not a partial row: the write is
-    one `AuditEntry` in one transaction that is never committed. That is a
-    call that happened, against real customer data, with no audit trace.
-    On this exact path it is not a regression -- before this middleware the
-    same request never returned at all, so there was no row then either --
-    but it IS a new shape: the transaction now completes from the client's
-    point of view, so the gap sits in a finished request rather than in one
-    still notionally in flight. Nothing here fixes it; a fix belongs with
-    whoever owns ADR 0006, not in an edge deadline.
+  - **It still cancels an audit write, and can leave a call with no
+    OUTCOME recorded.** `docs/decisions/0006-audit-write-failure.md` makes
+    auditing fail-closed, and `services/api/middleware/audit.py` is FastMCP
+    middleware running INSIDE the server, so this middleware is outside it
+    and cancelling the request cancels whichever audit write is in flight --
+    one `AuditEntry` in one transaction that is never committed, not a
+    partial row.
+
+    What that costs changed on 2026-09-18, and this bullet was rewritten with
+    it. Before, the only audit write happened AFTER the tool: the backend was
+    reached, the cancellation took the write, and `audit_log` held ZERO rows
+    for a call that had already served real customer data. That is no longer
+    what happens, because the audit middleware now commits an entry row
+    (`outcome='reaching'`) before the first backend request and fails the
+    call closed if it cannot. Measured in
+    `tests/test_request_deadline.py`: with the audit store silent, the entry
+    write is what stalls and `/accounts` is never requested
+    (`test_a_deadline_during_the_entry_write_never_reaches_the_backend`);
+    with the store silent only for the completion write, the backend IS
+    reached and the entry row survives the cancellation
+    (`test_a_deadline_after_the_backend_was_reached_leaves_a_durable_entry_
+    row`).
+
+    The residual is a real one and is smaller: a cancelled call can leave a
+    `reaching` row with no partner, so the table says the operator touched
+    this customer's data and no outcome was ever recorded. That is a true
+    statement about a call that happened rather than silence about one.
 
   - **It does not make the service responsive.** See the deadline value in
-    `services/api/settings.py`: 88.0 seconds is longer than any consumer AI
+    `services/api/settings.py`: 101.0 seconds is longer than any consumer AI
     client will wait. This control exists to return the WORKER, not to give
     the caller a timely answer.
 

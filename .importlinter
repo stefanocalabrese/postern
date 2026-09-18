@@ -22,3 +22,20 @@ source_modules =
     services.confirm
 forbidden_modules =
     services.api
+
+# A third contract, added 2026-09-18 with the audit entry row. That row is
+# written from a hook `BackendClient` invokes, and the whole reason it is a
+# pre-bound zero-argument callable is so the facade never learns a tool name,
+# an argument dict, or that a store exists. Nothing enforced that: the facade
+# importing `postern_core.store` directly would be a one-line change with a
+# green gate, and the design note saying it must not would have been the only
+# thing standing in the way. Observed to fail before being trusted, the same
+# way the two above were: adding `from postern_core.store import audit` to
+# facade/client.py breaks it, naming the file and the line.
+[importlinter:contract:facade-not-store]
+name = The backend facade must not import the store
+type = forbidden
+source_modules =
+    postern_core.facade
+forbidden_modules =
+    postern_core.store

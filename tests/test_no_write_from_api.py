@@ -29,6 +29,7 @@ def server() -> FastMCP:
         "https://backend.test",
         StubTokenMinter(),
         transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json={"accounts": []})),
+        before_backend_request=None,
     )
     return build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 

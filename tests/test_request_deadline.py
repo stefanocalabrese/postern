@@ -13,15 +13,20 @@ it does -- the distinction that matters, because the obvious implementation
 (`asyncio.wait_for`) does NOT, measured in this file.
 
 THE COST. `docs/decisions/0006-audit-write-failure.md` makes auditing
-fail-closed: one row per tool call, and a call that cannot be audited does not
-succeed. `services/api/middleware/audit.py` is FastMCP middleware running
-INSIDE the server, so the ASGI deadline is outside it and cancelling the
-request cancels the audit write with everything else.
-`test_a_deadline_during_the_audit_write_leaves_the_call_unaudited` measures
-what that leaves in `audit_log` for a call whose tool body already ran and
-whose backend was already reached: ZERO rows. That is a tool call with no
-audit trace, which is the property ADR 0006 exists to prevent, and it is
-written down in the module docstring of the middleware rather than left here.
+fail-closed, and `services/api/middleware/audit.py` is FastMCP middleware
+running INSIDE the server, so the ASGI deadline is outside it and cancelling
+the request cancels whichever audit write is in flight.
+
+This file measured the worst version of that until 2026-09-18: with the only
+audit write sitting after the tool, a cancelled call whose backend had
+already served the customer's accounts left ZERO rows. The audit middleware
+now commits an entry row before the first backend request, so the two tests
+that pair here measure what replaced it --
+`test_a_deadline_during_the_entry_write_never_reaches_the_backend` (the
+store is silent, so nothing is touched) and
+`test_a_deadline_after_the_backend_was_reached_leaves_a_durable_entry_row`
+(the touch happened and the table says so, with no outcome recorded). The
+remaining cost is the unpaired row, not the missing one.
 
 Timings are small on purpose (`DEADLINE`, `COMMAND` below) so the gate does
 not spend minutes proving a wait. Every bounded assertion carries a LOWER
@@ -68,7 +73,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from services.api.asgi.header_validation import HeaderBodyValidation
 from services.api.asgi.request_deadline import RequestDeadline
 from services.api.main import create_app
-from services.api.middleware.audit import AuditMiddleware
+from services.api.middleware.audit import AuditMiddleware, record_data_touch
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
 
@@ -95,7 +100,7 @@ from tests.test_store_query_stall_deadline import (
 )
 
 # The deadline the integration tests configure. Far below `Settings`'
-# production 88.0s so the gate stays quick; the production number is derived
+# production 101.0s so the gate stays quick; the production number is derived
 # in `services/api/settings.py` and is not a measurement.
 DEADLINE = 1.5
 
@@ -642,24 +647,24 @@ async def _nowhere(message: Message) -> None:
 def test_settings_carries_the_derived_default_and_reads_the_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """88.0 is not a preference and not a round number: it is the sum
+    """101.0 is not a preference and not a round number: it is the sum
     `services/api/settings.py` derives from the per-phase budgets already in
     this repository. A test pinning the literal is what makes a later change
     to it deliberate.
 
     Both routes to the value are pinned, and the second is the one that
-    matters: production reads `from_env`, which carries its own `"88.0"`
+    matters: production reads `from_env`, which carries its own `"101.0"`
     string literal in an `os.environ.get` default. Pinning only the dataclass
     field would let those two drift, with the gate green and every deployment
     on the stale number. Same shape as
     `tests/test_store_timeouts.py:260-273`, which pins the store budgets
     through `from_env` with the variables explicitly unset.
     """
-    assert Settings.for_testing().request_deadline_seconds == 88.0
+    assert Settings.for_testing().request_deadline_seconds == 101.0
 
     monkeypatch.setenv("POSTERN_BACKEND_BASE_URL", "https://backend.test")
     monkeypatch.delenv("POSTERN_REQUEST_DEADLINE_SECONDS", raising=False)
-    assert Settings.from_env().request_deadline_seconds == 88.0
+    assert Settings.from_env().request_deadline_seconds == 101.0
 
     monkeypatch.setenv("POSTERN_REQUEST_DEADLINE_SECONDS", "12.5")
     assert Settings.from_env().request_deadline_seconds == 12.5
@@ -729,6 +734,12 @@ def _deadline_app(
             )
         ),
         transport=httpx2.MockTransport(backend_handler),
+        # Wired exactly as `create_app` wires it
+        # (`test_create_app_wires_the_entry_write_into_the_backend_client`
+        # pins that). Without it this app reaches the backend with no entry
+        # row, and the two tests below would measure an assembly production
+        # does not run.
+        before_backend_request=record_data_touch,
     )
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
     server = build_server(
@@ -875,36 +886,35 @@ async def test_a_silent_store_is_bounded_at_the_deadline_and_does_not_accumulate
         await asyncio.wait_for(stalled.close(), RECOVERY)
 
 
-async def test_a_deadline_during_the_audit_write_leaves_the_call_unaudited(
+async def test_a_deadline_during_the_entry_write_never_reaches_the_backend(
     pg_url: str,
     key_pair: RSAKeyPair,
     database: Database,
     consent_session: AsyncSession,
     silent_server: SilentServer,
 ) -> None:
-    """The cost, measured: a tool call with no row in `audit_log`.
+    """The audit store is silent, so no customer data moves at all.
 
-    The stall is moved off the consent lookup and onto the audit write, which
-    is the shape `docs/verification/2026-09-17-query-stall-deadline.md`
-    recorded as M5: consent answers, the tool runs, the operator's backend
-    serves the customer's accounts, and the request then hangs in
-    `AuditMiddleware`'s write holding an answer it never delivered. Here the
-    deadline ends that hang -- and `AuditMiddleware` is FastMCP middleware
-    running inside the server, so the cancellation takes its write with it.
+    This test measured the opposite outcome until 2026-09-18, and the old
+    result is worth keeping in view: with the only audit write sitting AFTER
+    `call_next`, consent answered, the tool ran, the operator's backend
+    served `/accounts`, the deadline then cancelled the write, and
+    `audit_log` held zero rows -- a call that happened against a real
+    customer's data with no trace in it. `services/api/middleware/audit.py`
+    now commits an entry row BEFORE the first backend request, and that write
+    fails closed like every other one, so the same silence stops the call
+    instead of following it.
 
-    ZERO rows, not a partial one: `postern_core.store.audit.append` adds one
-    `AuditEntry` and `_write` commits it, so a cancelled write leaves an
-    uncommitted transaction and nothing durable. The backend assertion is
-    what makes this a finding rather than a curiosity -- `/accounts` was
-    reached, so this is a call that HAPPENED, against a real customer's data,
-    with no trace in the table `docs/decisions/0006-audit-write-failure.md`
-    exists to keep complete.
+    `b"audit_log"` still selects the first audit statement on the connection,
+    which is now the entry INSERT's own `Parse`. What changed is what that
+    costs: `backend.paths` is EMPTY, where the same line used to read
+    `["/accounts"]`.
 
-    Not a regression on this exact path, and the distinction belongs here:
-    before this middleware the same request never returned at all, so there
-    was no row then either. What is new is that the client is now told
-    something and moves on, which makes the missing row a gap in a completed
-    transaction rather than a request still notionally in flight.
+    Zero rows, and here that is the truthful table rather than a gap in it:
+    nothing was touched, so there is nothing to record. The rows that could
+    not be written are the entry row (cancelled mid-write, one `AuditEntry`
+    in one uncommitted transaction) and the completion row (the tool's own
+    failure, whose write goes to the same silence).
     """
     await _seed(consent_session, CUSTOMER, "accounts")
     silent_server.trigger = b"audit_log"
@@ -919,12 +929,75 @@ async def test_a_deadline_during_the_audit_write_leaves_the_call_unaudited(
 
             assert waited >= DEADLINE, f"answered in {waited:.2f}s -- the stall did not reproduce"
             assert response.status_code == 504
-            assert backend.paths == ["/accounts"], (
-                "the tool body must have run: this test is about a call that HAPPENED"
+            assert backend.paths == [], (
+                "the entry write must fail closed BEFORE any customer data is reached"
             )
             assert await _rows(database) == [], (
                 "an audit row survived the cancellation -- re-read the middleware docstring"
             )
+
+            silent_server.resume()
+    finally:
+        await asyncio.wait_for(stalled_audit.close(), RECOVERY)
+
+
+async def test_a_deadline_after_the_backend_was_reached_leaves_a_durable_entry_row(
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    silent_server: SilentServer,
+) -> None:
+    """The shape this whole change exists for: the operator touched customer
+    data, the request was then cancelled, and the table still says so.
+
+    The silence is moved off the entry write and onto the COMPLETION write,
+    which is the only remaining arrangement in which the old bug's
+    precondition survives: consent answers, the entry row commits, the tool
+    runs, `/accounts` is served, and the request then hangs in the write that
+    would have recorded the outcome. The deadline cancels that write exactly
+    as it did before -- nothing here makes a cancelled write survive.
+
+    Selecting WHICH write goes silent is done with a parameter value rather
+    than with statement text, because both writes run the same INSERT:
+    `b"returned"` is carried in the completion row's own `Bind` and appears
+    in no earlier packet on this connection (the entry row binds
+    `b"reaching"`, and the INSERT text names no outcome at all). If that ever
+    stopped holding, this test fails at the row assertion below rather than
+    passing for the wrong reason.
+
+    One row, `outcome='reaching'`, committed in its own transaction before
+    the first backend request and therefore not the cancelled one. What the
+    table then says is exactly true and no more: this call reached for this
+    customer's data under this tool name, and no outcome was ever recorded
+    for it. `duration_ms` is NULL on that row because no tool duration
+    exists for it, and `call_id` is the key a reader pairs it on -- here
+    finding nothing, which IS the finding.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    silent_server.trigger = b"returned"
+    stalled_audit = Database(silent_server.url(pg_url), command_timeout_seconds=COMMAND)
+    backend = RecordingBackend()
+    try:
+        app = _deadline_app(database, stalled_audit, key_pair, backend, _settings(pg_url), DEADLINE)
+        async with _Calls(app, _token(key_pair)) as calls:
+            started = time.monotonic()
+            response = await _finished(calls.start(), DEADLINE + RECOVERY)
+            waited = time.monotonic() - started
+
+            assert waited >= DEADLINE, f"answered in {waited:.2f}s -- the stall did not reproduce"
+            assert response.status_code == 504
+            assert backend.paths == ["/accounts"], (
+                "the tool body must have run: this test is about a call that HAPPENED"
+            )
+
+            rows = await _rows(database)
+            assert [(row.tool_name, row.outcome) for row in rows] == [(GATED_TOOL, "reaching")], (
+                "the entry row did not survive the cancellation that took the completion row"
+            )
+            assert rows[0].call_id is not None, "an entry row with nothing to pair it on"
+            assert rows[0].duration_ms is None, "an entry row cannot carry a tool duration"
+            assert rows[0].refusal_reason is None, "the entry row is written after consent allowed"
 
             silent_server.resume()
     finally:
@@ -939,7 +1012,14 @@ async def test_control_the_same_call_against_a_healthy_store_is_audited(
 ) -> None:
     """The control for the two tests above, and the proof the deadline is
     inert on a working request: the same app, the same deadline, a store that
-    answers -- one row, one backend call, HTTP 200."""
+    answers -- two rows, one backend call, HTTP 200.
+
+    Two rows and not one since 2026-09-18, in the order they were written:
+    `reaching`, committed before `/accounts` was requested, and `returned`
+    after the tool answered. They carry the same `call_id`, which is what a
+    reader pairs them on, and it is not NULL -- an unpaired `reaching` row is
+    the finding in the test above, so this control has to establish that a
+    healthy call does NOT leave one."""
     await _seed(consent_session, CUSTOMER, "accounts")
     backend = RecordingBackend()
     app = _deadline_app(database, database, key_pair, backend, _settings(pg_url), DEADLINE)
@@ -953,5 +1033,8 @@ async def test_control_the_same_call_against_a_healthy_store_is_audited(
     assert json.loads(response.text)["result"]["isError"] is False
     assert backend.paths == ["/accounts"]
     rows = await _rows(database)
-    assert [row.tool_name for row in rows] == [GATED_TOOL]
-    assert [row.outcome for row in rows] == ["returned"]
+    assert [row.tool_name for row in rows] == [GATED_TOOL, GATED_TOOL]
+    assert [row.outcome for row in rows] == ["reaching", "returned"]
+    assert rows[0].call_id is not None and rows[0].call_id == rows[1].call_id, (
+        "the two rows of one call must be joinable"
+    )

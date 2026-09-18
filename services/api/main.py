@@ -58,7 +58,7 @@ from starlette.middleware import Middleware
 from services.api.asgi.header_validation import HeaderBodyValidation
 from services.api.asgi.request_deadline import RequestDeadline
 from services.api.jwks import jwks_route
-from services.api.middleware.audit import AuditMiddleware
+from services.api.middleware.audit import AuditMiddleware, record_data_touch
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
 
@@ -174,6 +174,22 @@ def create_app(
         ),
         transport=transport,
         timeout=_backend_timeout(settings),
+        # The entry audit row, committed before this client reaches the
+        # operator's backend and failing the call if it cannot be
+        # (`services/api/middleware/audit.py`, and
+        # `docs/decisions/0006-audit-write-failure.md` for why closed rather
+        # than open). Wired here because this is the only place that holds
+        # both halves: the façade that will make the request, and the
+        # middleware module that knows what to record about it.
+        #
+        # The hook is a module-level function, not a bound method, and that
+        # is the shape the mismatch forces: this client is built once per
+        # process while the row is per call, so `record_data_touch` reads the
+        # per-call values off a `ContextVar` the middleware sets. Nothing
+        # about a tool, an argument or a store crosses into
+        # `postern_core.facade` -- it depends on a zero-argument callable
+        # Protocol and nothing else.
+        before_backend_request=record_data_touch,
     )
     # Task 6: one `Database` per process, built unconditionally.
     # `create_async_engine` is lazy (Task 1's own tests construct one against
@@ -226,9 +242,13 @@ def create_app(
         db=consent_db,
         auth_override=auth_override,
     )
-    # Task 6: one audit row per tool call, success or failure, regardless of
+    # Task 6: an audit row per tool call, success or failure, regardless of
     # whether consent enforcement itself is active -- see the module
-    # docstring and `services/api/middleware/audit.py`.
+    # docstring and `services/api/middleware/audit.py`. Since 2026-09-18 a
+    # call that reaches the operator's backend writes a second, earlier row,
+    # through the `before_backend_request` hook wired above; installing this
+    # middleware is what makes that hook resolvable at all, so the two go
+    # together and neither is conditional.
     server.add_middleware(AuditMiddleware(db))
     app = server.http_app(
         path="/mcp",

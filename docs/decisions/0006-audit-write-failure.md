@@ -246,3 +246,128 @@ read-only domains -- rather than a retry or a queue. That is a genuine design
 with its own trade-offs (a domain-by-domain policy table, a decision about
 which domain a given tool belongs to, and a second code path to keep in sync
 with the first), and nobody has asked for it yet.
+
+## Amendment, 18 September 2026: two rows, and three ways this record went stale
+
+This record is cited as the authority for an audit write that did not exist
+when it was written. Three of its statements are now wrong or incomplete, and
+the decision it records is unchanged and in fact stronger. The original
+reasoning above is left exactly as it was.
+
+### capo's ruling, which is the premise
+
+**`audit_log` is a record of customer data the operator TOUCHED, not a record
+of calls it served.** Ruled 18 September 2026. Everything below follows from
+that and not from a new reading of this record.
+
+### 1. "One audit row per tool call" is no longer the shape
+
+The Question section above describes one row per call, written after the tool
+returned or raised. That was accurate then. A tool call now writes up to two
+rows, and `services/api/middleware/audit.py`'s module docstring is the
+current description:
+
+- `outcome='reaching'`, committed in its own transaction immediately before
+  the first backend request of the call, from a callable the middleware
+  pre-binds and `postern_core.facade.client.BackendClient` invokes.
+- `outcome='returned'` or `'raised'`, after the call finishes. Unchanged.
+
+They share a `call_id`. A call that reaches no backend -- one consent
+refused, one that failed earlier, one whose tool touches nothing -- still
+writes exactly one row, as before.
+
+**Why the write moved.** `services/api/asgi/request_deadline.py` created a
+request deadline, and `tests/test_request_deadline.py` measured what the
+single-row shape cost under it: with the audit store on a path silent in both
+directions, consent answered, the tool ran, the operator's backend served the
+customer's accounts, the deadline cancelled the request, and `audit_log` held
+zero rows. Under the ruling above that is a missing row, not a documented
+limitation.
+
+**What it buys, in this record's own terms.** Fail-closed used to mean an
+audit outage could still leave data touched with nothing recorded, because
+the touch happened before the write was attempted. It now means the backend
+is never reached at all. The residual is an unpaired `reaching` row -- "we
+touched this, no outcome was recorded" -- which is a true statement about a
+call that happened rather than silence about one.
+
+### 2. The operator now sees three failure paths, not two
+
+"What an operator sees when the audit store is down" enumerates two ERROR
+lines. There is a third, and it is the one that needed the most care because
+the middleware never sees it: the entry write raises inside the tool body, so
+if that call's completion write then SUCCEEDS, the operator would have been
+left with an ordinary-looking `raised` row and no ERROR line anywhere.
+`_PendingEntry.record` logs it through the same logger at ERROR with
+`exc_info` set, before re-raising:
+
+- Entry path: `"audit entry write failed for tool %r; the backend request it
+  precedes will not be made"`.
+
+The same caveat this section already records applies to it: the line is only
+a signal if this module's logger is enabled in the hosting process.
+
+### 3. The `-32603` containment claim is contradicted by measurement
+
+"Where each path's message containment actually lives" says the MCP SDK
+runner turns an unhandled non-`FastMCPError` into a generic `-32603 Internal
+server error` rather than echoing `str(exc)`, and treats that as what keeps a
+store exception's text off the wire on the success path.
+
+Measured against the composed app in
+`tests/test_asgi_app.py::test_a_tool_call_fails_closed_when_the_audit_
+database_is_unreachable`, on this repository's pinned versions, that is not
+what happens. With the audit store pointed at a refused address, the
+JSON-RPC error carried `code: 0` and a message containing the raw connection
+target `127.0.0.1`. It did NOT carry the DSN's credentials, since asyncpg's
+`ConnectionRefusedError` names only the address it tried. So the disclosure
+this record treats as prevented has been reaching the client all along, at
+the level of an internal address rather than a secret.
+
+The entry write changes the ENVELOPE of that same disclosure and not its
+content. Because the exception is raised inside the tool body, FastMCP
+returns it as `CallToolResult(is_error=True)` inside an HTTP 200, so the same
+text arrives as a tool error rather than as a top-level JSON-RPC error. Both
+shapes are pinned by that test.
+
+**Not wrapped, and the first reason given for that was false.** An earlier
+version of this paragraph argued that substituting a quiet exception of our
+own would make `audit_log.detail` read `AuditWriteFailed` instead of naming
+the actual failure. That benefit does not exist. `detail` records
+`type(exc).__name__`, and FastMCP wraps anything a tool body raises in
+`ToolError` before the middleware sees it
+(`fastmcp/server/server.py:1555`), so an entry-write failure ALREADY records
+`detail='ToolError'`, the same value an ordinary tool failure records, and a
+wrapper of our own would be wrapped into `ToolError` in its turn. This table
+cannot distinguish an entry-write outage from any other tool error through
+that column, and no wrapping decision changes it. The ERROR line in the
+section above is the compensation, and the only thing in the record that
+separates the two.
+
+What survives is the disclosure argument, narrower than it first looks.
+Wrapping WOULD keep the address off the wire on the entry-write path, since
+the quiet message is what FastMCP would embed instead. It would do nothing
+on the completion write's SUCCESS path, where the raw store exception
+escapes `on_call_tool` unchanged and reaches the client as a JSON-RPC error
+carrying the same address.
+
+The completion write's RAISED path leaks nothing to begin with, and an
+earlier draft of this paragraph blurred that by writing "the completion-write
+path" as though it were one thing: `raise exc from audit_exc` substitutes
+the tool's own exception before anything leaves `on_call_tool`, which is the
+distinction the "Where each path's message containment actually lives"
+section above already draws. So the open surface is two of the three write
+paths, not three, and wrapping the entry write would close one of those two.
+The one left open is the completion write's success path, holding a
+disclosure that predates this change entirely. Whoever decides an internal
+address must not reach the client should fix it at the level of that
+disclosure, for both open paths at once.
+
+### What is NOT changed by any of this
+
+The decision itself. Audit-or-refuse, on every path, for the reasons the
+Decision section gives. The cost section's amendment of the same date still
+holds and now has a wider reach: a store that is merely slow fails calls, and
+with the entry write it fails them *before* the backend is reached rather
+than after. That is this record's own bargain moved earlier in the call, not
+a new trade-off.

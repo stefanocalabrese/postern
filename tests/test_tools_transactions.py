@@ -40,7 +40,10 @@ def _handler(request: httpx2.Request) -> httpx2.Response:
 def server() -> FastMCP:
     SEEN.clear()
     backend = BackendClient(
-        "https://backend.test", StubTokenMinter(), transport=httpx2.MockTransport(_handler)
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=httpx2.MockTransport(_handler),
+        before_backend_request=None,
     )
     return build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 
@@ -57,7 +60,10 @@ def _server_with_rows(rows: list[dict[str, Any]]) -> FastMCP:
         return httpx2.Response(200, json={"transactions": rows})
 
     backend = BackendClient(
-        "https://backend.test", StubTokenMinter(), transport=httpx2.MockTransport(handler)
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=httpx2.MockTransport(handler),
+        before_backend_request=None,
     )
     return build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 

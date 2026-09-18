@@ -1,4 +1,56 @@
-"""One audit row per tool call, success or failure.
+"""Up to two audit rows per tool call: one before the operator touches
+customer data, one after the call finishes.
+
+WHY TWO. Until 2026-09-18 this module wrote a single row AFTER `call_next`,
+which meant the backend was reached first and the record was attempted
+afterwards. `tests/test_request_deadline.py` measured what that costs: with
+the audit store on a path silent in both directions, consent answered, the
+tool ran, the operator's backend served the customer's accounts, the edge
+deadline cancelled the request, and `audit_log` held ZERO rows -- not a
+partial row, one `AuditEntry` in one transaction that never committed. capo
+ruled the same day that this table records customer data the operator
+TOUCHED, not calls it served, so that is a missing row rather than a
+documentation gap.
+
+The entry row (`outcome='reaching'`) is committed in its own transaction
+before the first backend request of the call, and fails closed
+(docs/decisions/0006-audit-write-failure.md). That inverts the failure mode:
+an audit outage used to mean data touched with nothing recorded, and now
+means the backend is never reached at all.
+
+IT FAILS CLOSED DIFFERENTLY FROM THE OTHER TWO WRITES, in three ways worth
+having before reading further. MECHANISM: the completion writes are caught
+and re-raised by `on_call_tool` itself, while this one propagates up through
+the facade and the tool body, so the guarantee now also depends on no
+intermediate frame swallowing it -- nothing does today, and nothing enforces
+that. ENVELOPE: because it raises inside the tool, FastMCP returns it as
+`CallToolResult(is_error=True)` in an HTTP 200, where a completion-write
+failure escapes `on_call_tool` and becomes a top-level JSON-RPC error
+(measured both ways in `tests/test_asgi_app.py`). LOGGING: it needs its own
+ERROR line, because the middleware never sees it -- `_PendingEntry.record`
+carries that line and says why.
+
+Under a cancellation the shape is: entry row committed, tool body runs,
+deadline fires, no completion row ever written. The table then says "we
+touched this, no outcome was recorded", which is the true statement.
+
+WHERE THE ENTRY ROW IS WRITTEN FROM, and why not from here. This middleware
+runs OUTSIDE `call_next`, and FastMCP evaluates a tool's `auth=` consent
+check inside `_get_tool`, which `call_next` reaches
+(`fastmcp/server/server.py:886-915`, cited by `services/api/consent.py`). A
+write at the top of `on_call_tool` would therefore land before authorization
+was decided: its `refusal_reason` could only ever be NULL, and a call consent
+then REFUSED -- which touches nothing -- would get an entry row recording an
+intent rather than a touch. So the write is bound here and INVOKED from
+`postern_core.facade.client.BackendClient`, immediately before its first HTTP
+request, which is the actual data-touch boundary. `record_data_touch` below
+is the seam; `_PendingEntry` is what this module pre-binds so the façade
+never learns a tool name, an argument dict, or that a store exists.
+
+A consent-denied call therefore still produces exactly ONE row, unchanged:
+`outcome='raised'`, `detail='NotFoundError'`, with the refusal reason. So
+does any call that fails before its first backend request, and so does one
+whose tool reaches no backend at all.
 
 Failures reach `on_call_tool` as RAISED EXCEPTIONS: the `isError: true`
 envelope is built above the middleware chain, so a hook inspecting
@@ -26,8 +78,12 @@ failed `CustomerRef` -- and never the subject that failed, for the reason
 `_customer_ref` gives below.
 """
 
+import asyncio
 import logging
 import time
+import uuid
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, NamedTuple
 
@@ -44,6 +100,9 @@ from postern_core.store.models import (
     ABSENCE_NO_ACCESS_TOKEN,
     ABSENCE_NO_STRING_SUBJECT,
     ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
+    OUTCOME_RAISED,
+    OUTCOME_REACHING,
+    OUTCOME_RETURNED,
 )
 from pydantic import TypeAdapter, ValidationError
 
@@ -284,6 +343,230 @@ def _request_id(context: MiddlewareContext[CallToolRequestParams]) -> str | None
     return str(request_id)[:_MAX_REQUEST_ID]
 
 
+@dataclass
+class _PendingEntry:
+    """Everything the entry row needs, bound before the tool runs and written
+    when something is about to reach the operator's backend.
+
+    Every field is settled by the time `on_call_tool` constructs this, which
+    is what makes a zero-argument callable possible at all. `redaction_budget
+    _exhausted` is the one worth checking rather than assuming: it is
+    `RedactionScope.exhausted` read AFTER the `with redaction_budget()` block
+    has closed, and nothing spends from that allowance afterwards -- the
+    context manager resets the `ContextVar` on exit (masking.py), and tool
+    RESPONSES deliberately do not opt in and take a fresh per-string budget
+    each. So the value this row carries is measured, not assumed, and it is
+    the same value the completion row will carry.
+
+    WRITTEN AT MOST ONCE PER TOOL CALL, which is the guard `record` holds and
+    the façade explicitly does not. Every façade function issues exactly one
+    `get_json` today -- `facade/accounts.py:52` and `:57`, `facade/cards.py:80`,
+    `facade/transactions.py:121` -- so "one entry row per call" currently
+    holds by arithmetic rather than by construction, and the first tool that
+    reads before it writes (a `payments.create_payment` doing a payee lookup)
+    would silently write N rows for one call and break the pairing. The guard
+    lives here rather than in `BackendClient` because "one tool call" is a
+    concept this module owns and that one does not: this object's lifetime IS
+    the call.
+
+    The lock is what makes it at-most-once rather than usually-once. Two
+    `get_json` calls issued concurrently from one tool body would both find
+    `written` False across the `await` in between and both insert; the lock
+    serialises them so the second sees the first's result.
+
+    `written` IS SET INSIDE THE SESSION BLOCK, on the line after the commit,
+    and that placement is load-bearing rather than tidy. Set after the block
+    instead, a commit that succeeds followed by a raising session exit --
+    `AsyncSession.__aexit__` closes the session and can raise on its own --
+    leaves a durable `reaching` row with the flag still False, so a caller
+    that catches the exception and touches again writes a SECOND `reaching`
+    row under the same `call_id`. That is precisely the pairing break this
+    guard exists to prevent, arrived at through the guard. No tool swallows
+    that exception today, so nothing in the suite reaches this window; it is
+    fixed rather than documented because the first tool that does swallow it
+    would not announce itself.
+
+    The two failure shapes that remain are therefore different, and both are
+    correct. A write that never commits leaves `written` False, so a second
+    toucher retries and fails too, rather than reaching the backend on the
+    strength of a row that does not exist
+    (`test_a_second_touch_after_a_failed_entry_write_fails_too`). A write
+    that commits and then raises leaves `written` True, so a second toucher
+    returns quietly -- the row it needed is already durable, and the
+    exception the first toucher saw has already stopped that first request.
+    """
+
+    db: Database
+    at: datetime
+    subject: _Subject
+    tool_name: str
+    arguments: dict[str, Any]
+    redaction_budget_exhausted: bool
+    request_id: str | None
+    call_id: str
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    written: bool = False
+
+    async def record(self) -> None:
+        async with self.lock:
+            if self.written:
+                return
+            try:
+                await self._write_entry_row()
+            except Exception as audit_exc:
+                # The THIRD failure path, and the one
+                # docs/decisions/0006-audit-write-failure.md did not have
+                # when it enumerated what an operator sees. Logged here
+                # because this write is the only one of the three the
+                # middleware never sees: it raises inside the tool body, so
+                # if that tool's own completion write then SUCCEEDS, the
+                # operator is left with a `raised` row and no ERROR line
+                # anywhere -- an entry-write outage wearing the shape of
+                # ordinary tool failures. Re-raised unchanged: stopping the
+                # backend request is the whole point, and the caller needs
+                # the exception to do it.
+                logger.error(
+                    "audit entry write failed for tool %r; the backend request "
+                    "it precedes will not be made",
+                    self.tool_name,
+                    exc_info=audit_exc,
+                )
+                raise
+
+    async def _write_entry_row(self) -> None:
+        """The write itself, split out only so `record` above can wrap it in
+        one `try` without burying the row's own field-by-field reasoning
+        inside an exception handler."""
+        async with self.db.sessionmaker() as session:
+            await audit.append(
+                session,
+                at=self.at,
+                customer_ref=self.subject.customer_ref,
+                customer_ref_absence_reason=self.subject.absence_reason,
+                tool_name=self.tool_name,
+                arguments=self.arguments,
+                outcome=OUTCOME_REACHING,
+                # NULL: nothing has gone wrong, and `detail` records what
+                # did. The completion row is where an outcome is
+                # described.
+                detail=None,
+                redaction_budget_exhausted=self.redaction_budget_exhausted,
+                # NULL, and the one column where that needs saying: the
+                # tool body has not finished, so no duration exists to
+                # record. `AuditEntry.duration_ms` gives the rule that
+                # keeps this distinguishable from a pre-migration row --
+                # `outcome` is what separates them, not this column.
+                duration_ms=None,
+                request_id=self.request_id,
+                # NULL, and TRUE rather than merely unknown, which is
+                # the whole reason this write sits behind the consent check
+                # instead of at the top of `on_call_tool`. FastMCP
+                # evaluates `auth=` in `_get_tool`, inside `call_next`, so
+                # any refusal has already been decided by the time anything
+                # reaches the backend, and a refused call never gets here.
+                #
+                # The claim is "consent did not refuse this call", NOT
+                # "consent allowed it", and the difference is one real tool
+                # rather than pedantry: `start_session` is registered with
+                # no `auth=` at all (`services/api/tools/bootstrap.py:75`,
+                # while the other four pass `auth=check`) and it reaches the
+                # backend through `accounts_facade.list_accounts`. Its entry
+                # row's NULL therefore means no consent check ran, which is
+                # exactly what NULL says on this column
+                # (`AuditEntry.refusal_reason` lists all three states it
+                # covers). Writing the stronger claim would make this
+                # comment false for one tool in five.
+                #
+                # THAT TOOL IS DESCRIBED HERE AND PINNED NOWHERE. No test
+                # drives `start_session` through this write:
+                # `tests/test_bootstrap.py:31` builds its `BackendClient`
+                # with `before_backend_request=None`, so the one ungated
+                # tool that reaches the backend is also the one whose entry
+                # row nothing exercises. A reader should not take the
+                # paragraph above as covered behaviour -- it is read off the
+                # registration and the facade call, not off a measurement.
+                refusal_reason=None,
+                call_id=self.call_id,
+            )
+            # INSIDE the session block, on the line after the commit: see
+            # the class docstring for the duplicate row the other placement
+            # produces.
+            self.written = True
+
+
+# Set by `AuditMiddleware.on_call_tool` and read by `record_data_touch`,
+# which runs deeper in the same call stack.
+#
+# A `ContextVar` and not `request.state`, where `services/api/consent.py`
+# went the other way, and the two are not in conflict. `consent._refuse`
+# rejected a `ContextVar` because it writes from DEEPER than the middleware
+# that reads it, and a value set in a child task's context does not propagate
+# back to the parent. This is the reverse direction -- set in the middleware,
+# read further down -- which is the direction a `ContextVar` does carry, and
+# `postern_core.domain.masking.redaction_budget()` is this repository's
+# existing precedent for it (`AuditMiddleware.on_call_tool`, below, already
+# relies on it). That reason decides it on its own.
+#
+# The second consideration is not a defect in `request.state`, and saying so
+# would misread this repository's own use of it. `get_http_request()` RAISES
+# for a call arriving through the in-process `Client(transport=server)`
+# transport, and a tool called that way still reaches the backend. So a
+# `request.state` design has to ANSWER that case, where a `ContextVar` never
+# raises it: `consent._refuse` answers it by returning quietly and says why
+# -- a call with no HTTP request carries no token, so there was no consent
+# decision to file -- and that answer is correct there and would be wrong
+# here, since the touch happens regardless. Choosing `request.state` would
+# mean choosing to raise on a path its existing reader deliberately does not,
+# which is a divergence to maintain rather than a shape to inherit.
+_pending_entry: ContextVar[_PendingEntry | None] = ContextVar(
+    "postern_pending_audit_entry", default=None
+)
+
+
+async def record_data_touch() -> None:
+    """Commit this call's entry row, if it has not been committed already.
+
+    Wired into `postern_core.facade.client.BackendClient` by
+    `services/api/main.py::create_app` as its `before_backend_request` hook,
+    and invoked immediately before each backend request. The façade holds
+    this module-level function, not the per-call callable: a `BackendClient`
+    is built once per process and the entry it writes is per request, so
+    something has to bridge the two, and this is that bridge.
+
+    RAISES when no entry is pending, rather than returning quietly. Nothing
+    in this service reaches the backend outside a tool call, so an empty
+    `ContextVar` here means one of two things, and they end differently.
+
+    EITHER the value did not propagate to this frame, with `AuditMiddleware`
+    installed. The exception surfaces as the tool call's own failure and the
+    completion row records `outcome='raised'` with `detail='ToolError'`, NOT
+    `'RuntimeError'`: FastMCP wraps anything a tool body raises before the
+    middleware sees it (`fastmcp/server/server.py:1555`, `raise ToolError(...)
+    from e`), so `type(exc).__name__` never reads the original type. That is
+    an established property of this table, not a new one --
+    `tests/test_audit_middleware.py::test_an_ordinary_tool_failure_records_no_
+    refusal_reason` has pinned it since before this write existed.
+
+    So the ROW DOES NOT IDENTIFY THIS CAUSE, or separate it from any other
+    exception raised inside a tool body. What names it is the message below,
+    in the traceback and in the error text the client receives.
+
+    OR `AuditMiddleware` is not installed on this server at all, in which
+    case there is no completion row either and nothing is recorded anywhere
+    -- the raise is the only signal, and it is still the right one, because
+    the alternative is a backend request nothing will ever record. The
+    message names that cause for whoever reads the traceback.
+    """
+    entry = _pending_entry.get()
+    if entry is None:
+        raise RuntimeError(
+            "no audit entry is pending for this call, so a backend request "
+            "cannot be recorded before it is made; AuditMiddleware must be "
+            "installed on any server whose BackendClient carries this hook"
+        )
+    await entry.record()
+
+
 class AuditMiddleware(Middleware):
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -408,8 +691,32 @@ class AuditMiddleware(Middleware):
         # duration by padding its arguments, and would blur the one thing an
         # investigator reads this column for: which TOOL was slow.
         started = time.monotonic()
+        # Minted here, once, for both of this call's rows. `uuid.uuid4()` and
+        # not the JSON-RPC `request_id` above: that one is the client's, and
+        # `_request_id` returns None whenever it cannot be read, with the row
+        # written anyway -- two rows joined on a column that is NULL on both
+        # are not a pair. See `AuditEntry.call_id` (models.py).
+        pending = _PendingEntry(
+            db=self.db,
+            at=at,
+            subject=subject,
+            tool_name=name,
+            arguments=arguments,
+            redaction_budget_exhausted=scope.exhausted,
+            request_id=request_id,
+            call_id=str(uuid.uuid4()),
+        )
+        token = _pending_entry.set(pending)
         try:
-            result = await call_next(context)
+            try:
+                result = await call_next(context)
+            finally:
+                # Reset before either audit write runs, not after: the entry
+                # is only ambient while the tool that might touch the backend
+                # is running. `reset`, not `set(None)`, so a nested caller's
+                # own pending entry -- if this middleware is ever installed
+                # twice -- is restored rather than wiped.
+                _pending_entry.reset(token)
         except Exception as exc:
             # A failing call has a duration too, and a SLOW failure -- a
             # backend timeout, a lock held to the end of a transaction -- is
@@ -456,12 +763,19 @@ class AuditMiddleware(Middleware):
                     subject.absence_reason,
                     name,
                     arguments,
-                    "raised",
+                    OUTCOME_RAISED,
                     type(exc).__name__,
                     scope.exhausted,
                     duration_ms,
                     request_id,
                     refusal_reason,
+                    # The same value the entry row carries, whether or not
+                    # that row was ever written. A completion row with no
+                    # entry row is a real and common state -- consent refused
+                    # the call, the tool failed before its first backend
+                    # request, or it reaches no backend at all -- and reads
+                    # as exactly that: nothing was touched.
+                    pending.call_id,
                 )
             except Exception as audit_exc:
                 logger.error(
@@ -485,7 +799,7 @@ class AuditMiddleware(Middleware):
                 subject.absence_reason,
                 name,
                 arguments,
-                "returned",
+                OUTCOME_RETURNED,
                 None,
                 scope.exhausted,
                 duration_ms,
@@ -502,6 +816,11 @@ class AuditMiddleware(Middleware):
                 # every consent-gated tool on the server, not just this one
                 # (see `services/api/consent.py`'s module docstring).
                 None,
+                # Pairs this row with the `reaching` row the façade wrote for
+                # the same call, when there was one. A `returned` row with no
+                # partner means the tool answered without reaching the
+                # backend.
+                pending.call_id,
             )
         except Exception as audit_exc:
             # Fail closed here too, and deliberately rather than by
@@ -558,6 +877,11 @@ class AuditMiddleware(Middleware):
         # reasoning behind it, on the one column that distinguishes a
         # consent record from an agent's typo.
         refusal_reason: str | None,
+        # Required, no default, and typed `str` rather than `str | None`: the
+        # value comes off the `_PendingEntry` this call built, so it exists
+        # unconditionally, and a NULL here would orphan this row from the
+        # entry row that shares its call.
+        call_id: str,
     ) -> None:
         async with self.db.sessionmaker() as session:
             await audit.append(
@@ -573,4 +897,5 @@ class AuditMiddleware(Middleware):
                 duration_ms=duration_ms,
                 request_id=request_id,
                 refusal_reason=refusal_reason,
+                call_id=call_id,
             )

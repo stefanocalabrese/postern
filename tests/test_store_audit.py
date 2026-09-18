@@ -14,6 +14,12 @@ from postern_core.store.engine import Database
 from postern_core.store.models import ABSENCE_NO_ACCESS_TOKEN, AuditEntry
 from sqlalchemy import delete, select
 
+# `audit.append` requires a correlation key and accepts no None: every row it
+# writes has to be joinable to the other row of its own tool call. These probe
+# rows have no partner, so the value is a fixed literal rather than a real
+# `uuid4` -- what is under test here is a column round trip, not a pairing.
+PROBE_CALL_ID = "probe-call-id"
+
 # `append()` commits for real, which rules out the rollback-based `session`
 # fixture the consent tests use, for two reasons rather than one. First,
 # `conftest.py`'s `session` binds to a connection on which `conn.begin()`
@@ -63,6 +69,7 @@ async def test_append_with_redaction_budget_exhausted_true_persists_true(
             duration_ms=0,
             request_id=None,
             refusal_reason=None,
+            call_id=PROBE_CALL_ID,
         )
     async with database.sessionmaker() as s:
         row = (await s.execute(select(AuditEntry))).scalar_one()
@@ -92,6 +99,7 @@ async def test_append_with_redaction_budget_exhausted_false_persists_false(
             duration_ms=0,
             request_id=None,
             refusal_reason=None,
+            call_id=PROBE_CALL_ID,
         )
     async with database.sessionmaker() as s:
         row = (await s.execute(select(AuditEntry))).scalar_one()

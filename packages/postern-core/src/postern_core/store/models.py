@@ -91,6 +91,38 @@ CUSTOMER_REF_ABSENCE_REASONS: tuple[str, ...] = (
     ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
 )
 
+# The closed vocabulary of `AuditEntry.outcome`, and the newest of the three
+# in this module even though the column is the oldest: `outcome` carried bare
+# string literals at its two call sites in
+# `services/api/middleware/audit.py` and no constraint at all until migration
+# 71a4c0d9e3b2, while both columns above have been constrained since the
+# revision that added them. Adding `OUTCOME_REACHING` is what made that
+# inconsistency worth closing rather than noting: a third writer of this
+# column is exactly the change that a CHECK constraint exists to catch when
+# it misspells the value.
+#
+# `returned` and `raised` describe the TOOL and are written after it ran, one
+# per call, by `AuditMiddleware.on_call_tool`'s two branches.
+#
+# `reaching` describes the OPERATOR and is written before any customer data
+# is reached, by the callable that middleware pre-binds and
+# `postern_core.facade.client.BackendClient` invokes before its first HTTP
+# request. Present tense deliberately: the row is committed BEFORE the
+# request is issued, so at the instant it becomes durable the backend has not
+# been reached yet. That direction is the chosen one -- a row claiming a
+# touch that a crash then prevented is a false positive an investigator can
+# resolve against the backend's own logs, where the reverse (touch first,
+# record after) is the hole this value was added to close, and it resolves to
+# nothing at all.
+#
+# A `reaching` row therefore does NOT assert that the backend answered, that
+# it was even connected to, or that the data came back. It asserts that this
+# process was about to ask for it and had committed to saying so first.
+OUTCOME_REACHING = "reaching"
+OUTCOME_RETURNED = "returned"
+OUTCOME_RAISED = "raised"
+OUTCOMES: tuple[str, ...] = (OUTCOME_REACHING, OUTCOME_RETURNED, OUTCOME_RAISED)
+
 
 class ConsentRecord(Base):
     __tablename__ = "consents"
@@ -117,6 +149,27 @@ class AuditEntry(Base):
     __tablename__ = "audit_log"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # When the tool CALL ARRIVED, not when this row was written.
+    # `services/api/middleware/audit.py` passes `context.timestamp` to both
+    # of a call's rows, so the pair shares one timestamp and a reader can see
+    # at a glance that they belong together.
+    #
+    # WHAT THAT MEANS IS NOT RECORDED HERE, and the `reaching` row makes the
+    # omission worth naming: that row's whole point is the instant it becomes
+    # durable, which is immediately before the backend is reached, and this
+    # column does not carry that instant. On a call where the consent lookup
+    # took thirteen seconds (`services/api/settings.py` derives that ceiling)
+    # the table cannot say when the operator actually reached for the
+    # customer's data -- only when the request that led there arrived. The
+    # gap between the two is bounded by the request deadline and by nothing
+    # in this table.
+    #
+    # Recording the write instant instead, or as a second column, was
+    # considered and not done: it would make the pair's two `at` values
+    # differ, which reads as two events rather than one call, and nothing in
+    # this repository has asked to measure arrival-to-touch latency.
+    # `duration_ms` on the completion row is the one interval this table does
+    # measure, and its own comment says exactly which one.
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     # 128, same reasoning as `ConsentRecord.customer_ref` above: `_OPAQUE`'s
     # current maximum is 65 characters, and a failed insert here means no
@@ -131,6 +184,56 @@ class AuditEntry(Base):
     tool_name: Mapped[str] = mapped_column(String(64))
     arguments: Mapped[dict[str, Any]] = mapped_column(JSONB)
     outcome: Mapped[str] = mapped_column(String(16))
+    # The exception TYPE that ended the call, never its message: a
+    # `pydantic.ValidationError` message embeds the raw offending value,
+    # which is the leak path CLAUDE.md's masked-type rule describes, and this
+    # is a long-lived store. `services/api/middleware/audit.py` writes
+    # `type(exc).__name__` and nothing else.
+    #
+    # ITS REAL VOCABULARY IS THREE VALUES, and only one of them is ever the
+    # type the code that failed actually raised. They correspond to the three
+    # stages a `tools/call` passes through, so what this column records is
+    # HOW FAR the call got:
+    #
+    # `NotFoundError` -- no tool was reached. The name is unknown, or the
+    # consent check refused it: FastMCP's `_get_tool` answers None for both
+    # and the dispatch raises one exception for both, which is why
+    # `refusal_reason` below exists at all.
+    #
+    # `ValidationError` -- a tool was found and its ARGUMENTS were rejected,
+    # in the dispatch, before the body ran. Not wrapped, because no tool body
+    # raised it. It has exactly one cause and that cause is the caller: a
+    # malformed tool call, produced on demand. `NotFoundError` above is
+    # agent-controllable too (a name nobody registered) but not ONLY that,
+    # since it also covers the operator's own refusal, and `refusal_reason`
+    # is what separates those. An abuse-detection reader therefore wants the
+    # two values apart even though both precede the tool body: one of them is
+    # unambiguously the caller, the other is two facts sharing a name.
+    #
+    # `ToolError` -- the body ran and raised. FastMCP wraps whatever it was
+    # (`fastmcp/server/server.py:1555`, `raise ToolError(...) from e`) before
+    # this middleware's handler reads the type, so a tool's own `ValueError`,
+    # a backend `BackendError`, a masking `ValidationError` on a RESPONSE and
+    # a failed entry write all land here as the same four letters. A masking
+    # `ValidationError` on ARGUMENTS does not: that one is the stage above.
+    #
+    # Measured against a DEFAULT server on 2026-09-18, which is what
+    # production runs: a wrong-type argument and a missing required argument
+    # both record `ValidationError`. `tests/conftest.py`'s
+    # `strict_input_validation=True` is needed for one narrower case only,
+    # the digit-only string coerced into an `int` -- on a default server that
+    # call succeeds and records `outcome='returned'` with NULL here. The
+    # third value is not an artefact of that fixture.
+    # `tests/test_audit_middleware.py::test_the_detail_records_the_exception_
+    # type_not_its_message` asserts the closed set of three.
+    #
+    # Anything finer has to come from another column (`refusal_reason`) or
+    # from the server's own logs, and a reader who treats `detail` as the
+    # exception the code raised will be wrong for every row that is not a
+    # refusal or an argument rejection.
+    #
+    # NULL on every `returned` row and on every `reaching` row: nothing went
+    # wrong, and this column only ever describes something that did.
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Reports one fact: this call's redaction checksum allowance ran out
     # (`_ScanBudget.exhausted`, masking.py, is `remaining <= 0`). That is
@@ -172,6 +275,16 @@ class AuditEntry(Base):
     # "measured, under one millisecond", NULL means "no measurement exists
     # for this row". Collapsing the first into the second would make live
     # rows indistinguishable from pre-migration ones.
+    #
+    # NULL GAINED A SECOND MEANING with migration 71a4c0d9e3b2, and the two
+    # are told apart by `outcome`, not by this column. An `outcome='reaching'`
+    # row is written BEFORE the tool body runs, so there is no tool duration
+    # in existence to record on it and never will be; a NULL on a `returned`
+    # or `raised` row still means what the paragraphs above say. Writing 0
+    # there instead would claim a call that took under a millisecond, which
+    # is a measurement nobody made. The rule is therefore: NULL with
+    # `outcome='reaching'` means "this row shape has no duration"; NULL with
+    # either other outcome means "this row predates this column".
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # The JSON-RPC id of the client request this call arrived on, stored as
     # its string form: an id may be a string or a number on the wire, and
@@ -297,6 +410,59 @@ class AuditEntry(Base):
     # `customer_ref`, and a value here saying it would be the same claim
     # stored twice, free to disagree with itself.
     customer_ref_absence_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Which tool call this row belongs to. One value per
+    # `AuditMiddleware.on_call_tool` invocation, so the `reaching` row and the
+    # `returned`/`raised` row for one call carry the same one and a reader can
+    # put them back together.
+    #
+    # NOT `request_id`, and the difference decides whether the pairing works
+    # at all. `request_id` is the JSON-RPC id the CLIENT chose, and its own
+    # comment above says it is genuinely absent sometimes -- no
+    # `fastmcp_context`, or a `Context.request_id` that raises -- with the row
+    # written anyway, because a missing identifier must never become a missing
+    # audit row. Two rows keyed on a column that is NULL on both are not a
+    # pair, they are two orphans, and they go missing in exactly the degraded
+    # conditions where an investigator most wants them joined. This column is
+    # minted server-side (`uuid.uuid4()`, `services/api/middleware/audit.py`)
+    # from nothing the caller supplies and has no absent case: every row this
+    # application writes from now on carries one.
+    #
+    # NULLABLE at the column level, and only for rows written before
+    # migration 71a4c0d9e3b2. A `NOT NULL` column cannot be added to a table
+    # with rows in it without a default or a backfill, and this table is
+    # append-only and regulator-facing: a backfill would be the only UPDATE
+    # it has ever taken (the reasoning
+    # `ck_audit_log_customer_ref_xor_absence` below already spells out), and
+    # a default would invent a correlation between rows that were never
+    # correlated. So NULL here means "this row predates the column", the same
+    # meaning `duration_ms` and `request_id` carry.
+    #
+    # THE DATABASE STILL ENFORCES IT on every new row, through
+    # `ck_audit_log_call_id_present` below rather than through this column's
+    # own nullability. `NOT NULL` and a `CHECK ... NOT VALID` are not the
+    # same trade: the first cannot skip the existing rows, the second is
+    # created unvalidated, so PostgreSQL never scans them and enforces on
+    # every INSERT from that point on -- which on an append-only table is
+    # every row that will ever be written. This repository already made that
+    # choice once, for the xor constraint in migration 3186c04c018c.
+    #
+    # `String(36)`: `str(uuid.uuid4())` is exactly 36 characters, and unlike
+    # `tool_name` or `request_id` this value is not agent-controlled, so there
+    # is no over-length input to clamp and no reason to leave headroom for one.
+    # Stored as text rather than as PostgreSQL `uuid` so a regulator or a DBA
+    # reads it out of a `SELECT` unchanged and greps a log for the same string,
+    # which is the whole use; the 16-byte-per-row saving is not worth a type
+    # that renders differently in every client.
+    #
+    # NO INDEX, stated rather than left to be discovered. Pairing a row with
+    # its partner (`WHERE call_id = ...`) and the query this shape exists for
+    # -- entry rows with no completion row, an anti-join on this column --
+    # both scan the table today. The index was left out because an audit table
+    # is write-heavy and read-rarely and nothing in this repository queries
+    # this column yet; whoever writes the first such query should add it
+    # deliberately, with the write cost in view, rather than inherit one
+    # nobody sized.
+    call_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     __table_args__ = (
         Index("ix_audit_log_customer_at", "customer_ref", "at"),
@@ -321,6 +487,51 @@ class AuditEntry(Base):
         CheckConstraint(
             column("refusal_reason").in_(REFUSAL_REASONS),
             name="ck_audit_log_refusal_reason",
+        ),
+        # The same enforcement for `outcome`, which went without one for five
+        # revisions while the two columns added after it both got one. The
+        # asymmetry was the argument for adding it: a new value in this column
+        # needed no migration and no review of what the vocabulary is, which
+        # is how a fourth outcome nobody documented arrives in a
+        # regulator-facing table and every query filtering on the documented
+        # three silently stops seeing it.
+        #
+        # NOT NULL on the column itself, so unlike the two constraints around
+        # it this one admits no NULL: `audit.append` requires the value and
+        # every row that has ever existed carries one.
+        #
+        # Same cost as the others under the fail-closed policy
+        # (docs/decisions/0006-audit-write-failure.md): a violation costs the
+        # whole audit row and the call. Nothing an agent sends can reach this
+        # column -- all three values are literals chosen by
+        # `services/api/middleware/audit.py` -- so the only way an unlisted
+        # string reaches an INSERT is a code change that added an outcome
+        # without the migration that widens this constraint, which is the
+        # failure this is for.
+        CheckConstraint(
+            column("outcome").in_(OUTCOMES),
+            name="ck_audit_log_outcome",
+        ),
+        # Every row written since migration 71a4c0d9e3b2 carries a
+        # correlation key. `call_id` stays nullable at the column level for
+        # the rows that predate it; this is what makes the absence
+        # unreachable for every row after it, and it is the whole reason the
+        # guarantee is not merely "`audit.append` requires the parameter".
+        #
+        # PRE-EXISTING ROWS ALL VIOLATE THIS -- every one of them has NULL in
+        # a column that did not exist -- so the migration creates it
+        # `NOT VALID`, exactly as 3186c04c018c does for the xor constraint
+        # and for exactly the same reason. The trailing cost is the same one
+        # too: `pg_constraint.convalidated` stays false, and running
+        # `VALIDATE CONSTRAINT` later scans the table and fails on those
+        # rows, so it is not a tidy-up to run blind. SQLAlchemy's
+        # `CheckConstraint` cannot express `NOT VALID`; a database built from
+        # this metadata rather than from the migrations would get a validated
+        # one, which on an empty table is the same thing, and no such path
+        # exists in this repo (tests run `alembic upgrade head`).
+        CheckConstraint(
+            "call_id IS NOT NULL",
+            name="ck_audit_log_call_id_present",
         ),
         # Same enforcement, same reasoning, for the absence vocabulary: every
         # value is chosen by `services/api/middleware/audit.py`'s

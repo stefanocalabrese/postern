@@ -220,6 +220,11 @@ async def test_a_denial_and_a_typo_are_now_distinguishable_in_the_audit_log(
     back out of Postgres through `session`, a connection whose identity map
     never held the middleware's objects, so a value that only ever existed
     in SQLAlchemy memory cannot pass this test.
+
+    The two-row unpack below also pins something the entry row could have
+    changed and does not: two calls, two rows. A refused call and an unknown
+    tool each still produce exactly ONE row, because neither reaches the
+    backend and the `reaching` row records a touch rather than an attempt.
     """
     await seed(consent_session, CUSTOMER, "accounts")
     token = token_for(key_pair, CUSTOMER)
@@ -346,8 +351,16 @@ async def test_a_permitted_call_that_succeeds_records_no_refusal_reason(
     assert json.loads(response.text)["result"]["isError"] is False
 
     entries = await rows(session)
-    assert [(e.tool_name, e.outcome) for e in entries] == [("accounts.get_balance", "returned")]
-    assert entries[0].refusal_reason is None
+    # Two rows, because this call reached the backend: the entry row committed
+    # before it did and the completion row after it answered. Both carry NULL
+    # here, and the entry row's NULL is the stronger statement of the two --
+    # it is written from below the consent check, so it can only exist on a
+    # call consent allowed.
+    assert [(e.tool_name, e.outcome) for e in entries] == [
+        ("accounts.get_balance", "reaching"),
+        ("accounts.get_balance", "returned"),
+    ]
+    assert [e.refusal_reason for e in entries] == [None, None]
 
 
 async def test_a_permitted_call_that_fails_is_not_stamped_with_another_tools_denial(
@@ -380,7 +393,11 @@ async def test_a_permitted_call_that_fails_is_not_stamped_with_another_tools_den
     )
     assert json.loads(response.text)["result"]["isError"] is True
 
-    entry = (await rows(session))[0]
+    # The COMPLETION row, which is the second one: this tool reached the
+    # backend (and got a 404 back), so an entry row was committed first.
+    entries = await rows(session)
+    assert [e.outcome for e in entries] == ["reaching", "raised"]
+    entry = entries[1]
     assert entry.tool_name == "accounts.get_balance"
     assert entry.outcome == "raised"
     # Not `NotFoundError`: the tool was found and consented, and failed

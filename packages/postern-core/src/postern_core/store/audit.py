@@ -47,7 +47,13 @@ async def append(
     # about when the row was written, on a regulator-facing table. Both
     # branches of `AuditMiddleware.on_call_tool` measure a real value,
     # including the one that handles a raised exception.
-    duration_ms: int,
+    #
+    # `int | None` since the entry row exists: an `outcome='reaching'` row is
+    # written before the tool body runs, so there is no duration in existence
+    # to pass. That is the ONLY caller allowed to pass None, and it stays
+    # required rather than defaulted precisely so that passing None is a
+    # decision a caller writes down rather than one it inherits.
+    duration_ms: int | None,
     # Required even though `None` is a legitimate value here, unlike on
     # `duration_ms`: NULL must mean "the middleware looked for a request id
     # and there was none", never "a caller forgot the argument". Only the
@@ -63,6 +69,15 @@ async def append(
     # a default would let a future branch answer "not refused" without ever
     # asking `services/api/consent.py` whether it refused.
     refusal_reason: str | None,
+    # Required and never None from any caller, which is the opposite of
+    # `request_id` above and is the whole point of the column existing
+    # separately from it. `AuditEntry.call_id` is NULLABLE only because rows
+    # written before migration 71a4c0d9e3b2 have nothing to put there; a row
+    # this function writes always carries the caller's minted value, because
+    # a NULL correlation key turns the entry row and the completion row for
+    # one call into two unpairable orphans. Typed `str`, so mypy refuses a
+    # caller that passes None rather than leaving the guarantee to a comment.
+    call_id: str,
 ) -> None:
     session.add(
         AuditEntry(
@@ -77,6 +92,7 @@ async def append(
             duration_ms=duration_ms,
             request_id=request_id,
             refusal_reason=refusal_reason,
+            call_id=call_id,
         )
     )
     await session.commit()

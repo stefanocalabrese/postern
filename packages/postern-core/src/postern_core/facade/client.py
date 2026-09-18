@@ -13,7 +13,7 @@ two, per the plan.
 """
 
 import warnings
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -54,6 +54,36 @@ class TokenMinter(Protocol):
     """Mints the internal token for one backend hop (handoff §7.2)."""
 
     def __call__(self, customer: CustomerRef, audience: str) -> str: ...
+
+
+class BackendRequestHook(Protocol):
+    """Run, and awaited, immediately before this client reaches the backend.
+
+    Takes nothing and returns nothing, and that shape is the coupling budget
+    rather than an accident. `services/api`'s audit log needs a durable row
+    committed before any customer data is touched, and that row carries a
+    tool name and a scrubbed argument dict -- MCP vocabulary this package
+    does not have and must not learn. So the caller PRE-BINDS those values
+    into a zero-argument callable and this client only decides WHEN to run
+    it. The same pattern `TokenMinter` above and
+    `postern_core.facade.protocol.BackendReader` already use: a Protocol
+    narrow enough that the implementation can live anywhere, which is why
+    `postern_core.facade` still imports nothing from `postern_core.store`.
+
+    IF IT RAISES, THE REQUEST IS NOT MADE. That is the contract, not a side
+    effect of where it is called: the whole value of running first is that a
+    caller which cannot record the touch can stop it. `get_json` does not
+    catch it, so the exception reaches the tool handler as the call's own
+    failure.
+
+    Idempotency is the CALLER's problem, not this client's. One tool call may
+    reach `get_json` more than once -- no facade function does today, each
+    making exactly one request, but a read-before-write would -- and this
+    client invokes the hook once per request, every time, with no memory
+    between them.
+    """
+
+    def __call__(self) -> Awaitable[None]: ...
 
 
 class StubTokenMinter:
@@ -129,6 +159,7 @@ class BackendClient:
         *,
         transport: httpx2.AsyncBaseTransport | None = None,
         timeout: float | httpx2.Timeout = 10.0,
+        before_backend_request: BackendRequestHook | None,
     ) -> None:
         # `timeout` widened from a bare `float` to also accept `httpx2.Timeout`
         # (Task 12 finding): a single float here applies independently to
@@ -140,6 +171,27 @@ class BackendClient:
         # correction, `httpx2.AsyncClient(timeout=...)` already accepted a
         # `Timeout` instance.
         self._minter = minter
+        # REQUIRED with no default, though `None` is a legitimate value: the
+        # rule `postern_core.store.audit.append` applies to its own
+        # parameters one layer down, for the same reason. A hook left off
+        # reaches the operator's backend with nothing recorded first, which
+        # is exactly the hole it exists to close, and a defaulted parameter
+        # lets a future construction site inherit that silently instead of
+        # writing the decision down.
+        #
+        # `None` stays legal because this package has callers with genuinely
+        # nothing to record: every façade unit test in
+        # `tests/test_facade_client.py` builds a client with no audit
+        # middleware behind it. Defaulting it to the real hook instead would
+        # be worse than either -- `postern_core.facade` would have to import
+        # `services.api`, inverting the layering this package exists to keep
+        # one-way.
+        #
+        # What still is not enforced: that the API service passes a non-None
+        # one. `services/api/main.py::create_app` does, and
+        # `tests/test_audit_entry_row.py::test_create_app_wires_the_entry_
+        # write_into_the_backend_client` fails if it stops.
+        self._before_backend_request = before_backend_request
         self._client = httpx2.AsyncClient(
             base_url=base_url,
             transport=transport,
@@ -161,6 +213,16 @@ class BackendClient:
     ) -> Any:
         _validate_path(path)
         token = self._minter(customer, audience)
+        if self._before_backend_request is not None:
+            # LAST, with nothing between it and the request but the request
+            # itself. Path validation and minting are local work that touches
+            # no customer data, so a failure in either leaves nothing to have
+            # recorded; from this line on, the next thing that happens is a
+            # socket carrying this customer's identity to the operator's
+            # backend. Not guarded by try/except on purpose: see
+            # `BackendRequestHook` on why a hook that raises must stop the
+            # request rather than be logged past.
+            await self._before_backend_request()
         response = await self._client.get(
             path, params=params, headers={"Authorization": f"Bearer {token}"}
         )

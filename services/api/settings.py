@@ -74,7 +74,7 @@ class Settings:
     # two separate paths. That is a cap, not a bound: whether either request
     # ever returns was not determined.
     #
-    # 88.0 is derived, not chosen, and every term is a number already in this
+    # 101.0 is derived, not chosen, and every term is a number already in this
     # repository. Per DATABASE OPERATION, from `Database.__init__`'s own
     # arithmetic (`postern_core/store/engine.py`): 1.0 pool + 2.0 connect +
     # 3.0 statement = 6.0s when the checkout opens a connection, and 1.0 +
@@ -82,27 +82,44 @@ class Settings:
     # the check three statements (BEGIN, the ping, ROLLBACK) that each inherit
     # `command_timeout`. Per BACKEND REQUEST, from the four fields above:
     # 1.0 pool + 2.0 connect + 2.0 write + 5.0 read = 10.0s. Operations per
-    # `tools/call`: the audit write is always one, and the consent lookup is
-    # one when it succeeds -- `services/api/consent.py` caches a successful
+    # `tools/call`: TWO audit writes since 2026-09-18 (an entry row committed
+    # before the backend is reached and a completion row after the tool
+    # finishes -- `services/api/middleware/audit.py`), and the consent lookup
+    # is one when it succeeds -- `services/api/consent.py` caches a successful
     # answer on `request.state` -- but a lookup that RAISES is never cached,
     # and that module measures FIVE evaluations for one `tools/call` carrying
-    # arguments. The ceiling is therefore the arrangement where the first four
-    # evaluations burn 13.0s each and the fifth still succeeds:
-    # 5x13.0 + 10.0 + 13.0 = 88.0s.
+    # arguments. They run in that order, since consent is evaluated inside
+    # `_get_tool` and the entry row is written from the façade below it. The
+    # ceiling is therefore the arrangement where the first four evaluations
+    # burn 13.0s each and the fifth still succeeds:
+    # 5x13.0 + 13.0 + 10.0 + 13.0 = 101.0s.
+    #
+    # WHAT THAT SUM BOUNDS is a reachable store and a reachable backend,
+    # which is the qualifier `postern_core/store/engine.py` already carries
+    # for its own numbers. Every term above is a deadline on a wait that ends
+    # in an answer, a reset or a refusal. Against a path silent in BOTH
+    # directions none of them bounds anything -- `command_timeout` fires and
+    # SQLAlchemy's invalidation then awaits asyncpg's undeadlined close
+    # (`docs/verification/2026-09-17-query-stall-deadline.md`, not returned at
+    # a 60-second cap) -- and the entry write adds one more database operation
+    # that can meet exactly that condition. On such a path this value is the
+    # cap this middleware imposes, not a bound the terms predict.
     #
     # That number is uncomfortably large and is written here rather than
     # quietly rounded down. It is longer than any consumer AI client will
     # wait, so in practice the client gives up first; what this deadline
     # returns is the WORKER, not a timely answer. Two more honest readings of
-    # it: the realistic success ceiling is 13.0 + 10.0 + 13.0 = 36.0s and the
-    # realistic denial ceiling (every lookup raising, the backend never
-    # reached) is 5x13.0 + 13.0 = 78.0s, while a healthy call was measured at
-    # 0.10s end to end in the verification record above. And the reason to sit
-    # AT the ceiling rather than below it is a property, not caution: a
-    # deadline above every individually-bounded sum can only fire once some
-    # wait has already escaped its own deadline, which keeps this from
-    # preempting requests the store and the backend would still have served --
-    # and, because a cancelled request loses its audit row
+    # it: the realistic success ceiling is 13.0 + 13.0 + 10.0 + 13.0 = 49.0s
+    # and the realistic denial ceiling (every lookup raising, the backend
+    # never reached) is 5x13.0 + 13.0 = 78.0s -- unchanged by the entry
+    # write, because a refused call never reaches the backend and so never
+    # writes one -- while a healthy call was measured at 0.10s end to end in
+    # the verification record above. And the reason to sit AT the ceiling
+    # rather than below it is a property, not caution: a deadline above every
+    # individually-bounded sum can only fire once some wait has already
+    # escaped its own deadline, which keeps this from preempting requests the
+    # store and the backend would still have served -- and, because a
+    # cancelled request loses whichever audit row it was writing
     # (`request_deadline.py`, and `docs/decisions/0006-audit-write-failure.md`),
     # every second shaved off this value buys back latency by trading away
     # audit rows for calls that were merely slow.
@@ -114,7 +131,7 @@ class Settings:
     # `POSTERN_REQUEST_DEADLINE_SECONDS=0` reached for as an off switch fails
     # at startup instead of 504-ing every request. There is no off switch;
     # raise the number instead.
-    request_deadline_seconds: float = 88.0
+    request_deadline_seconds: float = 101.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -182,7 +199,7 @@ class Settings:
             ),
             max_body_bytes=int(os.environ.get("POSTERN_MAX_BODY_BYTES", str(1_048_576))),
             request_deadline_seconds=float(
-                os.environ.get("POSTERN_REQUEST_DEADLINE_SECONDS", "88.0")
+                os.environ.get("POSTERN_REQUEST_DEADLINE_SECONDS", "101.0")
             ),
         )
 

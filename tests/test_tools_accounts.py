@@ -32,7 +32,10 @@ def _handler(request: httpx2.Request) -> httpx2.Response:
 @pytest.fixture
 def client_and_server() -> FastMCP:
     backend = BackendClient(
-        "https://backend.test", StubTokenMinter(), transport=httpx2.MockTransport(_handler)
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=httpx2.MockTransport(_handler),
+        before_backend_request=None,
     )
     return build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 
@@ -147,7 +150,10 @@ async def test_accounts_list_validation_error_does_not_leak_the_raw_iban(
         )
 
     backend = BackendClient(
-        "https://backend.test", StubTokenMinter(), transport=httpx2.MockTransport(_bad_iban_handler)
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=httpx2.MockTransport(_bad_iban_handler),
+        before_backend_request=None,
     )
     server = build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 

@@ -33,7 +33,10 @@ def _handler(request: httpx2.Request) -> httpx2.Response:
 @pytest.fixture
 def server() -> FastMCP:
     backend = BackendClient(
-        "https://backend.test", StubTokenMinter(), transport=httpx2.MockTransport(_handler)
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=httpx2.MockTransport(_handler),
+        before_backend_request=None,
     )
     return build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 
@@ -43,7 +46,10 @@ def _server_with_cards(cards: list[dict[str, Any]]) -> FastMCP:
         return httpx2.Response(200, json={"cards": cards})
 
     backend = BackendClient(
-        "https://backend.test", StubTokenMinter(), transport=httpx2.MockTransport(handler)
+        "https://backend.test",
+        StubTokenMinter(),
+        transport=httpx2.MockTransport(handler),
+        before_backend_request=None,
     )
     return build_server(Settings.for_testing(), resolver=lambda: TEST_CUSTOMER, backend=backend)
 
