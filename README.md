@@ -95,7 +95,8 @@ uv sync
 make ci
 ```
 
-`make ci` runs six gates: `lint`, `fmt-check`, `type`, `imports`, `lock`, `test`.
+`make ci` runs seven gates: `lint`, `fmt-check`, `type`, `imports`, `lock`,
+`citations`, `test`.
 They run locally because GitHub Actions minutes are billed on private repos. A
 workflow file lands in Task 14 with `on: workflow_dispatch` only, so nothing fires
 on push until someone decides to spend the minutes.

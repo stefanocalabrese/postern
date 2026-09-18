@@ -45,8 +45,8 @@ measured on 2026-09-17, `accounts.get_balance` with arguments and a real
 ran accounts.list=True, accounts.get_balance=True, transactions.list=False,
 cards.list=False, accounts.get_balance=True -- two denials recorded during
 one call that succeeded. A single "last denial" slot could not touch that
-successful row: `audit.py`'s `returned` path writes `refusal_reason` as a
-literal `None` (:504) and never reads the cache. The row it would corrupt
+successful row: `audit.py`'s `OUTCOME_RETURNED` path writes `refusal_reason`
+as a literal `None` and never reads the cache. The row it would corrupt
 is the `raised` path's, which DOES read the cache
 (`consent.refusal_for(context.message.name)`, `audit.py:436`) -- a call
 consent ALLOWED but whose tool body then raised, stamped there with a stale
