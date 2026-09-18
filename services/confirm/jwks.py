@@ -19,7 +19,7 @@ intentional, for reasons stronger than "the import-linter contract forbids
    trusting a control that does not apply here. And a shared JWKS module is
    exactly the kind of place a later "accept multiple key sources" or
    "publish all configured keys" convenience lands as a small, reasonable-
-   looking commit — Task 3's own measurement is what that costs: a combined
+   looking commit -- Task 3's own measurement is what that costs: a combined
    key set voids the read/write split outright, because a process holding
    only the read key can claim the write issuer, sign with the read key,
    and a gateway resolving that issuer against a combined set accepts it.
@@ -30,7 +30,7 @@ intentional, for reasons stronger than "the import-linter contract forbids
    Starlette in the shared library every test and both deployables import.
    There is nowhere sensible to move this to, not just a rule against it.
 3. Do not factor `services/api/jwks.py` and this file together.
-4. If one needs a change, change both and keep them in step — that is the
+4. If one needs a change, change both and keep them in step -- that is the
    supported path here, not a workaround around point 3. The realistic way
    these two drift is nameable: one side gains a `Cache-Control` header or a
    caching layer, or a `joserfc` `public_jwks()` export shape changes, and

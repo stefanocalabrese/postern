@@ -93,14 +93,22 @@ class Database:
         `pool_pre_ping=True` below is three statements, not one -- BEGIN, the
         ping itself, ROLLBACK (`sqlalchemy/dialects/postgresql/asyncpg.py:820-831`)
         -- each inheriting `command_timeout`, which puts that shape at 1.0 +
-        3x3.0 + 3.0 = 13.0s. Multiply by the operations one tool call makes:
-        two when the consent lookup succeeds (the lookup, then the audit
-        write), because `services/api/consent.py` caches a successful answer
-        on `request.state` and the several checks a single call evaluates
-        share it. A lookup that RAISES is never cached, so a failing store is
-        re-attempted once per evaluation -- that module measures 5 of them
-        for one `tools/call` carrying arguments -- and this budget is paid
-        each time.
+        3x3.0 + 3.0 = 13.0s. Both sums bound a REACHABLE store, one that
+        answers late, resets, or refuses. Each of those three statements does
+        inherit the deadline; the connection invalidation that follows the
+        first one to expire does not, so on a path silent in both directions
+        the pre-ping hangs exactly like the query and neither sum applies
+        (below, and `docs/verification/2026-09-17-query-stall-deadline.md`,
+        which measured both paths). Measured end to end through a real HTTP
+        request, a reachable stall at these defaults returns in 3.09s.
+        Multiply by the operations one tool call makes: two when the consent
+        lookup succeeds (the lookup, then the audit write), because
+        `services/api/consent.py` caches a successful answer on
+        `request.state` and the several checks a single call evaluates share
+        it. A lookup that RAISES is never cached, so a failing store is
+        re-attempted once per evaluation -- that module measures 5 of them for
+        one `tools/call` carrying arguments -- and this budget is paid each
+        time.
 
         One case remains unbounded and no value here fixes it: a socket that
         goes silent in both directions mid-statement AND does not answer the
@@ -113,10 +121,15 @@ class Database:
         only when a second connection opened to the same dead address
         finishes (`asyncpg/connect_utils.py:1255-1281`, `loop.create_connection`
         with no timeout). Measured through `AsyncSession.execute`: still
-        running at 20s with `command_timeout=1.0`. A store that answers, or
-        resets, or refuses is bounded by the numbers above; one that is
-        silently dropping every packet including a fresh connection's is
-        bounded by the kernel, not by this.
+        running at 20s with `command_timeout=1.0`. Measured again end to end
+        through a real HTTP request, on the query path and on the pre-ping
+        path both, at `command_timeout=1.0`: neither had returned within the
+        60-second cap the measurement used
+        (`docs/verification/2026-09-17-query-stall-deadline.md`). That is a
+        cap, not a bound -- whether either request ever returns was not
+        determined. A store that answers, or resets, or refuses is bounded by
+        the numbers above; one that is silently dropping every packet
+        including a fresh connection's is bounded by the kernel, not by this.
         """
         # `pool_timeout` is a QueuePool argument. `create_async_engine`
         # consumes it only if the pool class in use accepts it, and rejects
