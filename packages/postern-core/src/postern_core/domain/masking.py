@@ -13,7 +13,9 @@ toward a client MUST call `errors(include_input=False)` or
 """
 
 import contextvars
+import functools
 import re
+import string
 import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -135,7 +137,17 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 # Arabic-Indic numerals. Do not "fix" this by making the two patterns
 # agree -- that is exactly the kind of asymmetry a later reader tidies into
 # a bug without knowing why it existed.
-_PAN_IN_TEXT_RE = re.compile(r"\d{12,}")
+#
+# The `{12,}` bound is named rather than written inline because
+# `_mask_bridged_runs` (below) has to reach the same "long enough to be a
+# card" decision on a digit run this pattern can no longer see in one
+# piece. Naming it is NOT the start of reconciling this pattern with
+# `_PAN_RE`: the `\d`-versus-`[0-9]` divergence above stays exactly as it
+# is, and `_PAN_MIN_DIGITS` counts ASCII digits only, on purpose, since it
+# is used against a span that has already been established to be mostly
+# ASCII.
+_PAN_MIN_DIGITS = 12
+_PAN_IN_TEXT_RE = re.compile(rf"\d{{{_PAN_MIN_DIGITS},}}")
 
 # ISO/IEC 7812-1 caps a PAN at 19 digits; no scheme issues a longer one.
 _PAN_MAX_DIGITS = 19
@@ -1000,7 +1012,8 @@ def _build_enclosed_alphanumeric_lookalikes() -> dict[str, str]:
 
 
 # Hand-enumerated: Cyrillic and Greek letters visually identical -- not
-# merely similar -- to a Latin letter, both cases, plus dotless i. This is
+# merely similar -- to a Latin letter, both cases, plus dotless i and the
+# Kelvin sign. This is
 # the ONLY source in `_LOOKALIKE_TABLE` with no mechanical derivation and no
 # formal Unicode property backing it ("confusable with a specific other
 # letter" is not itself an enumerable Unicode property the way
@@ -1099,6 +1112,30 @@ _HAND_GREEK_LOOKALIKES = {
 }
 _HAND_MISC_LOOKALIKES = {
     "ı": "i",  # LATIN SMALL LETTER DOTLESS I
+    # U+212A KELVIN SIGN, catalogued rather than exempted, and it arrived
+    # here by reversing a mistake worth recording. It was briefly a member
+    # of `_LATIN_SCRIPT_EXEMPTIONS` below, on the reasoning that it is
+    # Script=Latin with no "LATIN" in its name -- true, and it reopened a
+    # leak: replacing the "K" of MT92MALT01100ABCDEFGH1234IJKL56 with it
+    # returned the complete IBAN unmasked and byte-identical to a reader.
+    #
+    # It is the only character in that set CANONICALLY equivalent to an
+    # ASCII letter rather than merely compatibility-equivalent:
+    # `unicodedata.normalize("NFC", "K") == "K"` is True, so Unicode
+    # itself says this IS the letter K, where `º` only says it is
+    # "like" an "o". That distinction is the rule for which side of the
+    # line a character belongs on. Canonical equivalence to an ASCII
+    # alphanumeric means catalogue it here; compatibility equivalence
+    # means exempt it, because that is where the ordinals and superscripts
+    # real Spanish and Catalan text uses actually live.
+    #
+    # Cataloguing also beats bridging for this character on output quality,
+    # not just on safety: the skeleton goes fully ASCII, so the IBAN pass
+    # earns a real `MT•• •••• KL56` instead of the bare marker bridging
+    # would have produced. And there is no false-positive cost on the other
+    # side -- nobody writes the deprecated Kelvin sign in a reference code,
+    # they write K.
+    "K": "K",
 }
 
 _LOOKALIKE_TABLE: dict[str, str] = {
@@ -1282,28 +1319,569 @@ def _delookalike(value: str) -> str:
     the ~70-100ms difference on this specific adversarial shape is the
     measured price of that correctness fix, not an oversight in it.
 
-    Residual gap, stated for an auditor rather than left implicit: this
-    function closes the leak for exactly the codepoints in
-    `_LOOKALIKE_TABLE` -- fullwidth Latin, Mathematical Alphanumeric Latin,
-    Enclosed Alphanumeric Latin, and the hand-enumerated Cyrillic/Greek
-    look-alikes (both cases) plus dotless i. Any OTHER non-ASCII codepoint
-    that splits a token the same way -- a Cyrillic letter with no Latin
-    look-alike (Ж, none attempted), an Armenian, Georgian or CJK character,
-    or a future Unicode-assigned Cyrillic/Greek look-alike not yet added to
-    the hand-enumerated slice -- is NOT covered and still reaches
-    `_redact_free_text`'s output as a full, unmasked leak, identically to
-    main before this change. See
+    Scope, stated for an auditor rather than left implicit, and NARROWER
+    than the leak this module closes: this function closes the leak for
+    exactly the codepoints in `_LOOKALIKE_TABLE` -- fullwidth Latin,
+    Mathematical Alphanumeric Latin, Enclosed Alphanumeric Latin, and the
+    hand-enumerated Cyrillic/Greek look-alikes (both cases) plus dotless i
+    and the Kelvin sign.
+    Any OTHER non-ASCII codepoint that splits a token the same way -- a
+    Cyrillic letter with no Latin look-alike (Ж, none attempted), an
+    Armenian, Georgian or CJK character, or a future Unicode-assigned
+    Cyrillic/Greek look-alike not yet added to the hand-enumerated slice --
+    is not something this function can do anything about, because it
+    answers "what did this codepoint pretend to be", and for those
+    codepoints there is no answer.
+
+    That used to be where the matter ended, and a full, unmasked IBAN or
+    PAN reached `_redact_free_text`'s output as a result. It no longer
+    does: `_mask_bridged_runs` below answers the OTHER question -- "did a
+    codepoint interrupt a run that was otherwise plain ASCII" -- which is
+    structural, needs no table, and covers every non-Latin script at once.
+    A codepoint this function cannot map no longer ends a token; the run is
+    bridged across it and bare-masked. See that function's own docstring
+    for what it does NOT cover, which is five named shapes and not a single
+    bounded set: only ONE of the five is limited to Latin-named codepoints,
+    and even that one is bounded by name prefix rather than by Unicode
+    block or by Script. The other four (edge splitters, the 590 Me/Mc/Sk
+    marks, two splitters in a short national format, and this table's own
+    curation) are open in any script. See
     `test_residual_gap_an_uncatalogued_cyrillic_letter_still_leaks` (tests/
-    test_masking_confusables.py) for that gap demonstrated directly, not
-    asserted from reading this comment. Heuristic look-alike redaction
-    cannot, by its nature, enumerate every codepoint that could ever render
-    like an ASCII character; closing this class of leak completely belongs
-    upstream, in a backend that returns pre-masked projections rather than
-    free text a homoglyph can hide inside at all (handoff §10.17).
+    test_masking_confusables.py) for the Ж case demonstrated directly
+    rather than asserted from this comment.
+
+    Neither function makes this class fully closable here. Heuristic
+    look-alike redaction cannot, by its nature, enumerate every codepoint
+    that could ever render like an ASCII character, and bridging cannot
+    fire on Latin-named codepoints without masking ordinary Spanish,
+    Catalan and Turkish reference codes.
+
+    Closing it completely belongs upstream, and the citation that used to
+    sit here -- handoff §10.17 -- was the wrong one: it asks whether the
+    domain teams will return pre-masked VALUES on agent-facing
+    projections, pointing at §6.5, which is about typed PAN and IBAN
+    fields. A memo is not a typed field, so §10.17 could be answered yes
+    without moving this class at all. What would move it is pre-scrubbed
+    remittance information, a wider commitment that the handoff does not
+    raise anywhere (zero occurrences of "remittance" or "free text" in it,
+    and every "memo" is inside "memory"). No section number, and no owning
+    team, is the honest statement. See `_mask_bridged_runs`.
     """
     if value.isascii():
         return value
     return value.translate(_LOOKALIKE_TRANS)
+
+
+# The second half of the look-alike defence, and the one that is NOT an
+# enumeration: `_delookalike` above answers "what did this codepoint
+# pretend to be", which only a table can answer and only for the codepoints
+# in it; everything below answers "did a codepoint interrupt a token that
+# was otherwise plain ASCII", which is a structural question with no table
+# in it at all.
+#
+# Why that second question had to be asked separately: `_delookalike`'s
+# table closes the leak for its own 884 codepoints and for nothing else, so
+# `MT92MALT01100ЖBCDEFGH1234IJKL56` (Cyrillic Ж, U+0416, which looks like
+# no Latin letter and is therefore in no look-alike table) reached the
+# output verbatim -- `_IBAN_IN_TEXT_RE` is `[A-Za-z0-9]`-only, so Ж ended
+# the token, both fragments landed under `_IBAN_MIN_LEN`, and no checksum
+# ever ran. Armenian, Georgian, CJK, Hebrew, Thai, Devanagari and every
+# codepoint a future Unicode version assigns did the same thing.
+#
+# That IS a full leak, not a corruption, and the difference is worth
+# measuring rather than asserting: with one character of an IBAN hidden,
+# mod-97 restores it from the other thirty with 1 or 2 candidates (measured
+# across every position of NL91ABNA0417164300, MT92MALT01100ABCDEFGH1234
+# IJKL56 and ES9121000418450200051332: min 1, max 2, mean 1.23-1.29). With
+# one digit of a PAN hidden, Luhn restores it with EXACTLY 1 candidate at
+# every position of both a 16-digit Visa and a 15-digit AmEx. So the
+# fragment that reached the output was not "the IBAN minus a character", it
+# was the IBAN.
+#
+# The rejected fix, measured before it was rejected, because it is the
+# obvious one and the next reader will think of it too: make the candidate
+# generator structural rather than enumerated -- treat each interrupting
+# codepoint as a WILDCARD, try every ASCII alphanumeric in its place, and
+# let the mod-97 checksum decide whether it was really an IBAN, exactly the
+# way the checksum already rejects merchant references that happen to be
+# IBAN-shaped. It does not work, and the reason is arithmetic rather than
+# implementation: a wildcard ranges over 36 values and mod-97 has 97
+# residues, so a single wildcard makes roughly 36/97 of ARBITRARY spans
+# satisfiable. Measured on random letter-letter-digit-digit-opening spans,
+# 4,000 trials per length:
+#
+#   span length   plain mod-97 hits   one wildcard, some assignment hits
+#         14            0.83%                      33.98%
+#         18            1.10%                      34.52%
+#         22            1.03%                      33.90%
+#         31            1.15%                      35.02%
+#         34            1.25%                      33.35%
+#
+# and once that span is scanned the way `_find_iban_in_token` scans a token
+# (every qualifying start, every length, longest first), the per-span rate
+# compounds, 600 trials per length:
+#
+#   token length   plain scan masks   wildcard scan masks
+#         14             1.2%                34.5%
+#         20             6.5%                87.2%
+#         31            19.8%                95.0%
+#         40            29.3%                91.0%
+#         60            38.5%                89.2%
+#
+# A gate that fires on 95% of arbitrary 31-character tokens is not a
+# checksum gate, it is "mask every mixed-script token" wearing one -- which
+# is `approach_c` in tests/test_masking_homoglyph_measurement.py, already
+# measured there and already rejected.
+#
+# What it costs to get that same behaviour the expensive way, measured
+# rather than assumed, because the first version of this comment asserted
+# "strictly more CPU" and that is not what the numbers say. Both built as
+# drop-in callables over the same Ж-bridged payloads, min of 3 trials:
+# 8 KiB, approach_c 0.12ms against the wildcard gate's 1.37ms; 64 KiB,
+# 0.92ms against 10.14ms -- about 11x on adversarial input. On a realistic
+# accented memo the wildcard gate is CHEAPER, 7.70us against 9.81us,
+# because approach_c's own regex runs where the wildcard version's
+# skeleton fast path does not. So: an order of magnitude worse exactly
+# where cost is attacker-chosen, and slightly better where it is not.
+#
+# And a second wildcard (36^2 = 1,296 assignments against 97 residues)
+# removes what little evidence the first left, so the attacker's
+# counter-move is to substitute twice. The checksum cannot do the
+# false-positive work the table does by being small.
+#
+# What ships instead keeps the checksum where it already earns its keep --
+# deciding what to DISCLOSE about a token, never whether to mask one -- and
+# makes the masking decision purely structural:
+#
+#   A non-ASCII alphanumeric character whose Unicode NAME does not contain
+#   "LATIN", sitting between two ASCII alphanumerics, does not end a token.
+#   The run is bridged across it and, if what remains could still have been
+#   an identifier, the whole run is bare-masked.
+#
+# Quote that sentence as written. The shorter paraphrase -- "from a
+# non-Latin script" -- is the one a reader reaches for, it is NOT what the
+# code does, and believing it is what produced the ordinal-indicator
+# regression: U+00BA is Script=Latin and has no "LATIN" in its name, so the
+# paraphrase and the implementation disagree about it and the
+# implementation won. `_is_script_intrusion` opens by saying so.
+#
+# Bare `_MASK`, never `XX•• •••• YYYY`: nothing here has been checksummed,
+# so there is no identified IBAN and therefore no approved last-four to
+# disclose -- the same refusal `_redact_iban_match` already makes for an
+# over-long or ambiguous token, for the same reason.
+#
+# The Latin exemption is the deliberate cost, and it is what keeps this
+# from being `approach_c`: ordinary Spanish, Catalan, Turkish, Polish and
+# Nordic text puts a non-ASCII LATIN letter inside an alphanumeric
+# reference code all the time ("REFERÈNCIA20240912BCN",
+# "URBANITZACIÓ1234567890", "CONDOMINIREF00219438À" -- all three in this
+# module's own false-positive corpus, all three added specifically because
+# they trip a rule built on "non-ASCII is suspicious"). Bridging across
+# those is exactly what would mask them, so they are exempted.
+#
+# Exempted by a name test PLUS a list, not by a formula alone, and that is
+# worth stating precisely because the first version of this comment claimed
+# "a formula rather than a list" while `_LATIN_SCRIPT_EXEMPTIONS` sat
+# eighteen entries long a few lines below it. The name test carries the
+# overwhelming majority and is what makes a future Unicode Latin block free
+# to arrive; the list carries the characters whose names the test gets
+# wrong. Both halves are load-bearing, and the list half is the one that
+# needed adding after it masked ordinary Catalan.
+# The residual all of this leaves is stated on `_mask_bridged_runs` below.
+
+
+# Script=Latin characters whose Unicode NAME does not contain "LATIN", which
+# is the gap between the property this module wants and the test it can
+# actually run. `unicodedata` exposes no Script property, so the name is the
+# only mechanical stand-in available -- and for these it gives the wrong
+# answer, which made them count as intrusions and masked ordinary text.
+# Found by review after the first version of this pass shipped, and it was a
+# REGRESSION rather than a pre-existing gap: `FACTURANº20240912`,
+# `1ªPLANTAEDIFICI2026` and `superficie120m²parcela4455` all came back as a
+# bare `••••` here while passing through untouched on the commit before it.
+# Spanish, Catalan, Portuguese and Italian use the ordinal indicators and
+# superscripts constantly, and this deployment's home market writes all four.
+#
+# The corpus did not catch it, and the reason is worth recording rather than
+# just fixing: `DEVOLUCIÓ COMANDA ÒPERA Nº445210` was in the false-positive
+# corpus and passed, but only because `Nº445210` has seven ASCII
+# alphanumerics and the floor is fourteen -- not because `º` was exempt.
+# A corpus entry that passes for the wrong reason is not coverage, so
+# `FACTURANº20240912` and `1ªPLANTAEDIFICI2026` were added alongside it,
+# both long enough to clear the floors.
+#
+# Counts here are against Unicode 15.0.0, which is what
+# `unicodedata.unidata_version` reports in this interpreter and what
+# `_DEFAULT_IGNORABLE_UNASSIGNED_RANGES` above already pins. This set is
+# explicitly NOT claimed to be complete: it is the characters review
+# demonstrated, plus the Latin modifier letters in U+02B0-U+02E4 derived by
+# compatibility decomposition rather than hand-listed. Anything Script=Latin
+# and name-less that is not in here is part of residual 1 below, which is
+# where an incomplete list belongs -- stated, not silently assumed closed.
+#
+# COMPATIBILITY equivalence only. A character CANONICALLY equivalent to an
+# ASCII alphanumeric does NOT belong here, it belongs in
+# `_LOOKALIKE_TABLE`: canonical equivalence is Unicode saying the
+# character IS that letter, where compatibility equivalence only says it
+# is a styled or semantic variant of one. U+212A KELVIN SIGN sat in this
+# set for exactly one commit on the "Script=Latin, no LATIN in the name"
+# reasoning and reopened a complete-IBAN leak; it is catalogued in
+# `_HAND_MISC_LOOKALIKES` above, which explains the reversal in full. The
+# predicate that sorts the two cases is one line --
+# `normalize("NFC", ch) == <an ASCII letter>` means catalogue, not exempt
+# -- and `test_no_exemption_is_canonically_equivalent_to_ascii` holds it
+# for the whole set rather than for the one character that broke it.
+_LATIN_SCRIPT_EXEMPTIONS: frozenset[str] = frozenset("ªºµ²³¹¼½¾ʼ") | frozenset(
+    chr(cp)
+    for cp in range(0x02B0, 0x02E5)
+    if unicodedata.category(chr(cp)) == "Lm"
+    and unicodedata.normalize("NFKD", chr(cp))[:1].isascii()
+    and unicodedata.normalize("NFKD", chr(cp))[:1].isalnum()
+)
+
+
+def _is_script_intrusion(ch: str) -> bool:
+    """True if `ch` is an alphanumeric character whose Unicode name does not
+    contain "LATIN" -- the thing that splits a token without being a
+    look-alike for anything.
+
+    Read that as written, not as "from a non-Latin script". The two are not
+    the same set, and the gap between them is `_LATIN_SCRIPT_EXEMPTIONS`
+    immediately above: U+00BA MASCULINE ORDINAL INDICATOR is Script=Latin,
+    sits in Latin-1 Supplement, is `isalnum()`, and has no "LATIN" in its
+    name. The name test is a stand-in for the Script property, and a
+    stand-in with known counterexamples.
+
+    Four tests, each load-bearing, each with a test that fails if it is
+    removed (tests/test_masking_confusables.py):
+
+    Non-ASCII, because an ASCII alphanumeric is what the token is MADE of,
+    and every other ASCII character (space, hyphen, underscore, full stop)
+    is a separator a reader can see, which is this module's own documented
+    grouped-IBAN limitation rather than an evasion.
+
+    Alphanumeric, because the non-ASCII characters that are not letters or
+    digits are overwhelmingly visible breaks -- an em dash, a Chinese full
+    stop, a Catalan punt volat -- and bridging across those would mask
+    `FACTURA2026·REFERENCIA4455`. That is the reason for the test, and it
+    is NOT true of the whole complement: the 13 Me (enclosing mark), 452 Mc
+    (spacing combining mark) and 125 Sk (modifier symbol) codepoints are
+    not alphanumeric and are not visible breaks either, and all 590 of them
+    put a complete IBAN through. See `_mask_bridged_runs`'s residual 3.
+
+    Not named "LATIN", because that is where the accented letters live that
+    ordinary Spanish, Catalan, Turkish, Polish and Nordic text puts inside
+    reference codes. A name test rather than a codepoint-range list on
+    purpose -- a future Unicode version adding a Latin Extended block is
+    covered without this file changing, which is the property the
+    hand-enumerated Cyrillic/Greek table above conspicuously does not have.
+
+    `unicodedata.name` raises `ValueError` for an unnamed codepoint, so the
+    default is `""`, which contains no "LATIN" and therefore counts as an
+    intrusion: the fail-closed direction, and load-bearing rather than
+    incidental. 6,145 alphanumeric codepoints have no Unicode name at all
+    (Unicode 15.0.0, this interpreter), Tangut U+17000 among them, and a
+    Tangut splitter is bridged ONLY because of that default. Flipping it to
+    `"LATIN"` would exempt every one of them, which is why
+    `test_an_unnamed_codepoint_is_treated_as_an_intrusion` exists.
+
+    Never called on a look-alike this module already resolves: every caller
+    passes the `_delookalike` SKELETON, in which a codepoint from
+    `_LOOKALIKE_TABLE` has already become its ASCII letter or digit. That
+    is what lets a disguised-but-catalogued IBAN still earn a full
+    `XX•• •••• YYYY` mask instead of being bare-masked here first.
+
+    `lru_cache` because `unicodedata.name` is a database lookup. It is
+    called once per RUN-BOUNDARY character, not once per non-ASCII
+    character: `_bridged_runs` only probes the characters that terminate an
+    ASCII-alphanumeric run, and it probes them whatever they are, so plenty
+    of the calls are on ASCII characters. Real text draws from very few
+    distinct codepoints and so hits the cache almost always: the whole
+    seven-script false-positive corpus (103 entries: Spanish/Catalan,
+    Greek, Bulgarian, Serbian, Turkish, CJK, Arabic -- naming the first
+    slice rather than eliding it, since Spanish/Catalan is the largest and
+    the one the ordinal-indicator regression landed in) contains 106
+    distinct characters this function says yes to, against a `maxsize`
+    of 4096. Counted on this function directly, so that figure
+    includes the catalogued look-alikes it would answer yes for but is
+    never actually asked about, and excludes `º`, which counted before
+    `_LATIN_SCRIPT_EXEMPTIONS` existed and is exactly the regression.
+
+    An attacker who cycles through more
+    codepoints than the cache holds just pays the uncached rate, which is
+    59ns and is measured, with the payload built to force it, on
+    `_redact_free_text`.
+    """
+    return (
+        not ch.isascii()
+        and ch.isalnum()
+        and ch not in _LATIN_SCRIPT_EXEMPTIONS
+        and "LATIN" not in unicodedata.name(ch, "")
+    )
+
+
+_is_script_intrusion = functools.lru_cache(maxsize=4096)(_is_script_intrusion)
+
+_ASCII_ALNUM = frozenset(string.ascii_letters + string.digits)
+
+# How many ASCII digits a bridged run must still show before it is treated
+# as something that could have been an IBAN. ISO 13616 puts two check
+# digits at positions 2 and 3 of every IBAN, so two is the floor a real one
+# cannot go under.
+#
+# Derive the slack against the registry's SHORTEST format, not against the
+# longest, which is where the first version of this comment went wrong: it
+# reasoned from MT92MALT01100ABCDEFGH1234IJKL56 (31 characters, 13 digits,
+# so hiding exactly twelve of the thirteen is needed to get under this
+# floor) and then generalised, which flatters the floor by fifteen
+# characters. Norway's format is 15: NO9386011117947 is 13 ASCII digits and
+# 2 letters, so hiding just TWO digits leaves 11, under `_PAN_MIN_DIGITS`,
+# and 13 alphanumerics, under `_IBAN_MIN_LEN`. Both floors therefore have
+# about one character of slack on the shortest real format, and two
+# intrusions clear them: 66 of the 78 interior position pairs evade. That
+# is residual 4 on `_mask_bridged_runs`, measured there, and it is a
+# property of the floors rather than an oversight in them -- raising either
+# floor to catch it would mask short legitimate references instead.
+#
+# Two rather than one because one would be a number with no derivation
+# behind it.
+_IDENTIFIER_MIN_DIGITS = 2
+
+
+def _bridged_runs(skeleton: str) -> Iterator[tuple[int, int]]:
+    """Every span of `skeleton` that is a maximal run of ASCII
+    alphanumerics joined across at least one block of script intrusions.
+
+    A block, not a character: one intrusion per split point is all an
+    attacker needs, but nothing stops them using three in a row, so the
+    walk consumes a whole run of intrusions at once.
+
+    ASCII alphanumeric on BOTH sides is required for a block to bridge. A
+    block at the start or end of a run is not bridged, and that is a
+    deliberate limit, not an oversight: the only rule that would bridge one
+    is a rule that fires on every Latin word abutting another script with
+    no space between them.
+
+    The corpus entry that actually dies if this requirement is dropped is
+    "SAMSUNGGALAXYS24手机壳" (16 ASCII alphanumerics, 2 digits, CJK at the
+    trailing edge), and it is named here because the two examples an
+    earlier version of this docstring gave -- "東京レストランTokyo" and
+    "iPhone14手机壳" -- do NOT demonstrate it: both sit below
+    `_could_be_an_identifier`'s floors anyway, so they survive whether or
+    not edge blocks bridge. See `_mask_bridged_runs`'s own docstring for
+    what this requirement leaves open, which is residual 2.
+
+    Yields nothing for a run with no intrusion in it. Such a run is
+    ordinary text that `_IBAN_IN_TEXT_RE` and `_PAN_IN_TEXT_RE` already
+    tokenize correctly by themselves, and handing it to the bare-masking
+    path would replace every checksum-verified `XX•• •••• YYYY` mask in
+    this module with a bare marker.
+    """
+    length = len(skeleton)
+    index = 0
+    while index < length:
+        if skeleton[index] not in _ASCII_ALNUM:
+            index += 1
+            continue
+        start = index
+        bridged = False
+        while True:
+            while index < length and skeleton[index] in _ASCII_ALNUM:
+                index += 1
+            after = index
+            while after < length and _is_script_intrusion(skeleton[after]):
+                after += 1
+            if after > index and after < length and skeleton[after] in _ASCII_ALNUM:
+                bridged = True
+                index = after
+                continue
+            break
+        if bridged:
+            yield start, index
+
+
+def _could_be_an_identifier(span: str) -> bool:
+    """Whether a bridged run still looks like something worth masking, with
+    every intrusion in it treated as unknown.
+
+    Two ways in, mirroring the two things this module masks:
+
+    What this module treats as a PAN is `_PAN_MIN_DIGITS` to
+    `_PAN_MAX_DIGITS` digits and nothing else, so `_PAN_MIN_DIGITS` ASCII
+    digits anywhere in the run is enough on its own -- "41111111Ж11114417"
+    is sixteen of them. This route is the ONLY one that can reach a card
+    shorter than `_IBAN_MIN_LEN` characters, which is why the tests for it
+    use 12- and 13-digit cards rather than the 16-digit one above.
+
+    What it treats as an IBAN is `_IBAN_MIN_LEN` to `_IBAN_MAX_LEN`
+    alphanumerics of which at least `_IDENTIFIER_MIN_DIGITS` are digits
+    (ISO 13616's check digits), so a run needs both counts. The
+    alphanumeric floor is what keeps "Nº445210" (seven) and
+    "БанкSofiaОфис" (ten, after `_delookalike`) out; the digit floor is what
+    keeps "TokyoStation東京レストランShopping" (twenty alphanumerics, zero
+    digits) out. Both of those are in this module's own mixed-script corpus
+    (tests/test_masking_confusables.py) precisely so that removing either
+    floor fails a test rather than quietly widening what gets masked.
+
+    Counted on ASCII characters only, never on the intrusions: an intrusion
+    is unknown by construction, and counting an unknown toward "this has
+    enough digits to be a card" would let an attacker manufacture the
+    evidence for their own redaction out of the characters they chose.
+    """
+    alnum = 0
+    digits = 0
+    for ch in span:
+        if ch in _ASCII_ALNUM:
+            alnum += 1
+            if ch.isdigit():
+                digits += 1
+    if digits >= _PAN_MIN_DIGITS:
+        return True
+    return alnum >= _IBAN_MIN_LEN and digits >= _IDENTIFIER_MIN_DIGITS
+
+
+def _mask_bridged_runs(value: str, skeleton: str) -> str:
+    """Replace every bridged run that could still have been an identifier
+    with a bare `_MASK`, taking everything outside such a run from `value`.
+
+    Same position-preserving contract `_sub_preserving_original` keeps, and
+    for the same reason: spans are located in `skeleton` (so a catalogued
+    look-alike has already become its ASCII letter and a run is not split
+    by one) while every character outside a masked span is copied from
+    `value` verbatim. `skeleton` and `value` are index-aligned because
+    `_delookalike` is length-preserving, which the module-level check above
+    `_LOOKALIKE_TRANS` enforces at import time. Returns `value` ITSELF,
+    unchanged and identity-comparable, when nothing qualifies -- which is
+    what lets `_redact_free_text` skip rebuilding its skeleton.
+
+    THE RESIDUAL. SIX shapes, and the count has been wrong twice: this
+    docstring first said "two", which read as exhaustive when it was a list
+    of the two that had been thought about, and then said "five" while a
+    seventh-of-a-card case sat untested next door. Each of the six now has
+    a test in tests/test_masking_confusables.py, so none can be lost by a
+    later edit to this comment, and a number stated here is a number some
+    test will defend. Counts are against Unicode 15.0.0, the version
+    `unicodedata.unidata_version` reports here.
+
+    1. A splitter whose Unicode NAME contains "LATIN".
+       "MT92MALT01100ÀBCDEFGH1234IJKL56" still reaches the output verbatim,
+       because `_is_script_intrusion` exempts those to keep
+       "URBANITZACIÓ1234567890" and its corpus siblings untouched. Say it
+       precisely: the exempt set is bounded by NAME PREFIX, not by Unicode
+       block and not by Script -- `_LATIN_SCRIPT_EXEMPTIONS` exists exactly
+       because those three do not coincide. And do not picture this as
+       accented letters a reader would notice: U+0261 LATIN SMALL LETTER
+       SCRIPT G, U+026A LATIN LETTER SMALL CAPITAL I and U+1D04 LATIN
+       LETTER SMALL CAPITAL C are all exempt and are pixel-level ASCII
+       homoglyphs. An attacker picks from that end of the set, not from À.
+    2. A splitter at a token EDGE rather than between two ASCII
+       alphanumerics, in ANY script. "MT92MALT01100ABCDEFGH1234IJKL5Ж"
+       leaves a thirty-character ASCII run that the ordinary IBAN pass
+       scans, finds does not checksum, and leaves as written -- thirty of
+       the IBAN's thirty-one characters. Not closed because the only rule
+       that closes it fires on ordinary text (see `_bridged_runs`).
+    3. A splitter that is not alphanumeric but is not a visible break
+       either, in ANY script: the 13 Me (enclosing mark), 452 Mc (spacing
+       combining mark) and 125 Sk (modifier symbol) codepoints. All 590
+       put the COMPLETE IBAN through, substituted or inserted, measured by
+       census over every one of them rather than sampled. An enclosing mark
+       is a zero-advance glyph drawn over the previous character, which is
+       the same property `Mn` is already stripped for.
+       DELIBERATELY NOT FIXED HERE, and the reasoning is not "later":
+       stripping Me alone closes 13 of 590 while letting this comment claim
+       the class is handled; Mc is Indic spacing vowel signs, and stripping
+       those mangles Devanagari, which is the exact failure that forced
+       this module's whole-value-transliteration reversal; and Sk contains
+       real letters used in Latin orthographies. The likely seam is
+       widening `_is_script_intrusion` rather than `_STRIPPED_CATEGORIES`,
+       since bridging leaves the character in the output where stripping
+       deletes it -- but that pulls Devanagari and Arabic into bridging
+       range and needs the seven-script corpus re-measured first. That is a
+       measurement, not a one-line addition.
+    4. TWO splitters in a short national format, which is the attacker's
+       direct counter-move against the floors in `_could_be_an_identifier`
+       and belongs named rather than rediscovered. Norway's is 15
+       characters (NO9386011117947, already a fixture in this file's own
+       byte-width comment). Of the 78 interior position pairs, 66 evade:
+       hiding two of its 13 ASCII digits leaves 11, under `_PAN_MIN_DIGITS`
+       of 12, and 13 ASCII alphanumerics, under `_IBAN_MIN_LEN` of 14. The
+       other 12 pairs are exactly those touching position 1, its only
+       interior letter, which keeps the digit count at 12 and masks. So the
+       floors do work, and they have about one character of slack against
+       the registry's shortest format. Recovery from an evading pair is not
+       hypothetical: mod-97 restores the hidden pair with min 1, max 5,
+       mean 1.70 candidates once the analyst uses the NO format's own shape
+       (`NO` then 13 digits), or min 5, max 22, mean 13.77 without it.
+    5. `_LOOKALIKE_TABLE`'s own completeness, still a hand-curated question
+       for the catalogued look-alike path and unchanged by this pass.
+    6. ONE splitter substituted into a 12-digit card, which is residual 4's
+       argument on the PAN side and strictly sharper, because
+       `_PAN_MIN_DIGITS` has NO slack where `_IBAN_MIN_LEN` has a
+       character of it. 12 digits is the floor exactly, so hiding one digit
+       leaves 11 (under `_PAN_MIN_DIGITS`) and 11 alphanumerics (under
+       `_IBAN_MIN_LEN`) and both routes fail: it leaks at all ten interior
+       positions of 869926608025, with Luhn restoring the hidden digit at
+       exactly one candidate per position. Note the mutation KIND matters
+       here and nowhere else in this list: INSERTING a splitter into the
+       same card preserves all twelve digits and masks normally, so a test
+       written with insertion passes while substitution leaks. That is how
+       this shape stayed hidden behind a green test.
+
+    None of these is closable by this module's own means. Do NOT read that
+    as "handoff §10.17 will close them", which is what an earlier version
+    of this docstring said and what the same sentence on `_delookalike`
+    still implied: §10.17 asks whether the domain teams will expose
+    agent-facing projections returning pre-masked VALUES, and §6.5, the
+    section it points at, is about typed PAN and IBAN FIELDS. Answer
+    §10.17 yes tomorrow and account and card objects stop carrying full
+    PANs while this entire class is untouched, because a memo is not a
+    masked field. The handoff never contemplates scrubbing identifiers out
+    of free text at all: it has zero occurrences of "remittance", zero of
+    "free text", and its only "memo" substrings are inside "memory".
+    Closing this class upstream needs a WIDER commitment than §10.17 --
+    pre-scrubbed remittance information -- and that is not currently an
+    open question in the handoff, so there is no section number to cite
+    and no team that owns it.
+
+    Cost. Zero checksums, so `_ScanBudget`/`_IBAN_SCAN_BUDGET` -- a budget
+    over CHECKSUM operations -- is untouched by this and cannot be spent by
+    it. What it does add is one more O(length) preprocessing pass in the
+    same unbudgeted class `_strip_invisible` and `_delookalike` already
+    occupy, skipped entirely (one `str.isascii` call) when the skeleton is
+    plain ASCII, which is every all-ASCII memo and every value whose
+    look-alikes `_delookalike` fully resolved. The measured numbers are on
+    `_redact_free_text`.
+
+    THE INVARIANT THE BUDGET ARGUMENT RESTS ON, because the obvious version
+    of that argument is wrong. It is NOT enough that bullets are not
+    `[A-Za-z0-9]` so the surviving tokens are "a subset": masking an
+    arbitrary span could TRUNCATE a token, and `_find_iban_in_token`'s cost
+    is not monotone in token length. Measured: a 34-character token costing
+    6 checksums has a 30-character prefix costing 21, because the shorter
+    token has more qualifying starts that reach a checksum without one of
+    them terminating the scan early. The claim holds for a different
+    reason: `_bridged_runs` yields only spans that begin and end at the
+    boundary of a MAXIMAL ASCII-alphanumeric run, so a masked span never
+    cuts a token in half -- it removes whole tokens and nothing else.
+    An optimisation that masked only the qualifying sub-span, or trimmed
+    the span to what `_could_be_an_identifier` actually counted, would be
+    a visible improvement in output quality and would silently break this
+    guarantee. Do not make one without re-deriving the budget bound.
+    """
+    if skeleton.isascii():
+        return value
+    pieces: list[str] = []
+    last_end = 0
+    for start, end in _bridged_runs(skeleton):
+        if not _could_be_an_identifier(skeleton[start:end]):
+            continue
+        pieces.append(value[last_end:start])
+        pieces.append(_MASK)
+        last_end = end
+    if not pieces:
+        return value
+    pieces.append(value[last_end:])
+    return "".join(pieces)
 
 
 def _sub_preserving_original(
@@ -1753,6 +2331,89 @@ def _redact_free_text(value: str) -> str:
     # worst case, where the budget-exhaustion behaviour it depends on
     # (nothing changing) essentially never holds.
     iban_skeleton = _delookalike(value)
+
+    # Bridging runs first, before either scan, for the same ordering reason
+    # `_strip_invisible` runs before everything: a run interrupted by an
+    # uncatalogued codepoint is one the two scans below CANNOT see as a
+    # single token, so anything they do to its fragments happens on a
+    # shape that is already wrong. Running this afterwards would let the
+    # PAN pass mask the first twelve digits of "411111111111Ж4417" and
+    # leave "1111Ж4417" sitting against its own mask -- the mask-adjacency
+    # shape `_redact_pan_match`'s unbounded run pattern exists to avoid --
+    # instead of bare-masking the whole run once.
+    #
+    # It runs AFTER `_delookalike` rather than on `value` directly so that
+    # a catalogued look-alike is already an ASCII letter by the time a run
+    # is measured. That is what keeps the 40-case leak-closure corpus at
+    # `properly_masked`: "MT92MАLT01100ABCDEFGH1234IJKL56" (Cyrillic А) has
+    # an all-ASCII skeleton, so no run is bridged, so it reaches the IBAN
+    # pass and earns a full country code and last four instead of the bare
+    # marker this pass would have given it.
+    #
+    # The skeleton has to be rebuilt when something WAS masked, and only
+    # then: `_MASK` is four characters replacing a span of any length, so
+    # the old skeleton stops being index-aligned with `value` the moment a
+    # splice happens. The identity check is exact -- `_mask_bridged_runs`
+    # returns `value` itself when it changes nothing -- rather than an
+    # equality test, because an equality test on a 1 MiB value is a full
+    # comparison to learn something the callee already knows.
+    #
+    # COST OF BRIDGING, measured against this same file at git HEAD before
+    # the pass existed (both versions imported into one process and timed
+    # interleaved, min of 5 trials, two full runs on an ordinary
+    # development machine -- the two runs are reported as a band rather
+    # than averaged, because the spread between them is machine state, not
+    # a property of either version):
+    #
+    #   realistic memo                      before (us)   after (us)
+    #   all-ASCII, 67 chars                  1.97-2.62    2.01-2.83
+    #   accented Catalan, 61 chars           7.13-9.84    8.90-12.69
+    #   Greek, 89 chars                     11.06-15.21   17.00-22.88
+    #
+    # The all-ASCII memo -- the overwhelming majority of real traffic --
+    # pays one `str.isascii` call and nothing else, which is the +2-8%
+    # above. The Greek memo pays +50-54%, and that is the honest headline
+    # number for legitimate non-Latin text: its skeleton is NOT ASCII (the
+    # Greek letters `_LOOKALIKE_TABLE` does not cover survive
+    # `_delookalike`), so the walk runs in full and finds nothing. It is
+    # still ~17-23 microseconds against ~11-15, which is a large fraction
+    # of a very small number.
+    #
+    #   1 MiB payload                       before (ms)   after (ms)
+    #   ASCII adversarial (module's own)    167.7-226.1   168.1-223.8
+    #   homoglyphed, catalogued А           262.3-350.9   262.5-343.7
+    #   homoglyphed, UNCATALOGUED Ж         114.0-148.0   154.2-206.4
+    #   bridged-but-rejected (no digits)    110.4-139.2   161.3-205.9
+    #   bridged, 20k DISTINCT splitters           --          200.4
+    #
+    # The first two rows are unchanged because their skeletons ARE plain
+    # ASCII (every look-alike in them is catalogued), so the pass
+    # short-circuits. The two Ж rows are the ones this pass pays for, at
+    # +35-48%: the payload is built so that every 128-character token
+    # bridges, so the walk runs end to end. Neither becomes the new worst
+    # case -- both land under the ASCII adversarial shape's own cost in
+    # both runs, which is the shape `_IBAN_SCAN_BUDGET` was derived
+    # against. The last row is the attempt to beat the `lru_cache` on
+    # `_is_script_intrusion` by cycling 20,000 distinct CJK codepoints
+    # across 260,096 splitter positions; it did not (`unicodedata.name` is
+    # 59ns uncached, measured, so the cache is worth about 10% and losing
+    # it entirely is not a cliff).
+    #
+    # CHECKSUM BUDGET: unchanged, and structurally incapable of rising.
+    # This pass spends no checksums, and the only thing it does to the
+    # value is replace an alphanumeric span with four bullets -- which are
+    # not `[A-Za-z0-9]` -- so the tokens `_IBAN_IN_TEXT_RE` finds
+    # afterwards are always a subset of the ones it would have found
+    # before. Measured on every shape above: identical spend, and the two
+    # Ж rows now spend ZERO where the unfixed code also spent zero. No
+    # value that did not already exhaust `_IBAN_SCAN_BUDGET` starts doing
+    # so, so `audit_log.redaction_budget_exhausted` fires on exactly the
+    # shapes it fired on before this change and on no new ones.
+    bridged = _mask_bridged_runs(value, iban_skeleton)
+    if bridged is not value:
+        value = bridged
+        iban_skeleton = _delookalike(value)
+
     after_iban = _sub_preserving_original(_IBAN_IN_TEXT_RE, _redact_iban, iban_skeleton, value)
     pan_skeleton = iban_skeleton if after_iban == value else _delookalike(after_iban)
     return _sub_preserving_original(_PAN_IN_TEXT_RE, _redact_pan_match, pan_skeleton, after_iban)

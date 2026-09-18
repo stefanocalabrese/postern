@@ -679,7 +679,30 @@ SPANISH_CATALAN_CORPUS: list[str] = [
     "URBANITZACIÓ1234567890",
     "CONDOMINIREF00219438À",
     "REFERÈNCIA20240912BCN",
+    # Ordinal indicators and superscripts glued into a long alphanumeric
+    # run. Added after review found a REGRESSION these would have caught
+    # and the corpus did not: U+00BA and U+00AA are Script=Latin, live in
+    # Latin-1 Supplement, and are `isalnum()`, but their Unicode NAMES are
+    # "MASCULINE/FEMININE ORDINAL INDICATOR" with no "LATIN" in them, so
+    # the first version of `_is_script_intrusion` bridged across them and
+    # masked all three of these. "DEVOLUCIÓ COMANDA ÒPERA Nº445210" above
+    # passed throughout, but only because "Nº445210" has seven ASCII
+    # alphanumerics against a floor of fourteen -- it passed for the wrong
+    # reason, which is why these three are long enough to clear the floors.
+    "FACTURANº20240912",
+    "1ªPLANTAEDIFICI2026",
 ]
+# "superficie120m²parcela4455" is deliberately NOT in the corpus above: it
+# is ALREADY COVERED twice over, so adding it would buy nothing. The
+# regression it demonstrates is pinned in this corpus by the two "Nº"/"1ª"
+# entries, and U+00B2 itself is pinned by
+# `test_the_exemption_set_covers_the_characters_review_named` in
+# tests/test_masking_confusables.py, which also carries the string as a
+# fixture. Keeping it out additionally avoids having to widen the
+# NFKC-casualty filter in `test_false_positives_on_legitimate_text` (which
+# exempts ordinal indicators) to admit superscripts -- but that is a
+# convenience, not the reason: that filter is an enumeration of a rejected
+# approach's known casualties, so widening it would not have weakened it.
 
 # Α Β Ε Ζ Η Ι Κ Μ Ν Ο Ρ Τ Υ Χ -- every one of these is a key in
 # _HAND_GREEK_LOOKALIKES. Realistic merchant descriptors, payee names and
@@ -808,7 +831,7 @@ def test_false_positive_corpus_covers_at_least_seven_scripts() -> None:
 
 
 def test_false_positives_on_legitimate_text() -> None:
-    """Reported PER SCRIPT, not as one aggregate across all 101 entries --
+    """Reported PER SCRIPT, not as one aggregate across all 103 entries --
     an aggregate is exactly the kind of number that would hide false-positive
     cost landing unevenly across scripts (see the fairness note in this
     file's own module docstring and in the report this test's numbers feed).
@@ -986,11 +1009,11 @@ def test_table_sizes_and_maintenance_notes() -> None:
     print(f"{'enclosed alphanumeric (derived via unicodedata.name)':<45}{len(_ENCLOSED_TABLE):>10}")
     print(f"{'hand-enumerated Cyrillic (14 upper + 14 lower)':<45}{len(_HAND_CYRILLIC):>10}")
     print(f"{'hand-enumerated Greek (14 upper + 14 lower)':<45}{len(_HAND_GREEK):>10}")
-    print(f"{'hand-enumerated misc (dotless i)':<45}{len(_HAND_MISC):>10}")
+    print(f"{'hand-enumerated misc (dotless i, Kelvin sign)':<45}{len(_HAND_MISC):>10}")
     print(f"{'TOTAL hand-maintained (cyrillic+greek+misc)':<45}{len(_HAND_TABLE):>10}")
     print(f"{'TOTAL table (all four sources, deduplicated)':<45}{len(_CONFUSABLES_TABLE):>10}")
     print(f"\nunicodedata.unidata_version in this interpreter: {unicodedata.unidata_version}")
-    assert len(_HAND_TABLE) == 57, "hand-maintained table drifted from the count this report cites"
+    assert len(_HAND_TABLE) == 58, "hand-maintained table drifted from the count this report cites"
 
 
 def test_second_drift_gate_now_covers_the_lookalike_table() -> None:

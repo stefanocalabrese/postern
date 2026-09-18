@@ -1358,7 +1358,7 @@ def test_hand_lookalike_tables_have_the_documented_size() -> None:
     the version-pin test below exists for."""
     assert len(_HAND_CYRILLIC_LOOKALIKES) == 28  # 14 uppercase + 14 lowercase
     assert len(_HAND_GREEK_LOOKALIKES) == 28  # 14 uppercase + 14 lowercase
-    assert len(_HAND_MISC_LOOKALIKES) == 1  # dotless i only
+    assert len(_HAND_MISC_LOOKALIKES) == 2  # dotless i, U+212A KELVIN SIGN
 
 
 def test_bundled_unicode_version_matches_the_version_the_lookalike_table_was_derived_against() -> (
@@ -1366,7 +1366,7 @@ def test_bundled_unicode_version_matches_the_version_the_lookalike_table_was_der
 ):
     """The gate for the drift the count lock above cannot see: a newer
     bundled Unicode version assigning a brand-new Cyrillic or Greek
-    codepoint with a Latin look-alike, sitting entirely outside the 57
+    codepoint with a Latin look-alike, sitting entirely outside the 58
     codepoints `_HAND_CYRILLIC_LOOKALIKES`/`_HAND_GREEK_LOOKALIKES`/
     `_HAND_MISC_LOOKALIKES` already enumerate."""
     actual = unicodedata.unidata_version
