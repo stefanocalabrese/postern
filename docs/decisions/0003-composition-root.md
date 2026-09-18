@@ -162,6 +162,19 @@ and the check the day the real minter exists.
 `test_create_app_allows_stub_minter_when_customer_auth_is_unset`,
 `test_create_app_allows_stub_minter_when_explicitly_overridden`.
 
+**Amendment, 2026-09-18: `_refuse_stub_minter_in_production` and
+`Settings.allow_stub_token_minter` are deleted.** `d203606`
+("refactor(api): delete the stub-minter startup guard and its flag")
+removed the guard, the flag (env `POSTERN_ALLOW_STUB_TOKEN_MINTER`), and
+the three tests named in the Proof block above. The guard read a settings
+shape (`customer_jwks_uri` and `customer_token_issuer` both set), never
+which minter `create_app` actually built, so once `StubTokenMinter`
+stopped being constructed there it refused exactly the deployments running
+the genuine `ReadTokenMinter`. `services/api/main.py:21-30` records the
+measurement made before removal: the same production-shaped settings
+raised no `RuntimeError` and started a `ReadTokenMinter`. Nothing checks
+production shape at startup now -- no replacement control exists.
+
 ## Defect found while proving the above: `app = create_app()` at import time
 
 The plan's own draft ended `main.py` with a bare `app = create_app()`. This

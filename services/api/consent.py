@@ -44,9 +44,14 @@ measured on 2026-09-17, `accounts.get_balance` with arguments and a real
 `MCP-Protocol-Version` header, for a customer consented to `accounts` only,
 ran accounts.list=True, accounts.get_balance=True, transactions.list=False,
 cards.list=False, accounts.get_balance=True -- two denials recorded during
-one call that succeeded. A single "last denial" slot on the request would
-have stamped `domain_not_consented` onto that successful row, which on a
-regulator-facing table is a false statement about a call that was allowed.
+one call that succeeded. A single "last denial" slot could not touch that
+successful row: `audit.py`'s `returned` path writes `refusal_reason` as a
+literal `None` (:504) and never reads the cache. The row it would corrupt
+is the `raised` path's, which DOES read the cache
+(`consent.refusal_for(context.message.name)`, `audit.py:436`) -- a call
+consent ALLOWED but whose tool body then raised, stamped there with a stale
+`domain_not_consented` left by some other tool's check earlier in the same
+request. That is still a false statement on a regulator-facing table.
 Keying by `AuthContext.component.name` -- the registered name, which is the
 name the client asked for -- keeps each decision attached to the tool it
 was made about.
