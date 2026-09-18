@@ -25,9 +25,15 @@ which minter `create_app` built, so once the stub stopped being constructed
 here it refused exactly the deployments running the genuine minter.
 Measured before removal against that settings shape: no flag raised
 `RuntimeError` naming `StubTokenMinter`, and `POSTERN_ALLOW_STUB_TOKEN_MINTER=1`
-started the app with a `ReadTokenMinter`. Nothing checks minter identity or
-deployment shape at startup now, and the ephemeral-key warning below restores
-none of it: that fires on a generated signing key, which is a different hazard.
+started the app with a `ReadTokenMinter`. Between that deletion and 2026-09-18
+nothing checked minter identity or deployment shape at startup, and the
+ephemeral-key warning below restored none of it: that fires on a generated
+signing key, which is a different hazard. What checks it now is
+`postern_core.auth.minter_probe.refuse_unverifiable_minter`, called in
+`create_app` below on the minter that function has just built: one probe
+token, verified against the key set this same process publishes, and no start
+if the two disagree. It reads no settings, so the shape the deleted guard
+mistook for a deployment never enters into it, and it has no override flag.
 `docs/decisions/0003-composition-root.md` and `0004-base-images.md` each carry
 dated amendments recording the deletion and what did and did not replace it.
 
@@ -56,9 +62,10 @@ from postern_core.auth.keys import (
     KeySource,
     warn_ephemeral_signing_key,
 )
+from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import ReadTokenMinter
 from postern_core.facade.client import BackendClient
-from postern_core.identity import CustomerResolver
+from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
 from starlette.middleware import Middleware
 
@@ -68,6 +75,13 @@ from services.api.jwks import jwks_route
 from services.api.middleware.audit import AuditMiddleware, record_data_touch
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
+
+# Subject of the one token `create_app` mints to check its own minter. It is a
+# reference to nobody: `CustomerRef` accepts it (the pattern is `cust[:_]`
+# followed by alphanumerics) and no fixture, `stub/backend.py::OWNERS` entry
+# or test in this repository uses it. The token it appears in is verified in
+# process and discarded; nothing sends it anywhere.
+_STARTUP_PROBE = CustomerRef(value="cust_startupprobe")
 
 
 def _read_key_source(settings: Settings) -> KeySource:
@@ -187,11 +201,32 @@ def create_app(
     # plumbing a later task owns rather than a value that could be guessed
     # here.
     read_key_source = _read_key_source(settings)
+    read_minter = ReadTokenMinter(
+        InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
+    )
+    # Before that minter reaches anything that could send one of its tokens:
+    # mint one, and refuse to start unless it verifies against the key set
+    # `jwks_route` below publishes from this same `read_key_source`. Keyed on
+    # the object above having been BUILT, never on a settings shape, for the
+    # reason `d203606` left in the module docstring.
+    # `refuse_unverifiable_minter` carries the rest: why this one refuses
+    # where `warn_ephemeral_signing_key` above only warns, why neither takes
+    # an override flag, and why the write path has no equivalent call yet.
+    #
+    # HERE and not lower down, for a reason worth stating: `BackendClient`
+    # opens an `httpx2.AsyncClient` and `Database` builds an engine, and both
+    # are closed only by `_close_resources_after_fastmcp_shutdown`, which a
+    # `RuntimeError` out of this function means never runs. Refusing before
+    # either exists abandons no open resource.
+    refuse_unverifiable_minter(
+        lambda: read_minter(_STARTUP_PROBE, "accounts.svc"),
+        built=read_minter,
+        key_source=read_key_source,
+        role="READ",
+    )
     backend = BackendClient(
         settings.backend_base_url,
-        ReadTokenMinter(
-            InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
-        ),
+        read_minter,
         transport=transport,
         timeout=_backend_timeout(settings),
         # The entry audit row, committed before this client reaches the

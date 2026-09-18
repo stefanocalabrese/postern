@@ -221,6 +221,91 @@ warning on `customer_jwks_uri` and `customer_token_issuer` both being set --
 the deleted guard's own definition of production -- turns
 `test_the_api_composition_root_warns_when_no_read_pem_path_is_set` red.
 
+**Third amendment, 2026-09-18: a startup control checks the minter again, and
+what it checks is VERIFIABILITY, not identity.** The distinction is not
+pedantry and this heading was corrected in review for reaching past the code:
+a minter that produces a correctly signed token carrying an attacker-chosen
+`sub` passes this check. What it establishes is that the credential is signed
+by the key this process publishes, not that the process built any particular
+class, and not that the claims inside are right. The last bullet above
+("Nothing in this codebase checks minter identity or deployment shape at
+startup") stays true of `warn_ephemeral_signing_key`, and is now overtaken on
+the codebase by a control narrower than the one it names.
+`postern_core.auth.minter_probe.refuse_unverifiable_minter`,
+called from `services/api/main.py::create_app` on the `ReadTokenMinter` that
+function has just built, mints one token for a synthetic subject
+(`cust_startupprobe`, a reference no fixture or `stub/backend.py::OWNERS`
+entry uses) and decodes it against the key set the same process publishes from
+the same `KeySource`. If it does not verify, `create_app` raises `RuntimeError`
+and the process never serves.
+
+Three things separate it from the guard this record originally described:
+
+- **It reads no settings.** "Production shape" plays no part, because the
+  question it asks is whether the credential this process just minted verifies
+  against the key set this process just published, and that has the same right
+  answer under `Settings.for_testing()`, in the compose stack and in a real
+  deployment. That is what makes an unconditional refusal affordable where the
+  original guard needed `Settings.allow_stub_token_minter` to stay usable at
+  all.
+- **It refuses rather than warns, and takes no override flag** -- the opposite
+  of the amendment above, for reasons `refuse_unverifiable_minter`'s docstring
+  carries in full. In short: the ephemeral-key hazard is reachable by
+  configuration and an unset PEM path is the documented local path, while no
+  `Settings` field, environment variable or `create_app` parameter selects a
+  minter, so this refusal has no legitimate deployment left to break. And the
+  two hazards fail in opposite directions. An ephemeral key signs genuine
+  tokens that a verifier without the matching public key rejects; a
+  placeholder's `stub.read.<customer>` is believed by any backend that does not
+  check signatures -- `stub/backend.py::_subject` reads exactly that prefix and
+  scopes its answers by whatever follows it.
+- **It covers the API composition root only.**
+  `services/confirm/main.py::create_confirm_app` builds a `WriteTokenMinter`,
+  discards it and mints no token in this release, so that process holds no
+  minter to report on. The call belongs there when Plan 5's approval callback
+  gives it one.
+
+What it still does not check: the `iss`, `aud`, `scope` and `exp` claims
+(`jwt.decode` verifies the signature and nothing else, and claim policy is the
+gateway's), anything whatsoever about the customer-facing authentication
+layer, and -- the one blind spot worth naming -- a token with no `kid` header.
+Measured: a kid-less RS256 token is accepted against a one-key key set and
+raises `InvalidKeyIdError("invalid_key_id: No key for kid: 'None'")` against a
+two-key one, so because every process here publishes exactly one key, a future
+`InternalTokenMinter` that stopped setting `kid` would pass this probe and fail
+against a real verifier holding several keys.
+
+**What it costs the deployment.** Measured on one developer machine, the probe
+is a mean of 0.96ms over 20 runs against 70.7ms for the `GeneratedKeySource`
+construction already on that path: one signature, one verification, no I/O.
+The forward cost is the one to decide deliberately. `KeySource` is the seam
+Vault lands behind, and if a Vault-backed implementation ever makes minting a
+remote signing call, this line turns "Vault unreachable, the first tool call
+fails" into "Vault unreachable, the container never becomes ready" -- a crash
+loop rather than a degraded pod.
+
+**Proof:** `tests/test_startup_minter_probe.py`, 10 tests, each of the four
+mutations below observed: deleting the `create_app` call turns 3 red;
+replacing the decode with `len(token.split(".")) == 3` turns 6 red, since
+`stub.read.cust_probe` is itself three segments; warning instead of raising
+turns the same 6 red; pasting the minted token into the refusal message turns
+`test_the_refusal_does_not_carry_the_credential_it_minted` red.
+
+A fifth mutation answers a question this file is the right place for, since
+the test file has no case for it: replacing the body with an unconditional
+refusal turns
+`tests/test_asgi_app.py::test_a_configured_pem_path_signs_instead_of_a_generated_key`
+and
+`tests/test_ephemeral_key_warning.py::test_the_api_composition_root_is_silent_when_a_real_pem_is_configured`
+red, so the `FileKeySource` branch does run through the probe on every CI run,
+and the first of those configures a non-default kid (`read-file`). No
+PEM-branch test of the probe's own was added: the probe body has no branch on
+key provenance, and both key sources derive `signing_key()` and
+`public_jwks()` from one `self._key` object that `create_app` hands to both
+the minter and the JWKS route, so the mismatch cannot be produced by choosing
+a branch -- only by an edit to `create_app`, which the stub test already
+models.
+
 ## Defect found while proving the above: `app = create_app()` at import time
 
 The plan's own draft ended `main.py` with a bare `app = create_app()`. This
