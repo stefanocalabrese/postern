@@ -25,9 +25,11 @@ which minter `create_app` built, so once the stub stopped being constructed
 here it refused exactly the deployments running the genuine minter.
 Measured before removal against that settings shape: no flag raised
 `RuntimeError` naming `StubTokenMinter`, and `POSTERN_ALLOW_STUB_TOKEN_MINTER=1`
-started the app with a `ReadTokenMinter`. Nothing checks production shape at
-startup now; `docs/decisions/0003-composition-root.md` and `0004-base-images.md`
-still describe the guard as live.
+started the app with a `ReadTokenMinter`. Nothing checks minter identity or
+deployment shape at startup now, and the ephemeral-key warning below restores
+none of it: that fires on a generated signing key, which is a different hazard.
+`docs/decisions/0003-composition-root.md` and `0004-base-images.md` each carry
+dated amendments recording the deletion and what did and did not replace it.
 
 Task 6 adds the database: one `Database` per process, built unconditionally
 from `settings.database_url` (the constructor never connects --
@@ -48,7 +50,12 @@ import httpx2
 from fastmcp.server.auth import AuthProvider
 from fastmcp.server.http import StarletteWithLifespan
 from postern_core.auth.internal_jwt import InternalTokenMinter
-from postern_core.auth.keys import FileKeySource, GeneratedKeySource, KeySource
+from postern_core.auth.keys import (
+    FileKeySource,
+    GeneratedKeySource,
+    KeySource,
+    warn_ephemeral_signing_key,
+)
 from postern_core.auth.read_minter import ReadTokenMinter
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerResolver
@@ -77,11 +84,24 @@ def _read_key_source(settings: Settings) -> KeySource:
 
     A process restart throws a generated key away, which is exactly why a
     deployment must set the path: the JWKS Task 3 publishes would otherwise
-    change under every verifier on every restart.
+    change under every verifier on every restart. That sentence has been in
+    this docstring since Plan 3 Task 2 and the code said nothing at runtime;
+    since 2026-09-18 the generated branch warns, unconditionally and without
+    refusing. `warn_ephemeral_signing_key` carries why it is neither gated
+    nor fatal, and `docs/verification/2026-09-18-multi-replica-jwks.md`
+    measures what the discarded key costs a caller.
     """
     if settings.read_key_pem_path is not None:
         return FileKeySource(Path(settings.read_key_pem_path), kid=settings.read_key_kid)
-    return GeneratedKeySource(kid=settings.read_key_kid)
+    # Warn AFTER the key exists, not on `read_key_pem_path is None` read a
+    # second time from settings: the lesson of `d203606` is that a control
+    # keyed on configuration shape drifts away from what the process actually
+    # built. This fires only on the object below having been constructed.
+    source = GeneratedKeySource(kid=settings.read_key_kid)
+    warn_ephemeral_signing_key(
+        role="READ", kid=settings.read_key_kid, pem_env_var="POSTERN_READ_KEY_PEM_PATH"
+    )
+    return source
 
 
 def _backend_timeout(settings: Settings) -> httpx2.Timeout:

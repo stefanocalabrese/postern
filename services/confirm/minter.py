@@ -16,7 +16,12 @@ in this service derives a scope from it yet; Plan 5/6 is expected to.
 from pathlib import Path
 
 from postern_core.auth.internal_jwt import InternalTokenMinter
-from postern_core.auth.keys import FileKeySource, GeneratedKeySource, KeySource
+from postern_core.auth.keys import (
+    FileKeySource,
+    GeneratedKeySource,
+    KeySource,
+    warn_ephemeral_signing_key,
+)
 from postern_core.identity import CustomerRef
 
 from services.confirm.settings import ConfirmSettings
@@ -46,11 +51,24 @@ def _write_key_source(settings: ConfirmSettings) -> KeySource:
     Mirrors `services.api.main._read_key_source`: a set `write_key_pem_path`
     is the Vault Agent shape, unset means generate 2048 bits in process,
     which `ConfirmSettings.for_testing()` and the local docker-compose stack
-    both want.
+    both want. Since 2026-09-18 it mirrors the warning too. This is the half
+    with more at stake, since this key is what will sign write tokens for
+    `payments.svc` and `cards.svc` (`WRITE_SCOPES` above).
+    `docs/verification/2026-09-18-multi-replica-jwks.md` measured two live
+    `confirm` replicas publishing different 2048-bit moduli under the one
+    `kid` `write-1`; it minted no write token, which that record's own
+    unverified list states, so the divergence is measured on this side and
+    the `bad_signature: ` cost of it only on the read side.
     """
     if settings.write_key_pem_path is not None:
         return FileKeySource(Path(settings.write_key_pem_path), kid=settings.write_key_kid)
-    return GeneratedKeySource(kid=settings.write_key_kid)
+    # Same ordering as `_read_key_source`: the key first, the warning second,
+    # so the warning reports something built rather than something configured.
+    source = GeneratedKeySource(kid=settings.write_key_kid)
+    warn_ephemeral_signing_key(
+        role="WRITE", kid=settings.write_key_kid, pem_env_var="POSTERN_WRITE_KEY_PEM_PATH"
+    )
+    return source
 
 
 def build_write_minter(settings: ConfirmSettings) -> tuple[WriteTokenMinter, KeySource]:

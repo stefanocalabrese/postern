@@ -175,6 +175,52 @@ measurement made before removal: the same production-shaped settings
 raised no `RuntimeError` and started a `ReadTokenMinter`. Nothing checks
 production shape at startup now -- no replacement control exists.
 
+**Further amendment, 2026-09-18: one startup control now exists, and it is
+not a replacement for the guard above.** The sentence closing the amendment
+immediately before this one ("no replacement control exists") was accurate
+when written and is now too broad, so this records exactly what landed and
+what it leaves undone. `postern_core.auth.keys.warn_ephemeral_signing_key`
+emits a `RuntimeWarning` whenever a composition root builds an in-process
+signing key: `services/api/main.py::_read_key_source` and
+`services/confirm/minter.py::_write_key_source` each call it on the line
+after `GeneratedKeySource(...)` returns, so it fires on the key having been
+BUILT, not on `read_key_pem_path is None` being read from settings a second
+time.
+
+What the message says: the key is discarded on exit, every restart and every
+replica signs with a different one, and the published `kid` (`read-1` /
+`write-1`) comes from a settings default and never from the key, so a token
+minted here fails against another replica's JWKS as
+`joserfc.errors.BadSignatureError('bad_signature: ')` -- an empty
+description that reads like a forged token -- rather than as the
+`InvalidKeyIdError` that would name a key mismatch. Both halves were
+measured on 2026-09-18 against four live replicas:
+`docs/verification/2026-09-18-multi-replica-jwks.md`.
+
+What it does NOT do:
+
+- **It does not refuse.** Startup continues in every case. Refusing would
+  stop `docker compose up` and `Settings.for_testing()`, and the way back
+  would be a named override flag, which is what
+  `POSTERN_ALLOW_STUB_TOKEN_MINTER` was.
+- **It is unconditional, so it never asks whether this is production.** That
+  is the design, not an omission: neither `Settings` nor `ConfirmSettings`
+  carries a deployment-environment field, and inferring one from a settings
+  shape is exactly the error `d203606` deleted. `Settings.for_testing()`,
+  `ConfirmSettings.for_testing()` and both `docker-compose.yml` services
+  (neither sets a PEM path) warn too. That noise is the accepted price.
+- **It covers ephemeral signing keys only.** It says nothing about which
+  minter `create_app` built, which is what
+  `_refuse_stub_minter_in_production` nominally checked. Nothing in this
+  codebase checks minter identity or deployment shape at startup, and this
+  control does not change that.
+
+**Proof:** `tests/test_ephemeral_key_warning.py`, 8 tests, each assertion
+observed failing before being trusted. The sharpest of them: gating the
+warning on `customer_jwks_uri` and `customer_token_issuer` both being set --
+the deleted guard's own definition of production -- turns
+`test_the_api_composition_root_warns_when_no_read_pem_path_is_set` red.
+
 ## Defect found while proving the above: `app = create_app()` at import time
 
 The plan's own draft ended `main.py` with a bare `app = create_app()`. This
