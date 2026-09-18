@@ -113,15 +113,15 @@ Local development needs no VPC: `docker compose` with Postgres and stubbed backe
 
 ## CI gates that block the build
 
-Four from handoff §8.7, plus three from the zero-trust plan §6.1. These block, they do not warn:
+Four from handoff §8.7, plus three from the zero-trust plan §6.1. Gates 1, 2, 3 and 6 exist and run in `make ci`; where a gate exists, it blocks, it does not warn. Gates 4, 5 and 7 do not exist in this repo, verified by search on 18 September 2026, and each names below what it is blocked on:
 
 1. **Golden masking test**: every tool against fixtures, assert no output matches a PAN or IBAN regex. Add it while there are four tools, not later with twenty.
 2. **Header/body mismatch** returns 400 + `-32020`. Write this test first; a generic `ToolError` may not produce the right status.
 3. **Import-linter**: `services.api` must not import `services.confirm`. This is the A3 control expressed as a lint rule.
-4. **Backend OpenAPI contract tests** against published artifacts.
-5. **IAM policy test**: the read role cannot assume the write role or read its Vault path.
+4. **Backend OpenAPI contract tests** against published artifacts. **Not built, blocked on the domain teams publishing an artifact.** No OpenAPI document, no `mcp-tools.yaml` manifest and no contract test exists here, and handoff §8.5 steps 1 to 3 put all three in the backend repos, so there is nothing to test against. `packages/postern-core/src/postern_core/domain/models.py` is this repo's MCP-facing contract and is deliberately not the backend's shapes.
+5. **IAM policy test**: the read role cannot assume the write role or read its Vault path. **Not built, blocked on infrastructure that is not in this repo.** Zero IAM policies, zero Terraform files, no `hvac` and no Vault: `packages/postern-core/src/postern_core/auth/keys.py` is the seam Vault lands behind and its docstring records that no test here touches Vault, and handoff §12 puts infrastructure in a separate Terraform repo. The code-level half of the same property is pinned by `tests/test_key_split_is_a_property.py` and `.importlinter`, which is a different assertion from an IAM one.
 6. **Cross-customer contract tests** per domain service (ZT-2).
-7. **Cosign signature + SBOM verification at deploy**, as a hard gate. Signing without verification is ceremony.
+7. **Cosign signature + SBOM verification at deploy**, as a hard gate. Signing without verification is ceremony. **Not built, blocked on there being a deploy to gate.** No `cosign`, `sbom`, `syft` or `trivy` reference in `Makefile`, `.github/workflows/ci.yml`, `Dockerfile` or anywhere outside the design docs, and this repo has no registry, no pipeline and no deploy step. What the operator already requires (SBOM format, signing, registry) is still handoff open question §10.26.
 
 ## Before implementing
 
