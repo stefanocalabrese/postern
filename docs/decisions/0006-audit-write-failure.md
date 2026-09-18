@@ -175,6 +175,53 @@ the audit store is unreachable, `accounts.list` fails exactly as hard as
 There is no tiering in this fix between reads and writes, and this record
 does not invent one.
 
+**Amendment, 2026-09-18: the outage above is no longer the only way to pay
+this cost.** `61934d1` ("feat(store): bound every wait on the way to
+Postgres") gave `Database.__init__` a `command_timeout_seconds`, defaulting
+to `3.0`
+(`packages/postern-core/src/postern_core/store/engine.py`). Before that
+commit, "the audit store is unreachable" was the condition that triggered
+this section. After it, unreachable is no longer required: a store that is
+merely slow -- up, answering, reachable -- now fails the call too, at the
+command timeout, because the consent lookup and the audit write both still
+fail closed on whatever exception that timeout raises. A store that would
+have answered in 4 seconds now fails the call at 3. A slow dependency is a
+condition every deployment meets far more often than a full outage, so this
+is a lower and much more reachable threshold than the one this section
+originally described, and a reader who watches a call fail against a
+database that is merely slow will reach for "bug" before "policy" unless
+this section says otherwise.
+
+Measured in `docs/verification/2026-09-17-query-stall-deadline.md`: a query
+stalled behind a table lock -- a live, reachable store, not a down one --
+now fails at 3.09s against production defaults. Read alone that number
+looks like a regression; the same record measured why it is not. Before
+`61934d1`, sixteen concurrent calls against a stalled store left fifteen of
+them hanging with no deadline at all, and only the sixteenth ever produced
+an answer, at 30 seconds, for the unrelated reason of a connection pool it
+could not get a slot from. After `61934d1`, the same sixteen calls all
+answer, in 3.45s. Turning fifteen indefinite hangs into fifteen bounded
+failures, at the price of failing a call a slightly slower store would have
+served, is this record's own fail-closed bargain carried through from the
+down case to the slow case, not a new trade-off.
+
+**The residual, with the bound corrected.** A path silent in both
+directions -- a blackholing firewall rule, a security group closed under an
+incident, a failed-over primary whose old address still accepts -- is not
+bounded by any of the above. `command_timeout` fires on schedule, but
+SQLAlchemy then invalidates the connection through asyncpg's graceful
+close, which awaits asyncpg's own out-of-band cancel with no deadline of
+its own -- and that includes the `pool_pre_ping` health check every pooled
+checkout runs, which the fix's own reasoning treated as already covered and
+is not. `docs/verification/2026-09-17-query-stall-deadline.md`'s
+end-to-end reproduction, a real HTTP request against a socket silent in
+both directions with `command_timeout=1.0`, had not returned on either path
+at its 60-second cap. This record's original bargain -- a bounded outage
+window instead of an unbounded one -- does not hold for this shape: the
+call neither succeeds nor fails, it holds a pool connection open
+indefinitely, and enough concurrent instances of it exhaust the pool the
+same way the pre-`61934d1` case did.
+
 ## What was not built, and why
 
 - **No retry.** A retry turns a hard outage into a slower hard outage unless
