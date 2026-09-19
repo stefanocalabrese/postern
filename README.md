@@ -17,16 +17,22 @@ first-party case.
 
 ## Status
 
-`make ci` exits 0 on 836 tests, measured 18 September 2026.
+`make ci` exits 0, measured 19 September 2026. The test count lives in
+`CLAUDE.md`, which re-derives it whenever it moves; a second copy here would
+only be a second thing to go stale.
 
 Five read tools are registered: `start_session`, `accounts.list`,
 `accounts.get_balance`, `transactions.list` and `cards.list`. Every one but
 `start_session` is gated by a Postgres-backed consent check, which filters the
 catalogue and refuses the call, because filtering `tools/list` alone leaves a
-hidden tool callable by name. Every tool call writes a row to an append-only
-`audit_log`, and a failed audit write fails the call
-(`docs/decisions/0006-audit-write-failure.md`). Six migrations build the two
-tables. Customer tokens are verified against a configured JWKS and issuer.
+hidden tool callable by name. Every tool call writes to an append-only
+`audit_log`: a row when the operator's backend is touched
+(`outcome='reaching'`, committed in its own transaction) and a row when the
+call finishes, paired by `call_id`. A call the consent check refuses touches
+nothing, so it writes only the second. A failed audit write fails the call
+(`docs/decisions/0006-audit-write-failure.md`). The migrations under
+`migrations/versions/` build the `consents` and `audit_log` tables.
+Customer tokens are verified against a configured JWKS and issuer.
 The read/write signing-key split is real: each service holds one key and
 publishes only that key at `/.well-known/jwks.json`, and import-linter holds
 the two services apart in both directions. Calls to Postgres are bounded by
@@ -95,8 +101,8 @@ uv sync
 make ci
 ```
 
-`make ci` runs seven gates: `lint`, `fmt-check`, `type`, `imports`, `lock`,
-`citations`, `test`.
+`make ci` runs the gates named by the `ci` target in `Makefile`: `lint`,
+`fmt-check`, `type`, `imports`, `lock`, `citations`, `test`.
 They run locally because GitHub Actions minutes are billed on private repos. A
 workflow file lands in Task 14 with `on: workflow_dispatch` only, so nothing fires
 on push until someone decides to spend the minutes.
