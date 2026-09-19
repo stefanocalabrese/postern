@@ -28,9 +28,9 @@ hidden tool callable by name. Every tool call writes a row to an append-only
 (`docs/decisions/0006-audit-write-failure.md`). Six migrations build the two
 tables. Customer tokens are verified against a configured JWKS and issuer.
 The read/write signing-key split is real: each service holds one key and
-publishes only that key at `/.well-known/jwks.json`, and two import-linter
-contracts hold the two services apart in both directions. Calls to Postgres
-are bounded by connect, command and pool timeouts.
+publishes only that key at `/.well-known/jwks.json`, and import-linter holds
+the two services apart in both directions. Calls to Postgres are bounded by
+connect, command and pool timeouts.
 
 Still absent: every payments tool, the approval callback (`services/confirm`
 today publishes its JWKS and nothing else), the RFC 8628 device grant and the
@@ -116,8 +116,9 @@ docs/decisions/            decision records
 docs/superpowers/plans/    the implementation plan being executed
 ```
 
-The `.importlinter` contract forbids `services.api` from importing
-`services.confirm`, and it scans `postern_core` too. With only `services` in
+`.importlinter` holds the import rules, one `forbidden` contract each, and it
+scans `postern_core` as well as `services`. That `services.api` must not import
+`services.confirm` is one of those contracts. With only `services` in
 `root_packages` the two-hop route `services.api -> postern_core ->
 services.confirm` is reported as KEPT with exit 0, which is the route a real
 regression would take through the one library both services import.
