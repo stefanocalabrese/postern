@@ -11,3 +11,10 @@ build/
 .env
 .env.*
 .DS_Store
+
+# Worktrees created by the EnterWorktree tool. Other sessions work here
+# concurrently, and `make ci`'s `ruff check .` is unscoped, so without this
+# one session's in-progress files fail another session's gate on code that is
+# in neither commit. Measured 19 September 2026: a planted file here produced
+# 4 errors in a clean tree.
+.claude/worktrees/

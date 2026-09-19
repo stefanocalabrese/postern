@@ -2,7 +2,6 @@
   "generated_by": "make citations-baseline",
   "what": "Bare file:line citations per file. They are counted, never checked. The gate fails when a file carries more than its number here, so a new citation has to be anchored. Lowering a number is free; raising one is a decision a reviewer should see in the diff.",
   "bare_citations_by_file": {
-    "CLAUDE.md": 1,
     "docs/decisions/0003-composition-root.md": 1,
     "docs/decisions/0004-base-images.md": 1,
     "docs/decisions/0005-protocol-version-header-gates-modern-dispatch.md": 1,
