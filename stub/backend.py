@@ -15,8 +15,8 @@ All four domain routes scope their answer to the subject of the internal
 token they receive (handoff §7.1's layer 2, `MCP server -> backend`) and
 refuse a request that carries none. That is not ZT-2 itself: the domain
 services that must enforce on `sub` belong to another team and are not in
-this repo, and `docs/postern-zero-trust-plan.md:88` still records A5's
-enforcement as unverified there. It is what gives a cross-customer test
+this repo, and `docs/postern-zero-trust-plan.md` §3.2's A5 row still records
+that enforcement as unverified there. It is what gives a cross-customer test
 something that can fail here. Before it, every route took `_request: Request`
 and never read it, so a caller naming `acc_4111111111114417` got `acc_7f3a`
 back with no error: the stub did not merely skip the ownership check, it
@@ -215,7 +215,7 @@ async def balance(request: Request) -> JSONResponse:
     # A 403 here would confirm that `acc_7f3a` is a real account while an
     # invented ref got a 404, which hands an attacker holding one valid
     # customer token a working account-enumeration oracle -- the disclosure
-    # `docs/postern-zero-trust-plan.md:88` calls A5, the confused deputy
+    # `docs/postern-zero-trust-plan.md` §3.2 calls A5, the confused deputy
     # ZT-2 exists to stop. Both cases take this one branch and return the
     # same body, so they are indistinguishable from outside. It reads like a
     # lost 403; it is the point.

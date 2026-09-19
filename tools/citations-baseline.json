@@ -22,7 +22,7 @@
     "services/api/consent.py": 5,
     "services/api/main.py": 4,
     "services/api/middleware/audit.py": 8,
-    "stub/backend.py": 3,
+    "stub/backend.py": 1,
     "tests/test_audit_entry_row.py": 10,
     "tests/test_audit_refusal_reason.py": 3,
     "tests/test_consent_check_failure_mode.py": 2,
@@ -31,7 +31,7 @@
     "tests/test_request_deadline.py": 4,
     "tests/test_store_timeouts.py": 1,
     "tests/test_stub_fixture_parity.py": 3,
-    "tests/test_stub_subject_scoping.py": 2,
+    "tests/test_stub_subject_scoping.py": 1,
     "tests/test_tools_accounts.py": 1,
     "tests/test_tools_cards.py": 1
   }

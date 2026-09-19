@@ -1,10 +1,11 @@
 """The backend stub must enforce on the internal token's subject (ZT-2).
 
-`docs/postern-zero-trust-plan.md:301` makes ZT-2 the critical path: "If the
-domain services do not enforce on the token subject, nothing else in this
-plan matters." Those services are another team's code and are not in this
-repo, so what this file tests is the local test double, `stub/backend.py` --
-the thing a cross-customer test has to run against. Until it enforced,
+`docs/postern-zero-trust-plan.md` §7 makes ZT-2 the critical path in those
+words, and says why: "If the domain services do not enforce on the token
+subject, nothing else in this plan matters." Those services are another
+team's code and are not in this repo, so what this file tests is the local
+test double, `stub/backend.py` -- the thing a cross-customer test has to run
+against. Until it enforced,
 nothing in local dev could fail such a test: all four domain routes took
 `_request: Request`, never read it, and returned the same fixtures to
 anybody, so the four `docs/verification/` records of runs against the compose
