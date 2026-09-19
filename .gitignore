@@ -18,3 +18,19 @@ build/
 # in neither commit. Measured 19 September 2026: a planted file here produced
 # 4 errors in a clean tree.
 .claude/worktrees/
+
+# Scratch handoff for a local model picking this repo up when the Claude usage
+# limit is hit. One file per repository, at this root, shared by every session
+# and every worktree; a global hook in ~/.claude/hooks/handoff-local/ keeps its
+# mechanical facts current. Untracked on purpose: it carries sessions'
+# unverified working notes, which must never read as reviewed history. The glob
+# also covers the `.tmp-<pid>` file the hook writes before renaming over it.
+# The hook also deletes from that file, under one rule: a section goes only if
+# nobody ever typed in it and its session could not be proved to exist against a
+# transcript on disk. "Typed in it" means differing from the template in any way
+# at all, including prose added beside an untouched placeholder rather than over
+# it, because the first version of that test counted placeholders and deleted a
+# section with two paragraphs of notes in it. Nothing a session wrote is ever
+# removed, which is why the file is safe to leave to a hook and still not safe
+# to commit.
+/handoff-for-local.md*
