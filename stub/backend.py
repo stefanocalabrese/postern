@@ -102,7 +102,8 @@ OWNERS = {
 BALANCES = {"acc_7f3a": BALANCE}
 
 # `StubTokenMinter`'s entire output
-# (`packages/postern-core/src/postern_core/facade/client.py:77`).
+# (`packages/postern-core/src/postern_core/facade/client.py`'s
+# `StubTokenMinter.__call__` returns `f"stub.read.{customer.value}"`).
 _STUB_MINTER_PREFIX = "stub.read."
 
 # One constant body for every 404 from `balance()`, so "belongs to someone

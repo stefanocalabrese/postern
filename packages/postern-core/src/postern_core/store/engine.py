@@ -89,9 +89,10 @@ class Database:
         waiting for the pool, 2.0s connecting, 3.0s on the statement = 6.0s
         when the checkout has to open a connection, since SQLAlchemy skips
         the pre-ping on a connection it just created
-        (`sqlalchemy/pool/base.py:1299-1303`). On a recycled connection the
+        (`sqlalchemy/pool/base.py::_checkout` pings only when its
+        `connection_is_fresh` is false). On a recycled connection the
         `pool_pre_ping=True` below is three statements, not one -- BEGIN, the
-        ping itself, ROLLBACK (`sqlalchemy/dialects/postgresql/asyncpg.py:820-831`)
+        ping itself, ROLLBACK (`sqlalchemy/dialects/postgresql/asyncpg.py::_async_ping`)
         -- each inheriting `command_timeout`, which puts that shape at 1.0 +
         3x3.0 + 3.0 = 13.0s. Both sums bound a REACHABLE store, one that
         answers late, resets, or refuses. Each of those three statements does
@@ -119,9 +120,10 @@ class Database:
         `await self.cancel_sent_waiter` with no deadline on that await
         (`asyncpg/protocol/protocol.pyx:602-613`), and that waiter resolves
         only when a second connection opened to the same dead address
-        finishes (`asyncpg/connect_utils.py:1255-1281`, `loop.create_connection`
-        with no timeout). Measured through `AsyncSession.execute`: still
-        running at 20s with `command_timeout=1.0`. Measured again end to end
+        finishes (`asyncpg/connect_utils.py::_cancel` reaches that address
+        through `loop.create_connection` with no timeout). Measured through
+        `AsyncSession.execute`: still running at 20s with
+        `command_timeout=1.0`. Measured again end to end
         through a real HTTP request, on the query path and on the pre-ping
         path both, at `command_timeout=1.0`: neither had returned within the
         60-second cap the measurement used

@@ -12,7 +12,7 @@ but SQLAlchemy then invalidates the connection through asyncpg's graceful
 `close()`, whose first act is `await self.cancel_sent_waiter` with no deadline
 on that await (`asyncpg/protocol/protocol.pyx:602-613`), and that waiter is
 resolved only by a SECOND connection opened to the same silent address
-(`asyncpg/connect_utils.py:1255-1281`).
+(`asyncpg/connect_utils.py::_cancel`).
 
 `docs/verification/2026-09-17-query-stall-deadline.md` measured that end to
 end through a real HTTP request with `command_timeout=1.0`, on the query path
@@ -163,10 +163,10 @@ class _Response:
     this was wrong. `started` used to be set BEFORE `await send(message)`, on
     the reasoning that over-approximating was safe in one direction. It is
     not, because a send can be cancelled while suspended INSIDE the server:
-    `uvicorn/protocols/http/httptools_impl.py:463-475` (0.52.4) opens its
-    `send()` with `if self.flow.write_paused and not self.disconnected: await
+    `uvicorn/protocols/http/httptools_impl.py::send` (0.52.4) opens with
+    `if self.flow.write_paused and not self.disconnected: await
     self.flow.drain()` and sets its own `response_started` only after that
-    await returns, at :475. Cancel the request while that drain is parked -- a large
+    await returns. Cancel the request while that drain is parked -- a large
     tool response to a client that has stopped reading, past the 64KB
     high-water mark, is enough -- and the server never saw the start while
     this middleware believed it had, so `_expire` would follow it with an
@@ -303,13 +303,14 @@ class RequestDeadline:
             # this comment claimed. uvicorn does not cancel the ASGI task on
             # disconnect: it sets `cycle.disconnected = True` and wakes a
             # pending `receive()` with `http.disconnect`
-            # (`httptools_impl.py:123-126`), and the only `cancel()` in any of
-            # the three HTTP protocol implementations in 0.52.4 is
-            # `timeout_keep_alive_task.cancel()`. The real sources are
-            # uvicorn's graceful-shutdown timeout, which cancels every
-            # in-flight request task (`uvicorn/server.py:297-298`), and any
-            # enclosing cancellation scope -- a task group, a test harness, a
-            # future middleware -- whose whole contract is that it propagates.
+            # (`uvicorn/protocols/http/httptools_impl.py::connection_lost`),
+            # and the only `cancel()` in any of the three HTTP protocol
+            # implementations in 0.52.4 is `timeout_keep_alive_task.cancel()`.
+            # The real sources are uvicorn's graceful-shutdown timeout, which
+            # cancels every in-flight request task (`uvicorn/server.py`'s
+            # `shutdown`), and any enclosing cancellation scope -- a task
+            # group, a test harness, a future middleware -- whose whole
+            # contract is that it propagates.
             # Cancelled, not awaited, for the same reason the deadline path
             # does not await it. `BaseException` because `CancelledError` is
             # one.
@@ -378,8 +379,9 @@ async def _expire(response: _Response, send: Send, seconds: float) -> None:
         # nothing. What the client gets is then the server's own handling of
         # an app that returned without finishing -- for uvicorn, a 500 if no
         # start was processed and a closed transport if one was
-        # (`httptools_impl.py:437-444`) -- which is worse than a truncated
-        # body and better than a RuntimeError raised inside the server.
+        # (`uvicorn/protocols/http/httptools_impl.py::run_asgi`) -- which is
+        # worse than a truncated body and better than a RuntimeError raised
+        # inside the server.
         return
     if response.complete:
         # The response is already fully on the wire and the task is merely

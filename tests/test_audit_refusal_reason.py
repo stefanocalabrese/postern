@@ -1,9 +1,9 @@
 """A consent denial and a mistyped tool name must differ in the AUDIT ROW and
 nowhere else.
 
-Before `audit_log.refusal_reason`, the two were the same row. FastMCP's
-`_get_tool` returns no tool both for a name it does not know and for a tool
-whose `auth=` check denied the caller (`fastmcp/server/server.py:886-915`),
+Before `audit_log.refusal_reason`, the two were the same row.
+`fastmcp/server/server.py::_get_tool` returns no tool both for a name it does
+not know and for a tool whose `auth=` check denied the caller,
 and the dispatch turns both into one `NotFoundError`, so `AuditMiddleware`
 recorded `outcome='raised'`, `detail='NotFoundError'` for each and an
 investigator reading the table could not tell a refused `cards.list` from a
@@ -168,9 +168,10 @@ async def call(
     `MCP-Protocol-Version` is opt-in because it changes how many consent
     checks run. With it present and non-empty arguments on the call, the MCP
     SDK dispatches a full internal `tools/list` to validate Mcp-Param
-    headers (`mcp/server/_streamable_http_modern.py:285-359`, gated in
-    `mcp/server/streamable_http_manager.py:191-196`), which evaluates EVERY
-    consent-gated tool's check, not just the one being called.
+    headers (`mcp/server/_streamable_http_modern.py`'s `_mcp_param_rejection`,
+    gated in `mcp/server/streamable_http_manager.py`'s `_handle_request`),
+    which evaluates EVERY consent-gated tool's check, not just the one being
+    called.
     """
     headers = {
         "Content-Type": "application/json",

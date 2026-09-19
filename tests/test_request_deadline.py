@@ -388,7 +388,7 @@ async def test_a_response_already_begun_keeps_its_status_and_is_terminated() -> 
 class _ParkingServer:
     """uvicorn's `send()`, reduced to the three lines that decide this case.
 
-    `uvicorn/protocols/http/httptools_impl.py:463-475` (0.52.4, the version in
+    `uvicorn/protocols/http/httptools_impl.py::send` (0.52.4, the version in
     this lockfile) is:
 
         async def send(self, message):
@@ -544,12 +544,13 @@ async def test_a_cancelled_request_takes_the_inner_app_down_with_it() -> None:
     cancels the outer task by hand and goes nowhere near uvicorn. uvicorn does
     not cancel the ASGI task on disconnect at all: it sets
     `cycle.disconnected = True` and wakes a pending `receive()` with
-    `http.disconnect` (`httptools_impl.py:123-126`), and the only `cancel()`
-    in any of its three HTTP protocol implementations in 0.52.4 is
-    `timeout_keep_alive_task.cancel()`. The real sources are the
-    graceful-shutdown timeout, which cancels every in-flight request task
-    (`uvicorn/server.py:297-298`), and any enclosing cancellation scope. What
-    this test verifies is the branch, which is what it was always doing.
+    `http.disconnect` (`uvicorn/protocols/http/httptools_impl.py`'s
+    `connection_lost`), and the only `cancel()` in any of its three HTTP
+    protocol implementations in 0.52.4 is `timeout_keep_alive_task.cancel()`.
+    The real sources are the graceful-shutdown timeout, which cancels every
+    in-flight request task (`uvicorn/server.py`'s `shutdown`), and any
+    enclosing cancellation scope. What this test verifies is the branch,
+    which is what it was always doing.
     """
     middleware = RequestDeadline(_hangs(), seconds=100.0)
     outer = asyncio.ensure_future(_drive(middleware))
@@ -657,8 +658,9 @@ def test_settings_carries_the_derived_default_and_reads_the_environment(
     string literal in an `os.environ.get` default. Pinning only the dataclass
     field would let those two drift, with the gate green and every deployment
     on the stale number. Same shape as
-    `tests/test_store_timeouts.py:260-273`, which pins the store budgets
-    through `from_env` with the variables explicitly unset.
+    `tests/test_store_timeouts.py::test_default_store_timeouts_sum_to_the_
+    stated_six_second_worst_case`, which pins the store budgets through
+    `from_env` with the variables explicitly unset.
     """
     assert Settings.for_testing().request_deadline_seconds == 101.0
 

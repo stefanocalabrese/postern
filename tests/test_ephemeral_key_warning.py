@@ -95,9 +95,10 @@ def test_the_api_warning_fires_under_a_production_shaped_configuration() -> None
     `_refuse_stub_minter_in_production` decided "this is production" from
     exactly these two fields being set and never from what `create_app`
     built, so once `ReadTokenMinter` replaced `StubTokenMinter` it refused
-    the genuine deployments and nothing else (`d203606`,
-    `services/api/main.py:21-30`). This warning forms no opinion about the
-    deployment at all: same input, no refusal, and the warning still fires
+    the genuine deployments and nothing else (`d203606`, whose removal note
+    `services/api/main.py` still carries in its module docstring). This
+    warning forms no opinion about the deployment at all: same input, no
+    refusal, and the warning still fires
     because the key really was generated.
     """
     settings = Settings(

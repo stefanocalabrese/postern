@@ -24,8 +24,8 @@ but SQLAlchemy then invalidates the connection through asyncpg's graceful
 `close(timeout=2)`, which begins with `await self.cancel_sent_waiter` and
 applies no deadline to that await (`asyncpg/protocol/protocol.pyx:602-613`);
 the waiter resolves only when a second connection to the same dead address
-completes (`asyncpg/connect_utils.py:1255-1281`, `loop.create_connection`
-with no timeout). Measured through `AsyncSession.execute`: still running 20
+completes (`asyncpg/connect_utils.py::_cancel`, whose `loop.create_connection`
+carries no timeout). Measured through `AsyncSession.execute`: still running 20
 seconds later. `Database.__init__`'s docstring says the same thing; no test
 here asserts a bound that does not exist.
 """

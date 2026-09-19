@@ -1,20 +1,21 @@
 """`stub/backend.py` and `tests/fixtures/backend_responses.py` must agree.
 
-`stub/backend.py:5` states the parity as that module's reason to exist -- it
-"returns the same shapes and the same PAN/IBAN values as
-`tests/fixtures/backend_responses.py`" -- and `stub/backend.py:78` repeats it
-as the reason ownership lives in a separate `OWNERS` mapping instead of an
+`stub/backend.py`'s module docstring states the parity as that module's
+reason to exist -- it "returns the same shapes and the same PAN/IBAN values
+as `tests/fixtures/backend_responses.py`" -- and `stub/backend.py`'s `OWNERS`
+repeats it as the reason ownership lives in a separate mapping instead of an
 `owner` key on each row. Nothing enforced either claim: the two files
 hand-duplicate three constants and four response bodies, and
 `tests/test_stub_subject_scoping.py`, the only test that imports the stub,
 never imports the fixtures.
 
 The duplication is load-bearing in opposite directions. `pytest` drives the
-fixtures through `httpx2.MockTransport` (`tests/test_masking_golden.py:32`
-and five other test modules import them); `docker compose` drives the stub,
-and four `docs/verification/` records are measurements taken against that
-running stack. Change one side's PAN and those records stop corroborating
-anything the unit suite proves, with nothing in the diff saying so.
+fixtures through `httpx2.MockTransport` (`tests/test_masking_golden.py`'s
+`fx` import; eight test modules in `tests/` import them, this file included);
+`docker compose` drives the stub, and four `docs/verification/` records are
+measurements taken against that running stack. Change one side's PAN and
+those records stop corroborating anything the unit suite proves, with nothing
+in the diff saying so.
 
 This is not the §6.1 backend OpenAPI contract gate and does not stand in for
 it. Both sides are local doubles written in this repo; no domain service's

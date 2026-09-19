@@ -209,8 +209,8 @@ async def test_a_tool_that_reaches_the_backend_writes_an_entry_row_first(
     registers is declared without `auth=`, so no consent check runs for any
     of them and the stronger reading would be false for all four. It is also
     false in production for one real tool -- `start_session` carries no
-    `auth=` either (`services/api/tools/bootstrap.py:75`) and still reaches
-    the backend, which
+    `auth=` either (`services/api/tools/bootstrap.py`'s `start_session`) and
+    still reaches the backend, which
     `test_the_ungated_tool_writes_an_entry_row_and_its_refusal_reason_is_null`
     at the bottom of this file now measures. NULL covers all three of the
     states `AuditEntry.refusal_reason` documents, and "no check ran" is one
@@ -409,9 +409,10 @@ async def test_two_sequential_backend_requests_write_one_entry_row(
     """The guard that keeps the pairing usable once a tool makes more than
     one request.
 
-    No façade function does today -- `facade/accounts.py:52` and `:57`,
-    `facade/cards.py:80` and `facade/transactions.py:121` are one `get_json`
-    each -- so without this the first multi-request tool (a
+    No façade function does today -- `facade/accounts.py`'s `list_accounts`
+    and `get_balance`, `facade/cards.py`'s `list_cards` and
+    `facade/transactions.py`'s `list_transactions` are one `get_json` each --
+    so without this the first multi-request tool (a
     `payments.create_payment` that looks a payee up before writing) would
     silently write N entry rows for one call and break the join, with no
     test failing. `_PendingEntry.record` holds the guard, not
@@ -486,8 +487,8 @@ async def test_an_entry_write_failure_is_logged_for_the_operator(
 
     `audit_log.detail` cannot do it: FastMCP wraps anything a tool body
     raises in `ToolError` before the middleware reads `type(exc).__name__`
-    (`fastmcp/server/server.py:1555`), so a failed entry write records the
-    same `detail='ToolError'` as a tool that raised on its own. The two
+    (`fastmcp/server/server.py::call_tool`), so a failed entry write records
+    the same `detail='ToolError'` as a tool that raised on its own. The two
     completion-write failure paths each got a logging test when
     docs/decisions/0006-audit-write-failure.md was written
     (`tests/test_audit_middleware.py`); this is the third path's, and it
@@ -671,11 +672,12 @@ async def test_the_ungated_tool_writes_an_entry_row_and_its_refusal_reason_is_nu
     to survive, and until this test nothing exercised it.
 
     It is the only one of the five registered tools declared without `auth=`
-    (`services/api/tools/bootstrap.py:75`; the other four carry `auth=check`
-    at `services/api/tools/accounts.py:26` and `:35`,
-    `services/api/tools/transactions.py:28` and
-    `services/api/tools/cards.py:24`), and it reaches the operator's backend
-    anyway, through `accounts_facade.list_accounts`. So it is the one
+    (`services/api/tools/bootstrap.py`'s `start_session`; the other four
+    carry `auth=check` on `services/api/tools/accounts.py`'s `accounts_list`
+    and `accounts_get_balance`, `services/api/tools/transactions.py`'s
+    `transactions_list` and `services/api/tools/cards.py`'s `cards_list`),
+    and it reaches the operator's backend anyway, through
+    `accounts_facade.list_accounts`. So it is the one
     ungated tool that writes an entry row -- and `services/api/middleware/audit.py` names
     it as the reason that row's NULL `refusal_reason` may only be read as
     "consent did not refuse this call", never "consent allowed it".
@@ -903,8 +905,8 @@ async def test_a_commit_that_then_raises_records_a_touch_that_never_happened(
     assert entry.reaching_at is not None
     # `ToolError`, not `RuntimeError`: FastMCP wraps whatever a tool body
     # raises before this middleware reads the type
-    # (`fastmcp/server/server.py:1555`), so nothing in the row names the
-    # session close as the cause. The ERROR line
+    # (`fastmcp/server/server.py::call_tool`), so nothing in the row names
+    # the session close as the cause. The ERROR line
     # `test_an_entry_write_failure_is_logged_for_the_operator` pins is what
     # does.
     assert completion.detail == "ToolError"

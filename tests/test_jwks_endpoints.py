@@ -55,7 +55,8 @@ async def test_the_read_jwks_stays_anonymous_while_customer_auth_is_enforced() -
     against ONE app object, with no `Authorization` header on either
     request: the JWKS answers 200, and `/mcp` answers 401 with
     `WWW-Authenticate: Bearer`, which is `RequireAuthMiddleware` refusing an
-    anonymous caller (`fastmcp/server/http.py:621-629`). The 401 is the half
+    anonymous caller (`fastmcp/server/http.py::create_streamable_http_app`
+    wraps the `/mcp` endpoint in it). The 401 is the half
     that carries the proof. A 200 from the JWKS alone cannot distinguish
     "this route is exempt from auth" from "auth is not being enforced in
     this configuration", and those are the only two explanations.

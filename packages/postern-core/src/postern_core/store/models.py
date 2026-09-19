@@ -288,7 +288,7 @@ class AuditEntry(Base):
     # unambiguously the caller, the other is two facts sharing a name.
     #
     # `ToolError` -- the body ran and raised. FastMCP wraps whatever it was
-    # (`fastmcp/server/server.py:1555`, `raise ToolError(...) from e`) before
+    # (`fastmcp/server/server.py::call_tool`, `raise ToolError(...) from e`) before
     # this middleware's handler reads the type, so a tool's own `ValueError`,
     # a backend `BackendError`, a masking `ValidationError` on a RESPONSE and
     # a failed entry write all land here as the same four letters. A masking
@@ -319,9 +319,10 @@ class AuditEntry(Base):
     # checksum that completes a full, correctly-identified scan, so True
     # can mean nothing was degraded; and a token can be bare-masked
     # without the allowance running out at all -- an over-length token
-    # spends no budget (masking.py:474, returned before any checksum
-    # runs), and an ambiguous token spends checksums but need not spend
-    # the last one (masking.py:419-420) -- so False can still accompany a
+    # spends no budget (`masking.py`'s `_redact_iban_match` returns the
+    # bare marker above `_IBAN_SCAN_MAX_TOKEN`, before any checksum runs),
+    # and an ambiguous token spends checksums but need not spend the last
+    # one (`masking.py`'s `_Ambiguous`) -- so False can still accompany a
     # bare-masked value. Named for the budget, not for "degraded", because
     # the budget is the only thing this column actually reports, and this
     # table is regulator-facing, where overclaiming precision is worse
@@ -391,7 +392,7 @@ class AuditEntry(Base):
     # The column exists because a consent denial and a mistyped tool name
     # were byte-identical rows. FastMCP's `_get_tool` returns None both for
     # a name it does not know and for a tool whose `auth=` check said no
-    # (fastmcp 4.0.3, `fastmcp/server/server.py:886-915`), and the dispatch
+    # (fastmcp 4.0.3, `fastmcp/server/server.py::_get_tool`), and the dispatch
     # turns both into one `NotFoundError`, so both landed here as
     # `outcome='raised'`, `detail='NotFoundError'`, differing only in
     # `tool_name`. Measured against the running server, 2026-09-17: a denied

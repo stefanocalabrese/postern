@@ -36,8 +36,8 @@ touched this, no outcome was recorded", which is the true statement.
 
 WHERE THE ENTRY ROW IS WRITTEN FROM, and why not from here. This middleware
 runs OUTSIDE `call_next`, and FastMCP evaluates a tool's `auth=` consent
-check inside `_get_tool`, which `call_next` reaches
-(`fastmcp/server/server.py:886-915`, cited by `services/api/consent.py`). A
+check inside `fastmcp/server/server.py::_get_tool`, which `call_next`
+reaches (`services/api/consent.py` cites it too). A
 write at the top of `on_call_tool` would therefore land before authorization
 was decided: its `refusal_reason` could only ever be NULL, and a call consent
 then REFUSED -- which touches nothing -- would get an entry row recording an
@@ -542,14 +542,15 @@ class _PendingEntry:
 
     WRITTEN AT MOST ONCE PER TOOL CALL, which is the guard `record` holds and
     the façade explicitly does not. Every façade function issues exactly one
-    `get_json` today -- `facade/accounts.py:52` and `:57`, `facade/cards.py:80`,
-    `facade/transactions.py:121` -- so "one entry row per call" currently
-    holds by arithmetic rather than by construction, and the first tool that
-    reads before it writes (a `payments.create_payment` doing a payee lookup)
-    would silently write N rows for one call and break the pairing. The guard
-    lives here rather than in `BackendClient` because "one tool call" is a
-    concept this module owns and that one does not: this object's lifetime IS
-    the call.
+    `get_json` today -- `facade/accounts.py`'s `list_accounts` and
+    `get_balance`, `facade/cards.py`'s `list_cards`,
+    `facade/transactions.py`'s `list_transactions` -- so "one entry row per
+    call" currently holds by arithmetic rather than by construction, and the
+    first tool that reads before it writes (a `payments.create_payment` doing
+    a payee lookup) would silently write N rows for one call and break the
+    pairing. The guard lives here rather than in `BackendClient` because "one
+    tool call" is a concept this module owns and that one does not: this
+    object's lifetime IS the call.
 
     The lock is what makes it at-most-once rather than usually-once. Two
     `get_json` calls issued concurrently from one tool body would both find
@@ -681,10 +682,12 @@ class _PendingEntry:
                 # The claim is "consent did not refuse this call", NOT
                 # "consent allowed it", and the difference is one real tool
                 # rather than pedantry: `start_session` is registered with
-                # no `auth=` at all (`services/api/tools/bootstrap.py:75`,
-                # while the other four pass `auth=check`) and it reaches the
-                # backend through `accounts_facade.list_accounts`. Its entry
-                # row's NULL therefore means no consent check ran, which is
+                # no `auth=` at all (`services/api/tools/bootstrap.py`'s
+                # `start_session`, whose `@mcp.tool` decorator passes only a
+                # name and annotations, while the other four pass
+                # `auth=check`) and it reaches the backend through
+                # `accounts_facade.list_accounts`. Its entry row's NULL
+                # therefore means no consent check ran, which is
                 # exactly what NULL says on this column
                 # (`AuditEntry.refusal_reason` lists all three states it
                 # covers). Writing the stronger claim would make this
@@ -700,7 +703,7 @@ class _PendingEntry:
                 # refused with `domain_not_consented`. That second call is
                 # what makes the NULL mean something -- it rules out the
                 # stronger reading, since a check that ran for this customer
-                # refuses. `tests/test_bootstrap.py:31` still builds its
+                # refuses. `tests/test_bootstrap.py::server` still builds its
                 # client with `before_backend_request=None`, which is why
                 # that file's tools never write an entry row and this one had
                 # to be pinned elsewhere.
@@ -767,9 +770,9 @@ async def record_data_touch() -> None:
     installed. The exception surfaces as the tool call's own failure and the
     completion row records `outcome='raised'` with `detail='ToolError'`, NOT
     `'RuntimeError'`: FastMCP wraps anything a tool body raises before the
-    middleware sees it (`fastmcp/server/server.py:1555`, `raise ToolError(...)
-    from e`), so `type(exc).__name__` never reads the original type. That is
-    an established property of this table, not a new one --
+    middleware sees it (`fastmcp/server/server.py::call_tool`, `raise
+    ToolError(...) from e`), so `type(exc).__name__` never reads the original
+    type. That is an established property of this table, not a new one --
     `tests/test_audit_middleware.py::test_an_ordinary_tool_failure_records_no_
     refusal_reason` has pinned it since before this write existed.
 
@@ -1011,9 +1014,9 @@ class AuditMiddleware(Middleware):
             duration_ms = _elapsed_ms(started)
             # Read here and not before `call_next`, because the consent
             # check runs INSIDE it: FastMCP evaluates a tool's `auth=` in
-            # `_get_tool` (`fastmcp/server/server.py:886-915`), which the
-            # dispatch this `call_next` reaches calls before the tool body,
-            # so a denial is always filed by the time this line runs.
+            # `fastmcp/server/server.py::_get_tool`, which the dispatch this
+            # `call_next` reaches calls before the tool body, so a denial is
+            # always filed by the time this line runs.
             #
             # Keyed on the RAW requested name, not the scrubbed `name` about
             # to be written: `consent._refuse` files its decision under the

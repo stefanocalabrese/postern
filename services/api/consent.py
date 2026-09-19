@@ -1,7 +1,8 @@
 """Consent as a per-tool authorization check.
 
 FastMCP's `auth=` parameter takes an AuthCheck, which may be async
-(fastmcp/utilities/authorization.py:47 and :230-250). FastMCP applies it in
+(`fastmcp/utilities/authorization.py`'s `AuthCheck` union, awaited by
+`_evaluate_check` in that module). FastMCP applies it in
 BOTH places: `list_tools` filters the catalogue with it, and `_get_tool`
 returns None when it fails, so the call reports `Unknown tool`.
 
@@ -10,13 +11,15 @@ a hidden tool remains callable by name. Measured, 2026-09-14.
 
 The check is cached per request because a `tools/call` carrying non-empty
 arguments triggers a full internal `tools/list` dispatch to validate
-Mcp-Param headers (mcp/server/_streamable_http_modern.py:285-359), gated on
-the real `MCP-Protocol-Version` HTTP header naming a non-handshake version
-(mcp/server/streamable_http_manager.py:191-196) -- absent that header (every
-helper in this task's own tests omits it) the internal dispatch never runs
-at all. Measured with it present, against `accounts.get_balance`: that one
-internal `tools/list` pass alone evaluates every consent-gated tool's check
-once each (`accounts.list`, `accounts.get_balance`, `transactions.list`,
+Mcp-Param headers (`mcp/server/_streamable_http_modern.py`'s
+`_mcp_param_rejection`, which reaches that dispatch through
+`_tool_input_schema`), gated on the real `MCP-Protocol-Version` HTTP header
+naming a non-handshake version (`mcp/server/streamable_http_manager.py`'s
+`_handle_request`) -- absent that header (every helper in this task's own
+tests omits it) the internal dispatch never runs at all. Measured with it
+present, against `accounts.get_balance`: that one internal `tools/list` pass
+alone evaluates every consent-gated tool's check once each (`accounts.list`,
+`accounts.get_balance`, `transactions.list`,
 `cards.list` -- 4 calls, since `accounts.list` and `accounts.get_balance`
 share one `consent_for("accounts", db)` closure but are still two separate
 `Tool` objects), plus one more from the real dispatch's own `_get_tool`
@@ -35,7 +38,7 @@ middleware to infer a reason from an exception type or a message string --
 an inference that breaks the first time a third refusal reason exists.
 `refusal_for` is what `services/api/middleware/audit.py` reads back, after
 `call_next` raises: FastMCP evaluates `auth=` inside `_get_tool`
-(`fastmcp/server/server.py:886-915`), which the middleware's own `call_next`
+(`fastmcp/server/server.py::_get_tool`), which the middleware's own `call_next`
 reaches, so the decision is always filed before the middleware looks.
 
 Filed PER TOOL NAME, and that is not a detail. One `tools/call` evaluates
@@ -48,10 +51,11 @@ one call that succeeded. A single "last denial" slot could not touch that
 successful row: `audit.py`'s `OUTCOME_RETURNED` path writes `refusal_reason`
 as a literal `None` and never reads the cache. The row it would corrupt
 is the `raised` path's, which DOES read the cache
-(`consent.refusal_for(context.message.name)`, `audit.py:436`) -- a call
-consent ALLOWED but whose tool body then raised, stamped there with a stale
-`domain_not_consented` left by some other tool's check earlier in the same
-request. That is still a false statement on a regulator-facing table.
+(`consent.refusal_for(context.message.name)`, in `audit.py`'s
+`on_call_tool`) -- a call consent ALLOWED but whose tool body then raised,
+stamped there with a stale `domain_not_consented` left by some other tool's
+check earlier in the same request. That is still a false statement on a
+regulator-facing table.
 Keying by `AuthContext.component.name` -- the registered name, which is the
 name the client asked for -- keeps each decision attached to the tool it
 was made about.

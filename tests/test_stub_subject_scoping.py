@@ -33,8 +33,8 @@ from stub import backend as stub
 
 # The two customers `tests/test_consent_enforcement.py` already uses, in the
 # exact shape `StubTokenMinter` emits
-# (`packages/postern-core/src/postern_core/facade/client.py:77`), which is
-# what the stub receives in local dev.
+# (`packages/postern-core/src/postern_core/facade/client.py`'s
+# `StubTokenMinter.__call__`), which is what the stub receives in local dev.
 OWNER = "Bearer stub.read.cust_7f3a"
 OTHER = "Bearer stub.read.cust_9b21"
 

@@ -14,12 +14,12 @@ rewrite, and their names say so.
 MEASURED ANSWER: it fails CLOSED, on both halves and in both failure shapes.
 
 The mechanism is FastMCP's, not this project's.
-`fastmcp/utilities/authorization.py:236-250` (`_evaluate_check`) catches
+`fastmcp/utilities/authorization.py`'s `_evaluate_check` catches
 `Exception` around every auth check, logs "Auth check ... raised an
 unexpected exception", and returns `False` -- its own docstring: "it is
 logged and treated as a denial so a broken check fails closed". Both places
 that consult `auth=` go through it (`run_auth_checks`, called from
-`fastmcp/server/server.py:879` for `list_tools` and `:910` for `_get_tool`),
+`fastmcp/server/server.py::list_tools` and from that module's `_get_tool`),
 which is why the catalogue and the call agree. The HTTP status stays 200
 because a denial is `CallToolResult(is_error=True)` inside a 200, never a
 status -- CLAUDE.md's "Version traps" records that `ToolError` cannot

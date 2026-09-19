@@ -274,9 +274,9 @@ def create_app(
 
     # Consent is enforced against `AuthContext.token`, which only exists when
     # real customer authentication is configured. `has_real_customer_auth`
-    # reuses the exact signal `build_server` builds its `JWTVerifier` from
-    # (`services/api/server.py:103-109`): both jwks_uri and issuer set, or
-    # (Task 4) a test-injected `auth_override`. Passing `db` into
+    # reuses the exact signal `services/api/server.py::build_server` builds
+    # its `JWTVerifier` from: both jwks_uri and issuer set, or (Task 4) a
+    # test-injected `auth_override`. Passing `db` into
     # `build_server` regardless would deny every consent-gated call in the
     # documented no-auth path (`Settings.for_testing()`, the local
     # docker-compose stack) -- there is no validated token there for
@@ -349,15 +349,15 @@ def create_app(
     _close_resources_after_fastmcp_shutdown(app, backend, db)
     # Plan 3 Task 3: the public half of that same key, appended to the router
     # of the object this function returns rather than served from a parent
-    # Starlette app mounting this one. `StarletteWithLifespan.lifespan` is a
-    # property returning `self.router.lifespan_context`
-    # (`fastmcp/server/http.py:348-351`), and the documented parent shape,
-    # `Starlette(routes=[Mount(path, app)], lifespan=app.lifespan)`,
+    # Starlette app mounting this one.
+    # `fastmcp/server/http.py::StarletteWithLifespan.lifespan` is a property
+    # returning `self.router.lifespan_context`, and the documented parent
+    # shape, `Starlette(routes=[Mount(path, app)], lifespan=app.lifespan)`,
     # evaluates that property once and stores the value it read into its own
-    # router (`starlette/routing.py:607`). A parent built before the call
-    # above writes the wrapped context back therefore keeps FastMCP's
-    # session manager working and every request answering normally while
-    # silently dropping `backend.aclose()` and `db.close()`, with no
+    # router (`starlette/routing.py::Router.__init__`). A parent built before
+    # the call above writes the wrapped context back therefore keeps
+    # FastMCP's session manager working and every request answering normally
+    # while silently dropping `backend.aclose()` and `db.close()`, with no
     # exception and no failing test. Appending here runs after the wrapper
     # and leaves `app.router.lifespan_context` untouched;
     # `tests/test_asgi_app.py` asserts both shutdown hooks still fire
@@ -366,7 +366,7 @@ def create_app(
     # mount, so nothing shadows this path. The route is unauthenticated by
     # construction, which is what a gateway fetching a key set needs:
     # `RequireAuthMiddleware` wraps the `/mcp` endpoint object itself
-    # (`fastmcp/server/http.py:621-629`), not the app, and
+    # (`fastmcp/server/http.py::create_streamable_http_app`), not the app, and
     # `HeaderBodyValidation` returns early on any non-POST.
     app.router.routes.append(jwks_route(read_key_source))
     return app
