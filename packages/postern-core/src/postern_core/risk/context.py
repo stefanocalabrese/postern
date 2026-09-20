@@ -10,7 +10,7 @@ This module has no opinion on thresholds — that lives in the engine.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -78,7 +78,7 @@ class RiskContext:
         if days > self._max_days:
             self._max_days = days
 
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, int | float]:
         """Return a serialisable snapshot for logging/alerting."""
         return {
             "records": self._records,

@@ -23,15 +23,9 @@ tests on the stub's four domain routes. This file adds a compact round-
 trip that exercises all four routes in one test function.
 """
 
-import base64
-import json
-from typing import Any
-
 import httpx2
-import pytest
 
 from stub import backend as stub
-
 
 # --- Helpers ---
 
@@ -68,7 +62,6 @@ async def test_all_domain_routes_enforce_subject_scoping() -> None:
 
     Covers all four domain routes in one test for compactness.
     """
-    owner = _jwt_sub("cust_7f3a")
     other = _jwt_sub("cust_9b21")
 
     # Accounts: other customer gets empty list, not 403 (no enumeration)

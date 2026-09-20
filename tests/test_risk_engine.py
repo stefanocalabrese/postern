@@ -14,12 +14,10 @@ Signals are immutable; the engine is stateless.
 import dataclasses
 
 import pytest
-
 from postern_core.risk.context import RiskContext
 from postern_core.risk.engine import (
     RiskConfig,
     RiskEngine,
-    RiskSignal,
     Severity,
 )
 
@@ -281,4 +279,3 @@ def test_account_used_pct_is_one_when_exhausted() -> None:
     engine = RiskEngine()
     used = engine._account_used_pct(ctx)
     assert used == 1.0
-
