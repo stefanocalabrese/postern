@@ -1356,16 +1356,14 @@ def _delookalike(value: str) -> str:
     fire on Latin-named codepoints without masking ordinary Spanish,
     Catalan and Turkish reference codes.
 
-    Closing it completely belongs upstream, and the citation that used to
-    sit here -- handoff §10.17 -- was the wrong one: it asks whether the
-    domain teams will return pre-masked VALUES on agent-facing
-    projections, pointing at §6.5, which is about typed PAN and IBAN
-    fields. A memo is not a typed field, so §10.17 could be answered yes
-    without moving this class at all. What would move it is pre-scrubbed
-    remittance information, a wider commitment that the handoff does not
-    raise anywhere (zero occurrences of "remittance" or "free text" in it,
-    and every "memo" is inside "memory"). No section number, and no owning
-    team, is the honest statement. See `_mask_bridged_runs`.
+    Closing it completely belongs upstream. The honest statement is not a
+    section number and not an owning team: it is a wider commitment than the
+    handoff raises anywhere (zero occurrences of "remittance" or "free text"
+    in it, and every "memo" is inside "memory"). What would move this class
+    is pre-scrubbed remittance information from the domain services — a
+    commitment that handoff §10.17 does not make (it asks only about
+    pre-masked typed fields, §6.5). See ADR-0008 for the full analysis and
+    acceptance of these residuals. See `_mask_bridged_runs`.
     """
     if value.isascii():
         return value
@@ -1836,21 +1834,21 @@ def _mask_bridged_runs(value: str, skeleton: str) -> str:
        written with insertion passes while substitution leaks. That is how
        this shape stayed hidden behind a green test.
 
-    None of these is closable by this module's own means. Do NOT read that
-    as "handoff §10.17 will close them", which is what an earlier version
-    of this docstring said and what the same sentence on `_delookalike`
-    still implied: §10.17 asks whether the domain teams will expose
-    agent-facing projections returning pre-masked VALUES, and §6.5, the
-    section it points at, is about typed PAN and IBAN FIELDS. Answer
-    §10.17 yes tomorrow and account and card objects stop carrying full
-    PANs while this entire class is untouched, because a memo is not a
-    masked field. The handoff never contemplates scrubbing identifiers out
-    of free text at all: it has zero occurrences of "remittance", zero of
-    "free text", and its only "memo" substrings are inside "memory".
-    Closing this class upstream needs a WIDER commitment than §10.17 --
-    pre-scrubbed remittance information -- and that is not currently an
-    open question in the handoff, so there is no section number to cite
-    and no team that owns it.
+    None of these is closable by this module's own means. See ADR-0008 for
+    the full analysis, acceptance, and upstream closure path. The earlier
+    version of this docstring said "handoff §10.17 will close them" — that
+    was wrong. §10.17 asks whether the domain teams will expose agent-facing
+    projections returning pre-masked VALUES, and §6.5 is about typed PAN
+    and IBAN FIELDS. Answer §10.17 yes tomorrow and account and card objects
+    stop carrying full PANs while this entire class is untouched, because a
+    memo is not a masked field. The handoff never contemplates scrubbing
+    identifiers out of free text at all: it has zero occurrences of
+    "remittance", zero of "free text", and its only "memo" substrings are
+    inside "memory". Closing this class upstream needs a WIDER commitment
+    than §10.17 — pre-scrubbed remittance information — and that is not
+    currently an open question in the handoff, so there is no section number
+    to cite and no team that owns it. ADR-0008 records this as an accepted
+    risk with the upstream path documented.
 
     Cost. Zero checksums, so `_ScanBudget`/`_IBAN_SCAN_BUDGET` -- a budget
     over CHECKSUM operations -- is untouched by this and cannot be spent by
