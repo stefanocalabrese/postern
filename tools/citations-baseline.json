@@ -15,6 +15,7 @@
     "docs/verification/2026-09-16-zt2-coverage.md": 21,
     "docs/verification/2026-09-17-query-stall-deadline.md": 1,
     "docs/verification/2026-09-18-multi-replica-jwks.md": 12,
+    "handoff-for-local.md": 2,
     "tests/test_tools_accounts.py": 1,
     "tests/test_tools_cards.py": 1
   }
