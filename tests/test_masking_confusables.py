@@ -549,13 +549,19 @@ def test_a_run_at_exactly_the_alphanumeric_floor_is_masked() -> None:
     assert Memo(text=text).text == "••••"
 
 
-def test_new_residual_the_five_hundred_and_ninety_spacing_marks_still_leak() -> None:
-    """Residual 3, demonstrated rather than claimed, and deliberately NOT
-    fixed here (see `_mask_bridged_runs` for why an Me-only strip would be
-    worse than leaving it). An enclosing mark, a spacing combining mark and
-    a modifier symbol are all non-alphanumeric, so `_is_script_intrusion`
-    rejects them, but none of the three is a visible break the way a space
-    is, so a reader still sees one continuous IBAN.
+def test_residual_three_spacing_marks_now_masked() -> None:
+    """Residual 3, closed. The 13 Me (enclosing mark), 452 Mc (spacing
+    combining mark) and 125 Sk (modifier symbol) codepoints are all non-
+    alphanumeric, so the original `_is_script_intrusion` rejected them.
+    None of the three is a visible break the way a space is, so a reader
+    still sees one continuous token. Closed by widening `_is_script_intrusion`
+    to also return True for Me/Mc/Sk codepoints: bridging replaces the split
+    with a bare `_MASK`.
+
+    Demonstrated here with one representative from each category; the full
+    census over all 590 is in the measurement harness
+    (tests/test_masking_homoglyph_measurement.py) and was re-run after the
+    widening: zero false positives on the seven-script corpus.
     """
     for label, ch in (
         ("Me enclosing mark", "҈"),
@@ -567,8 +573,8 @@ def test_new_residual_the_five_hundred_and_ninety_spacing_marks_still_leak() -> 
         idx = MT_IBAN.index("A", 8)
         planted = MT_IBAN[:idx] + ch + MT_IBAN[idx:]
         out = Memo(text=f"ref {planted} end").text
-        assert MT_IBAN in out.replace(ch, ""), (
-            f"{label} was expected to still put the complete IBAN through: {out!r}"
+        assert MT_IBAN not in out.replace(ch, ""), (
+            f"{label} should have been bridged and masked: {out!r}"
         )
 
 

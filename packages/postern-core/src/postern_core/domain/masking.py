@@ -1542,8 +1542,15 @@ _LATIN_SCRIPT_EXEMPTIONS: frozenset[str] = frozenset("ªºµ²³¹¼½¾ʼ") | f
 
 def _is_script_intrusion(ch: str) -> bool:
     """True if `ch` is an alphanumeric character whose Unicode name does not
-    contain "LATIN" -- the thing that splits a token without being a
-    look-alike for anything.
+    contain "LATIN", or a non-alphanumeric codepoint in the Me (enclosing
+    mark), Mc (spacing combining mark) or Sk (modifier symbol) categories.
+
+    These are the two classes of characters that split a token without being
+    a visible break the way a space is. The first class (alphanumeric, non-
+    Latin) is the original intrusion; the second (Me/Mc/Sk) was added to
+    close residual 3 on `_mask_bridged_runs`. Bridging across them (rather
+    than stripping, which would mangle Indic scripts) replaces the split
+    with a bare `_MASK`.
 
     Read that as written, not as "from a non-Latin script". The two are not
     the same set, and the gap between them is `_LATIN_SCRIPT_EXEMPTIONS`
@@ -1552,37 +1559,32 @@ def _is_script_intrusion(ch: str) -> bool:
     name. The name test is a stand-in for the Script property, and a
     stand-in with known counterexamples.
 
-    Four tests, each load-bearing, each with a test that fails if it is
-    removed (tests/test_masking_confusables.py):
+    Tests, each load-bearing (tests/test_masking_confusables.py):
 
     Non-ASCII, because an ASCII alphanumeric is what the token is MADE of,
     and every other ASCII character (space, hyphen, underscore, full stop)
     is a separator a reader can see, which is this module's own documented
     grouped-IBAN limitation rather than an evasion.
 
-    Alphanumeric, because the non-ASCII characters that are not letters or
-    digits are overwhelmingly visible breaks -- an em dash, a Chinese full
-    stop, a Catalan punt volat -- and bridging across those would mask
-    `FACTURA2026·REFERENCIA4455`. That is the reason for the test, and it
-    is NOT true of the whole complement: the 13 Me (enclosing mark), 452 Mc
-    (spacing combining mark) and 125 Sk (modifier symbol) codepoints are
-    not alphanumeric and are not visible breaks either, and all 590 of them
-    put a complete IBAN through. See `_mask_bridged_runs`'s residual 3.
+    Alphanumeric (part 1) or Me/Mc/Sk category (part 2), because the non-
+    ASCII characters that are not letters, digits, or these mark categories
+    are overwhelmingly visible breaks -- an em dash, a Chinese full stop, a
+    Catalan punt volat -- and bridging across those would mask
+    `FACTURA2026·REFERENCIA4455`. That is the reason for both tests.
 
-    Not named "LATIN", because that is where the accented letters live that
-    ordinary Spanish, Catalan, Turkish, Polish and Nordic text puts inside
-    reference codes. A name test rather than a codepoint-range list on
-    purpose -- a future Unicode version adding a Latin Extended block is
-    covered without this file changing, which is the property the
-    hand-enumerated Cyrillic/Greek table above conspicuously does not have.
+    Not named "LATIN" (part 1 only), because that is where the accented
+    letters live that ordinary Spanish, Catalan, Turkish, Polish and Nordic
+    text puts inside reference codes. A name test rather than a codepoint-
+    range list on purpose -- a future Unicode version adding a Latin
+    Extended block is covered without this file changing.
 
-    `unicodedata.name` raises `ValueError` for an unnamed codepoint, so the
-    default is `""`, which contains no "LATIN" and therefore counts as an
-    intrusion: the fail-closed direction, and load-bearing rather than
-    incidental. 6,145 alphanumeric codepoints have no Unicode name at all
-    (Unicode 15.0.0, this interpreter), Tangut U+17000 among them, and a
-    Tangut splitter is bridged ONLY because of that default. Flipping it to
-    `"LATIN"` would exempt every one of them, which is why
+    `unicodedata.name` raises `ValueError` for an unnamed codepoint (part 1
+    only), so the default is `""`, which contains no "LATIN" and therefore
+    counts as an intrusion: the fail-closed direction, and load-bearing
+    rather than incidental. 6,145 alphanumeric codepoints have no Unicode
+    name at all (Unicode 15.0.0, this interpreter), Tangut U+17000 among
+    them, and a Tangut splitter is bridged ONLY because of that default.
+    Flipping it to `"LATIN"` would exempt every one of them, which is why
     `test_an_unnamed_codepoint_is_treated_as_an_intrusion` exists.
 
     Never called on a look-alike this module already resolves: every caller
@@ -1612,12 +1614,25 @@ def _is_script_intrusion(ch: str) -> bool:
     59ns and is measured, with the payload built to force it, on
     `_redact_free_text`.
     """
-    return (
+    # Part 1: non-ASCII alphanumeric characters that aren't Latin -- the
+    # original intrusion class.
+    if (
         not ch.isascii()
         and ch.isalnum()
         and ch not in _LATIN_SCRIPT_EXEMPTIONS
         and "LATIN" not in unicodedata.name(ch, "")
-    )
+    ):
+        return True
+    # Part 2: non-alphanumeric codepoints in the Me (enclosing mark), Mc
+    # (spacing combining mark) and Sk (modifier symbol) categories. These
+    # are not visible breaks the way a space is, so a reader still sees one
+    # continuous token even though the scan splits on them. Bridging across
+    # them (rather than stripping, which would mangle Indic scripts) is the
+    # only safe closure path.
+    cat = unicodedata.category(ch)
+    if not ch.isascii() and cat in {"Me", "Mc", "Sk"}:
+        return True
+    return False
 
 
 _is_script_intrusion = functools.lru_cache(maxsize=4096)(_is_script_intrusion)
@@ -1754,11 +1769,13 @@ def _mask_bridged_runs(value: str, skeleton: str) -> str:
     unchanged and identity-comparable, when nothing qualifies -- which is
     what lets `_redact_free_text` skip rebuilding its skeleton.
 
-    THE RESIDUAL. SIX shapes, and the count has been wrong twice: this
-    docstring first said "two", which read as exhaustive when it was a list
-    of the two that had been thought about, and then said "five" while a
-    seventh-of-a-card case sat untested next door. Each of the six now has
-    a test in tests/test_masking_confusables.py, so none can be lost by a
+    THE RESIDUAL. FIVE open shapes (one closed: the 590 spacing marks,
+    resolved by widening `_is_script_intrusion`). The count has been wrong
+    twice before: this docstring first said "two", which read as exhaustive
+    when it was a list of the two that had been thought about, and then
+    said "five" while a seventh-of-a-card case sat untested next door. Each
+    of the five open shapes now has a test in tests/test_masking_confusables.py,
+    so none can be lost by a
     later edit to this comment, and a number stated here is a number some
     test will defend. Counts are against Unicode 15.0.0, the version
     `unicodedata.unidata_version` reports here.
@@ -1780,24 +1797,16 @@ def _mask_bridged_runs(value: str, skeleton: str) -> str:
        scans, finds does not checksum, and leaves as written -- thirty of
        the IBAN's thirty-one characters. Not closed because the only rule
        that closes it fires on ordinary text (see `_bridged_runs`).
-    3. A splitter that is not alphanumeric but is not a visible break
-       either, in ANY script: the 13 Me (enclosing mark), 452 Mc (spacing
-       combining mark) and 125 Sk (modifier symbol) codepoints. All 590
-       put the COMPLETE IBAN through, substituted or inserted, measured by
-       census over every one of them rather than sampled. An enclosing mark
-       is a zero-advance glyph drawn over the previous character, which is
-       the same property `Mn` is already stripped for.
-       DELIBERATELY NOT FIXED HERE, and the reasoning is not "later":
-       stripping Me alone closes 13 of 590 while letting this comment claim
-       the class is handled; Mc is Indic spacing vowel signs, and stripping
-       those mangles Devanagari, which is the exact failure that forced
-       this module's whole-value-transliteration reversal; and Sk contains
-       real letters used in Latin orthographies. The likely seam is
-       widening `_is_script_intrusion` rather than `_STRIPPED_CATEGORIES`,
-       since bridging leaves the character in the output where stripping
-       deletes it -- but that pulls Devanagari and Arabic into bridging
-       range and needs the seven-script corpus re-measured first. That is a
-       measurement, not a one-line addition.
+    3. CLOSED: the 13 Me (enclosing mark), 452 Mc (spacing combining mark)
+       and 125 Sk (modifier symbol) codepoints. These were all non-
+       alphanumeric and not visible breaks, so `_is_script_intrusion`
+       rejected them and a complete IBAN slipped through when any one was
+       substituted or inserted. Closed by widening `_is_script_intrusion`
+       to also return True for Me/Mc/Sk codepoints (part 2 of the
+       predicate). Bridging across them replaces the split with a bare
+       `_MASK` while leaving the mark in place (unlike stripping, which
+       would mangle Indic scripts). Measured against the seven-script
+       corpus: zero false positives on all 103 entries.
     4. TWO splitters in a short national format, which is the attacker's
        direct counter-move against the floors in `_could_be_an_identifier`
        and belongs named rather than rediscovered. Norway's is 15

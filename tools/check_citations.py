@@ -54,7 +54,11 @@ WHAT THIS CATCHES
 - A NEW bare `file:line` citation, by ratchet: `tools/citations-baseline.json`
   records how many each file carries, and any file carrying more than its
   baseline fails. Converting citations is always allowed; adding an
-  uncheckable one is not.
+  uncheckable one is not. The gate never fails when a file carries fewer
+  bare citations than its baseline (a "LOOSE" baseline), because that
+  means citations were converted to anchored form, which is the desired
+  direction. A loose baseline is a signal that cleanup happened, not a
+  regression.
 
 WHAT THIS PROVABLY CANNOT CATCH
 
