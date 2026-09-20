@@ -4,7 +4,7 @@
 
 **Audience:** a Claude Code session implementing this, with access to the codebase and AWS accounts.
 
-**Status:** assessment complete, ZT-1 to ZT-8 defined, none implemented. Three of the seven §6.1 CI gates are live and blocking in `make ci`: golden masking, header/body mismatch, and import-linter, whose `.importlinter` now carries three contracts (neither service may import the other, and `postern_core.facade` may not import `postern_core.store`). A fourth, cross-customer contract tests, runs in `make ci` against this repo's stub backend only (`tests/test_stub_subject_scoping.py` against `stub/backend.py`); the per-domain-service suite §6.1 asks for is owed by the teams that own those services. The remaining three are not built.
+**Status:** assessment complete, ZT-1 to ZT-8 defined. Implemented: ZT-3 (digest drift), ZT-7 (revocation list), ZT-8 (default-deny egress analysis), ZT-1 (continuous authorization and revocation). Resolved by decision record: ZT-6 (DPoP not viable, compensating controls accepted). Remaining open: ZT-2 (subject enforcement in domain services — blocked on backend teams), ZT-5 follow-up (IP/ASN anomaly detection for risk engine).
 
 **Two kinds of content:** §1 to §7 specify the product. The threat model, the eight work items, their acceptance criteria and the §5 residual risks hold for any operator deploying this. §8 and the **Dependency:** lines under ZT-2 and ZT-1 record something else: what one deployment has asked of which named team, and what has not come back. A second operator inherits the first kind and replaces the second with the teams and the answers of its own organization.
 
@@ -58,7 +58,7 @@ Ranked by severity. Detail and acceptance criteria in §4.
 |---|---|---|
 | **ZT-2** | Subject enforcement in domain services unverified | **Critical** |
 | **ZT-1** | No continuous authorization or session revocation | **High** |
-| **ZT-6** | Bearer tokens are not sender-constrained | **High** |
+| **ZT-6** | Bearer tokens are not sender-constrained | **High — resolved by decision record 0010** |
 | **ZT-3** | No workload attestation (signing without verification) | Medium |
 | **ZT-5** | No per-session anomaly detection | Medium |
 | **ZT-4** | No microsegmentation inside the MCP VPC | Medium |
@@ -88,7 +88,7 @@ Ranked by severity. Detail and acceptance criteria in §4.
 | **A1** | Injected text in a transaction memo causes `create_payment` to an attacker IBAN | No execute tool (§6.2); push payload built server-side from the stored row (§6.3); `payee_ref` only, no raw IBAN from the agent (§6.5) | User approves a payment they did not intend but *can see correctly*. Social engineering remains. |
 | **A2** | QR relayed to a phishing page; victim approves the attacker's session | Pairing code shown on both surfaces and confirmed **before** identity verification; rotating QR; short TTL (§7.3) | Depends on the app actually implementing the pairing screen — **open question 10** |
 | **A3** | RCE in `postern-api` attempts a payment | Read-path Vault key only; Istio rejects write-audience claims; write path is a separate deployable (§7.2, §8.2) | Attacker can read everything the read role can read |
-| **A4** | Valid token replayed from attacker infrastructure | **None — bearer tokens** | **ZT-6** |
+| **A4** | Valid token replayed from attacker infrastructure | 60s TTL; jti replay cache (A10); revocation on every mint | **ZT-6 — compensating controls in place; IP/ASN anomaly detection pending (ZT-5 follow-up)** |
 | **A5** | Confused deputy: customer A's session reads customer B's accounts | JWT `sub` propagated (§7.2) — **enforcement unverified** | **ZT-2 — critical** |
 | **A6** | Bulk exfiltration via many legitimate-looking reads | Bounded result sets, per-client rate limits (§6.5) | No per-customer behavioural baseline — **ZT-5** |
 | **A7** | Malicious dependency in the Python image | ECR scan + Trivy + SBOM (§12.4) | Signing without deploy-time verification — **ZT-3** |
@@ -137,17 +137,24 @@ Tokens are issued once at the QR flow and an agent session can run for hours. Ze
 ---
 
 ### ZT-6 — Sender-constrained tokens
-**Severity: high.**
+**Severity: high — resolved by decision record 0010.**
 
 Bearer tokens are the classic zero-trust weakness: possession is authorization. A token exfiltrated from an AI vendor's infrastructure (A8) works from anywhere.
 
-**Do:**
-- Investigate **DPoP (RFC 9449)** for the client→MCP-server layer. Binds the token to a key the client holds, so a stolen token is useless without the key.
-- **First: check whether the MCP authorization spec at `2026-07-28` supports or mandates DPoP, and which client vendors implement it.** If Claude, ChatGPT and Perplexity do not, this cannot ship unilaterally — we design for the weakest client (§1).
-- If DPoP is not viable, compensate: shorter token lifetimes (ZT-1), client IP/ASN anomaly detection (ZT-5), and strict audience scoping.
-- Internal JWTs (§7.2) are already effectively sender-constrained by the Vault key split — no change needed there.
+**DPoP investigation:** DPoP / RFC 9449 appears nowhere in the MCP `2026-07-28` spec. Zero hits across the specification, changelog, and extension mechanisms. Claude, ChatGPT (OpenAI), and Perplexity do not implement DPoP. FastMCP 4.x has no DPoP middleware. Unilateral adoption would break the bootstrap tool (§4.2 of the handoff), which is the only context-delivery mechanism that works everywhere.
 
-**Acceptance:** either DPoP is implemented end-to-end with at least one client, or a written decision record stating why not and which compensating controls carry the risk.
+**Decision:** accept the risk with compensating controls (see `docs/decisions/0010-dpop-sender-constraint.md`).
+
+**Compensating controls in place:**
+- **60-second token lifetime** (ZT-1) — narrow exploitation window.
+- **jti replay cache** (A10 / ZT-1) — duplicate tokens raise `ValueError`.
+- **Revocation on every mint** (ZT-1) — compromised sessions die at next request.
+- **Audience scoping** (Vault key split) — read minter cannot produce write tokens; Istio enforces issuer-based routing.
+- **Internal JWTs sender-constrained** (Vault key split) — separate read/write keys, issuer-based routing.
+
+**Residual gap:** client IP/ASN anomaly detection is not yet wired into the risk engine. The framework (`RiskContext`, `RiskEngine`) exists; the data collection layer (ASGI middleware reading `X-Forwarded-For` / `remote_addr`) is a ZT-5 follow-up.
+
+**Acceptance:** ✅ satisfied by decision record 0010 (`docs/decisions/0010-dpop-sender-constraint.md`).
 
 ---
 
