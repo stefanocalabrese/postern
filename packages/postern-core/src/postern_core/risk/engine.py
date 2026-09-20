@@ -10,44 +10,18 @@ Signals carry a `Severity` that maps to the appropriate response:
 Thresholds are configurable via `RiskConfig`. Defaults are sized against
 the handoff's "not 200 records" framing (§6.5) and the MAX_ROWS=100
 already in `facade/transactions.py`.
+
+Shared types (`RiskSignal`, ``Severity``) live in ``types.py`` to avoid
+circular imports with the IP anomaly detector.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import Any
 
 from postern_core.risk.context import RiskContext
-
-
-@dataclass(frozen=True)
-class RiskSignal:
-    """One anomaly detected by the engine.
-
-    Immutable so it can be logged, serialized, or passed to a tier-escalation
-    decision without mutation concerns.
-    """
-
-    code: str
-    """Machine-readable identifier (e.g. ``RECORD_BUDGET_80PCT``)."""
-
-    description: str
-    """Human-readable explanation for logs and audit trails."""
-
-    severity: Severity
-    """What kind of response this signal demands."""
-
-    details: dict[str, Any] = field(default_factory=dict)
-    """Structured data for alerting systems (record counts, thresholds, etc.)."""
-
-
-class Severity(Enum):
-    """How urgently the signal demands action."""
-
-    LOW = auto()
-    MEDIUM = auto()
-    HIGH = auto()
+from postern_core.risk.types import RiskSignal, Severity
 
 
 @dataclass(frozen=True)

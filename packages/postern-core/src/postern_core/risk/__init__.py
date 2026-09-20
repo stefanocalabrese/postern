@@ -8,12 +8,21 @@ zero-trust plan §4.
 This is an in-memory tracker — no persistence, no baseline learning.
 Baselines and ZT-1 refresh integration are future work (blocked on the
 fraud/risk platform team for ZT-1).
+
+ZT-5 follow-up: IP/ASN anomaly detection via ``IpAnomalyDetector`` and
+``IpTracker`` — detects impossible travel, excessive IP diversity, and
+suspicious ASN connections (compensating control for ZT-6).
 """
 
-from postern_core.risk.context import RecordCount, RiskContext
-from postern_core.risk.engine import RiskConfig, RiskEngine, RiskSignal, Severity
+from postern_core.risk.context import IpTracker, RecordCount, RiskContext
+from postern_core.risk.engine import RiskConfig, RiskEngine, Severity
+from postern_core.risk.ip_anomaly import IpAnomalyConfig, IpAnomalyDetector
+from postern_core.risk.types import RiskSignal
 
 __all__ = [
+    "IpAnomalyConfig",
+    "IpAnomalyDetector",
+    "IpTracker",
     "RecordCount",
     "RiskConfig",
     "RiskContext",
