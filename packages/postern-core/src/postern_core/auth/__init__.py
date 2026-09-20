@@ -10,17 +10,21 @@ JWT carries a ``jti`` that the revocation list checks.  Three scopes:
 - **Per-customer + per-client**: revoke all sessions for a customer–client pair.
 - **Per-client kill switch**: revoke every session from one client (all customers).
 
+ZT-1 — Continuous authorization: ``ReadTokenMinter`` checks the revocation
+list and jti replay cache on every mint. A revoked session dies at mint, not
+at next refresh.
+
 See ``postern_core.auth.revocation.RevocationList`` for the API.
 """
 
 from postern_core.auth.keys import GeneratedKeySource, KeySource
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
-from postern_core.auth.read_minter import ReadTokenMinter
+from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
 
 __all__ = [
     "GeneratedKeySource",
+    "JtiReplayCache",
     "KeySource",
-    "PemKeySource",
     "ReadTokenMinter",
     "refuse_unverifiable_minter",
 ]

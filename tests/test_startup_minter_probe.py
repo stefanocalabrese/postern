@@ -92,7 +92,7 @@ def test_a_stub_minter_wired_into_the_composition_root_is_refused(
 
     Both shapes refuse, because the probe never looks at either one.
     """
-    monkeypatch.setattr(api_main, "ReadTokenMinter", lambda _inner: StubTokenMinter())
+    monkeypatch.setattr(api_main, "ReadTokenMinter", lambda _inner, **_kw: StubTokenMinter())
     with pytest.raises(RuntimeError, match="StubTokenMinter"):
         create_app(settings)
 
@@ -101,7 +101,7 @@ def test_the_refusal_names_the_object_the_process_built(monkeypatch: pytest.Monk
     """`StubTokenMinter` is the actionable half of the message: it names the
     edit to undo. The role and the absence of an override flag are the rest.
     """
-    monkeypatch.setattr(api_main, "ReadTokenMinter", lambda _inner: StubTokenMinter())
+    monkeypatch.setattr(api_main, "ReadTokenMinter", lambda _inner, **_kw: StubTokenMinter())
     with pytest.raises(RuntimeError) as refusal:
         create_app(Settings.for_testing())
     message = str(refusal.value)

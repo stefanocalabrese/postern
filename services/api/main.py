@@ -55,7 +55,7 @@ from pathlib import Path
 import httpx2
 from fastmcp.server.auth import AuthProvider
 from fastmcp.server.http import StarletteWithLifespan
-from postern_core.auth.internal_jwt import InternalTokenMinter
+from postern_core.auth.internal_jwt import _LIFETIME, InternalTokenMinter
 from postern_core.auth.keys import (
     FileKeySource,
     GeneratedKeySource,
@@ -63,7 +63,8 @@ from postern_core.auth.keys import (
     warn_ephemeral_signing_key,
 )
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
-from postern_core.auth.read_minter import ReadTokenMinter
+from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
+from postern_core.auth.revocation import RevocationList
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
@@ -201,8 +202,17 @@ def create_app(
     # plumbing a later task owns rather than a value that could be guessed
     # here.
     read_key_source = _read_key_source(settings)
+    # ZT-1: continuous authorization — revocation list and jti replay cache.
+    # The revocation list is checked before mint (customer+client, kill-switch);
+    # the jti cache is checked after mint (session replay, A10). Both are
+    # in-memory and stateless — a production deployment would back them with
+    # Redis or a database table.
+    revocation_list = RevocationList()
+    jti_cache = JtiReplayCache(max_age_seconds=_LIFETIME.total_seconds())
     read_minter = ReadTokenMinter(
-        InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
+        InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source),
+        revocation_list=revocation_list,
+        jti_cache=jti_cache,
     )
     # Before that minter reaches anything that could send one of its tokens:
     # mint one, and refuse to start unless it verifies against the key set
