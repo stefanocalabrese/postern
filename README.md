@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="Postern — Zero-Trust MCP Server for Banking">
+  <img src="logos/svg/postern-lockup-light.svg" alt="Postern — Zero-Trust MCP Server for Banking">
 </p>
 
 # Postern
