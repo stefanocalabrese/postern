@@ -128,6 +128,21 @@ inside the markdown design docs.
 
 ## 📚 Documentation
 
+### User Guide (new)
+
+Structured documentation with setup instructions, component manuals, and glossary:
+
+- [**Getting Started**](docs/user-guide/getting-started.md) — Prerequisites, installation, configuration
+- [**API Service**](docs/user-guide/components/api-service.md) — Read path: MCP tools, OAuth endpoints
+- [**Confirm Service**](docs/user-guide/components/confirm-service.md) — Write path: device auth, approvals
+- [**Risk Engine**](docs/user-guide/components/risk-engine.md) — Anomaly detection, tier escalation
+- [**Session Store**](docs/user-guide/components/session-store.md) — In-memory and Redis backends
+- [**Masking**](docs/user-guide/components/masking.md) — PAN/IBAN redaction layers
+- [**Audit System**](docs/user-guide/components/audit.md) — Two-row pattern, fail-closed writes
+- [**Glossary**](docs/user-guide/glossary.md) — Key terms and concepts
+
+### Design Documents
+
 Read in this order:
 
 1. **[`docs/postern-design-handoff.md`](docs/postern-design-handoff.md)** — The architecture, 868 lines.
