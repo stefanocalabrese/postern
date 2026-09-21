@@ -39,9 +39,19 @@ class WriteTokenMinter:
     def __init__(self, minter: InternalTokenMinter) -> None:
         self._minter = minter
 
-    def mint(self, *, subject_value: str, audience: str, scope: str) -> str:
+    def mint(
+        self,
+        *,
+        subject_value: str,
+        audience: str,
+        scope: str,
+        challenge_id: str = "",
+    ) -> str:
         return self._minter.mint(
-            subject=CustomerRef(value=subject_value), audience=audience, scope=scope
+            subject=CustomerRef(value=subject_value),
+            audience=audience,
+            scope=scope,
+            challenge_id=challenge_id or None,
         )
 
 

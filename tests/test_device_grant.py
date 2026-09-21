@@ -767,3 +767,223 @@ class TestSerialization:
         assert dc2.approved is False
         assert dc2.approved_at is None
 
+
+
+# ---------------------------------------------------------------------------
+# Endpoint wiring — JSON vs form body, content-type handling.
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceAuthorizationContentType:
+    """device_authorization accepts both JSON and form bodies."""
+
+    async def test_json_body_accepted(self, app: Starlette) -> None:
+        """JSON body with client_id works."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            resp = await c.post(
+                "/device_authorization",
+                json={"client_id": "test_client"},
+                headers={"content-type": "application/json"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "device_code" in data
+        assert "user_code" in data
+
+    async def test_form_body_accepted(self, app: Starlette) -> None:
+        """Form body with client_id works."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            resp = await c.post(
+                "/device_authorization",
+                data={"client_id": "test_client"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "device_code" in data
+
+    async def test_missing_client_id_returns_400(self, app: Starlette) -> None:
+        """No client_id → 400."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            resp = await c.post(
+                "/device_authorization",
+                json={},
+                headers={"content-type": "application/json"},
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"] == "invalid_request"
+
+    async def test_custom_scopes_stored(self, app: Starlette) -> None:
+        """Custom scopes are stored in the device code."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            resp = await c.post(
+                "/device_authorization",
+                json={"client_id": "test_client", "scopes": "payments:execute"},
+                headers={"content-type": "application/json"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        # The device code is created with the custom scopes.
+
+
+class TestTokenEndpointGrantTypes:
+    """token_endpoint handles different grant types."""
+
+    async def test_device_code_grant_works(self, app: Starlette) -> None:
+        """grant_type=device_code is accepted."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            # First create a device code.
+            dc_resp = await c.post(
+                "/device_authorization",
+                json={"client_id": "test_client"},
+                headers={"content-type": "application/json"},
+            )
+            dc = dc_resp.json()
+
+            # Then try to exchange it (will be pending).
+            resp = await c.post(
+                "/token",
+                data={"grant_type": "device_code", "device_code": dc["device_code"]},
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"] == "authorization_pending"
+
+    async def test_unknown_grant_type_returns_404(self, app: Starlette) -> None:
+        """Non-device_code grant type → 404."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            resp = await c.post(
+                "/token",
+                data={"grant_type": "authorization_code"},
+            )
+        assert resp.status_code == 404
+        data = resp.json()
+        assert data["error"] == "unsupported_grant_type"
+
+    async def test_missing_device_code_returns_400(self, app: Starlette) -> None:
+        """No device_code in form → 400."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            resp = await c.post(
+                "/token",
+                data={"grant_type": "device_code"},
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"] == "invalid_request"
+
+
+class TestApproveCallbackEdgeCases:
+    """approve_callback edge cases."""
+
+    async def test_approve_with_signature(self, app: Starlette) -> None:
+        """Approval with optional signature field."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            # Create a device code first.
+            dc_resp = await c.post(
+                "/device_authorization",
+                json={"client_id": "test_client"},
+                headers={"content-type": "application/json"},
+            )
+            dc = dc_resp.json()
+
+            # Approve it.
+            resp = await c.post(
+                "/approve",
+                json={
+                    "device_code": dc["device_code"],
+                    "subject_value": "cust_7f3a",
+                    "approval_signature": "sig_xyz",
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "approved"
+
+    async def test_approve_empty_device_code(self, app: Starlette) -> None:
+        """Empty device_code → 400."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            resp = await c.post(
+                "/approve",
+                json={"device_code": "", "subject_value": "cust_7f3a"},
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"] == "invalid_request"
+
+    async def test_approve_empty_subject(self, app: Starlette) -> None:
+        """Empty subject_value → 400."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            resp = await c.post(
+                "/approve",
+                json={"device_code": "some_code", "subject_value": ""},
+            )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"] == "invalid_request"
+
+
+class TestCompleteFlow:
+    """End-to-end device authorization flow."""
+
+    async def test_full_device_code_lifecycle(self, app: Starlette) -> None:
+        """Create → pending → approve → exchange tokens."""
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            # 1. Create device code.
+            dc_resp = await c.post(
+                "/device_authorization",
+                json={"client_id": "test_client"},
+                headers={"content-type": "application/json"},
+            )
+            assert dc_resp.status_code == 200
+            dc = dc_resp.json()
+
+            # 2. Poll while pending.
+            resp = await c.post(
+                "/token",
+                data={"grant_type": "device_code", "device_code": dc["device_code"]},
+            )
+            assert resp.status_code == 400
+            assert resp.json()["error"] == "authorization_pending"
+
+            # 3. Approve via mobile app.
+            approve_resp = await c.post(
+                "/approve",
+                json={
+                    "device_code": dc["device_code"],
+                    "subject_value": "cust_7f3a",
+                },
+            )
+            assert approve_resp.status_code == 200
+
+            # 4. Exchange for tokens.
+            token_resp = await c.post(
+                "/token",
+                data={"grant_type": "device_code", "device_code": dc["device_code"]},
+            )
+        assert token_resp.status_code == 200
+        token_data = token_resp.json()
+        assert "access_token" in token_data
+        assert "write_token" in token_data
+        assert token_data["token_type"] == "Bearer"

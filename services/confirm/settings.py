@@ -15,6 +15,11 @@ This is a deliberate exception: the device grant flow mints both read and
 write tokens in one atomic step, so it needs both keys. The separation is
 preserved at startup — no code path hands one process both keys for general
 use; the device grant is a controlled exception.
+
+Approval callback (§6.3, §8.3) adds:
+- ``backend_base_url`` — base URL for backend write endpoints (payments.svc,
+  cards.svc). The callback POSTs to these after marking a challenge approved.
+- ``database_url`` — Postgres connection for the challenges table.
 """
 
 import os
@@ -34,6 +39,12 @@ class ConfirmSettings:
     read_key_pem_path: str | None = None
     read_key_kid: str = "read-1"
     read_token_issuer: str = "https://mcp-read.internal"  # noqa: S105
+    # Approval callback (§6.3, §8.3): backend write endpoints + challenges DB.
+    backend_base_url: str = "https://backend.internal"  # noqa: S105
+    database_url: str = "postgresql+asyncpg://postern:postern@localhost:5432/postern"
+    database_connect_timeout_seconds: float = 2.0
+    database_command_timeout_seconds: float = 3.0
+    database_pool_timeout_seconds: float = 1.0
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -57,6 +68,22 @@ class ConfirmSettings:
             read_key_kid=os.environ.get("POSTERN_READ_KEY_KID", "read-1"),
             read_token_issuer=os.environ.get(
                 "POSTERN_READ_TOKEN_ISSUER", "https://mcp-read.internal"
+            ),
+            backend_base_url=os.environ.get(
+                "POSTERN_BACKEND_BASE_URL", "https://backend.internal"
+            ),
+            database_url=os.environ.get(
+                "POSTERN_DATABASE_URL",
+                "postgresql+asyncpg://postern:postern@localhost:5432/postern",
+            ),
+            database_connect_timeout_seconds=float(
+                os.environ.get("POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS", "2.0")
+            ),
+            database_command_timeout_seconds=float(
+                os.environ.get("POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS", "3.0")
+            ),
+            database_pool_timeout_seconds=float(
+                os.environ.get("POSTERN_DATABASE_POOL_TIMEOUT_SECONDS", "1.0")
             ),
         )
 

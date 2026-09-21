@@ -11,7 +11,7 @@ from postern_core.store.models import AuditEntry, ConsentRecord
 
 
 def test_both_tables_are_registered_on_the_metadata() -> None:
-    assert set(Base.metadata.tables) == {"consents", "audit_log"}
+    assert set(Base.metadata.tables) == {"consents", "audit_log", "challenges"}
 
 
 def test_consent_is_unique_per_customer_and_domain() -> None:
