@@ -838,3 +838,89 @@ class AuditEntry(Base):
             name="ck_audit_log_customer_ref_xor_absence",
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# ChallengeRecord — approval workflow state (handoff §7.4, §8.3).
+# ---------------------------------------------------------------------------
+
+class ChallengeRecord(Base):
+    """SQLAlchemy model for the challenge approval workflow.
+
+    Each write operation (payment, card freeze, etc.) creates one row here.
+    The row is the source of truth for what executes: the confirmation
+    payload sent to the phone is built server-side from this stored row,
+    never re-sent or re-specified by the agent.
+
+    Columns:
+
+    ``challenge_id``
+        UUID primary key, opaque unique identifier. The idempotency key for
+        ``create_payment`` — calling again with identical parameters inside
+        a short window returns the existing pending challenge.
+
+    ``customer_ref``
+        The customer who initiated the operation (from token). Indexed for
+        per-customer status queries.
+
+    ``tool_name``
+        Which MCP tool triggered this challenge (e.g. ``payments.create_payment``).
+
+    ``payload``
+        JSONB: the full operation payload as presented to the device — amount,
+        payee, account. Built server-side from stored data.
+
+    ``tier``
+        Verification tier applied (0 = session, 1 = app approval, 2 = app +
+        identity verification). Enforced by CHECK constraint.
+
+    ``status``
+        Current state: pending | approved | executed | declined | expired.
+        Enforced by CHECK constraint.
+
+    ``created_at`` / ``expires_at``
+        Timestamps for challenge lifecycle. ``expires_at`` is a hard deadline;
+        challenges expire at 2–5 minutes depending on tier.
+
+    ``confirming_device``
+        Device identifier once the user approves (NULL until then).
+
+    ``verification_result``
+        Opaque reference to tier-2 verification result (selfie match).
+        Never stores the captured image — only the result and an audit
+        reference (handoff §7.4).
+
+    ``signature``
+        Device-bound key signature over the payload, provided by the mobile
+        app at approval time.
+    """
+
+    __tablename__ = "challenges"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    challenge_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    customer_ref: Mapped[str] = mapped_column(String(128), index=True)
+    tool_name: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    tier: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    confirming_device: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    verification_result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        # Closed vocabulary for tier: 0 = session, 1 = app approval, 2 = app + identity verification.
+        CheckConstraint(
+            column("tier").in_((0, 1, 2)),
+            name="ck_challenges_tier",
+        ),
+        # Closed vocabulary for status.
+        CheckConstraint(
+            column("status").in_((
+                "pending", "approved", "executed", "declined", "expired",
+            )),
+            name="ck_challenges_status",
+        ),
+    )
