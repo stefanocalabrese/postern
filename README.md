@@ -13,30 +13,30 @@
 [![MCP-compatible](https://img.shields.io/badge/MCP-compatible-6E56CF.svg)](https://modelcontextprotocol.io/)
 [![make ci](https://img.shields.io/badge/ci-passing-brightgreen.svg)](Makefile)
 
-## 🎯 What Postern is
+## What Postern is
 
 [MCP](https://modelcontextprotocol.io/) gives AI models tools, but it was built for
 a **local, trusted transport** (stdio on a single machine). Postern keeps MCP's tool
 model exactly as-is and wraps it in a **zero-trust security layer** so the same tools
 work safely across machines:
 
-- 🔒 **Authentication** — RFC 8628 device grant (QR pairing codes), JWT sessions,
+- **Authentication** — RFC 8628 device grant (QR pairing codes), JWT sessions,
   RS256 asymmetric tokens for multi-party deployments
-- 🛡️ **Per-session anomaly detection** — record budgets, account diversity
+- **Per-session anomaly detection** — record budgets, account diversity
   limits, session age caps; MEDIUM signals escalate verification tier, HIGH signals
   hard-fail the call and end the session
-- 🔐 **Three-tier verification** — `SESSION_ONLY` (reads) → `APP_APPROVAL`
+- **Three-tier verification** — `SESSION_ONLY` (reads) → `APP_APPROVAL`
   (device-bound key + PIN/biometric) → `APP_IDENTITY_VERIFICATION` (tier 1 plus
   server-side selfie matching with liveness)
-- 📋 **Fail-closed auditing** — every tool call writes two rows (entry before backend
+- **Fail-closed auditing** — every tool call writes two rows (entry before backend
   touch, completion after); a failed audit write fails the call
-- 🔑 **Key split architecture** — read and write keys are completely separate,
+- **Key split architecture** — read and write keys are completely separate,
   published on different JWKS endpoints; a compromised tool handler cannot mint a
   token the payments service will accept
-- 🎭 **PAN/IBAN masking** — multi-layer redaction (invisible character stripping,
+- **PAN/IBAN masking** — multi-layer redaction (invisible character stripping,
   lookalike codepoint mapping, script intrusion bridging, checksum validation) with
   a bounded scan budget of 100,000 checksum operations per call
-- 🚪 **Consent enforcement** — per-tool authorization via Postgres-backed consent
+- **Consent enforcement** — per-tool authorization via Postgres-backed consent
   table; filtering `tools/list` alone leaves hidden tools callable by name, so every
   call is checked
 
@@ -47,9 +47,9 @@ work safely across machines:
 > `accounts.get_balance`, `transactions.list` and `cards.list`. Every one but
 > `start_session` is gated by a Postgres-backed consent check.
 
-## ✨ Key Features
+## Key Features
 
-### 🔐 Authentication & Authorization
+### Authentication & Authorization
 
 - **RFC 8628 Device Grant** — QR pairing codes, user-visible verification codes
   (XXX-XXX format), anti-phishing matching on both surfaces before identity verification proceeds
@@ -58,13 +58,13 @@ work safely across machines:
 - **Per-tool consent** — `consent_for(domain, db)` returns an `AuthCheck` that filters
   the tool catalogue and refuses calls; refusal reasons are recorded in the audit log
 
-### 🛡️ Zero-Trust Controls
+### Zero-Trust Controls
 
 Continuous authorization, workload attestation, key split architecture, per-session
 anomaly detection, fail-closed auditing, and data masking. See the [Zero Trust overview](docs/zero-trust.md)
 for details on each control and what is still pending.
 
-### 📋 Audit & Compliance
+### Audit & Compliance
 
 - **Two-row audit pattern** — entry row (`outcome='reaching'`) committed before backend
   touch, completion row (`returned`/`raised`) after; paired by `call_id`
@@ -75,7 +75,7 @@ for details on each control and what is still pending.
 - **Fail-closed writes** — audit write failures block the call rather than allowing
   unrecorded data access
 
-### 🎭 Data Protection
+### Data Protection
 
 - **PAN/IBAN masking** — 5-layer redaction pipeline: invisible character stripping,
   lookalike codepoint mapping, script intrusion bridging, IBAN checksum validation,
@@ -83,7 +83,7 @@ for details on each control and what is still pending.
 - **CustomerRef validation** — pattern `^cust[:_][A-Za-z0-9]{1,60}$` rejects IBAN/PAN/national ID shapes at the identity layer
 - **Field-by-field projection** — `build_model` wrapper catches pydantic validation errors and re-raises as `BackendError(502, ...)`, preventing raw value leakage
 
-## 🏗️ Architecture
+## Architecture
 
 Two deployables share one library:
 
@@ -108,7 +108,7 @@ projects and masks back to the client.
 
 ![Sequence diagram of the Postern device-grant authorization flow and a tool call reaching a domain service behind Istio](docs/images/auth-flow.png)
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 uv sync
@@ -119,7 +119,7 @@ make ci          # lint, fmt-check, type, imports, lock, citations, test
 rather than `.`, because `ruff format` on `.` also rewrites the Python code fences
 inside the markdown design docs.
 
-## 📚 Documentation
+## Documentation
 
 ### User Guide (new)
 
@@ -153,7 +153,7 @@ Read in this order:
 - [ADR-0008](docs/decisions/0008-masking-residuals.md) — Accepted masking residual gaps
 - [ADR-0011](docs/decisions/0011-deploy-pipeline.md) — Deploy pipeline (GitHub Actions)
 
-## ⚠️ Rules that are decisions, not preferences
+## Rules that are decisions, not preferences
 
 Read [`CLAUDE.md`](CLAUDE.md) before changing anything. The load-bearing ones:
 
@@ -176,7 +176,7 @@ Read [`CLAUDE.md`](CLAUDE.md) before changing anything. The load-bearing ones:
   will build the wrong thing. Write "app identity verification", and "device unlock
   biometric" when the phone's own biometric is meant.
 
-## 🧪 Running the gates
+## Running the gates
 
 ```bash
 uv sync
@@ -188,7 +188,7 @@ They run locally because GitHub Actions minutes are billed on private repos. A w
 file is installed with `on: workflow_dispatch` only, so nothing fires on push until
 someone decides to spend the minutes.
 
-## 📦 Stack
+## Stack
 
 Python 3.12 (pinned in `.python-version`), fastmcp 4.0.3, pydantic 2.13.5,
 httpx2 2.12.0, SQLAlchemy 2.0 async, Alembic, uv.
@@ -207,7 +207,7 @@ The HTTP client is `httpx2`, not `httpx`, because that is what FastMCP 4 depends
 `TypeError` at mock-setup time. Backend tests inject an `httpx2.MockTransport`
 instead. See [ADR-0001](docs/decisions/0001-facade-http-client.md).
 
-## ⚠️ Critical path note
+## Critical path note
 
 **Domain service scoping is the critical path and it is not answered in this repo.**
 Istio validates the JWT; the operator's domain services must enforce on it. If any

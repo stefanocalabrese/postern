@@ -98,10 +98,10 @@ backend is never reached at all, rather than data being touched with nothing rec
 
 | Scenario | Entry row | Completion row | Result |
 |----------|-----------|----------------|--------|
-| Audit store down | ❌ fails | N/A | Call blocked (never reaches backend) |
-| Audit store slow (within timeout) | ✅ committed | ❌ fails | Backend reached, no outcome recorded |
-| Cancellation (deadline fires) | ✅ committed | ❌ never written | True statement: "touched, no outcome" |
-| Normal success | ✅ committed | ✅ committed | Full audit trail |
+| Audit store down | fails | N/A | Call blocked (never reaches backend) |
+| Audit store slow (within timeout) | committed | fails | Backend reached, no outcome recorded |
+| Cancellation (deadline fires) | committed | never written | True statement: "touched, no outcome" |
+| Normal success | committed | committed | Full audit trail |
 
 ### `_PendingEntry`, At-most-once guard
 
@@ -154,9 +154,9 @@ A `pydantic.ValidationError` message embeds the raw offending value, which is th
 leak path. The audit table is a long-lived store, so only the exception TYPE is recorded:
 
 ```python
-detail="NotFoundError"    # ✅ correct, type name only
+detail="NotFoundError"    type name only, type name only
 # NOT:
-detail="NotFoundError: account 'acc_123' not found"  # ❌ leaks raw value
+detail="NotFoundError: account 'acc_123' not found"  raw value
 ```
 
 ### `refusal_reason`, Transcribed, never inferred
