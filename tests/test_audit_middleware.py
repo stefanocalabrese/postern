@@ -464,6 +464,7 @@ async def test_the_database_refuses_an_absence_reason_outside_the_documented_set
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
                 client_id=None,
+                risk_signals=None,
             )
 
 
@@ -494,6 +495,7 @@ async def test_every_documented_absence_reason_is_accepted_by_that_constraint(
             refusal_reason=None,
             call_id=PROBE_CALL_ID,
             client_id=None,
+            risk_signals=None,
         )
     assert [e.customer_ref_absence_reason for e in await rows(session)] == list(
         CUSTOMER_REF_ABSENCE_REASONS
@@ -543,6 +545,7 @@ async def test_the_database_refuses_an_outcome_outside_the_documented_set(
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
                 client_id=None,
+                risk_signals=None,
             )
 
 
@@ -584,6 +587,7 @@ async def test_every_documented_outcome_is_accepted_by_that_constraint(
             refusal_reason=None,
             call_id=PROBE_CALL_ID,
             client_id=None,
+            risk_signals=None,
         )
     assert [e.outcome for e in await rows(session)] == list(OUTCOMES)
 
@@ -682,6 +686,7 @@ async def test_the_database_refuses_a_reaching_row_with_no_touch_instant(
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
                 client_id=None,
+                risk_signals=None,
             )
 
 
@@ -721,6 +726,7 @@ async def test_the_database_refuses_a_completion_row_carrying_a_touch_instant(
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
                 client_id=None,
+                risk_signals=None,
             )
 
 
@@ -755,6 +761,7 @@ async def test_the_database_refuses_a_row_with_neither_a_reference_nor_a_reason(
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
                 client_id=None,
+                risk_signals=None,
             )
 
 
@@ -785,6 +792,7 @@ async def test_the_database_refuses_a_row_with_both_a_reference_and_a_reason(
                 refusal_reason=None,
                 call_id=PROBE_CALL_ID,
                 client_id=None,
+                risk_signals=None,
             )
 
 
@@ -1978,6 +1986,7 @@ async def test_the_database_refuses_a_reason_outside_the_documented_set(
                 refusal_reason="reason_nobody_declared",
                 call_id=PROBE_CALL_ID,
                 client_id=None,
+                risk_signals=None,
             )
 
 
@@ -2007,5 +2016,6 @@ async def test_both_documented_reasons_are_accepted_by_that_constraint(
             refusal_reason=reason,
             call_id=PROBE_CALL_ID,
             client_id=None,
+            risk_signals=None,
         )
     assert [e.refusal_reason for e in await rows(session)] == list(REFUSAL_REASONS)
