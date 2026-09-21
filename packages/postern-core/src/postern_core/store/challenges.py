@@ -21,6 +21,8 @@ Usage::
     existing = await get_challenge(session, challenge.challenge_id)
 """
 
+import datetime as _dt
+
 from datetime import UTC, datetime
 from typing import Any
 
@@ -87,7 +89,7 @@ async def create_challenge(
         tier=tier_int,
         status="pending",
         created_at=now,
-        expires_at=now.replace() + __import__("datetime").timedelta(seconds=ttl),
+        expires_at=now.replace() + _dt.timedelta(seconds=ttl),
     )
     session.add(record)
     await session.flush()

@@ -4,11 +4,37 @@
 
 **Audience:** a Claude Code session implementing this, with access to the codebase and AWS accounts.
 
-**Status:** assessment complete, ZT-1 to ZT-8 defined. Implemented: ZT-3 (digest drift), ZT-7 (revocation list), ZT-8 (default-deny egress analysis), ZT-1 (continuous authorization and revocation), ZT-5 follow-up (IP/ASN anomaly detection, risk engine wiring, risk signals stored in audit_log JSONB column, pluggable session store with Redis backend for production — AWS ElastiCache / Google Memorystore / Azure Cache for Redis compatible via ``POSTERN_REDIS_URL``). Resolved by decision record: ZT-6 (DPoP not viable, compensating controls accepted). Remaining open: ZT-2 (subject enforcement in domain services — blocked on backend teams), payments tool contracts (deferred, read-only actions only).
+**Status:** assessment complete, ZT-1 to ZT-8 defined. Implemented: ZT-3 (digest drift + deploy pipeline with cosign signing/verification, SBOM generation via syft, Trivy scanning — ``.github/workflows/deploy.yml``, decision record 0011), ZT-7 (revocation list), ZT-8 (default-deny egress analysis), ZT-1 (continuous authorization and revocation), ZT-5 follow-up (IP/ASN anomaly detection, risk engine wiring, risk signals stored in audit_log JSONB column, pluggable session store with Redis backend for production — AWS ElastiCache / Google Memorystore / Azure Cache for Redis compatible via ``POSTERN_REDIS_URL``). Resolved by decision record: ZT-6 (DPoP not viable, compensating controls accepted). Remaining open: ZT-2 (subject enforcement in domain services — blocked on backend teams), payments tool contracts (deferred, read-only actions only).
 
 **Two kinds of content:** §1 to §7 specify the product. The threat model, the eight work items, their acceptance criteria and the §5 residual risks hold for any operator deploying this. §8 and the **Dependency:** lines under ZT-2 and ZT-1 record something else: what one deployment has asked of which named team, and what has not come back. A second operator inherits the first kind and replaces the second with the teams and the answers of its own organization.
 
 **Why both are still in one file:** relocating §8 and the dependency lines into a separate status document was considered and deferred. `docs/superpowers/plans/postern-foundation-and-read-surface-2026-09-12.md` cites §8 by section number in two places; `docs/verification/2026-09-16-zt2-coverage.md` and `docs/verification/2026-09-16-redaction-budget-exhausted.md` cite this file by line number and quote ZT-2's §4 wording verbatim. Those are dated records, never edited after the fact, and the rename on 17 September 2026 already broke their path citations once. Relabelling leaves every section number and every quoted sentence where it stands, and shifts line numbers by the length of this preamble. The deferral has a price, stated here rather than left to be found: product specification and one deployment's status still share a document, and a reader has to apply the labels above to tell them apart.
+
+---
+
+## ⚠️ EVERY OPERATOR MUST DO THESE THINGS THEMSELVES — NOTHING HERE IS DONE FOR YOU
+
+This repo is a **framework**, not a turnkey deployment. Every company that wants to run Postern must implement the items below in their own infrastructure, their own repos, and their own teams. **None of these are optional.** If you skip any of them, the zero-trust guarantees do not hold.
+
+1. **Backend domain service subject enforcement (ZT-2 — CRITICAL PATH).** Audit every handler in your backend services. Each one must scope queries by the JWT `sub` claim, not by any request body field. If a handler accepts an account ID from the request instead of deriving it from the token, cross-customer data access (A5) is live. This lives in your backend repos, not this one. **Answer this before writing any other ZT control.** If the domain services don't enforce on `sub`, nothing else matters.
+
+2. **Infrastructure (Terraform repo).** Zero Terraform files exist in this repo. You must create ECR repositories, ECS cluster + services (Fargate tasks referencing images by sha256 digest), separate task roles for read/write, VPC/subnets/PrivateLink to your Istio gateway, and SSM Parameter Store entries.
+
+3. **AWS-level tests (in your Terraform repo).** IAM policy test — assert read role cannot assume write role. ECS task definition validation — digest references, awsvpc mode, readonly root fs. Security group validation — read SG cannot reach write endpoints. Cosign integration test — push unsigned image, verify deploy rejects it.
+
+4. **GitHub configuration.** Create two GitHub Environments (`staging`, `production`) with required reviewers. Add secrets: `AWS_ROLE_ARN` (OIDC role), `AWS_ECR_REGISTRY`. The deploy workflow is ready — it just needs these.
+
+5. **Platform team requirements (handoff §10.26).** Confirm SBOM format, cosign signing approach (keyless OIDC vs KMS), approved base images, Trivy ignore list.
+
+6. **Vault integration.** Wire the `KeySource` seam to your real Vault backend — two signing roles (read + write), JWKS hosting, sidecar pattern.
+
+7. **Backend OpenAPI contract tests (gate 4).** Your backend teams must publish OpenAPI docs and `mcp-tools.yaml` manifests, plus contract tests.
+
+8. **GuardDuty Runtime Monitoring.** Enable on your Fargate tasks — platform team operation.
+
+9. **Red team scenarios (§6.2).** Run all six before production: prompt injection in memos, QR relay, token replay, cross-customer access, bulk extraction, session revocation timing.
+
+10. **Compliance sign-off.** Rendering risk (conduct/compliance), regulatory treatment (§5.4, DPO opinion on PSD2 classification), Art. 9 basis and DPIA for identity verification, third-party disclosure analysis (§10.19).
 
 ---
 
@@ -164,13 +190,13 @@ Bearer tokens are the classic zero-trust weakness: possession is authorization. 
 §12.4 signs images with cosign. Signing without verification is ceremony.
 
 **Do:**
-- Verify cosign signatures **at deploy time** as a hard gate — reject unsigned or mismatched images.
-- Verify SBOM presence and scan results as part of the same gate.
-- Pin base images by digest (already in §12.2) and fail the build on drift.
-- Runtime threat detection on the Fargate tasks (GuardDuty Runtime Monitoring or equivalent) — the tasks are internet-facing.
-- Confirm the read task role **cannot** assume the write role or read its Vault path; automated IAM policy test (§12.3).
+- Verify cosign signatures **at deploy time** as a hard gate — reject unsigned or mismatched images. ✅ Done: ``.github/workflows/deploy.yml`` verifies against Sigstore Rekor transparency log before deploy; unsigned images fail.
+- Verify SBOM presence and scan results as part of the same gate. ✅ Done: syft generates SPDX SBOMs, deploy stage checks artifact presence; Trivy scans for HIGH/CRITICAL vulnerabilities and blocks on exit-code 1.
+- Pin base images by digest (already in §12.2) and fail the build on drift. ✅ Done: ``test_zt3_digest_drift.py`` validates all external FROM lines use sha256 digests matching ``docs/decisions/0004-base-images.md``.
+- Runtime threat detection on the Fargate tasks (GuardDuty Runtime Monitoring or equivalent) — the tasks are internet-facing. ⏸️ Pending: no ECS infrastructure in this repo yet; requires platform team (§12.4).
+- Confirm the read task role **cannot** assume the write role or read its Vault path; automated IAM policy test (§12.3). ⏸️ Pending: blocked on infrastructure (Terraform repo, gate 5).
 
-**Acceptance:** a deliberately unsigned image fails deployment in a test run. The IAM policy test is in CI and passing.
+**Acceptance:** a deliberately unsigned image fails deployment in a test run. ✅ The deploy workflow's cosign verify step rejects images not signed by this repository's OIDC identity. SBOM absence and HIGH/CRITICAL vulnerabilities also block deploy.
 
 ---
 
@@ -305,7 +331,7 @@ The per-operation audit chain (§9) is the core artifact: tool call and argument
 |---|---|---|
 | **Before writing code** | ZT-2 audit started; fraud-signal inventory for ZT-1; DPoP viability check for ZT-6 | Know whether ZT-2 is a small fix or a programme |
 | **With the skeleton** | ZT-4 (security groups, DB roles), ZT-8 (egress enumeration), CI gates from §6.1 | These are cheap now, expensive later |
-| **Before shipping reads** | ZT-2 complete, ZT-3 deploy gate, ZT-7 kill switches | Reads cannot ship with A5 open |
+| **Before shipping reads** | ZT-2 complete, ZT-3 deploy gate ✅, ZT-7 kill switches | Reads cannot ship with A5 open |
 | **Before shipping writes** | ZT-1 complete, ZT-5 baseline alerting | Money cannot move without continuous authorization |
 | **Before production** | §6.2 red team scenarios; §5 residuals formally accepted | |
 

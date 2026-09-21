@@ -8,9 +8,13 @@ it onto a contextvar so that:
 * the IP tracker records client IPs
 * post-call evaluation runs ``RiskEngine`` + ``IpAnomalyDetector``
 
-The middleware does NOT hard-fail on HIGH signals — it records them and
-lets the tool complete. Tier escalation is handled by logging/alerting
-infrastructure (future work, ZT-1 refresh integration).
+Action model (per ZT-5 design):
+
+* ``LOW`` signals → logged, tool continues normally.
+* ``MEDIUM`` signals → session verification tier is escalated (tier 0 → 1,
+  or 1 → 2) so that subsequent calls require stronger verification.
+* ``HIGH`` signals → the current tool call is blocked with a
+  ``RiskActionError``, and the session is marked for termination.
 
 Session lifecycle:
 
@@ -39,6 +43,7 @@ from postern_core.risk.context import RiskContext
 from postern_core.risk.engine import RiskConfig, RiskEngine
 from postern_core.risk.ip_anomaly import IpAnomalyDetector
 from postern_core.risk.session import SessionStoreBase, set_current_session
+from postern_core.risk.types import RiskActionError
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,11 @@ class RiskMiddleware(Middleware):
             # Persist mutations (records, accounts, IPs) back to the store.
             await self.store.save_session(session_handle, ctx)
             return result
+        except RiskActionError:
+            # HIGH signal blocked the call — persist context (signals are on it)
+            # and re-raise so the caller sees the block.
+            await self.store.save_session(session_handle, ctx)
+            raise
         except Exception:
             # Even on failure, evaluate signals and persist (handler may have
             # recorded partial data before the exception).
@@ -144,9 +154,14 @@ class RiskMiddleware(Middleware):
         Runs after each tool call (success or failure). Data recording
         is done by handlers via ``get_current_session()`` before this runs.
 
-        Signals are stored on the context for audit logging and logged
-        at WARNING level for tier escalation monitoring.
-        No hard-fail is performed here — that's future work (ZT-1 refresh).
+        Action model:
+        - MEDIUM signals → escalate the session's verification tier so that
+          subsequent calls require stronger authentication.
+        - HIGH signals → raise ``RiskActionError`` to block the current call
+          and mark the session for termination.
+
+        All signals (regardless of severity) are stored on the context for
+        audit logging and logged at WARNING level.
         """
         try:
             # Evaluate general risk engine (record budgets, account diversity,
@@ -185,8 +200,35 @@ class RiskMiddleware(Middleware):
                     signal.description,
                 )
 
+            # --- Take action on MEDIUM and HIGH signals ---
+
+            # Escalate tier for any MEDIUM signal.
+            medium_signals = [s for s in signals if s.severity.name == "MEDIUM"] + [
+                s for s in ip_signals if s.severity.name == "MEDIUM"
+            ]
+            if medium_signals:
+                ctx.escalate_tier()
+                logger.info(
+                    "RiskMiddleware: escalated tier to %s for session=%s",
+                    ctx.verification_tier,
+                    session_handle[:8],
+                )
+
+            # Block on any HIGH signal.
+            high_signals = [s for s in signals if s.severity.name == "HIGH"] + [
+                s for s in ip_signals if s.severity.name == "HIGH"
+            ]
+            if high_signals:
+                logger.warning(
+                    "RiskMiddleware: blocking session=%s due to HIGH signals: %s",
+                    session_handle[:8],
+                    ", ".join(s.code for s in high_signals),
+                )
+                raise RiskActionError(high_signals)
+
         except Exception:
-            # Risk evaluation must never break the tool call.
+            # Risk evaluation must never break the tool call — unless it's a
+            # RiskActionError, which is intentionally raised to block the call.
             logger.exception(
                 "RiskMiddleware: risk evaluation failed; continuing without signal processing"
             )

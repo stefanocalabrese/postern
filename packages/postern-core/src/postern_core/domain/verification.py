@@ -49,6 +49,7 @@ to return an error or continue waiting.
 
 from __future__ import annotations
 
+import datetime as _dt
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -141,8 +142,6 @@ class Challenge:
 
     def __post_init__(self) -> None:
         """Set expires_at from created_at + TTL based on tier, if not provided."""
-        import datetime as _dt
-
         if self.expires_at is None:
             ttl_seconds = {
                 VerificationTier.SESSION_ONLY: 30,
@@ -278,8 +277,6 @@ class Challenge:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Challenge:
         """Deserialize from storage."""
-        import datetime as _dt
-
         created_at = _dt.datetime.fromtimestamp(data["created_at"], tz=UTC)
         expires_at_override = _dt.datetime.fromtimestamp(data["expires_at"], tz=UTC)
 

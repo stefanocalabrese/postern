@@ -20,6 +20,41 @@ class Severity(Enum):
     HIGH = auto()
 
 
+class RiskAction(Enum):
+    """What the middleware should do when a signal fires.
+
+    Maps severity to concrete action:
+    - ``LOW`` → log only, continue normally.
+    - ``MEDIUM`` → escalate the session's verification tier for subsequent
+      calls (tier 0 → tier 1, or tier 1 → tier 2).
+    - ``HIGH`` → hard-fail the current tool call and mark the session for
+      termination.
+    """
+
+    LOG = auto()
+    ESCALATE = auto()
+    BLOCK = auto()
+
+
+class RiskActionError(Exception):
+    """Raised by ``RiskMiddleware`` when a HIGH signal blocks a tool call.
+
+    Carries the signals that triggered the block so the caller can report
+    them to the user (e.g. "your session has been terminated due to
+    suspicious activity").
+
+    Attributes:
+        signals: The HIGH-severity signals that caused the block.
+    """
+
+    def __init__(self, signals: list[RiskSignal]) -> None:
+        self.signals = signals
+        super().__init__(
+            f"Session blocked by {len(signals)} risk signal(s): "
+            + ", ".join(s.code for s in signals)
+        )
+
+
 @dataclass(frozen=True)
 class RiskSignal:
     """One anomaly detected by the risk engine.

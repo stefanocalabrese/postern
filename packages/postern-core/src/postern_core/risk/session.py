@@ -199,15 +199,42 @@ class RedisSessionStore(SessionStoreBase):
         return handle
 
     async def get_session(self, session_handle: str) -> RiskContext | None:
-        """Look up the context for a session, or ``None`` if not found."""
+        """Look up the context for a session, or ``None`` if not found.
+
+        Computes remaining TTL from the deserialized context's ``_start_time``
+        so that sessions survive process restarts without losing their full
+        TTL budget. The original start time is wall-clock (stored in the JSON),
+        so we measure elapsed time since then and subtract from the configured
+        TTL to get what's left.
+        """
         data = await self._redis.get(self._key(session_handle))
         if data is None:
             return None
         try:
-            return RiskContext.from_json(data)
+            ctx = RiskContext.from_json(data)
         except (KeyError, ValueError, TypeError) as exc:  # pragma: no cover
             logger.warning("Failed to deserialize session %s: %s", session_handle, exc)
             return None
+
+        # Compute remaining TTL from the original start time. The stored
+        # _start_time is a wall-clock POSIX timestamp (set in to_dict()), so
+        # elapsed = now - start_time, and remaining = ttl - elapsed.
+        import time as _time
+
+        start_time = float(ctx.to_dict()["_start_time"])
+        elapsed = _time.time() - start_time
+        remaining_ttl = max(0, int(self._ttl - elapsed))
+
+        if remaining_ttl <= 0:
+            # Session has expired — clean up and return None.
+            await self._redis.delete(self._key(session_handle))
+            logger.info("Session %s expired (elapsed=%.1fs > ttl=%ds)", session_handle, elapsed, self._ttl)
+            return None
+
+        # Refresh the key with the computed remaining TTL so it doesn't
+        # expire prematurely on subsequent reads.
+        await self._redis.setex(self._key(session_handle), remaining_ttl, data)
+        return ctx
 
     async def remove_session(self, session_handle: str) -> None:
         """Remove a session."""

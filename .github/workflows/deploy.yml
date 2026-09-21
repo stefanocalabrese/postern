@@ -1,0 +1,213 @@
+name: deploy
+
+# workflow_dispatch ONLY — same model as ci.yml to avoid billed minutes.
+# Two stages: build (always runs on dispatch) and deploy (requires manual
+# environment approval). Each stage is idempotent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ${{ secrets.AWS_ECR_REGISTRY }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-1' }}
+
+jobs:
+  # ── Build stage ────────────────────────────────────────────────
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    outputs:
+      api_digest: ${{ steps.push-api.outputs.digest }}
+      confirm_digest: ${{ steps.push-confirm.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── CI gates (must pass before build) ───────────────────────
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: make lint
+      - run: make fmt-check
+      - run: make type
+      - run: make imports
+      - run: make lock
+      - run: make test
+
+      # ── Docker buildx (multi-platform, cache to ECR) ────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push api image
+        id: push-api
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          target: api
+          tags: |
+            ${{ env.REGISTRY }}/postern-api:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/postern-api:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/postern-api:buildcache,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Build and push confirm image
+        id: push-confirm
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          target: confirm
+          tags: |
+            ${{ env.REGISTRY }}/postern-confirm:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/postern-confirm:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/postern-confirm:buildcache,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      # ── SBOM generation (syft → SPDX) ───────────────────────────
+      - name: Generate SBOM — api
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/postern-api:${{ github.sha }}
+          output-file: sbom-api.spdx.json
+          format: spdx-json
+
+      - name: Generate SBOM — confirm
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/postern-confirm:${{ github.sha }}
+          output-file: sbom-confirm.spdx.json
+          format: spdx-json
+
+      # ── Vulnerability scanning (Trivy) ──────────────────────────
+      - name: Run Trivy scan — api
+        uses: aquasecurity/trivy-action@v0
+        with:
+          image-ref: ${{ env.REGISTRY }}/postern-api:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Run Trivy scan — confirm
+        uses: aquasecurity/trivy-action@v0
+        with:
+          image-ref: ${{ env.REGISTRY }}/postern-confirm:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      # ── Cosign signing (keyless, OIDC from GitHub) ──────────────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign api image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/postern-api@${{ steps.push-api.outputs.digest }}"
+
+      - name: Sign confirm image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/postern-confirm@${{ steps.push-confirm.outputs.digest }}"
+
+      # ── Upload SBOMs as artifacts (audit retention) ─────────────
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sboms-${{ github.sha }}
+          path: |
+            sbom-api.spdx.json
+            sbom-confirm.spdx.json
+          retention-days: 2555  # ~7 years for regulated compliance
+
+  # ── Deploy stage ───────────────────────────────────────────────
+
+  deploy:
+    name: deploy (${{ github.event.inputs.environment }})
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}  # manual approval gate
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Cosign verification (ZT-3 hard gate) ────────────────────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify cosign signature — api
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign verify \
+            --certificate-identity-regexp=".*" \
+            --certificate-oidc-issuer-regexp="https://token.actions.githubusercontent.com" \
+            --rekor-url=https://rekor.sigstore.dev \
+            "${{ env.REGISTRY }}/postern-api@${{ needs.build.outputs.api_digest }}" \
+            || (echo "::error::Cosign verification failed for api image — unsigned or tampered" && exit 1)
+
+      - name: Verify cosign signature — confirm
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign verify \
+            --certificate-identity-regexp=".*" \
+            --certificate-oidc-issuer-regexp="https://token.actions.githubusercontent.com" \
+            --rekor-url=https://rekor.sigstore.dev \
+            "${{ env.REGISTRY }}/postern-confirm@${{ needs.build.outputs.confirm_digest }}" \
+            || (echo "::error::Cosign verification failed for confirm image — unsigned or tampered" && exit 1)
+
+      # ── SBOM presence check ─────────────────────────────────────
+      - name: Download SBOM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sboms-${{ github.sha }}
+
+      - name: Verify SBOM presence — api
+        run: test -f sbom-api.spdx.json || (echo "::error::SBOM missing for api image" && exit 1)
+
+      - name: Verify SBOM presence — confirm
+        run: test -f sbom-confirm.spdx.json || (echo "::error::SBOM missing for confirm image" && exit 1)
+
+      # ── ECS deploy (placeholder — handoff §12.4 leaves this to platform team) ──
+      - name: Deploy api to ECS
+        run: |
+          echo "Deploying ${{ env.REGISTRY }}/postern-api@${{ needs.build.outputs.api_digest }} to ECS"
+          # TODO: aws ecs update-service --cluster <cluster> --service postern-api \
+          #        --task-definition <td-arn> --force-new-deployment
+          # The task definition references the image by digest, not tag.
+
+      - name: Deploy confirm to ECS
+        run: |
+          echo "Deploying ${{ env.REGISTRY }}/postern-confirm@${{ needs.build.outputs.confirm_digest }} to ECS"
+          # TODO: aws ecs update-service --cluster <cluster> --service postern-confirm \
+          #        --task-definition <td-arn> --force-new-deployment

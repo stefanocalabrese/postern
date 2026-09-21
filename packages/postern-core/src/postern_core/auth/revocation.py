@@ -78,13 +78,21 @@ class RevocationList:
     Thread-safe for the common case (single-threaded ASGI app). A production
     deployment would back this with Redis or a database table.
 
+    Uses O(1) set lookups per scope (audit fix 2026-09-21): three separate
+    sets indexed by the lookup key rather than one set requiring iteration.
+
     The check order matters: session revocation is checked first (most
     specific), then customer+client, then kill switch (least specific).
     This means a killed client's sessions are also caught by the session check.
     """
 
     def __init__(self) -> None:
-        self._entries: set[RevocationEntry] = set()
+        # O(1) lookup by jti — session revocation is the most specific scope.
+        self._session_jtis: set[str] = set()
+        # O(1) lookup by (customer_ref, client_id) — connected-app list.
+        self._customer_client: set[tuple[str, str]] = set()
+        # O(1) lookup by client_id — kill switch.
+        self._kill_switch: set[str] = set()
 
     def revoke_session(
         self,
@@ -104,7 +112,7 @@ class RevocationList:
                 (the jti alone is sufficient).
             client_id: Optional, for audit logging. Not used in the check.
         """
-        self._entries.add(RevocationEntry(jti=jti, customer_ref=customer_ref, client_id=client_id))
+        self._session_jtis.add(jti)
 
     def revoke_customer_client(
         self,
@@ -122,7 +130,7 @@ class RevocationList:
             customer_ref: The ``sub`` from the token (opaque customer identifier).
             client_id: The OAuth client ID of the AI vendor.
         """
-        self._entries.add(RevocationEntry(jti=None, customer_ref=customer_ref, client_id=client_id))
+        self._customer_client.add((customer_ref, client_id))
 
     def kill_switch(self, *, client_id: str) -> None:
         """Revoke every session from one client across all customers (ZT-7, kill switch).
@@ -133,14 +141,14 @@ class RevocationList:
         Args:
             client_id: The OAuth client ID of the AI vendor to disable.
         """
-        self._entries.add(RevocationEntry(jti=None, customer_ref=None, client_id=client_id))
+        self._kill_switch.add(client_id)
 
     def is_revoked(self, claims: dict[str, Any]) -> bool:
         """Check whether a token's claims are revoked.
 
         Returns True if any revocation entry matches the claims. The check
         order is: session (most specific) → customer+client → kill switch
-        (least specific).
+        (least specific). All lookups are O(1) set membership tests.
 
         Args:
             claims: The JWT claims dict (at minimum ``jti``, ``sub``, and
@@ -153,45 +161,38 @@ class RevocationList:
         customer_ref = claims.get("sub")
         client_id = claims.get("client_id")
 
-        # 1. Session revocation (most specific: jti alone)
-        if jti is not None:
-            for entry in self._entries:
-                if entry.jti == jti:
-                    return True
+        # 1. Session revocation (most specific: jti alone) — O(1).
+        if jti is not None and jti in self._session_jtis:
+            return True
 
-        # 2. Customer + client revocation (connected-app list)
+        # 2. Customer + client revocation (connected-app list) — O(1).
         if customer_ref is not None and client_id is not None:
-            for entry in self._entries:
-                if (
-                    entry.customer_ref == customer_ref
-                    and entry.client_id == client_id
-                    and entry.jti is None  # only customer-client entries, not session
-                ):
-                    return True
+            if (customer_ref, client_id) in self._customer_client:
+                return True
 
-        # 3. Kill switch (least specific: any token with this client_id)
-        if client_id is not None:
-            for entry in self._entries:
-                if entry.is_kill_switch and entry.client_id == client_id:
-                    return True
+        # 3. Kill switch (least specific: any token with this client_id) — O(1).
+        if client_id is not None and client_id in self._kill_switch:
+            return True
 
         return False
 
     def clear(self) -> None:
         """Remove all revocation entries. Useful for tests."""
-        self._entries.clear()
+        self._session_jtis.clear()
+        self._customer_client.clear()
+        self._kill_switch.clear()
 
     @property
     def entry_count(self) -> int:
         """Number of revocation entries (for testing/monitoring)."""
-        return len(self._entries)
+        return len(self._session_jtis) + len(self._customer_client) + len(self._kill_switch)
 
     def get_entries_by_scope(
         self,
     ) -> dict[str, int]:
         """Count entries by scope type. Useful for testing."""
         return {
-            "session": sum(1 for e in self._entries if e.is_session),
-            "customer_client": sum(1 for e in self._entries if e.is_customer_client),
-            "kill_switch": sum(1 for e in self._entries if e.is_kill_switch),
+            "session": len(self._session_jtis),
+            "customer_client": len(self._customer_client),
+            "kill_switch": len(self._kill_switch),
         }

@@ -48,6 +48,7 @@ is a validated token's subject to check it for, since consent has nowhere to
 read a customer from otherwise.
 """
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -106,6 +107,10 @@ def _read_key_source(settings: Settings) -> KeySource:
     refusing. `warn_ephemeral_signing_key` carries why it is neither gated
     nor fatal, and `docs/verification/2026-09-18-multi-replica-jwks.md`
     measures what the discarded key costs a caller.
+
+    Production deployments MUST set ``POSTERN_REQUIRE_PEM_KEY=1`` to refuse
+    startup with an ephemeral key. Without it, a restart changes the JWKS
+    and every verifier rejects all tokens until they re-fetch.
     """
     if settings.read_key_pem_path is not None:
         return FileKeySource(Path(settings.read_key_pem_path), kid=settings.read_key_kid)
@@ -117,6 +122,15 @@ def _read_key_source(settings: Settings) -> KeySource:
     warn_ephemeral_signing_key(
         role="READ", kid=settings.read_key_kid, pem_env_var="POSTERN_READ_KEY_PEM_PATH"
     )
+    # Audit finding (2026-09-21): refuse to start with ephemeral key when
+    # the operator has explicitly required a persisted PEM. Without this,
+    # a restart changes the JWKS and every verifier rejects all tokens.
+    if os.environ.get("POSTERN_REQUIRE_PEM_KEY") == "1":
+        raise RuntimeError(
+            "POSTERN_REQUIRE_PEM_KEY=1 but POSTERN_READ_KEY_PEM_PATH is not set. "
+            "A persisted PEM key is required for production: a restart with an "
+            "ephemeral key changes the JWKS and invalidates all existing tokens."
+        )
     return source
 
 
@@ -307,6 +321,20 @@ def create_app(
     from postern_core.risk.session import create_session_store
 
     session_store = create_session_store()
+
+    # Audit finding (2026-09-21): refuse to start without Redis when the
+    # operator has explicitly required it. Without Redis, sessions live only
+    # in process memory (lost on restart), revocation is lost on restart,
+    # and JTI replay protection is lost on restart. A production deployment
+    # that sets POSTERN_REQUIRE_REDIS=1 must also set POSTERN_REDIS_URL.
+    if os.environ.get("POSTERN_REQUIRE_REDIS") == "1":
+        redis_url = os.environ.get("POSTERN_REDIS_URL")
+        if not redis_url:
+            raise RuntimeError(
+                "POSTERN_REQUIRE_REDIS=1 but POSTERN_REDIS_URL is not set. "
+                "Production deployments require Redis for session persistence, "
+                "revocation lists, and JTI replay protection."
+            )
 
     server = build_server(
         settings,

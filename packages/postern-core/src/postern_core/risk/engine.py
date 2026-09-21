@@ -13,6 +13,12 @@ already in `facade/transactions.py`.
 
 Shared types (`RiskSignal`, ``Severity``) live in ``types.py`` to avoid
 circular imports with the IP anomaly detector.
+
+Future work: per-session call rate limiting (requests/minute). The current
+engine tracks records, accounts, days, and session age — but not the rate
+of calls. A burst of 50 calls in one second with small payloads would not
+trigger any signal today. A ``call_rate_per_minute`` threshold in a future
+``RiskConfig`` would catch this pattern. See audit finding (2026-09-21).
 """
 
 from __future__ import annotations

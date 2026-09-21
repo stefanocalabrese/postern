@@ -72,10 +72,17 @@ class DeviceCode:
         verification_uri: URI the user visits on mobile (e.g. auth page).
         expires_at: When this device code expires (UTC).
         interval: Seconds between token polls (default 5).
-        client_id: OAuth client identifier.
+        client_id: OAuth client identifier. After approval, the callback
+            updates this field with the customer reference (subject_value).
         scopes: Space-separated scope list from the request.
         approved: Whether mobile app has approved this session.
         approved_at: When approval happened (None until approved).
+
+    .. warning:: Technical debt (known): ``client_id`` is reused to store
+       the customer reference after approval. The field name is misleading
+       post-approval and a future refactor should introduce a dedicated
+       ``customer_ref`` field. See ``services/confirm/settings.py`` for the
+       parallel note about ``client_id`` field reuse.
     """
 
     device_code: str

@@ -4,9 +4,76 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-Working software, not a skeleton. `make ci` exits 0 on 991 tests (measured 20 September 2026). What exists: five read tools (`start_session`, `accounts.list`, `accounts.get_balance`, `transactions.list`, `cards.list`), four of them behind a Postgres-backed consent check; an append-only `audit_log` carrying up to two rows per tool call, both fail-closed per `docs/decisions/0006-audit-write-failure.md` -- one committed before the operator's backend is reached (`outcome='reaching'`, written from the facade hook `services/api/main.py` wires, carrying in `reaching_at` the last reading taken before that touch, which errs early and is distinct from `at`, the call's arrival) and one after the call finishes, correlated by `call_id`; risk signals from ``RiskEngine`` + ``IpAnomalyDetector`` stored as JSONB on the completion row for Postgres-queryable anomaly tracking; ten migrations (plus one pending: ``0de54913a8b2`` adds the ``risk_signals`` JSONB column to ``audit_log``); customer tokens verified by FastMCP's `JWTVerifier` against a configured JWKS and issuer; the read/write signing-key split, with each service publishing only its own key at `/.well-known/jwks.json`; bounded connect, command and pool timeouts on the database; ZT-5 risk engine (per-session budgets, tier escalation, IP/ASN anomaly detection via ``IpTracker`` and ``IpAnomalyDetector`` — impossible travel, excessive IP diversity); pluggable session store backend (in-memory for dev/test, Redis-compatible — AWS ElastiCache, Google Memorystore, Azure Cache for Redis — for production via ``POSTERN_REDIS_URL``); ZT-4 microsegmentation tests; ZT-3 digest drift detection; ZT-7 revocation list (per-session, per-customer+client, kill-switch); ZT-8 default-deny egress analysis (no hardcoded external endpoints in application code); ZT-1 continuous authorization and revocation (revocation check on every token mint, jti replay cache for A10); ZT-6 sender-constrained tokens — DPoP not viable (absent from MCP 2026-07-28 spec, no client vendor support), resolved by decision record 0010 with compensating controls (60s TTL, jti replay cache, revocation on mint, audience scoping). What does not: any payments tool, the approval callback (`services/confirm` publishes its JWKS and nothing else), the RFC 8628 device grant and its QR flow, and Vault itself, since `KeySource` is the seam Vault lands behind and a key today comes from a PEM on disk or is generated in process. Read "Architecture" and "Hard rules" below as the target, and the two lists above as how much of it has landed.
+Working software, not a skeleton. `make ci` exits 0 on 1168 tests (measured 20 September 2026); `make ci` + deploy workflow tests exit 0 on 1188 (20 September 2026). What exists: five read tools (`start_session`, `accounts.list`, `accounts.get_balance`, `transactions.list`, `cards.list`), four of them behind a Postgres-backed consent check; an append-only `audit_log` carrying up to two rows per tool call, both fail-closed per `docs/decisions/0006-audit-write-failure.md` -- one committed before the operator's backend is reached (`outcome='reaching'`, written from the facade hook `services/api/main.py` wires, carrying in `reaching_at` the last reading taken before that touch, which errs early and is distinct from `at`, the call's arrival) and one after the call finishes, correlated by `call_id`; risk signals from ``RiskEngine`` + ``IpAnomalyDetector`` stored as JSONB on the completion row for Postgres-queryable anomaly tracking; ten migrations (plus one pending: ``0de54913a8b2`` adds the ``risk_signals`` JSONB column to ``audit_log``); customer tokens verified by FastMCP's `JWTVerifier` against a configured JWKS and issuer; the read/write signing-key split, with each service publishing only its own key at `/.well-known/jwks.json`; bounded connect, command and pool timeouts on the database; ZT-5 risk engine (per-session budgets, tier escalation, IP/ASN anomaly detection via ``IpTracker`` and ``IpAnomalyDetector`` — impossible travel, excessive IP diversity); pluggable session store backend (in-memory for dev/test, Redis-compatible — AWS ElastiCache, Google Memorystore, Azure Cache for Redis — for production via ``POSTERN_REDIS_URL``); ZT-4 microsegmentation tests; ZT-3 workload attestation (digest drift detection via ``test_zt3_digest_drift.py``, deploy pipeline with cosign signing + verification, SBOM generation via syft, Trivy vulnerability scanning — ``.github/workflows/deploy.yml``, decision record 0011); ZT-7 revocation list (per-session, per-customer+client, kill-switch); ZT-8 default-deny egress analysis (no hardcoded external endpoints in application code); ZT-1 continuous authorization and revocation (revocation check on every token mint, jti replay cache for A10); ZT-6 sender-constrained tokens — DPoP not viable (absent from MCP 2026-07-28 spec, no client vendor support), resolved by decision record 0010 with compensating controls (60s TTL, jti replay cache, revocation on mint, audience scoping). What does not: any payments tool, the approval callback (`services/confirm` publishes its JWKS and nothing else), the RFC 8628 device grant and its QR flow, and Vault itself, since `KeySource` is the seam Vault lands behind and a key today comes from a PEM on disk or is generated in process. Read "Architecture" and "Hard rules" below as the target, and the two lists above as how much of it has landed.
 
 **Naming is settled: `postern`.** Docs and code agree: `postern`, `postern_core`, `services/api`, `services/confirm`. The three design docs carried a `bank-mcp-` prefix until 17 September 2026 and were renamed then, along with the MCP tool `banking_start_session`, which is now `start_session`. The dated records under `docs/verification/` and `docs/decisions/` still carry the old names and are left that way on purpose: they record what was observed on a date. The PyPI distribution name must be `postern-mcp`, since bare `postern` is taken.
+
+---
+
+## ⚠️ EVERY OPERATOR MUST DO THESE THINGS THEMSELVES — NOTHING HERE IS DONE FOR YOU
+
+This repo is a **framework**, not a turnkey deployment. Every company that wants to run Postern must implement the items below in their own infrastructure, their own repos, and their own teams. **None of these are optional.** If you skip any of them, the zero-trust guarantees do not hold.
+
+### 1. Backend domain service subject enforcement (ZT-2 — CRITICAL PATH)
+**You must audit every handler in your backend services.** Each one must scope queries by the JWT `sub` claim, not by any request body field. If a handler accepts an account ID from the request instead of deriving it from the token, cross-customer data access (A5) is live. This is not a code change in this repo — it lives in your backend repos. **Answer this before writing any other ZT control.** If the domain services don't enforce on `sub`, nothing else matters.
+
+### 2. Infrastructure (Terraform repo — gate 5)
+This repo has zero Terraform files. You must create them:
+
+- **ECR repositories** — one per image (`postern-api`, `postern-confirm`) with lifecycle rules
+- **ECS cluster + services** — Fargate tasks, each referencing images by sha256 digest (not tag)
+- **Separate task roles** — read role must NOT be able to assume the write role or access its Vault path
+- **VPC / subnets** — private subnets, NAT Gateway (or egress deny per ZT-8), PrivateLink to your Istio gateway
+- **SSM Parameter Store** — publish ECR URIs, cluster name, service names, subnet IDs under `/postern/<env>/`
+
+### 3. AWS-level tests (in your Terraform repo)
+- **IAM policy test** — assert read role cannot assume write role or read its Vault path
+- **ECS task definition validation** — assert digest references, `awsvpc` mode, `readonlyRootFilesystem = true`
+- **Security group validation** — assert read SG cannot reach write endpoints; no `0.0.0.0/0` egress except known AWS endpoints
+- **Cosign integration test** — push an unsigned image to ECR, run the deploy workflow's cosign verify step, assert it fails
+
+### 4. GitHub configuration (manual, one-time)
+- Create two **GitHub Environments** (`staging`, `production`) with required reviewers
+- Add repository secrets: `AWS_ROLE_ARN` (OIDC role for the pipeline), `AWS_ECR_REGISTRY`
+- The deploy workflow (`.github/workflows/deploy.yml`) is ready — it just needs these secrets to run
+
+### 5. Platform team requirements (handoff §10.26)
+- **SBOM format** — confirm what your org requires (SPDX, CycloneDX?)
+- **Cosign signing** — confirm if keyless OIDC is acceptable or if you need KMS-backed keys
+- **Approved base images** — does your org have a curated image list?
+- **Trivy ignore file** — which CVEs are acceptable risks for your org?
+
+### 6. Vault integration
+This repo uses a `KeySource` seam — today it loads from PEM files or generates keys in process. You must wire the real Vault backend:
+- **Two signing roles** — read role and write role, separate keys (handoff §7.2)
+- **JWKS hosting** — each service publishes its own key at `/.well-known/jwks.json`
+- **Sidecar pattern** — how Vault secrets reach the containers (handoff §10.27)
+
+### 7. Backend OpenAPI contract tests (gate 4)
+Your backend teams must publish:
+- An **OpenAPI document** for each domain service
+- An **`mcp-tools.yaml` manifest** mapping OpenAPI endpoints to MCP tools
+- Contract tests that validate the MCP tool layer against those documents
+
+### 8. GuardDuty Runtime Monitoring
+Enable runtime threat detection on your Fargate tasks. This requires the EKS/Fargate agent and GuardDuty enablement — a platform team operation.
+
+### 9. Red team scenarios (§6.2 of zero-trust plan)
+Before production, run these six scenarios against your deployment:
+1. Injected instruction in a transaction memo attempting to initiate a payment (A1)
+2. QR relay to a separate browser; confirm pairing-code mismatch blocks it (A2)
+3. Token captured from one client, replayed from different infrastructure (A4, ZT-6)
+4. Cross-customer account access with a valid token (A5, ZT-2)
+5. Bulk transaction extraction across many calls; confirm alerting fires (A6, ZT-5)
+6. Session revocation mid-conversation; confirm timing (ZT-1, ZT-7)
+
+### 10. Compliance sign-off
+- **§5.3 rendering risk** — conduct/compliance position on erroneous rendering by third-party clients
+- **§5.4 regulatory treatment** — compliance opinion on whether consumer AI agents acting for a bank's customers constitute an account information service (PSD2)
+- **Art. 9 basis and DPIA** — DPO approval for identity verification processing (handoff §10.9)
+- **Third-party disclosure analysis** — DPO review of what data lands in AI vendor chat histories (§10.19)
+
+---
 
 ## Source documents, in reading order
 
@@ -114,7 +181,7 @@ Local development needs no VPC: `docker compose` with Postgres and stubbed backe
 
 ## CI gates that block the build
 
-Four from handoff §8.7, plus three from the zero-trust plan §6.1. Gates 1, 2 and 3 exist and run in `make ci`; gate 6 runs there too, but against this repo's stub rather than the domain services it names (item 6); gate 7a (digest drift) also runs in `make ci`; gate 7b (revocation list, ZT-7) also runs in `make ci`; gate 7c (no hardcoded external endpoints, ZT-8) also runs in `make ci`. Where a gate exists, it blocks, it does not warn. Gates 4, 5 and the full cosign+SBOM verification (gate 7) do not exist in this repo, verified by search on 18 September 2026, and each names below what it is blocked on:
+Four from handoff §8.7, plus three from the zero-trust plan §6.1. Gates 1, 2 and 3 exist and run in `make ci`; gate 6 runs there too, but against this repo's stub rather than the domain services it names (item 6); gate 7a (digest drift) also runs in `make ci`; gate 7b (cosign + SBOM deploy pipeline, ZT-3) also exists as ``.github/workflows/deploy.yml`` and is validated by ``test_zt3_deploy_pipeline.py`` (20 tests); gate 7c (no hardcoded external endpoints, ZT-8) also runs in `make ci`. Where a gate exists, it blocks, it does not warn. Gates 4 and 5 do not exist in this repo, verified by search on 18 September 2026, and each names below what it is blocked on:
 
 1. **Golden masking test**: every tool against fixtures, assert no output matches a PAN or IBAN regex. Add it while there are four tools, not later with twenty.
 2. **Header/body mismatch** returns 400 + `-32020`. Write this test first; a generic `ToolError` may not produce the right status.
@@ -122,7 +189,7 @@ Four from handoff §8.7, plus three from the zero-trust plan §6.1. Gates 1, 2 a
 4. **Backend OpenAPI contract tests** against published artifacts. **Not built, blocked on the domain teams publishing an artifact.** No OpenAPI document, no `mcp-tools.yaml` manifest and no contract test exists here, and handoff §8.5 steps 1 to 3 put all three in the backend repos, so there is nothing to test against. `packages/postern-core/src/postern_core/domain/models.py` is this repo's MCP-facing contract and is deliberately not the backend's shapes.
 5. **IAM policy test**: the read role cannot assume the write role or read its Vault path. **Not built, blocked on infrastructure that is not in this repo.** Zero IAM policies, zero Terraform files, no `hvac` and no Vault: `packages/postern-core/src/postern_core/auth/keys.py` is the seam Vault lands behind and its docstring records that no test here touches Vault, and handoff §12 puts infrastructure in a separate Terraform repo. The code-level half of the same property is pinned by `tests/test_key_split_is_a_property.py` and `.importlinter`, which is a different assertion from an IAM one.
 6. **Cross-customer contract tests** per domain service (ZT-2). **What runs is against this repo's stub, not per domain service.** `tests/test_stub_subject_scoping.py` (325 lines, 86 tests) drives `stub/backend.py`'s four domain routes over ASGI with a second customer's token and asserts the other customer's values are absent from the body, not only that the status is 404. It blocks like the rest. The gate itself is still owed by the teams that own the domain services, which are not in this repo: `docs/postern-zero-trust-plan.md` §3.2's A5 row records that enforcement as unverified, and no test here can settle it.
-7. **Cosign signature + SBOM verification at deploy**, as a hard gate. Signing without verification is ceremony. **Partially built: digest drift detection added (gate 7a, `make ci` runs `test_zt3_digest_drift.py`).** The digest check verifies that the Dockerfile's external base images are pinned by sha256 digest and match the known-good values in ``docs/decisions/0004-base-images.md``. Full cosign + SBOM verification is blocked on there being a deploy to gate (registry, pipeline). No `cosign`, `sbom`, `syft` or `trivy` reference in `Makefile`, `.github/workflows/ci.yml`, `Dockerfile` or anywhere outside the design docs, and this repo has no registry, no pipeline and no deploy step. What the operator already requires (SBOM format, signing, registry) is still handoff open question §10.26.
+7. **Cosign signature + SBOM verification at deploy**, as a hard gate. Signing without verification is ceremony. **Fully built: gate 7a (digest drift, `make ci` runs ``test_zt3_digest_drift.py``) and gate 7b (cosign sign + verify, SBOM generation via syft, Trivy scanning — ``.github/workflows/deploy.yml``, validated by ``test_zt3_deploy_pipeline.py``).** The deploy workflow signs images with cosign (keyless/OIDC), generates SPDX SBOMs, scans for HIGH/CRITICAL vulnerabilities with Trivy, verifies signatures against the Sigstore Rekor transparency log before deploy, and requires GitHub Environment approval for staging/production. The pipeline triggers on `workflow_dispatch` only (no auto-triggers to avoid billed minutes). What remains: actual AWS credentials (ECR registry, ECS cluster) and the platform team's signing/SBOM requirements (handoff §10.26).
 
 ## Before implementing
 

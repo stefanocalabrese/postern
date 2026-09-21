@@ -14,6 +14,7 @@ import json
 import time
 from dataclasses import dataclass
 
+from postern_core.domain.verification import VerificationTier
 from postern_core.risk.types import RiskSignal
 
 
@@ -52,15 +53,30 @@ class IpTracker:
 
     Usage: call ``record_ip()`` from middleware or handler with the client IP;
     the tracker accumulates entries and exposes properties for anomaly detection.
+
+    **Bounded:** oldest entries are dropped when the list exceeds ``max_entries``
+    (default 100). This prevents unbounded memory growth from a session that
+    touches many distinct IPs (which itself is suspicious, but we must not
+    amplify the attack by allocating unbounded memory).
+
+    Audit fix (2026-09-21): previously unbounded — a session cycling through
+    thousands of IPs would grow the list without limit.
     """
 
-    __slots__ = ("_entries",)
+    __slots__ = ("_entries", "_max_entries")
 
-    def __init__(self) -> None:
+    def __init__(self, max_entries: int = 100) -> None:
         self._entries: list[IpEntry] = []
+        self._max_entries = max_entries
 
     def record_ip(self, ip_address: str) -> None:
-        """Record a client IP address at the current monotonic time."""
+        """Record a client IP address at the current monotonic time.
+
+        If the tracker is full, drops the oldest entry before appending
+        (FIFO eviction). This bounds memory at ``max_entries * sizeof(IpEntry)``.
+        """
+        if len(self._entries) >= self._max_entries:
+            self._entries.pop(0)  # Drop oldest entry.
         self._entries.append(IpEntry(ip_address=ip_address, recorded_at=time.monotonic()))
 
     @property
@@ -142,6 +158,7 @@ class RiskContext:
         "_ip_tracker",
         "_session_id",
         "_risk_signals",
+        "_verification_tier",
     )
 
     def __init__(self, session_id: str | None = None) -> None:
@@ -152,6 +169,7 @@ class RiskContext:
         self._ip_tracker = IpTracker()
         self._session_id = session_id
         self._risk_signals: list[RiskSignal] = []
+        self._verification_tier: VerificationTier = VerificationTier.SESSION_ONLY
 
     @property
     def record_count(self) -> RecordCount:
@@ -189,6 +207,30 @@ class RiskContext:
         """
         return self._risk_signals
 
+    @property
+    def verification_tier(self) -> VerificationTier:
+        """Current verification tier for this session.
+
+        Starts at ``SESSION_ONLY`` and escalates via
+        :meth:`escalate_tier` when the risk engine emits MEDIUM signals.
+        """
+        return self._verification_tier
+
+    def escalate_tier(self) -> None:
+        """Escalate the verification tier by one level.
+
+        Moves ``SESSION_ONLY`` → ``APP_APPROVAL`` →
+        ``APP_IDENTITY_VERIFICATION``.  Once at the maximum tier, this is
+        a no-op (the session cannot escalate further).
+
+        Called by ``RiskMiddleware`` when the risk engine emits MEDIUM
+        signals, so that subsequent tool calls require stronger verification.
+        """
+        if self._verification_tier < VerificationTier.APP_IDENTITY_VERIFICATION:
+            object.__setattr__(
+                self, "_verification_tier", VerificationTier(self._verification_tier + 1)
+            )
+
     def record_records(self, count: int) -> None:
         """Add `count` records to the session total."""
         self._records += count
@@ -210,6 +252,7 @@ class RiskContext:
             "max_days_requested": self._max_days,
             "session_age_seconds": round(self.session_age_seconds, 1),
             "session_id": self._session_id,
+            "verification_tier": str(self._verification_tier),
         }
         snap.update(self._ip_tracker.snapshot())
         return snap
@@ -237,6 +280,7 @@ class RiskContext:
                 }
                 for s in self._risk_signals
             ],
+            "_verification_tier": int(self._verification_tier),
         }
 
     @classmethod
@@ -260,6 +304,7 @@ class RiskContext:
             )
             for s in raw_signals  # type: ignore[attr-defined]
         ]
+        ctx._verification_tier = VerificationTier(int(data.get("_verification_tier", 0)))  # type: ignore[call-overload]
         return ctx
 
     def to_json(self) -> str:
