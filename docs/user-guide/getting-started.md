@@ -145,16 +145,20 @@ uv run uvicorn services.api.main:app --reload --port 8080
 uv run uvicorn services.confirm.main:app --reload --port 8082
 ```
 
-## Production Deployment Checklist
+## Production Deployment
 
-- [ ] Set `POSTERN_READ_KEY_PEM_PATH` to a persisted PEM key (not ephemeral)
-- [ ] Set `POSTERN_WRITE_KEY_PEM_PATH` to a persisted PEM key
-- [ ] Set `POSTERN_REDIS_URL` and `POSTERN_REQUIRE_REDIS=1`
-- [ ] Set `POSTERN_JWKS_URI` and `POSTERN_TOKEN_ISSUER` for customer JWT validation
-- [ ] Set `POSTERN_STRICT_HEADERS=1` to enforce MCP Streamable HTTP header compliance
-- [ ] Set `POSTERN_REQUIRE_PEM_KEY=1` to refuse startup with ephemeral keys
-- [ ] Configure Istio JWT validation (ZT-2) — domain services must scope queries by token `sub`
-- [ ] Run database migrations before first startup: `alembic upgrade head`
+Before deploying, ensure the following configuration items are set:
+
+| Item | Variable(s) | Purpose |
+|------|-------------|---------|
+| Persisted read key | `POSTERN_READ_KEY_PEM_PATH` | Not ephemeral — survives restarts |
+| Persisted write key | `POSTERN_WRITE_KEY_PEM_PATH` | Not ephemeral — survives restarts |
+| Redis backend | `POSTERN_REDIS_URL`, `POSTERN_REQUIRE_REDIS=1` | Session store and device code persistence |
+| JWKS / issuer URIs | `POSTERN_JWKS_URI`, `POSTERN_TOKEN_ISSUER` | Customer JWT validation |
+| Strict headers | `POSTERN_STRICT_HEADERS=1` | Enforce MCP Streamable HTTP header compliance |
+| Require PEM key | `POSTERN_REQUIRE_PEM_KEY=1` | Refuse startup with ephemeral keys |
+| Istio JWT validation (ZT-2) | — | Domain services must scope queries by token `sub` |
+| Database migrations | — | Run `alembic upgrade head` before first startup |
 
 ## Next Steps
 
