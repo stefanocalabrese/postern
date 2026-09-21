@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from postern_core.risk.types import RiskSignal
 
@@ -105,8 +105,7 @@ class IpTracker:
         """
         return {
             "entries": [
-                {"ip_address": e.ip_address, "recorded_at": e.recorded_at}
-                for e in self._entries
+                {"ip_address": e.ip_address, "recorded_at": e.recorded_at} for e in self._entries
             ],
         }
 

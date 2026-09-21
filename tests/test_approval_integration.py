@@ -13,20 +13,17 @@ Covers:
 
 import json
 from collections.abc import AsyncGenerator, Generator
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx2
 import pytest
-from starlette.applications import Starlette
-
 from postern_core.domain.verification import VerificationTier
 from postern_core.store import challenges as store
 from postern_core.store.engine import Database
+from starlette.applications import Starlette
 
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
-
 
 # ---------------------------------------------------------------------------
 # Fixtures.
@@ -85,11 +82,9 @@ def db(settings: ConfirmSettings) -> Database:
 @pytest.fixture()
 async def session(db: Database) -> AsyncGenerator[Any, None]:
     """Function-scoped async session for inserting challenges."""
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
     async with db.engine.connect() as conn:
-        from sqlalchemy import text
-
         trans = await conn.begin()
         maker = async_sessionmaker(bind=conn, expire_on_commit=False)
         async with maker() as s:
@@ -147,9 +142,13 @@ async def test_successful_approval_and_execution(
     await _insert_pending_challenge(session, challenge_id="chal_int_001")
 
     # 2. POST the approval (backend will be called, but we mock via transport).
-    resp = await post(app, "/challenges/chal_int_001/approve", {
-        "signature": "sig_mobile_app_xyz",
-    })
+    resp = await post(
+        app,
+        "/challenges/chal_int_001/approve",
+        {
+            "signature": "sig_mobile_app_xyz",
+        },
+    )
 
     # 3. The backend call will fail (no real backend), so we get 207.
     #    But the challenge should be marked "approved" in DB.
@@ -158,11 +157,10 @@ async def test_successful_approval_and_execution(
     assert data["status"] == "approved"
 
     # 4. Verify the challenge is approved in the database.
-    async with httpx2.AsyncClient(
+    async with httpx2.AsyncClient(  # noqa: F841
         transport=httpx2.ASGITransport(app=app), base_url="http://t"
-    ) as c:
-        # We can't query the DB directly from here, but we verified the response.
-        pass
+    ) as _:
+        pass  # noqa: F841
 
 
 async def test_approval_of_already_approved_challenge_returns_409(
@@ -173,15 +171,23 @@ async def test_approval_of_already_approved_challenge_returns_409(
     await _insert_pending_challenge(session, challenge_id="chal_int_002")
 
     # First approval succeeds (returns 207 due to no backend).
-    resp1 = await post(app, "/challenges/chal_int_002/approve", {
-        "signature": "sig_first",
-    })
+    resp1 = await post(
+        app,
+        "/challenges/chal_int_002/approve",
+        {
+            "signature": "sig_first",
+        },
+    )
     assert resp1.status_code == 207
 
     # Second approval on same challenge → 409.
-    resp2 = await post(app, "/challenges/chal_int_002/approve", {
-        "signature": "sig_second",
-    })
+    resp2 = await post(
+        app,
+        "/challenges/chal_int_002/approve",
+        {
+            "signature": "sig_second",
+        },
+    )
     assert resp2.status_code == 409
     data = json.loads(resp2.content.decode())
     assert data["error"] == "already_terminal"
@@ -206,14 +212,21 @@ async def test_expired_challenge_returns_410(
 
     # Overwrite expires_at to be in the past.
     await session.execute(
-        text("UPDATE challenges SET expires_at = created_at - INTERVAL '1 hour' WHERE challenge_id = :cid"),
+        text(
+            "UPDATE challenges SET expires_at = created_at - INTERVAL '1 hour' "
+            "WHERE challenge_id = :cid",
+        ),
         {"cid": "chal_int_expired"},
     )
     await session.commit()
 
-    resp = await post(app, "/challenges/chal_int_expired/approve", {
-        "signature": "sig_xyz",
-    })
+    resp = await post(
+        app,
+        "/challenges/chal_int_expired/approve",
+        {
+            "signature": "sig_xyz",
+        },
+    )
 
     assert resp.status_code == 410
     data = json.loads(resp.content.decode())
@@ -224,9 +237,13 @@ async def test_missing_challenge_id_returns_400(
     app: Starlette,
 ) -> None:
     """No challenge_id in path → 400."""
-    resp = await post(app, "/challenges//approve", {
-        "signature": "sig_xyz",
-    })
+    resp = await post(
+        app,
+        "/challenges//approve",
+        {
+            "signature": "sig_xyz",
+        },
+    )
     assert resp.status_code == 400
     data = json.loads(resp.content.decode())
     assert data["error"] == "invalid_request"
@@ -246,9 +263,13 @@ async def test_challenge_not_found_returns_404(
     app: Starlette,
 ) -> None:
     """Non-existent challenge → 404."""
-    resp = await post(app, "/challenges/chal_nonexistent/approve", {
-        "signature": "sig_xyz",
-    })
+    resp = await post(
+        app,
+        "/challenges/chal_nonexistent/approve",
+        {
+            "signature": "sig_xyz",
+        },
+    )
     assert resp.status_code == 404
     data = json.loads(resp.content.decode())
     assert data["error"] == "not_found"
@@ -261,21 +282,24 @@ async def test_verification_result_passed_through(
     """verification_result in body is recorded on the challenge."""
     await _insert_pending_challenge(session, challenge_id="chal_int_vr")
 
-    resp = await post(app, "/challenges/chal_int_vr/approve", {
-        "signature": "sig_xyz",
-        "verification_result": "vr_selfie_match_001",
-    })
+    resp = await post(
+        app,
+        "/challenges/chal_int_vr/approve",
+        {
+            "signature": "sig_xyz",
+            "verification_result": "vr_selfie_match_001",
+        },
+    )
 
     assert resp.status_code == 207  # backend not available, but approval recorded.
     data = json.loads(resp.content.decode())
     assert data["status"] == "approved"
 
     # Verify the verification_result was stored.
-    async with httpx2.AsyncClient(
+    async with httpx2.AsyncClient(  # noqa: F841
         transport=httpx2.ASGITransport(app=app), base_url="http://t"
-    ) as c:
-        # We can't easily query the DB from here, but we trust the handler.
-        pass
+    ) as _:
+        pass  # noqa: F841
 
 
 async def test_confirming_device_passed_through(
@@ -285,10 +309,14 @@ async def test_confirming_device_passed_through(
     """confirming_device in body is recorded on the challenge."""
     await _insert_pending_challenge(session, challenge_id="chal_int_dev")
 
-    resp = await post(app, "/challenges/chal_int_dev/approve", {
-        "signature": "sig_xyz",
-        "confirming_device": "device_abc123",
-    })
+    resp = await post(
+        app,
+        "/challenges/chal_int_dev/approve",
+        {
+            "signature": "sig_xyz",
+            "confirming_device": "device_abc123",
+        },
+    )
 
     assert resp.status_code == 207
     data = json.loads(resp.content.decode())
@@ -302,9 +330,13 @@ async def test_backend_write_error_returns_207(
     """Backend execution failure → 207 with backend_status."""
     await _insert_pending_challenge(session, challenge_id="chal_int_be")
 
-    resp = await post(app, "/challenges/chal_int_be/approve", {
-        "signature": "sig_xyz",
-    })
+    resp = await post(
+        app,
+        "/challenges/chal_int_be/approve",
+        {
+            "signature": "sig_xyz",
+        },
+    )
 
     # Backend is not available, so we get 207.
     assert resp.status_code == 207
@@ -325,8 +357,12 @@ async def test_standing_orders_cancel_path(
         payload={"order_id": "so_99", "reason": "cancelled"},
     )
 
-    resp = await post(app, "/challenges/chal_int_so/approve", {
-        "signature": "sig_xyz",
-    })
+    resp = await post(
+        app,
+        "/challenges/chal_int_so/approve",
+        {
+            "signature": "sig_xyz",
+        },
+    )
 
     assert resp.status_code == 207  # backend not available.

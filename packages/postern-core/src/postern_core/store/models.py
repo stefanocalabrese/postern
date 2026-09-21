@@ -844,6 +844,7 @@ class AuditEntry(Base):
 # ChallengeRecord — approval workflow state (handoff §7.4, §8.3).
 # ---------------------------------------------------------------------------
 
+
 class ChallengeRecord(Base):
     """SQLAlchemy model for the challenge approval workflow.
 
@@ -911,16 +912,23 @@ class ChallengeRecord(Base):
     signature: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        # Closed vocabulary for tier: 0 = session, 1 = app approval, 2 = app + identity verification.
+        # Closed vocabulary for tier: 0=session, 1=app approval,
+        # 2=app + identity verification.
         CheckConstraint(
             column("tier").in_((0, 1, 2)),
             name="ck_challenges_tier",
         ),
         # Closed vocabulary for status.
         CheckConstraint(
-            column("status").in_((
-                "pending", "approved", "executed", "declined", "expired",
-            )),
+            column("status").in_(
+                (
+                    "pending",
+                    "approved",
+                    "executed",
+                    "declined",
+                    "expired",
+                )
+            ),
             name="ck_challenges_status",
         ),
     )

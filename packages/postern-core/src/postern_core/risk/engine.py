@@ -17,8 +17,7 @@ circular imports with the IP anomaly detector.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 from postern_core.risk.context import RiskContext
 from postern_core.risk.types import RiskSignal, Severity

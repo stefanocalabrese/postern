@@ -58,9 +58,7 @@ class ConfirmSettings:
                 "POSTERN_DEVICE_VERIFICATION_URI",
                 "https://auth.postern.internal/verify",
             ),
-            device_code_ttl_seconds=int(
-                os.environ.get("POSTERN_DEVICE_CODE_TTL_SECONDS", "900")
-            ),
+            device_code_ttl_seconds=int(os.environ.get("POSTERN_DEVICE_CODE_TTL_SECONDS", "900")),
             device_poll_interval_seconds=int(
                 os.environ.get("POSTERN_DEVICE_POLL_INTERVAL_SECONDS", "5")
             ),
@@ -69,9 +67,7 @@ class ConfirmSettings:
             read_token_issuer=os.environ.get(
                 "POSTERN_READ_TOKEN_ISSUER", "https://mcp-read.internal"
             ),
-            backend_base_url=os.environ.get(
-                "POSTERN_BACKEND_BASE_URL", "https://backend.internal"
-            ),
+            backend_base_url=os.environ.get("POSTERN_BACKEND_BASE_URL", "https://backend.internal"),
             database_url=os.environ.get(
                 "POSTERN_DATABASE_URL",
                 "postgresql+asyncpg://postern:postern@localhost:5432/postern",

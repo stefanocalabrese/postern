@@ -36,6 +36,7 @@ class _MinterProtocol(Protocol):
         challenge_id: str = ...,
     ) -> str: ...
 
+
 # Built once at import time: validating a bare string against `FreeText`
 # doesn't need a wrapping `BaseModel`, just its `AfterValidator`.
 _FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)

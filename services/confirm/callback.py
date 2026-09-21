@@ -152,22 +152,28 @@ async def approve_challenge(request: Request) -> JSONResponse:
             )
             await session.commit()
 
-            return _json(200, {
-                "challenge_id": challenge_id,
-                "status": "executed",
-                "message": f"{challenge_record.tool_name} executed successfully",
-            })
+            return _json(
+                200,
+                {
+                    "challenge_id": challenge_id,
+                    "status": "executed",
+                    "message": f"{challenge_record.tool_name} executed successfully",
+                },
+            )
 
         except BackendWriteError as exc:
             # Execution failed — challenge is approved but not executed.
             # The backend may have partially processed the request; audit trail
             # captures this state for investigation.
-            return _json(207, {
-                "challenge_id": challenge_id,
-                "status": "approved",  # Approved but not executed.
-                "message": f"approval recorded, backend execution failed: {exc.detail}",
-                "backend_status": exc.status,
-            })
+            return _json(
+                207,
+                {
+                    "challenge_id": challenge_id,
+                    "status": "approved",  # Approved but not executed.
+                    "message": f"approval recorded, backend execution failed: {exc.detail}",
+                    "backend_status": exc.status,
+                },
+            )
 
         except ValueError as exc:
             # Tool not registered or payload missing required fields.
@@ -195,6 +201,7 @@ def _json(status: int, body: dict[str, Any]) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Route assembly.
 # ---------------------------------------------------------------------------
+
 
 def callback_routes() -> list:  # type: ignore[type-arg]
     """Build the approval callback route list.

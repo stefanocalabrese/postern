@@ -14,21 +14,20 @@ from datetime import UTC, datetime, timedelta
 
 import httpx2
 import pytest
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
-
 from postern_core.auth.device_codes import (
     DeviceCode,
     InMemoryDeviceCodeStore,
-    asdict_frozen,
     _device_code_to_dict,
     _generate_device_code,
     _generate_user_code,
+    asdict_frozen,
 )
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.routing import Route
 
 from services.confirm.device_auth import (
     approve_callback,
@@ -37,10 +36,10 @@ from services.confirm.device_auth import (
 )
 from services.confirm.settings import ConfirmSettings
 
-
 # ---------------------------------------------------------------------------
 # Fixtures.
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def settings() -> ConfirmSettings:
@@ -85,8 +84,6 @@ def app(
 
     async def _approve_callback(request: Request) -> Response:
         return await approve_callback(request)
-
-    from starlette.responses import JSONResponse
 
     routes: list[Route] = [
         Route("/device_authorization", _device_authorization, methods=["POST"]),
@@ -260,7 +257,10 @@ class TestInMemoryDeviceCodeStore:
         assert await store.get_device_code(code.device_code) is None
 
     @pytest.mark.asyncio
-    async def test_revoke_nonexistent(self, store: InMemoryDeviceCodeStore) -> None:        # Should not raise.
+    async def test_revoke_nonexistent(  # noqa: E501
+        self, store: InMemoryDeviceCodeStore
+    ) -> None:
+        # Should not raise.
         await store.revoke_device_code("nonexistent")
 
     @pytest.mark.asyncio
@@ -299,7 +299,9 @@ class TestDeviceAuthorizationEndpoint:
 
     @pytest.mark.asyncio
     async def test_returns_device_code_fields(self, app: Starlette) -> None:
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/device_authorization",
                 json={"client_id": "my-client", "scopes": "accounts:read"},
@@ -318,7 +320,9 @@ class TestDeviceAuthorizationEndpoint:
 
     @pytest.mark.asyncio
     async def test_missing_client_id(self, app: Starlette) -> None:
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post("/device_authorization", json={})
 
         assert resp.status_code == 400
@@ -328,7 +332,9 @@ class TestDeviceAuthorizationEndpoint:
     async def test_default_scopes_stored(self, app: Starlette) -> None:
         """Default scopes are stored on the device code (not returned per RFC 8628)."""
         store: InMemoryDeviceCodeStore = app.state.device_code_store
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/device_authorization",
                 json={"client_id": "my-client"},
@@ -354,7 +360,9 @@ class TestTokenExchangeEndpoint:
 
     @pytest.mark.asyncio
     async def test_missing_device_code(self, app: Starlette) -> None:
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/token",
                 data={"grant_type": "device_code"},
@@ -365,7 +373,9 @@ class TestTokenExchangeEndpoint:
 
     @pytest.mark.asyncio
     async def test_invalid_device_code(self, app: Starlette) -> None:
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/token",
                 data={"grant_type": "device_code", "device_code": "nonexistent"},
@@ -384,7 +394,9 @@ class TestTokenExchangeEndpoint:
             verification_uri="https://auth.example.com/verify",
         )
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/token",
                 data={"grant_type": "device_code", "device_code": code.device_code},
@@ -405,7 +417,9 @@ class TestTokenExchangeEndpoint:
         )
         store._codes["expired-code"] = code
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/token",
                 data={"grant_type": "device_code", "device_code": "expired-code"},
@@ -427,7 +441,9 @@ class TestTokenExchangeEndpoint:
         )
         await store.approve_device_code(code.device_code)
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/token",
                 data={"grant_type": "device_code", "device_code": code.device_code},
@@ -436,7 +452,7 @@ class TestTokenExchangeEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert "access_token" in data
-        assert data["token_type"] == "Bearer"
+        assert data["token_type"] == "Bearer"  # noqa: S105
         assert "expires_in" in data
         assert "write_token" in data
         # Tokens are non-empty JWT strings.
@@ -456,8 +472,10 @@ class TestTokenExchangeEndpoint:
         )
         store._codes["no-subject"] = code
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            _resp = await client.post(  # noqa: F841
                 "/approve",
                 json={"device_code": "no-subject", "subject_value": ""},
             )
@@ -482,7 +500,9 @@ class TestTokenExchangeEndpoint:
         )
         await store.update_device_code(code.device_code, updated)
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/token",
                 data={"grant_type": "device_code", "device_code": code.device_code},
@@ -502,7 +522,9 @@ class TestTokenExchangeEndpoint:
         )
         # Do NOT approve — test slow_down in pending state.
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             # First poll → authorization_pending (records poll time).
             resp1 = await client.post(
                 "/token",
@@ -512,7 +534,9 @@ class TestTokenExchangeEndpoint:
         assert resp1.json()["error"] == "authorization_pending"
 
         # Second poll immediately after → slow_down.
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp2 = await client.post(
                 "/token",
                 data={"grant_type": "device_code", "device_code": code.device_code},
@@ -522,7 +546,9 @@ class TestTokenExchangeEndpoint:
 
         # After waiting, poll → authorization_pending again (still not approved).
         await asyncio.sleep(6)
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp3 = await client.post(
                 "/token",
                 data={"grant_type": "device_code", "device_code": code.device_code},
@@ -548,7 +574,9 @@ class TestApproveCallback:
             verification_uri="https://auth.example.com/verify",
         )
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/approve",
                 json={
@@ -568,7 +596,9 @@ class TestApproveCallback:
 
     @pytest.mark.asyncio
     async def test_approve_missing_fields(self, app: Starlette) -> None:
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post("/approve", json={})
 
         assert resp.status_code == 400
@@ -576,7 +606,9 @@ class TestApproveCallback:
 
     @pytest.mark.asyncio
     async def test_approve_nonexistent_code(self, app: Starlette) -> None:
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/approve",
                 json={
@@ -598,7 +630,9 @@ class TestApproveCallback:
         )
         await store.approve_device_code(code.device_code)
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             resp = await client.post(
                 "/approve",
                 json={
@@ -622,9 +656,11 @@ class TestFullLifecycle:
     @pytest.mark.asyncio
     async def test_complete_flow(self, app: Starlette) -> None:
         """Device code creation → approval → token exchange."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        _store: InMemoryDeviceCodeStore = app.state.device_code_store  # noqa: F841
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             # Step 1: Request device code.
             resp = await client.post(
                 "/device_authorization",
@@ -688,7 +724,9 @@ class TestFullLifecycle:
         )
         store._codes["old-expired"] = old_code
 
-        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as client:
             # Old code → expired_token.
             resp = await client.post(
                 "/token",
@@ -769,7 +807,6 @@ class TestSerialization:
         assert dc2.approved_at is None
 
 
-
 # ---------------------------------------------------------------------------
 # Endpoint wiring — JSON vs form body, content-type handling.
 # ---------------------------------------------------------------------------
@@ -831,7 +868,7 @@ class TestDeviceAuthorizationContentType:
                 headers={"content-type": "application/json"},
             )
         assert resp.status_code == 200
-        data = resp.json()
+        _data = resp.json()  # noqa: F841
         # The device code is created with the custom scopes.
 
 
@@ -987,4 +1024,4 @@ class TestCompleteFlow:
         token_data = token_resp.json()
         assert "access_token" in token_data
         assert "write_token" in token_data
-        assert token_data["token_type"] == "Bearer"
+        assert token_data["token_type"] == "Bearer"  # noqa: S105

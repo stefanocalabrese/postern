@@ -17,7 +17,6 @@ from postern_core.store import challenges
 from postern_core.store.models import ChallengeRecord
 from sqlalchemy.ext.asyncio import AsyncSession
 
-
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
@@ -69,7 +68,7 @@ async def test_create_challenge_inserts_row(session: AsyncSession) -> None:
 
 
 async def test_create_challenge_sets_correct_ttl(session: AsyncSession) -> None:
-    now = datetime.now(UTC)
+    _now = datetime.now(UTC)  # noqa: F841
     for tier, expected_ttl in [(0, 30), (1, 180), (2, 300)]:
         record = await challenges.create_challenge(
             session,
@@ -80,7 +79,9 @@ async def test_create_challenge_sets_correct_ttl(session: AsyncSession) -> None:
             tier=VerificationTier(tier),
         )
         actual_ttl = (record.expires_at - record.created_at).total_seconds()
-        assert actual_ttl == expected_ttl, f"tier {tier}: got {actual_ttl}s, expected {expected_ttl}s"
+        assert actual_ttl == expected_ttl, (
+            f"tier {tier}: got {actual_ttl}s, expected {expected_ttl}s"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +105,9 @@ async def test_get_challenge_does_not_filter_on_expiry(session: AsyncSession) ->
     """``get_challenge`` returns expired rows — expiry is checked by the
     caller (polling loop) or via ``get_active_challenge``."""
     past = datetime.now(UTC) - timedelta(hours=1)
-    record = await _insert_challenge(session, challenge_id="chal_expired", tier=VerificationTier.APP_APPROVAL)
+    record = await _insert_challenge(  # noqa: E501
+        session, challenge_id="chal_expired", tier=VerificationTier.APP_APPROVAL
+    )
     # Manually set created_at to the past so expires_at is also in the past.
     record.created_at = past
     record.expires_at = past + timedelta(seconds=180)
@@ -127,7 +130,9 @@ async def test_get_active_challenge_returns_pending(session: AsyncSession) -> No
 
 async def test_get_active_challenge_returns_none_for_expired(session: AsyncSession) -> None:
     past = datetime.now(UTC) - timedelta(hours=1)
-    record = await _insert_challenge(session, challenge_id="chal_expired_active", tier=VerificationTier.APP_APPROVAL)
+    record = await _insert_challenge(  # noqa: E501
+        session, challenge_id="chal_expired_active", tier=VerificationTier.APP_APPROVAL
+    )
     record.created_at = past
     record.expires_at = past + timedelta(seconds=180)
     await session.flush()
@@ -229,7 +234,9 @@ async def test_list_customer_challenges_respects_limit(session: AsyncSession) ->
     assert len(rows) == 3
 
 
-async def test_list_customer_challenges_returns_empty_for_unknown_customer(session: AsyncSession) -> None:
+async def test_list_customer_challenges_returns_empty_for_unknown_customer(  # noqa: E501
+    session: AsyncSession,
+) -> None:
     rows = await challenges.list_customer_challenges(session, "cust_unknown", limit=50)
     assert rows == []
 
@@ -265,7 +272,7 @@ async def test_invalid_tier_rejected_by_check_constraint(session: AsyncSession) 
         expires_at=now + timedelta(seconds=180),
     )
     session.add(record)
-    with pytest.raises(Exception):  # IntegrityError from CHECK constraint.
+    with pytest.raises(Exception):  # noqa: B017 - IntegrityError from CHECK constraint.
         await session.flush()
 
 
@@ -283,7 +290,7 @@ async def test_invalid_status_rejected_by_check_constraint(session: AsyncSession
         expires_at=now + timedelta(seconds=180),
     )
     session.add(record)
-    with pytest.raises(Exception):  # IntegrityError from CHECK constraint.
+    with pytest.raises(Exception):  # noqa: B017 - IntegrityError from CHECK constraint.
         await session.flush()
 
 

@@ -192,10 +192,7 @@ class IpAnomalyDetector:
     def _signal_suspicious_asn(self) -> RiskSignal:
         return RiskSignal(
             code="SUSPICIOUS_ASN",
-            description=(
-                "Client connected from a known suspicious ASN. "
-                "End session."
-            ),
+            description=("Client connected from a known suspicious ASN. End session."),
             severity=Severity.HIGH,
             details={},
         )

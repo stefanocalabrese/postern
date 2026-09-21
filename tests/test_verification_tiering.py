@@ -10,16 +10,14 @@ Covers:
 - Human-readable summary generation.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
-
 from postern_core.domain.verification import (
-    Challenge,
     DEFAULT_VERIFICATION_TIER,
+    Challenge,
     VerificationTier,
 )
-
 
 # ---------------------------------------------------------------------------
 # VerificationTier enum.

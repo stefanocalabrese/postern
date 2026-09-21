@@ -84,11 +84,8 @@ def test_no_hardcoded_external_urls_in_packages() -> None:
         for line_no, url in _scan_file(pyfile):
             external_urls.append((pyfile, line_no, url))
 
-    assert external_urls == [], (
-        f"Hardcoded external URLs found in packages/:\n"
-        + "\n".join(
-            f"  {path}:{lineno} -> {url}" for path, lineno, url in external_urls
-        )
+    assert external_urls == [], "Hardcoded external URLs found in packages/:\n" + "\n".join(
+        f"  {path}:{lineno} -> {url}" for path, lineno, url in external_urls
     )
 
 
@@ -104,11 +101,8 @@ def test_no_hardcoded_external_urls_in_services() -> None:
         for line_no, url in _scan_file(pyfile):
             external_urls.append((pyfile, line_no, url))
 
-    assert external_urls == [], (
-        f"Hardcoded external URLs found in services/:\n"
-        + "\n".join(
-            f"  {path}:{lineno} -> {url}" for path, lineno, url in external_urls
-        )
+    assert external_urls == [], "Hardcoded external URLs found in services/:\n" + "\n".join(
+        f"  {path}:{lineno} -> {url}" for path, lineno, url in external_urls
     )
 
 
@@ -124,11 +118,8 @@ def test_no_hardcoded_external_urls_in_stub() -> None:
         for line_no, url in _scan_file(pyfile):
             external_urls.append((pyfile, line_no, url))
 
-    assert external_urls == [], (
-        f"Hardcoded external URLs found in stub/:\n"
-        + "\n".join(
-            f"  {path}:{lineno} -> {url}" for path, lineno, url in external_urls
-        )
+    assert external_urls == [], "Hardcoded external URLs found in stub/:\n" + "\n".join(
+        f"  {path}:{lineno} -> {url}" for path, lineno, url in external_urls
     )
 
 
@@ -150,4 +141,3 @@ def test_external_url_patterns_are_detected() -> None:
     assert not _is_internal("http://otel-collector.external:4317/v1/traces")
     assert not _is_internal("https://sns.us-east-1.amazonaws.com/")
     assert not _is_internal("http://crl.digicert.com/crl.pem")
-

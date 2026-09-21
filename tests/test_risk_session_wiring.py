@@ -12,10 +12,9 @@ Covers:
 """
 
 import dataclasses
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
-
 from postern_core.risk.context import RiskContext
 from postern_core.risk.engine import RiskConfig, RiskEngine
 from postern_core.risk.ip_anomaly import IpAnomalyDetector
@@ -25,8 +24,7 @@ from postern_core.risk.session import (
     get_current_session,
     set_current_session,
 )
-from postern_core.risk.types import RiskSignal, Severity
-
+from postern_core.risk.types import Severity
 
 # --- SessionStore tests ---
 
@@ -333,7 +331,7 @@ async def test_multiple_sessions_are_isolated() -> None:
     signals2 = RiskEngine(config).evaluate(ctx2)
 
     assert len(signals1) > 0  # 50 > 30
-    assert signals2 == []     # 10 <= 30
+    assert signals2 == []  # 10 <= 30
 
 
 # --- Serialization tests (Redis persistence) ---
@@ -456,7 +454,6 @@ async def test_in_memory_session_store_factory() -> None:
 async def test_redis_session_store_creates_and_retrieves() -> None:
     """RedisSessionStore creates and retrieves sessions via fakeredis."""
     import fakeredis.aioredis
-
     from postern_core.risk.session import RedisSessionStore
 
     # Create a fake async Redis client
@@ -478,7 +475,6 @@ async def test_redis_session_store_creates_and_retrieves() -> None:
 async def test_redis_session_store_removes() -> None:
     """RedisSessionStore removes sessions."""
     import fakeredis.aioredis
-
     from postern_core.risk.session import RedisSessionStore
 
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
@@ -497,7 +493,6 @@ async def test_redis_session_store_removes() -> None:
 async def test_redis_session_store_serialization_round_trip() -> None:
     """RedisSessionStore round-trips a full context with data and signals."""
     import fakeredis.aioredis
-
     from postern_core.risk.engine import RiskConfig, RiskEngine
     from postern_core.risk.session import RedisSessionStore
 
@@ -538,7 +533,6 @@ async def test_redis_session_store_serialization_round_trip() -> None:
 async def test_redis_session_store_key_prefix() -> None:
     """RedisSessionStore uses the configured key prefix."""
     import fakeredis.aioredis
-
     from postern_core.risk.session import RedisSessionStore
 
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
@@ -558,7 +552,6 @@ async def test_redis_session_store_key_prefix() -> None:
 async def test_redis_session_store_ttl() -> None:
     """RedisSessionStore sets TTL on created sessions."""
     import fakeredis.aioredis
-
     from postern_core.risk.session import RedisSessionStore
 
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)

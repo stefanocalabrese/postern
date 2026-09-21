@@ -117,12 +117,14 @@ def _make_state(
         verification_result: str | None = None,
         signature: str = "",
     ) -> ChallengeRecord | None:
-        update_status_calls.append({
-            "status": status,
-            "confirming_device": confirming_device,
-            "verification_result": verification_result,
-            "signature": signature,
-        })
+        update_status_calls.append(
+            {
+                "status": status,
+                "confirming_device": confirming_device,
+                "verification_result": verification_result,
+                "signature": signature,
+            }
+        )
         # Return a record so the handler's `if updated is None` check passes.
         return challenge_record
 

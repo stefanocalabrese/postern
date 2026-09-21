@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # Abstract base class — the interface all backends must implement.
 # ---------------------------------------------------------------------------
 
+
 class SessionStoreBase(ABC):
     """Abstract base class for risk session stores.
 
@@ -81,6 +82,7 @@ class SessionStoreBase(ABC):
 # Session handle — shared across all backends.
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class SessionHandle:
     """Opaque handle identifying a risk session.
@@ -96,6 +98,7 @@ class SessionHandle:
 # ---------------------------------------------------------------------------
 # In-memory backend (default for dev / test).
 # ---------------------------------------------------------------------------
+
 
 class InMemorySessionStore(SessionStoreBase):
     """In-memory store mapping ``session_handle`` → ``RiskContext``.
@@ -136,6 +139,7 @@ class InMemorySessionStore(SessionStoreBase):
 # ---------------------------------------------------------------------------
 # Redis backend — compatible with AWS ElastiCache, Google Memorystore, etc.
 # ---------------------------------------------------------------------------
+
 
 class RedisSessionStore(SessionStoreBase):
     """Redis-backed session store.
@@ -241,6 +245,7 @@ class RedisSessionStore(SessionStoreBase):
 # Factory — picks the right backend based on environment.
 # ---------------------------------------------------------------------------
 
+
 def create_session_store() -> SessionStoreBase:
     """Create a session store backed by the configured backend.
 
@@ -265,9 +270,7 @@ def create_session_store() -> SessionStoreBase:
 # ContextVar — shared across all backends.
 # ---------------------------------------------------------------------------
 
-_current_session: ContextVar[RiskContext | None] = ContextVar(
-    "postern_risk_session", default=None
-)
+_current_session: ContextVar[RiskContext | None] = ContextVar("postern_risk_session", default=None)
 
 
 def get_current_session() -> RiskContext | None:

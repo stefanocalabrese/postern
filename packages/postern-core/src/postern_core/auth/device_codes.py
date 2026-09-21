@@ -41,12 +41,14 @@ backend; without it, the in-memory store is used.
 
 from __future__ import annotations
 
+import dataclasses
+import json as _json
 import os
 import secrets
-import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from datetime import UTC as _UTC
 from typing import Any
 
 logger = __import__("logging").getLogger(__name__)
@@ -55,6 +57,7 @@ logger = __import__("logging").getLogger(__name__)
 # ---------------------------------------------------------------------------
 # DeviceCode — the core model.
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class DeviceCode:
@@ -126,6 +129,7 @@ class DeviceCode:
 # Abstract base class — the interface all backends must implement.
 # ---------------------------------------------------------------------------
 
+
 class DeviceCodeStoreBase(ABC):
     """Abstract base class for device code stores.
 
@@ -173,6 +177,7 @@ class DeviceCodeStoreBase(ABC):
 # ---------------------------------------------------------------------------
 # In-memory backend (default for dev / test).
 # ---------------------------------------------------------------------------
+
 
 def _generate_device_code() -> str:
     """Generate a cryptographically random device code (40+ chars)."""
@@ -251,7 +256,6 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
 
 def asdict_frozen(obj: Any) -> dict[str, Any]:
     """Convert a frozen dataclass to a mutable dict."""
-    import dataclasses
 
     if not dataclasses.is_dataclass(obj):
         raise TypeError(f"Expected a dataclass, got {type(obj).__name__}")
@@ -261,6 +265,7 @@ def asdict_frozen(obj: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Redis backend — compatible with AWS ElastiCache, Google Memorystore, etc.
 # ---------------------------------------------------------------------------
+
 
 class RedisDeviceCodeStore(DeviceCodeStoreBase):
     """Redis-backed device code store.
@@ -391,13 +396,6 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
 # Serialization helpers — add to DeviceCode dataclass.
 # ---------------------------------------------------------------------------
 
-# We patch the frozen dataclass with serialization methods after definition.
-# This avoids making the class non-frozen while still supporting Redis storage.
-
-import dataclasses
-import json as _json
-from datetime import UTC as _UTC
-
 
 def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
     """Serialize a DeviceCode to a plain dict."""
@@ -436,6 +434,7 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
 # Factory — picks the right backend based on environment.
 # ---------------------------------------------------------------------------
 
+
 def create_device_code_store() -> DeviceCodeStoreBase:
     """Create a device code store backed by the configured backend.
 
@@ -463,4 +462,3 @@ def create_device_code_store() -> DeviceCodeStoreBase:
 #: Alias for ``InMemoryDeviceCodeStore`` — kept so existing imports work.
 #: New code should use :func:`create_device_code_store` instead.
 DeviceCodeStore = InMemoryDeviceCodeStore
-

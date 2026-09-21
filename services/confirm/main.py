@@ -33,13 +33,12 @@ See ``services.confirm.device_auth`` for device auth endpoint implementations
 and ``services.confirm.callback`` for the challenge approval handler.
 """
 
-from starlette.applications import Starlette
-from starlette.routing import Route
-
-from postern_core.auth.device_codes import InMemoryDeviceCodeStore, create_device_code_store
+from postern_core.auth.device_codes import create_device_code_store
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource, warn_ephemeral_signing_key
 from postern_core.store.engine import Database
+from starlette.applications import Starlette
+from starlette.routing import Route
 
 from services.confirm.callback import callback_routes
 from services.confirm.device_auth import device_auth_routes
@@ -64,7 +63,7 @@ def create_confirm_app(settings: ConfirmSettings | None = None) -> Starlette:
     _write_minter, write_key_source = build_write_minter(settings)
 
     # --- Read key / minter (device grant exception) ---
-    from postern_core.auth.keys import FileKeySource, GeneratedKeySource
+    from postern_core.auth.keys import FileKeySource
 
     if settings.read_key_pem_path is not None:
         from pathlib import Path
@@ -79,9 +78,7 @@ def create_confirm_app(settings: ConfirmSettings | None = None) -> Starlette:
             kid=settings.read_key_kid,
             pem_env_var="POSTERN_READ_KEY_PEM_PATH",
         )
-    read_minter = InternalTokenMinter(
-        issuer=settings.read_token_issuer, key_source=read_key_source
-    )
+    read_minter = InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
 
     # --- Device code store ---
     device_code_store = create_device_code_store()
@@ -95,12 +92,16 @@ def create_confirm_app(settings: ConfirmSettings | None = None) -> Starlette:
     )
 
     # --- Assemble routes ---
-    routes: list[Route] = [jwks_route(write_key_source)] + device_auth_routes(
-        store=device_code_store,
-        settings=settings,
-        read_minter=read_minter,
-        write_minter=_write_minter._minter,  # InternalTokenMinter behind the wrapper.
-    ) + callback_routes()
+    routes: list[Route] = (
+        [jwks_route(write_key_source)]
+        + device_auth_routes(
+            store=device_code_store,
+            settings=settings,
+            read_minter=read_minter,
+            write_minter=_write_minter._minter,  # InternalTokenMinter behind the wrapper.
+        )
+        + callback_routes()
+    )
 
     app = Starlette(routes=routes)
     # Expose key sources on ``app.state`` for external consumers.

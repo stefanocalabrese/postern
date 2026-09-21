@@ -7,20 +7,15 @@ AuditMiddleware._write into the audit_log completion row.
 
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-from mcp.types import CallToolRequestParams
-from pydantic import BaseModel
-
 from postern_core.risk.context import RiskContext
-from postern_core.risk.session import set_current_session
 from postern_core.risk.engine import RiskConfig, RiskEngine
 from postern_core.risk.ip_anomaly import IpAnomalyDetector
-from postern_core.risk.types import RiskSignal, Severity
+from postern_core.risk.session import set_current_session
 
 
 @dataclass(frozen=True)
@@ -46,7 +41,7 @@ class _MockContext:
 class _FakeToken:
     """Minimal AccessToken mock."""
 
-    token_id: str = "fake"
+    token_id: str = "fake"  # noqa: S105
 
 
 async def test_no_session_handle_yields_null_risk_signals() -> None:
@@ -60,15 +55,13 @@ async def test_no_session_handle_yields_null_risk_signals() -> None:
         return MagicMock()
 
     # Patch _write to capture arguments without hitting the DB.
-    original_write = middleware._write
+    _original_write = middleware._write  # noqa: F841
 
     async def capture_write(*args: Any, **kwargs: Any) -> None:
         # _write signature: at, customer, absence_reason, name, arguments,
         # outcome, detail, redaction_budget_exhausted, duration_ms, request_id,
         # refusal_reason, call_id, client_id, risk_signals
-        captured.append(
-            _CapturedWrite(outcome=args[5], risk_signals=args[13])
-        )
+        captured.append(_CapturedWrite(outcome=args[5], risk_signals=args[13]))
 
     with patch.object(middleware, "_write", capture_write):
         ctx = _MockContext("test_tool", {"some": "arg"})
@@ -95,10 +88,9 @@ async def test_session_with_no_signals_yields_empty_list() -> None:
     set_current_session(ctx)
 
     try:
+
         async def capture_write(*args: Any, **kwargs: Any) -> None:
-            captured.append(
-                _CapturedWrite(outcome=args[5], risk_signals=args[13])
-            )
+            captured.append(_CapturedWrite(outcome=args[5], risk_signals=args[13]))
 
         with patch.object(middleware, "_write", capture_write):
             mock_ctx = _MockContext("test_tool", {"some": "arg"})
@@ -136,9 +128,7 @@ async def test_session_with_risk_signals_serialized_correctly() -> None:
         ctx._risk_signals = [*engine_signals, *ip_signals]
 
         async def capture_write(*args: Any, **kwargs: Any) -> None:
-            captured.append(
-                _CapturedWrite(outcome=args[5], risk_signals=args[13])
-            )
+            captured.append(_CapturedWrite(outcome=args[5], risk_signals=args[13]))
 
         with patch.object(middleware, "_write", capture_write):
             mock_ctx = _MockContext("test_tool", {"some": "arg"})
@@ -195,9 +185,7 @@ async def test_raised_path_includes_risk_signals() -> None:
         ctx._risk_signals = list(engine_signals)
 
         async def capture_write(*args: Any, **kwargs: Any) -> None:
-            captured.append(
-                _CapturedWrite(outcome=args[5], risk_signals=args[13])
-            )
+            captured.append(_CapturedWrite(outcome=args[5], risk_signals=args[13]))
 
         with patch.object(middleware, "_write", capture_write):
             mock_ctx = _MockContext("failing_tool")
@@ -228,9 +216,7 @@ async def test_risk_signals_null_without_session() -> None:
     set_current_session(None)
 
     async def capture_write(*args: Any, **kwargs: Any) -> None:
-        captured.append(
-            _CapturedWrite(outcome=args[5], risk_signals=args[13])
-        )
+        captured.append(_CapturedWrite(outcome=args[5], risk_signals=args[13]))
 
     with patch.object(middleware, "_write", capture_write):
         mock_ctx = _MockContext("test_tool")
@@ -238,5 +224,3 @@ async def test_risk_signals_null_without_session() -> None:
 
     assert len(captured) == 1
     assert captured[0].risk_signals is None
-
-

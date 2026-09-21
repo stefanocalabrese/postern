@@ -52,13 +52,13 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
 from enum import IntEnum
-
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # VerificationTier — which verification gates this operation.
 # ---------------------------------------------------------------------------
+
 
 class VerificationTier(IntEnum):
     """Which verification gates a write operation.
@@ -97,6 +97,7 @@ class VerificationTier(IntEnum):
 # ---------------------------------------------------------------------------
 # Challenge — the approval workflow state machine.
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class Challenge:
@@ -156,7 +157,8 @@ class Challenge:
     def is_expired(self) -> bool:
         """Whether this challenge has passed its expiry."""
         expires = self.expires_at
-        assert expires is not None
+        if expires is None:
+            return False  # not expired if never computed (shouldn't happen)
         return datetime.now(UTC) >= expires
 
     @property

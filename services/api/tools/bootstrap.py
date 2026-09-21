@@ -58,7 +58,7 @@ from postern_core.domain.models import ConsentSummary, SessionInfo
 from postern_core.facade import accounts as accounts_facade
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerResolver
-from postern_core.risk.session import SessionStoreBase, create_session_store
+from postern_core.risk.session import SessionStoreBase
 
 _READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 

@@ -35,7 +35,6 @@ from typing import Any
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
-
 from postern_core.risk.context import RiskContext
 from postern_core.risk.engine import RiskConfig, RiskEngine
 from postern_core.risk.ip_anomaly import IpAnomalyDetector
@@ -79,8 +78,7 @@ class RiskMiddleware(Middleware):
         ctx = await self.store.get_session(session_handle)
         if ctx is None:
             logger.warning(
-                "RiskMiddleware: session %r not found for tool %s; "
-                "running without risk tracking",
+                "RiskMiddleware: session %r not found for tool %s; running without risk tracking",
                 session_handle,
                 tool_name,
             )
@@ -107,17 +105,13 @@ class RiskMiddleware(Middleware):
             await self.store.save_session(session_handle, ctx)
             raise
 
-    def _extract_session_handle(
-        self, arguments: dict[str, Any] | None
-    ) -> str | None:
+    def _extract_session_handle(self, arguments: dict[str, Any] | None) -> str | None:
         """Extract ``session_handle`` from tool arguments."""
         if not arguments:
             return None
         return arguments.get("session_handle")
 
-    def _extract_client_ip(
-        self, context: MiddlewareContext[CallToolRequestParams]
-    ) -> str | None:
+    def _extract_client_ip(self, context: MiddlewareContext[CallToolRequestParams]) -> str | None:
         """Extract client IP from the request context.
 
         Reads ``X-Forwarded-For`` header first, falls back to remote address.
@@ -140,13 +134,11 @@ class RiskMiddleware(Middleware):
                         if peer and hasattr(peer, "host"):
                             return str(peer.host)
                 except Exception:
-                    pass
+                    logger.debug("IP extraction failed", exc_info=True)
 
         return None
 
-    def _evaluate_signals(
-        self, ctx: RiskContext, session_handle: str
-    ) -> None:
+    def _evaluate_signals(self, ctx: RiskContext, session_handle: str) -> None:
         """Evaluate risk engine and IP anomaly detector signals.
 
         Runs after each tool call (success or failure). Data recording
@@ -174,8 +166,7 @@ class RiskMiddleware(Middleware):
             snap = ctx.snapshot()
             for signal in signals:
                 logger.warning(
-                    "RiskSignal[%s] session=%s records=%d accounts=%d "
-                    "severity=%s: %s",
+                    "RiskSignal[%s] session=%s records=%d accounts=%d severity=%s: %s",
                     session_handle[:8],
                     signal.code,
                     snap.get("records", 0),
@@ -186,8 +177,7 @@ class RiskMiddleware(Middleware):
 
             for signal in ip_signals:
                 logger.warning(
-                    "IpAnomalySignal[%s] session=%s distinct_ips=%d "
-                    "severity=%s: %s",
+                    "IpAnomalySignal[%s] session=%s distinct_ips=%d severity=%s: %s",
                     signal.code,
                     session_handle[:8],
                     snap.get("distinct_ips", 0),
@@ -198,6 +188,5 @@ class RiskMiddleware(Middleware):
         except Exception:
             # Risk evaluation must never break the tool call.
             logger.exception(
-                "RiskMiddleware: risk evaluation failed; "
-                "continuing without signal processing"
+                "RiskMiddleware: risk evaluation failed; continuing without signal processing"
             )

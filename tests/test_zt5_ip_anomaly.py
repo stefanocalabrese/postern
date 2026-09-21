@@ -18,13 +18,12 @@ import dataclasses
 from unittest.mock import patch
 
 import pytest
-
 from postern_core.risk.context import IpTracker, RiskContext
 from postern_core.risk.ip_anomaly import (
     IpAnomalyConfig,
     IpAnomalyDetector,
 )
-from postern_core.risk.types import RiskSignal, Severity
+from postern_core.risk.types import Severity
 
 
 def _mock_tracker(ips: list[str], times: list[float]) -> IpTracker:
@@ -36,7 +35,7 @@ def _mock_tracker(ips: list[str], times: list[float]) -> IpTracker:
                Must be same length as ips and monotonically increasing.
     """
     tracker = IpTracker()
-    for ip, t in zip(ips, times):
+    for ip, t in zip(ips, times, strict=True):
         with patch("postern_core.risk.context.time.monotonic", return_value=t):
             tracker.record_ip(ip)
     return tracker
@@ -364,15 +363,10 @@ def test_risk_context_snapshot_includes_ip_data() -> None:
 def test_all_exports_available_from_risk_package() -> None:
     """All new and existing types are importable from postern_core.risk."""
     from postern_core.risk import (
-        IpAnomalyConfig,
         IpAnomalyDetector,
         IpTracker,
-        RecordCount,
-        RiskConfig,
-        RiskContext,
         RiskEngine,
         RiskSignal,
-        Severity,
     )
 
     # Verify they are the right types

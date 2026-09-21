@@ -40,30 +40,26 @@ Usage in ``main.py``::
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 from typing import Any
-
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
 
 from postern_core.auth.device_codes import (
     DeviceCode,
     DeviceCodeStoreBase,
-    InMemoryDeviceCodeStore,
     create_device_code_store,
 )
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.identity import CustomerRef
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from services.confirm.settings import ConfirmSettings
-
 
 # ---------------------------------------------------------------------------
 # Error responses — RFC 8628 §3.3 and §3.4 error codes.
 # ---------------------------------------------------------------------------
+
 
 def _error(status: int, code: str, description: str) -> JSONResponse:
     """Return an RFC 8628-compatible error response."""
@@ -79,6 +75,7 @@ def _error(status: int, code: str, description: str) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Device authorization endpoint — POST /device_authorization.
 # ---------------------------------------------------------------------------
+
 
 async def device_authorization(request: Request) -> JSONResponse:
     """Generate a device code and return QR pairing data.
@@ -140,6 +137,7 @@ async def device_authorization(request: Request) -> JSONResponse:
 # Token endpoint — POST /token with grant_type=device_code.
 # ---------------------------------------------------------------------------
 
+
 async def token_endpoint(request: Request) -> JSONResponse:
     """Exchange a device code for access tokens.
 
@@ -171,7 +169,9 @@ async def token_endpoint(request: Request) -> JSONResponse:
     form = await request.form()
     grant_type_raw = form.get("grant_type", "")
     grant_type: str = (
-        grant_type_raw.file.read().decode() if hasattr(grant_type_raw, "file") else str(grant_type_raw)
+        grant_type_raw.file.read().decode()
+        if hasattr(grant_type_raw, "file")
+        else str(grant_type_raw)
     )
 
     if grant_type != "device_code":
@@ -180,7 +180,9 @@ async def token_endpoint(request: Request) -> JSONResponse:
 
     device_code_raw = form.get("device_code", "")
     device_code_value: str = (
-        device_code_raw.file.read().decode() if hasattr(device_code_raw, "file") else str(device_code_raw)
+        device_code_raw.file.read().decode()
+        if hasattr(device_code_raw, "file")
+        else str(device_code_raw)
     )
     if not device_code_value:
         return _error(400, "invalid_request", "device_code is required")
@@ -268,6 +270,7 @@ async def token_endpoint(request: Request) -> JSONResponse:
 #                        for audit trail; the actual auth comes from the
 #                        app's own session).
 
+
 async def approve_callback(request: Request) -> JSONResponse:
     """Mobile app approval callback.
 
@@ -333,6 +336,7 @@ def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
 # Route assembly.
 # ---------------------------------------------------------------------------
 
+
 def device_auth_routes(
     store: DeviceCodeStoreBase,
     settings: ConfirmSettings,
@@ -373,6 +377,7 @@ def device_auth_routes(
 # Factory — picks the right backend based on environment.
 # ---------------------------------------------------------------------------
 
+
 def build_device_code_store() -> DeviceCodeStoreBase:
     """Create a device code store from environment.
 
@@ -382,4 +387,3 @@ def build_device_code_store() -> DeviceCodeStoreBase:
     This mirrors ``postern_core.risk.session.create_session_store``'s pattern.
     """
     return create_device_code_store()
-

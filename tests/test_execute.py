@@ -39,9 +39,7 @@ _TEST_PAN = "4111111111111111"
 class _StubWriteMinter:
     """Produces a fake JWT string; never performs real crypto."""
 
-    def mint(
-        self, *, subject_value: str, audience: str, scope: str, challenge_id: str = ""
-    ) -> str:
+    def mint(self, *, subject_value: str, audience: str, scope: str, challenge_id: str = "") -> str:
         return f"stub.write.{subject_value}.{audience}"
 
 
