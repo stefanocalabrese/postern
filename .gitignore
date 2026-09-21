@@ -34,3 +34,6 @@ build/
 # removed, which is why the file is safe to leave to a hook and still not safe
 # to commit.
 /handoff-for-local.md*
+
+# Internal development documentation (not for public consumption)
+dev-docs/

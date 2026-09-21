@@ -21,7 +21,7 @@ async def append(
     # _absence` (models.py) makes `customer_ref IS NULL` and this being
     # non-NULL the same statement, so a caller that defaults this to None
     # while passing no `customer_ref` loses the whole row and, under the
-    # fail-closed policy (docs/decisions/0006-audit-write-failure.md), the
+    # fail-closed policy (dev-docs/decisions/0006-audit-write-failure.md), the
     # call with it. Only the caller knows WHICH absence it saw -- no token,
     # no string subject, or a subject that failed `CustomerRef` -- and that
     # third case is the compromised-issuer signal the column exists to make
@@ -83,7 +83,7 @@ async def append(
     # entry row exactly as `duration_ms` belongs to the completion row, and
     # `ck_audit_log_reaching_at_matches_outcome` (models.py) rejects either
     # one written on the wrong row shape -- which under the fail-closed
-    # policy (docs/decisions/0006-audit-write-failure.md) costs the row and
+    # policy (dev-docs/decisions/0006-audit-write-failure.md) costs the row and
     # the call. A default would let a future caller file an entry row that
     # says a touch happened without saying when, which is the hole the column
     # was added to close, or stamp a completion row with a copy of its

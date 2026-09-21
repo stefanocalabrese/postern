@@ -12,7 +12,7 @@ The tests below prove it returns the request rather than merely looking like
 it does -- the distinction that matters, because the obvious implementation
 (`asyncio.wait_for`) does NOT, measured in this file.
 
-THE COST. `docs/decisions/0006-audit-write-failure.md` makes auditing
+THE COST. `dev-docs/decisions/0006-audit-write-failure.md` makes auditing
 fail-closed, and `services/api/middleware/audit.py` is FastMCP middleware
 running INSIDE the server, so the ASGI deadline is outside it and cancelling
 the request cancels whichever audit write is in flight.

@@ -477,7 +477,7 @@ async def test_every_documented_absence_reason_is_accepted_by_that_constraint(
     back, so a migration listing fewer values than the code can produce fails
     here rather than in production, where the cost is the audit row itself
     and the call with it (fail closed, see
-    docs/decisions/0006-audit-write-failure.md)."""
+    dev-docs/decisions/0006-audit-write-failure.md)."""
     for reason in CUSTOMER_REF_ABSENCE_REASONS:
         await store_audit.append(
             session,
@@ -701,7 +701,7 @@ async def test_the_database_refuses_a_completion_row_carrying_a_touch_instant(
     disagree, on a table where the pair is joined by `call_id` and read by
     someone reconstructing what happened. The constraint makes that write
     fail instead, at the cost the fail-closed policy sets
-    (docs/decisions/0006-audit-write-failure.md): the row, and the call.
+    (dev-docs/decisions/0006-audit-write-failure.md): the row, and the call.
 
     The accepted shapes are covered by
     `test_every_documented_outcome_is_accepted_by_that_constraint` above,
@@ -1077,7 +1077,7 @@ async def test_an_oversized_tool_name_still_produces_exactly_one_audit_row_after
 # containing `_MASK`. `_TRUNCATED` (U+2026 HORIZONTAL ELLIPSIS) is that
 # sentinel. Two ways it can go wrong, one section each below: a written value
 # one character too wide for its column, which under
-# `docs/decisions/0006-audit-write-failure.md` costs the row and the tool call
+# `dev-docs/decisions/0006-audit-write-failure.md` costs the row and the tool call
 # with it; and a sentinel on a value nothing was cut from, which makes the row
 # lie about itself.
 
@@ -1395,7 +1395,7 @@ def test_an_over_length_client_id_is_clipped_to_the_column_and_says_so() -> None
 
     Without the clamp this value reaches the INSERT and raises
     `asyncpg.exceptions.StringDataRightTruncationError`, which under
-    docs/decisions/0006-audit-write-failure.md costs the audit row and the
+    dev-docs/decisions/0006-audit-write-failure.md costs the audit row and the
     tool call.
     """
     raw = "https://mcp.example-bank.es/.well-known/oauth-client/" + "/".join(
@@ -1437,7 +1437,7 @@ def test_ordinary_client_ids_gain_no_sentinel() -> None:
     assert _client_id(None) is None
 
 
-# -- The audit-write-failure policy: docs/decisions/0006-audit-write-failure.md --
+# -- The audit-write-failure policy: dev-docs/decisions/0006-audit-write-failure.md --
 #
 # `_write` raises when the audit store itself is unavailable (connection
 # refused, pool exhausted, ...). `audit.append` is monkeypatched to raise
@@ -1509,7 +1509,7 @@ async def test_an_audit_write_failure_on_the_success_path_is_logged(
     `c1a1275` fixed the cause (`migrations/env.py` now passes
     `disable_existing_loggers=False`), so the workaround was removed here
     rather than kept as a belt-and-braces guard against a bug that no longer
-    exists -- see `docs/decisions/0006-audit-write-failure.md` for why a
+    exists -- see `dev-docs/decisions/0006-audit-write-failure.md` for why a
     silenced logger matters: it is the only signal an operator gets that
     this middleware's fail-closed policy fired, so losing it silently turns
     fail-closed into fail-silent. The hazard itself is not Alembic-specific
@@ -1565,7 +1565,7 @@ async def test_an_audit_write_failure_on_the_failure_path_is_logged(
 ) -> None:
     """Companion to the success-path logging test: the audit failure is
     observable here too, even though the caller's own error text names only
-    the tool, never the database. See `docs/decisions/0006-audit-write-failure.md`
+    the tool, never the database. See `dev-docs/decisions/0006-audit-write-failure.md`
     for why this log line matters: it is the only signal an operator gets
     that this middleware's fail-closed policy fired."""
     monkeypatch.setattr(store_audit, "append", _boom_append)
@@ -1727,7 +1727,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
     """Asserted, not reasoned about: `on_call_tool`'s failure path is a
     try/except nested inside a try/except, and it reads as correct while
     being wrong (that is the bug
-    docs/decisions/0006-audit-write-failure.md records). Adding two
+    dev-docs/decisions/0006-audit-write-failure.md records). Adding two
     arguments to the `_write` call inside the inner `try` is exactly the
     kind of edit that can move which exception leaves the function, so this
     pins the OBJECT identity, the type and the message -- not just "some
@@ -1998,7 +1998,7 @@ async def test_both_documented_reasons_are_accepted_by_that_constraint(
     goes through the real `append` and is read back, so a migration listing
     fewer values than the code can produce fails here rather than in
     production, where the cost is the audit row itself (fail closed, see
-    docs/decisions/0006-audit-write-failure.md)."""
+    dev-docs/decisions/0006-audit-write-failure.md)."""
     for reason in REFUSAL_REASONS:
         await store_audit.append(
             session,

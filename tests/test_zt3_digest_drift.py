@@ -2,7 +2,7 @@
 
 Verifies that the Dockerfile's external base images are pinned by sha256
 digest (not tag) and that the digests match the known-good values recorded
-in ``docs/decisions/0004-base-images.md``.
+in ``dev-docs/decisions/0004-base-images.md``.
 
 This is the only part of ZT-3 that can be tested in this repo:
 - Cosign verification at deploy time is blocked on there being a deploy
@@ -14,7 +14,7 @@ The digest drift check is a pure-text assertion: if someone changes the
 Dockerfile to use ``python:3.12-slim`` (tag) instead of the pinned digest,
 this test fails before the image is even built.
 
-See ``docs/decisions/0004-base-images.md`` for the resolved digests and
+See ``dev-docs/decisions/0004-base-images.md`` for the resolved digests and
 the rationale for why both are multi-arch manifest-list digests.
 """
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-# Known-good digests from docs/decisions/0004-base-images.md.
+# Known-good digests from dev-docs/decisions/0004-base-images.md.
 # These are the values that were resolved on 2026-09-14 and committed
 # into the Dockerfile. Any drift here means someone bumped a tag
 # without re-resolving and updating the decision record.
@@ -75,7 +75,7 @@ def test_all_external_from_lines_use_digests() -> None:
 
 
 def test_digests_match_decision_record() -> None:
-    """Dockerfile digests match docs/decisions/0004-base-images.md."""
+    """Dockerfile digests match dev-docs/decisions/0004-base-images.md."""
     dockerfile = _read_dockerfile()
 
     found: dict[str, str] = {}
@@ -120,7 +120,7 @@ def test_decision_record_lists_all_external_images() -> None:
     for image in found:
         assert image in _KNOWN_DIGESTS, (
             f"External image '{image}' is pinned by digest in the Dockerfile "
-            "but not listed in docs/decisions/0004-base-images.md. Add it."
+            "but not listed in dev-docs/decisions/0004-base-images.md. Add it."
         )
 
 

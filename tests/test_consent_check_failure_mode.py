@@ -4,7 +4,7 @@
 (`if domain in await _domains(db, customer)`). A store outage is not an
 exotic condition, and nothing in this repository had ever established what
 the check does when that line raises instead of returning a decision:
-`docs/decisions/0006-audit-write-failure.md` made that call deliberately for
+`dev-docs/decisions/0006-audit-write-failure.md` made that call deliberately for
 audit writes and wrote the cost down, but consent never had the equivalent.
 These tests pin the answer measured on 2026-09-17, so it is a fact in the
 repository before anyone changes it. They assert what IS, not what should
@@ -420,7 +420,7 @@ async def test_a_raising_consent_check_currently_files_no_refusal_reason(
     `services/api/consent.py`'s `_refuse` is what puts a reason on the row,
     and it sits on lines 188 and 192 -- both AFTER the `await _domains(...)`
     on line 190 that raised. So a store outage produces exactly the row
-    `docs/decisions/0006`-era code produced before `refusal_reason` existed:
+    `dev-docs/decisions/0006`-era code produced before `refusal_reason` existed:
     `outcome='raised'`, `detail='NotFoundError'`, reason NULL, which is
     byte-identical to a mistyped tool name. `tests/test_audit_refusal_reason.py`
     exists to keep a real consent denial distinguishable from a typo; this

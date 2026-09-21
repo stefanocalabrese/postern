@@ -12,7 +12,7 @@ A consent-denied or pre-backend-failure call produces exactly one row.
 packages/postern-core/src/postern_core/store/audit.py     audit.append (all parameters)
 packages/postern-core/src/postern_core/store/models.py    AuditEntry ORM model + CHECK constraints
 services/api/middleware/audit.py                          Two-row audit middleware (1263 lines)
-[ADR-0006](../../decisions/0006-audit-write-failure.md)   Fail-closed design
+[ADR-0006](../dev-docs/decisions/0006-audit-write-failure.md)   Fail-closed design
 ```
 
 ## Two-Row Pattern
@@ -84,7 +84,7 @@ is never written because the backend is never reached.
 
 ## Fail-Closed Writes (ADR-0006)
 
-See [ADR-0006](../../decisions/0006-audit-write-failure.md) for the full design rationale.
+See [ADR-0006](../dev-docs/decisions/0006-audit-write-failure.md) for the full design rationale.
 
 **Before 2026-09-18:** A single row was written AFTER `call_next`, meaning the backend
 was reached first and the record attempted afterwards. If the audit store was down,
@@ -241,5 +241,5 @@ The function is called from two places:
 | Audit append function | [`packages/postern-core/src/postern_core/store/audit.py`](../../../packages/postern-core/src/postern_core/store/audit.py) |
 | AuditEntry ORM model + CHECK constraints | [`packages/postern-core/src/postern_core/store/models.py`](../../../packages/postern-core/src/postern_core/store/models.py) |
 | Two-row audit middleware | [`services/api/middleware/audit.py`](../../../services/api/middleware/audit.py) |
-| ADR-0006: Fail-closed audit writes | [`docs/decisions/0006-audit-write-failure.md`](../../decisions/0006-audit-write-failure.md) |
+| ADR-0006: Fail-closed audit writes | [`docs/decisions/0006-audit-write-failure.md`](../dev-docs/decisions/0006-audit-write-failure.md) |
 | Masking in audit scrub | [`packages/postern-core/src/postern_core/domain/masking.py`](../../../packages/postern-core/src/postern_core/domain/masking.py) |

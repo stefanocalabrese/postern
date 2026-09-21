@@ -281,7 +281,7 @@ enforcement itself (filtering and rejection) was unaffected by the header's
 absence in both directions tested (an omitted-header `accounts.list` still
 succeeded with the masked IBAN; not shown as a numbered proof above because
 it duplicates Proof 4/6 except for the header, but it is in the audit log as
-row 7 -- see the count below). Written up as `docs/decisions/
+row 7 -- see the count below). Written up as `dev-docs/decisions/
 0005-protocol-version-header-gates-modern-dispatch.md` because it is a
 dependency-version fact, not a claim about this repo's own code, and the
 existing decision-record set already carries facts of that shape (e.g.

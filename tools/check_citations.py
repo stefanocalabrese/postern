@@ -6,7 +6,7 @@ Regenerate the ratchet baseline with `make citations-baseline`.
 
 WHY AN ANCHOR, AND NOT A LINE NUMBER
 
-On 2026-09-17 `docs/decisions/0007-audit-refusal-and-absence-reasons.md`
+On 2026-09-17 `dev-docs/decisions/0007-audit-refusal-and-absence-reasons.md`
 carried 39 bare `file:line` citations; 28 of them no longer pointed at what
 the prose said was there. Nine were wrong the day they were written, by a
 commit whose stated purpose was correcting citations, and four of those were
@@ -44,7 +44,7 @@ WHAT THIS CATCHES
   `refusal_for` against the middleware, when `services/api/consent.py` is
   where it lives. The report says where the name actually is.
 - An anchored citation to a symbol that was deleted outright. That is how
-  `docs/decisions/0004-base-images.md` was found still citing
+  `dev-docs/decisions/0004-base-images.md` was found still citing
   `_refuse_stub_minter_in_production`, which `d203606` removed on
   2026-09-17, on the first run of this tool.
 - An anchored citation whose path resolves nowhere, in the repo or in the
@@ -297,7 +297,7 @@ def _target_names(node: ast.expr) -> Iterator[str]:
 def bound_names(path: Path) -> frozenset[str]:
     """Every name `path` binds, dotted for class and function nesting.
 
-    Imports count. `docs/decisions/0006-audit-write-failure.md` writes
+    Imports count. `dev-docs/decisions/0006-audit-write-failure.md` writes
     "`migrations/env.py`'s `fileConfig` call", and that file imports the name
     from `logging.config` rather than defining it -- the citation is about
     the call site, which is genuinely there. The cost of counting them is

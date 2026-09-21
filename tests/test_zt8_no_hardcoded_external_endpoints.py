@@ -9,7 +9,7 @@ external services. Every URL must be either:
    ``os.environ.get(...)``).
 
 This is the code-level half of ZT-8's egress enumeration. The full
-enumeration (including infrastructure) is in ``docs/decisions/0009-egress-analysis.md``.
+enumeration (including infrastructure) is in ``dev-docs/decisions/0009-egress-analysis.md``.
 
 The zero-trust plan §4 says:
 - Enumerate what actually requires internet egress.
@@ -18,7 +18,7 @@ The zero-trust plan §4 says:
 This test ensures no code path introduces a hardcoded external URL that
 would require internet egress without the NAT Gateway.
 
-See ``docs/decisions/0009-egress-analysis.md`` for the full enumeration.
+See ``dev-docs/decisions/0009-egress-analysis.md`` for the full enumeration.
 """
 
 from __future__ import annotations

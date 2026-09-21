@@ -60,7 +60,7 @@ WHAT IT DOES NOT DO, stated plainly because this part reads as safe and is
 not:
 
   - **It still cancels an audit write, and can leave a call with no
-    OUTCOME recorded.** `docs/decisions/0006-audit-write-failure.md` makes
+    OUTCOME recorded.** `dev-docs/decisions/0006-audit-write-failure.md` makes
     auditing fail-closed, and `services/api/middleware/audit.py` is FastMCP
     middleware running INSIDE the server, so this middleware is outside it
     and cancelling the request cancels whichever audit write is in flight --
@@ -403,7 +403,7 @@ async def _expire(response: _Response, send: Send, seconds: float) -> None:
     # this process, which is the one place the fault is not. `ToolError` could
     # not have produced any of them: FastMCP 4 returns it as
     # `CallToolResult(is_error=True)` inside an HTTP 200, which is why this is
-    # ASGI middleware at all (docs/decisions/0002-header-validation.md).
+    # ASGI middleware at all (dev-docs/decisions/0002-header-validation.md).
     #
     # The body is a JSON-RPC error envelope because that is what the client
     # parses, with `mcp.types.REQUEST_TIMEOUT` (-32001, verified against mcp

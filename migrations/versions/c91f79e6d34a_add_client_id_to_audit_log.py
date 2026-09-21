@@ -52,7 +52,7 @@ def upgrade() -> None:
     `fastmcp.Client(transport=server)` transport -- the absence
     `models.py`'s `ABSENCE_NO_ACCESS_TOKEN` already names. A `NOT NULL`
     column would turn such a call into a failed INSERT, and under
-    docs/decisions/0006-audit-write-failure.md a failed audit write takes the
+    dev-docs/decisions/0006-audit-write-failure.md a failed audit write takes the
     tool call with it, so the column would fail closed on a path that works
     as designed. NULL therefore carries two meanings on this table, told
     apart by a sibling column rather than by this one: on a row written since
@@ -116,7 +116,7 @@ def upgrade() -> None:
     `asyncpg.exceptions.StringDataRightTruncationError`. That is the exact
     failure `_MAX_CLIENT_ID` and `_clamp` exist upstream of in
     `services/api/middleware/audit.py`, and under
-    docs/decisions/0006-audit-write-failure.md it would cost the audit row
+    dev-docs/decisions/0006-audit-write-failure.md it would cost the audit row
     and the tool call.
 
     The downgrade was then run: zero columns named `client_id` in
@@ -147,7 +147,7 @@ def downgrade() -> None:
 
     An application still running the newer code against a downgraded schema
     fails every audit write on the missing column, which under
-    docs/decisions/0006-audit-write-failure.md fails the tool call -- on the
+    dev-docs/decisions/0006-audit-write-failure.md fails the tool call -- on the
     entry write, before the backend is reached. That is the same shape
     71a4c0d9e3b2's and 9a7d4e51c6f8's downgrades leave, and it is the
     fail-closed direction: no customer data is touched without a row.

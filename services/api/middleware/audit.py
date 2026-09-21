@@ -14,7 +14,7 @@ documentation gap.
 
 The entry row (`outcome='reaching'`) is committed in its own transaction
 before the first backend request of the call, and fails closed
-(docs/decisions/0006-audit-write-failure.md). That inverts the failure mode:
+(dev-docs/decisions/0006-audit-write-failure.md). That inverts the failure mode:
 an audit outage used to mean data touched with nothing recorded, and now
 means the backend is never reached at all.
 
@@ -208,7 +208,7 @@ _MAX_REQUEST_ID = 128
 # belongs here is the same failure this file's other two bounds exist to
 # avoid: a value wider than the column raises
 # `asyncpg.exceptions.StringDataRightTruncationError` at the INSERT, which
-# under docs/decisions/0006-audit-write-failure.md costs the whole audit row
+# under dev-docs/decisions/0006-audit-write-failure.md costs the whole audit row
 # and the tool call.
 #
 # The value is NOT agent-chosen, which is the difference from `_MAX_TOOL_NAME`
@@ -228,7 +228,7 @@ def _clamp(value: str, limit: int) -> str:
     marker to a value already cut to the column width would write
     `limit + 1` characters, which is the `StringDataRightTruncationError`
     the clamp exists to avoid, and under
-    `docs/decisions/0006-audit-write-failure.md` a failed audit write takes
+    `dev-docs/decisions/0006-audit-write-failure.md` a failed audit write takes
     the tool call with it. The returned length is therefore at most exactly
     `limit`.
 
@@ -607,7 +607,7 @@ class _PendingEntry:
                 await self._write_entry_row()
             except Exception as audit_exc:
                 # The THIRD failure path, and the one
-                # docs/decisions/0006-audit-write-failure.md did not have
+                # dev-docs/decisions/0006-audit-write-failure.md did not have
                 # when it enumerated what an operator sees. Logged here
                 # because this write is the only one of the three the
                 # middleware never sees: it raises inside the tool body, so
@@ -1028,7 +1028,7 @@ class AuditMiddleware(Middleware):
             # so the lookup can only miss for them, and a miss records NULL
             # -- under-reporting a refusal instead of inventing one.
             refusal_reason = consent.refusal_for(context.message.name)
-            # Fail closed (docs/decisions/0006-audit-write-failure.md): an
+            # Fail closed (dev-docs/decisions/0006-audit-write-failure.md): an
             # audit-write failure here must never become the exception the
             # caller sees. Before this, an exception from `_write` replaced
             # `exc` by propagating unchanged, which put the DATABASE's
@@ -1166,7 +1166,7 @@ class AuditMiddleware(Middleware):
             # loudly. The cost is real and is not hidden: a database outage
             # now takes down every tool call, including ones that would
             # otherwise have succeeded. See
-            # docs/decisions/0006-audit-write-failure.md for the rejected
+            # dev-docs/decisions/0006-audit-write-failure.md for the rejected
             # alternative (write-through-and-log) and the reasoning.
             logger.error(
                 "audit write failed for tool %r after it returned successfully; "

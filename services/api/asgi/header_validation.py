@@ -35,7 +35,7 @@ class HeaderBodyValidation:
         nothing else in this stack (uvicorn, Starlette, FastMCP) imposes a
         request body size limit, so an unset cap is a real denial-of-service
         surface, not a theoretical one -- see
-        docs/decisions/0002-header-validation.md. This project has no basis
+        dev-docs/decisions/0002-header-validation.md. This project has no basis
         for choosing that number on a deployment's behalf, so there is no
         default other than unbounded; a deployment that needs the cap must
         set it explicitly, sized to its own edge.

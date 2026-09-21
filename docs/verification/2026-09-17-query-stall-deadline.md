@@ -295,7 +295,7 @@ terminate rather than close on invalidation, if SQLAlchemy exposes the choice;
 or accept it and put the deadline at the ASGI edge, which is the only place
 that bounds a request regardless of which dependency stalled, and which owes
 an HTTP status and therefore belongs in ASGI middleware for the reason
-`docs/decisions/0002-header-validation.md` records.
+`dev-docs/decisions/0002-header-validation.md` records.
 
 ## The committed test
 

@@ -229,7 +229,7 @@ async def test_duplicate_method_key_in_json_body_is_resolved_to_the_last_occurre
     would need a decision about what counts as a legitimate duplicate inside
     an arbitrary tool's own `arguments` object, which is out of scope for a
     header/body consistency check. Recorded as a finding in
-    docs/decisions/0002-header-validation.md.
+    dev-docs/decisions/0002-header-validation.md.
     """
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen))
@@ -322,7 +322,7 @@ async def test_real_stack_returns_a_genuine_400_through_build_server_and_http_ap
     `mcp.http_app(path="/mcp", middleware=[Middleware(HeaderBodyValidation, ...)])`
     on top of Task 4's `build_server`, driven through a real ASGI transport
     rather than the fake downstream app the rest of this file uses. `httpx`
-    is not installed in this project (see docs/decisions/0001-facade-http-client.md);
+    is not installed in this project (see dev-docs/decisions/0001-facade-http-client.md);
     this uses `httpx2.ASGITransport`, which mirrors `httpx.ASGITransport` and
     is already this project's HTTP stack.
     """
@@ -540,7 +540,7 @@ async def test_disconnect_mid_drain_does_not_crash_and_downstream_gets_the_parti
 
 async def test_body_exceeding_configured_cap_is_rejected_with_413_and_stops_buffering() -> None:
     """Nothing upstream of this middleware bounds request body size (see
-    docs/decisions/0002-header-validation.md): the drain buffers the whole
+    dev-docs/decisions/0002-header-validation.md): the drain buffers the whole
     body into memory before any check runs. `max_body_bytes` is opt-in and
     unset by default -- this project has no basis for guessing the number a
     given deployment's edge should own -- but when a deployment does set it,

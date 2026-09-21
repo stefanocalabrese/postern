@@ -13,7 +13,7 @@ The workflow must:
 3. Generate SBOMs with syft and upload as artifacts.
 4. Scan images for HIGH/CRITICAL vulnerabilities with Trivy.
 
-See ``docs/decisions/0011-deploy-pipeline.md`` for the full design.
+See ``dev-docs/decisions/0011-deploy-pipeline.md`` for the full design.
 """
 
 from __future__ import annotations

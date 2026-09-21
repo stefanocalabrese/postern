@@ -5,7 +5,7 @@ ASGI shutdown; nothing else may construct one, so connections are pooled
 rather than opened per request.
 
 Every phase of reaching Postgres carries its own deadline, the shape
-`docs/decisions/0003-composition-root.md` already gave the backend HTTP
+`dev-docs/decisions/0003-composition-root.md` already gave the backend HTTP
 client. Until this constructor took `connect_args`, the only deadline on the
 whole path was asyncpg's own `connect(timeout=60)` default: a store that
 completed the TCP handshake and then went silent held a request for a full
@@ -71,7 +71,7 @@ class Database:
         test that only asserts an exception.
 
         What the command timeout costs, in the terms
-        `docs/decisions/0006-audit-write-failure.md` used: a failed audit
+        `dev-docs/decisions/0006-audit-write-failure.md` used: a failed audit
         write fails the tool call, and `services/api/consent.py`'s check
         denies when its lookup raises, so this deadline converts "the store
         was slow" into "the call failed". A database that would have answered

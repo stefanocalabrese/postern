@@ -1,6 +1,6 @@
 """The citation gate, pinned against the failure it was built for.
 
-On 2026-09-17 `docs/decisions/0007-audit-refusal-and-absence-reasons.md`
+On 2026-09-17 `dev-docs/decisions/0007-audit-refusal-and-absence-reasons.md`
 carried 39 bare `file:line` citations and 28 pointed at something other than
 what the prose said. The one this file reproduces is
 `services/api/middleware/audit.py:725`: at commit cb39533 that line held a
@@ -65,7 +65,7 @@ def _historical_tree(root: Path, citation: str) -> Report:
                     return None
                 """,
             "services/api/middleware/audit.py": _audit_module(),
-            "docs/decisions/0007.md": f"""
+            "dev-docs/decisions/0007.md": f"""
                 `_refuse` files the decision on `request.state`, and {citation}
                 reads it back with `consent.refusal_for` after `call_next` raises.
                 """,
@@ -90,7 +90,7 @@ def test_the_defect_a_line_count_would_have_passed(tmp_path: Path) -> None:
 
     assert len(report.problems) == 1
     problem = report.problems[0]
-    assert problem.source == "docs/decisions/0007.md"
+    assert problem.source == "dev-docs/decisions/0007.md"
     assert "carries no `refusal_for`" in problem.message
     assert "found at services/api/consent.py::refusal_for" in problem.message
 

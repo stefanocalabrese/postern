@@ -62,7 +62,7 @@ captured token) and reverted with `git checkout -- stub/backend.py` both
 times. `git status --porcelain` and `git diff` were both empty after each
 revert, and again before this record was committed. The only file this commit
 adds is this record. This follows the precedent
-`docs/decisions/0004-base-images.md` sets for a probe edit ("The (reverted)
+`dev-docs/decisions/0004-base-images.md` sets for a probe edit ("The (reverted)
 probe edit to `pyproject.toml` was never committed; `git status`/`git diff`
 were checked clean before and after").
 

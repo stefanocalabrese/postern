@@ -80,7 +80,7 @@ def downgrade() -> None:
 
     An application still running the newer code against a downgraded schema
     fails every audit write on the missing column, which under
-    docs/decisions/0006-audit-write-failure.md fails the tool call -- on the
+    dev-docs/decisions/0006-audit-write-failure.md fails the tool call -- on the
     entry write, before the backend is reached. That is the fail-closed
     direction: no customer data is touched without a row.
     """

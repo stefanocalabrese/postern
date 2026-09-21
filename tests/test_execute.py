@@ -8,7 +8,7 @@ Tests for ``services.confirm.execute``:
 - ``_scrub_response`` — PAN/IBAN scrubbing on error bodies.
 
 Backend mocking is at the transport layer with ``httpx2.MockTransport``, per
-``docs/decisions/0001-facade-http-client.md``. ``respx`` is not installed and
+``dev-docs/decisions/0001-facade-http-client.md``. ``respx`` is not installed and
 cannot mock ``httpx2``.
 """
 

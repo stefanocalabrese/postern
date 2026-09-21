@@ -359,7 +359,7 @@ async def test_a_call_with_no_access_token_names_no_client_on_either_row(
     `Client(transport=server)` transport, which is a working path and not a
     degraded one, so `AuditEntry.client_id` is nullable rather than `NOT
     NULL`: the INSERT would otherwise fail, and under
-    docs/decisions/0006-audit-write-failure.md a failed audit write takes the
+    dev-docs/decisions/0006-audit-write-failure.md a failed audit write takes the
     tool call with it. The column would then fail closed on a transport the
     test suite above it runs entirely on.
 
@@ -455,7 +455,7 @@ async def test_an_entry_row_that_cannot_be_written_stops_the_call_before_the_bac
     façade hook and `get_json` never issues its request. Before this change
     the same outage let the tool run to completion and discovered the
     problem afterwards, which is how a call could touch real customer data
-    and leave nothing behind (docs/decisions/0006-audit-write-failure.md is
+    and leave nothing behind (dev-docs/decisions/0006-audit-write-failure.md is
     the policy; this is what it now buys).
 
     The tool call fails, which is the cost that record already states and
@@ -490,7 +490,7 @@ async def test_an_entry_write_failure_is_logged_for_the_operator(
     (`fastmcp/server/server.py::call_tool`), so a failed entry write records
     the same `detail='ToolError'` as a tool that raised on its own. The two
     completion-write failure paths each got a logging test when
-    docs/decisions/0006-audit-write-failure.md was written
+    dev-docs/decisions/0006-audit-write-failure.md was written
     (`tests/test_audit_middleware.py`); this is the third path's, and it
     matters more than either, because those two at least leave a row whose
     absence is informative.
@@ -569,7 +569,7 @@ async def test_a_second_touch_after_a_failed_entry_write_fails_too(
             # returned path, and that path's completion write is the one that
             # then fails against the same unreachable store. A raw store
             # exception escaping `on_call_tool` is the success-path behaviour
-            # `docs/decisions/0006-audit-write-failure.md` documents, and
+            # `dev-docs/decisions/0006-audit-write-failure.md` documents, and
             # `raise_on_error=False` does not suppress it because it is a
             # protocol-level error rather than `isError: true`.
             with pytest.raises(MCPError):

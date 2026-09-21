@@ -1,7 +1,7 @@
 """Backend façade client: GET-only, token-minted, error body scrubbed (Task 6).
 
 Backend mocking is at the transport layer with `httpx2.MockTransport`, per
-`docs/decisions/0001-facade-http-client.md`. `respx` is not installed and
+`dev-docs/decisions/0001-facade-http-client.md`. `respx` is not installed and
 cannot mock `httpx2`.
 """
 

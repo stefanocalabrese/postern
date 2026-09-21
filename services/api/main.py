@@ -2,7 +2,7 @@
 
 Four questions earlier tasks deliberately deferred here ("Task 12 owns
 composition"); the reasoning for each lives in
-`docs/decisions/0003-composition-root.md` and is summarised at its wiring
+`dev-docs/decisions/0003-composition-root.md` and is summarised at its wiring
 site below:
 
 1. `BackendClient` lifecycle and `aclose()` on shutdown, joined by `Database`
@@ -34,7 +34,7 @@ signing key, which is a different hazard. What checks it now is
 token, verified against the key set this same process publishes, and no start
 if the two disagree. It reads no settings, so the shape the deleted guard
 mistook for a deployment never enters into it, and it has no override flag.
-`docs/decisions/0003-composition-root.md` and `0004-base-images.md` each carry
+`dev-docs/decisions/0003-composition-root.md` and `0004-base-images.md` each carry
 dated amendments recording the deletion and what did and did not replace it.
 
 Task 6 adds the database: one `Database` per process, built unconditionally
@@ -257,7 +257,7 @@ def create_app(
         # The entry audit row, committed before this client reaches the
         # operator's backend and failing the call if it cannot be
         # (`services/api/middleware/audit.py`, and
-        # `docs/decisions/0006-audit-write-failure.md` for why closed rather
+        # `dev-docs/decisions/0006-audit-write-failure.md` for why closed rather
         # than open). Wired here because this is the only place that holds
         # both halves: the façade that will make the request, and the
         # middleware module that knows what to record about it.
@@ -286,7 +286,7 @@ def create_app(
     # They bound the connect, every statement, and the wait for a pooled
     # connection; `Database.__init__` carries the per-phase reasoning and,
     # more importantly, what the command timeout costs. In short: under
-    # `docs/decisions/0006-audit-write-failure.md` a failed audit write fails
+    # `dev-docs/decisions/0006-audit-write-failure.md` a failed audit write fails
     # the call, so a store slow enough to blow the statement budget now fails
     # calls it would previously have served late. That is the trade, taken
     # against a path whose two queries are one indexed SELECT and one INSERT.

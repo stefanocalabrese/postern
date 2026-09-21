@@ -134,48 +134,6 @@ Structured documentation with setup instructions, component manuals, and glossar
 - [**Audit System**](docs/user-guide/components/audit.md) — Two-row pattern, fail-closed writes
 - [**Glossary**](docs/user-guide/glossary.md) — Key terms and concepts
 
-### Design Documents
-
-Read in this order:
-
-1. **[`docs/postern-design-handoff.md`](docs/postern-design-handoff.md)** — The architecture, 868 lines.
-   Section 10 lists 28 open questions; several change the architecture rather than the code.
-2. **[`docs/postern-zero-trust-plan.md`](docs/postern-zero-trust-plan.md)** — The threat model and implementation plan.
-3. **[`docs/postern-python-implementation-guide.md`](docs/postern-python-implementation-guide.md)** — Framework specifics and code patterns.
-   Its section 0 verification protocol is mandatory.
-
-### Decision Records
-
-[`docs/decisions/`](docs/decisions/) — Architecture decision records for key design choices:
-
-- [ADR-0001](docs/decisions/0001-facade-http-client.md) — HTTP client choice (httpx2 over httpx)
-- [ADR-0006](docs/decisions/0006-audit-write-failure.md) — Fail-closed audit writes
-- [ADR-0008](docs/decisions/0008-masking-residuals.md) — Accepted masking residual gaps
-- [ADR-0011](docs/decisions/0011-deploy-pipeline.md) — Deploy pipeline (GitHub Actions)
-
-## Rules that are decisions, not preferences
-
-Read [`CLAUDE.md`](CLAUDE.md) before changing anything. The load-bearing ones:
-
-- **There is no payment execution tool.** `payments.create_payment` proposes;
-  `payments.get_payment_status` observes. Execution is triggered by the customer's
-  confirmation on their own device and runs in the approval callback. A
-  `submit_payment` in the schema hands the model an execution capability and makes
-  safety depend on it choosing not to use it.
-- **The confirmation payload is built server-side from the stored challenge row**,
-  never from agent input. An injected agent can propose a wrong payee. It cannot
-  change what the customer is shown before they approve.
-- **The token is the identity.** `user_id` is never a tool argument and is never
-  returned to the client.
-- **Masking is a type property.** `MaskedPan` and `MaskedIban` mask on construction.
-  A handler that forgets fails validation instead of leaking. Counterparty account
-  numbers are omitted entirely: name only.
-- **Never write "Face ID" in this codebase.** The operator's app brands its
-  identity-verification feature that way, but it is server-side selfie matching in
-  the backend cluster, not Apple's on-device feature. Any reader, human or model,
-  will build the wrong thing. Write "app identity verification", and "device unlock
-  biometric" when the phone's own biometric is meant.
-
 ## Running the gates
 
 ```bash
@@ -205,7 +163,7 @@ Two version traps will produce plausible and wrong code from memory:
 The HTTP client is `httpx2`, not `httpx`, because that is what FastMCP 4 depends on.
 `respx` cannot mock it: it type-checks against `httpx.Response` and raises
 `TypeError` at mock-setup time. Backend tests inject an `httpx2.MockTransport`
-instead. See [ADR-0001](docs/decisions/0001-facade-http-client.md).
+instead. See [ADR-0001](dev-docs/decisions/0001-facade-http-client.md).
 
 ## Critical path note
 

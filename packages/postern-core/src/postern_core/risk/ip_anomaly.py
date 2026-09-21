@@ -17,7 +17,7 @@ Signals follow the same severity model as the rest of the risk engine:
 This module is stateless: it takes an ``IpTracker`` snapshot and returns
 signals. The caller decides what to do with them.
 
-See ``docs/decisions/0010-dpop-sender-constraint.md`` for the threat model
+See ``dev-docs/decisions/0010-dpop-sender-constraint.md`` for the threat model
 context: without DPoP, IP anomaly detection is the primary compensating
 control for stolen-token replay from attacker infrastructure.
 """

@@ -5,7 +5,7 @@ Tests cover ``IpTracker`` and ``IpAnomalyDetector``:
 - IpAnomalyDetector: impossible travel, IP diversity escalation/hard limit,
   custom config thresholds, signal immutability.
 
-See ``docs/decisions/0010-dpop-sender-constraint.md`` for the threat model:
+See ``dev-docs/decisions/0010-dpop-sender-constraint.md`` for the threat model:
 without DPoP, IP anomaly detection is the primary compensating control for
 stolen-token replay from attacker infrastructure (threat A4).
 

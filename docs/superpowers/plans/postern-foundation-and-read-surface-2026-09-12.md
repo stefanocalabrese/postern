@@ -25,7 +25,7 @@
 | Payments, tier 2 | 6 | handoff §10.4, §10.10, §10.13, §10.17 |
 | Terraform, PrivateLink, Istio, WAF, RDS | separate repo (handoff §12.3) | |
 
-**Status, 2026-09-12:** Tasks 0, 1 and 2 are complete, committed as "chore: uv workspace skeleton with local CI gates", "docs: record facade HTTP client decision (httpx2, MockTransport)", and "feat(domain): masked PAN and IBAN types enforced by validator". Security review of Task 2 found defects in this plan's own text, corrected below; see `docs/decisions/0001-facade-http-client.md` for the façade HTTP client decision.
+**Status, 2026-09-12:** Tasks 0, 1 and 2 are complete, committed as "chore: uv workspace skeleton with local CI gates", "docs: record facade HTTP client decision (httpx2, MockTransport)", and "feat(domain): masked PAN and IBAN types enforced by validator". Security review of Task 2 found defects in this plan's own text, corrected below; see `dev-docs/decisions/0001-facade-http-client.md` for the façade HTTP client decision.
 
 **Naming assumption:** the design docs say `bank-mcp` / `bank_mcp_core`; this plan uses the repo's name, `postern` / `postern_core`. If that flips, it is one rename across this file and the skeleton.
 
@@ -55,7 +55,7 @@ Checked against primary sources on 2026-09-12. Anything not here is design reaso
 - In-process test client: `from fastmcp.client import Client`; `async with Client(transport=mcp) as c`. It accepts **no auth argument**, which is why this plan injects the customer resolver instead.
 - **Dependency is `httpx2>=2.5.0`, not `httpx`.**
 
-**Libraries:** pydantic 2.13.5 (`AfterValidator` preferred over `BeforeValidator`; `Annotated` metadata applies right-to-left), import-linter 2.15 (`lint-imports`, exits 1 on violation), uv 0.12.13, pytest-asyncio 1.4.0 (set both `asyncio_default_fixture_loop_scope` and `asyncio_default_test_loop_scope` or session teardown raises), httpx2 2.12.0 (the Task 1 spike found the `httpx`-mocking library cannot mock it; see `docs/decisions/0001-facade-http-client.md`), testcontainers 4.15.0 (`testcontainers.community.postgres`).
+**Libraries:** pydantic 2.13.5 (`AfterValidator` preferred over `BeforeValidator`; `Annotated` metadata applies right-to-left), import-linter 2.15 (`lint-imports`, exits 1 on violation), uv 0.12.13, pytest-asyncio 1.4.0 (set both `asyncio_default_fixture_loop_scope` and `asyncio_default_test_loop_scope` or session teardown raises), httpx2 2.12.0 (the Task 1 spike found the `httpx`-mocking library cannot mock it; see `dev-docs/decisions/0001-facade-http-client.md`), testcontainers 4.15.0 (`testcontainers.community.postgres`).
 
 **Pydantic 2.13 validation-bypass surface for `Annotated[str, AfterValidator]`**, measured during the Task 2 review against a model with `model_config = ConfigDict(extra="forbid", frozen=True)` and a `MaskedPan` field: `Strict(pan="4111111111114417").model_dump_json()` masks correctly; `Strict.model_construct(pan="4111111111114417").model_dump_json()` returns the raw PAN; `ok.model_copy(update={"pan": "4111111111114417"}).model_dump_json()` also returns the raw PAN, even under `frozen=True`. Plain attribute assignment (`ok.pan = "..."`) is the one idiom `frozen=True` blocks, raising `ValidationError`. No `ConfigDict` option closes `model_construct`; `model_copy(update=...)` is closed only by overriding the method to re-validate. Separately, `ValidationError.__str__` embeds `input_value=...` by default, confirmed by constructing with a raw PAN embedded in a string and finding it in `str(exc)`; `hide_input_in_errors=True` removes it from `str(exc)` and `repr(exc)` only, confirmed the same way. It does **not** remove it from `exc.errors()` or `exc.json()`, which still carry the raw PAN by default regardless of that setting — measured against Task 2's final commit (`3b0020d`): `"4111111111114417" in repr(exc.errors())` → `True`, `in exc.json()` → `True`, `in repr(exc.errors(include_input=False))` → `False`. Closing the leak for any client-facing error payload requires calling `errors(include_input=False)` / `json(include_input=False)` explicitly at the point of serialization; `hide_input_in_errors` alone is not sufficient.
 
@@ -71,7 +71,7 @@ Checked against primary sources on 2026-09-12. Anything not here is design reaso
 
 **D4. `cache_scope="private"` is set at server construction**, not per tool. The catalog varies by consent, so no result may be shared across authorization contexts.
 
-**D5. The façade's HTTP client is `httpx2`, resolved by the Task 1 spike.** `httpx2` is what FastMCP pulls. The `httpx`-mocking library cannot mock it (`TypeError` at mock-setup time, before any request), so it is dropped from the dev dependency group; backend tests mock at the transport layer instead, via an injected `httpx2.MockTransport(handler)`. See `docs/decisions/0001-facade-http-client.md`.
+**D5. The façade's HTTP client is `httpx2`, resolved by the Task 1 spike.** `httpx2` is what FastMCP pulls. The `httpx`-mocking library cannot mock it (`TypeError` at mock-setup time, before any request), so it is dropped from the dev dependency group; backend tests mock at the transport layer instead, via an injected `httpx2.MockTransport(handler)`. See `dev-docs/decisions/0001-facade-http-client.md`.
 
 **D6. Masked types strict-parse and reject rather than coerce.** A "looks masked" or "scrape any digits" approach coerces arbitrary text into a well-formed mask: the original approach turned `"card 4111111111114417 exp 12/28"` into `'•••• 1228'`, a confident, wrong answer that nothing downstream can catch. Rejecting anything that is not a well-formed PAN or a mod-97-valid IBAN is the only way to keep every accepted mask trustworthy.
 
@@ -324,7 +324,7 @@ git commit -m "chore: uv workspace skeleton with local CI gates"
 **Why this is first:** `fastmcp` 4.0.3 depends on `httpx2>=2.5.0` and lists no `httpx`. The façade client's HTTP library, and whether its test-mocking approach actually works against it, determines every backend test in Tasks 8 to 11. Guessing here invalidates four tasks.
 
 **Files:**
-- Create: `docs/decisions/0001-facade-http-client.md`
+- Create: `dev-docs/decisions/0001-facade-http-client.md`
 
 - [ ] **Step 1: Observe what is actually installed**
 
@@ -339,14 +339,14 @@ Second, `httpx2.MockTransport(handler)` injected into `BackendClient`'s transpor
 
 - [ ] **Step 3: Record the decision**
 
-Write `docs/decisions/0001-facade-http-client.md` with the observed result: the façade uses `httpx2` (FastMCP's own dependency, one HTTP stack in the image); backend tests mock at the **transport** layer via an injected `httpx2.MockTransport(handler)`; the `httpx`-mocking library is dropped from the dev dependency group, since it cannot mock `httpx2`.
+Write `dev-docs/decisions/0001-facade-http-client.md` with the observed result: the façade uses `httpx2` (FastMCP's own dependency, one HTTP stack in the image); backend tests mock at the **transport** layer via an injected `httpx2.MockTransport(handler)`; the `httpx`-mocking library is dropped from the dev dependency group, since it cannot mock `httpx2`.
 
 The decision record must state: the date, the observed command output for both approaches in Step 2, the chosen option, and the consequence for Tasks 8 to 11.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docs/decisions/0001-facade-http-client.md
+git add dev-docs/decisions/0001-facade-http-client.md
 git commit -m "docs: record facade HTTP client decision (httpx2, MockTransport)"
 ```
 
@@ -1704,7 +1704,7 @@ Expected: PASS, 10 passed
 
 - [ ] **Step 5: Record the two known deviations**
 
-Append to `docs/decisions/0002-header-validation.md`:
+Append to `dev-docs/decisions/0002-header-validation.md`:
 
 - The spec requires Base64 sentinel header values to be decoded before comparison. This implementation compares raw values only, so a client using sentinel encoding would be rejected. Close it in Plan 4 alongside the client allowlist, when the set of clients is known.
 - The spec also defines `Mcp-Param-{Name}` headers projected from a tool's `inputSchema` via `x-mcp-header`. No tool in this plan uses `x-mcp-header`, so no such header is validated. Revisit if a tool adopts it.
@@ -1712,7 +1712,7 @@ Append to `docs/decisions/0002-header-validation.md`:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add services/api/asgi/header_validation.py tests/test_header_body_mismatch.py docs/decisions/0002-header-validation.md
+git add services/api/asgi/header_validation.py tests/test_header_body_mismatch.py dev-docs/decisions/0002-header-validation.md
 git commit -m "feat(api): reject Mcp-Method/Mcp-Name body mismatch with 400 and -32020"
 ```
 
@@ -1720,7 +1720,7 @@ git commit -m "feat(api): reject Mcp-Method/Mcp-Name body mismatch with 400 and 
 code, as written, passed all 10 of its own tests but had two real bugs and one
 unaddressed operational gap, found by attacking the implementation rather
 than by extending its tests. Full detail, including the findings recorded but
-deliberately not fixed, is in `docs/decisions/0002-header-validation.md`;
+deliberately not fixed, is in `dev-docs/decisions/0002-header-validation.md`;
 summary of what changed in the code actually committed:
 
 - **Duplicate `Mcp-Method`/`Mcp-Name` headers.** `scope["headers"]` is a list;
@@ -1756,13 +1756,13 @@ summary of what changed in the code actually committed:
   `json.loads` keeps the last of a repeated top-level key; RFC 8259 §4 calls
   the behaviour unpredictable across implementations) and the header/body
   case-sensitivity, whitespace, and leak-surface checks. All are detailed in
-  `docs/decisions/0002-header-validation.md`.
+  `dev-docs/decisions/0002-header-validation.md`.
 
 `tests/test_header_body_mismatch.py` grew from the 10 tests above to 30: the
 20 added tests cover every finding, including a real end-to-end request
 through `build_server` + `mcp.http_app(middleware=[Middleware(
 HeaderBodyValidation, ...)])` driven with `httpx2.ASGITransport` (`httpx` is
-not installed in this project — `docs/decisions/0001-facade-http-client.md`).
+not installed in this project — `dev-docs/decisions/0001-facade-http-client.md`).
 `uv run pytest tests/test_header_body_mismatch.py -q` → `30 passed`.
 
 ---
@@ -1862,7 +1862,7 @@ This client exposes GET only. The write path lives in services/confirm and is
 reachable only from a signed approval, so a write method here would be the
 capability the whole design removes.
 
-`httpx2` is FastMCP 4's HTTP dependency; see docs/decisions/0001.
+`httpx2` is FastMCP 4's HTTP dependency; see dev-docs/decisions/0001.
 """
 
 from collections.abc import Mapping
@@ -3249,12 +3249,12 @@ git commit -m "feat(tools): banking_start_session bootstrap tool"
 
 **Corrected against what execution actually found (2026-09-14):**
 
-1. **The plan's own `main.py` draft ends with a bare `app = create_app()`, which reproduces the exact `Settings.from_env()`-at-import-time problem this task's own preamble warns about for `server.py`, one file over.** Measured: `uv run pytest tests/test_asgi_app.py` failed at *collection*, before any test ran, with `KeyError: 'POSTERN_BACKEND_BASE_URL'`, because `from services.api.main import create_app` executes the module's top level regardless of which name a test imports. Fixed with a PEP 562 module `__getattr__` that calls `create_app()` lazily, only when the `app` attribute is looked up; `uvicorn services.api.main:app` resolves its target the same way `getattr(import_module(...), "app")` would, so production is unaffected. See `docs/decisions/0003-composition-root.md`.
+1. **The plan's own `main.py` draft ends with a bare `app = create_app()`, which reproduces the exact `Settings.from_env()`-at-import-time problem this task's own preamble warns about for `server.py`, one file over.** Measured: `uv run pytest tests/test_asgi_app.py` failed at *collection*, before any test ran, with `KeyError: 'POSTERN_BACKEND_BASE_URL'`, because `from services.api.main import create_app` executes the module's top level regardless of which name a test imports. Fixed with a PEP 562 module `__getattr__` that calls `create_app()` lazily, only when the `app` attribute is looked up; `uvicorn services.api.main:app` resolves its target the same way `getattr(import_module(...), "app")` would, so production is unaffected. See `dev-docs/decisions/0003-composition-root.md`.
 2. **`create_app`'s draft signature (`settings: Settings | None = None`) has no way to inject a customer or a mocked backend transport**, which the adversarial pass requires (a real `tools/call` reaching a tool through `create_app()` itself, driven by `httpx2.ASGITransport`, with no live customer token or reachable bank in CI). Added two keyword-only parameters, `resolver: CustomerResolver | None` and `transport: httpx2.AsyncBaseTransport | None`, both `None` (real behaviour) in production; mirrors the DI seam `build_server` already established for the same reason (design decision D3).
 3. **`tests/test_no_write_from_api.py`'s `test_every_registered_tool_is_annotated_read_only` used `tool.annotations.readOnlyHint`, the deprecated camelCase alias** (Task 8 correction 3 already found this once for tool registration; it recurred here on the read side). Fixed to `.read_only_hint`, confirmed against `mcp.types.ToolAnnotations.model_fields` in the installed fastmcp 4.0.3.
 4. **`test_no_tool_parameter_accepts_a_masked_type` calls `tool.fn` on the result of `server.list_tools()`, which is typed to return the base `fastmcp.tools.base.Tool`, not `FunctionTool`; only `FunctionTool` has `.fn`.** `mypy --strict` rejected the plan's draft outright (`"Tool" has no attribute "fn"`). Fixed with an `isinstance(tool, FunctionTool)` assertion before the attribute access -- true for every tool this server registers today, and a real failure (not a silent skip) the day that stops being true.
-5. **The façade timeout and `max_body_bytes` deferred items needed new `Settings` fields the plan's draft never declared**: `backend_connect_timeout_seconds`, `backend_write_timeout_seconds`, `backend_read_timeout_seconds`, `backend_pool_timeout_seconds` (replacing a single `float` that Task 6 measured as applying independently to each httpx2 phase, not once total) and `max_body_bytes` (Task 5 shipped the mechanism unset on purpose). `BackendClient.__init__`'s `timeout` parameter was widened from `float` to `float | httpx2.Timeout` to accept the composed value; `httpx2.AsyncClient(timeout=...)` already accepted a `Timeout` instance, so this is a type-hint correction, not a behaviour change. Full reasoning in `docs/decisions/0003-composition-root.md`.
-6. **The adversarial pass's `StubTokenMinter`-in-production question needed a `Settings.allow_stub_token_minter` field and a `create_app` guard the plan's draft did not anticipate.** `create_app` now refuses to start with `StubTokenMinter` against a production-shaped configuration (real customer JWT auth configured) unless this flag is set explicitly. See `docs/decisions/0003-composition-root.md`.
+5. **The façade timeout and `max_body_bytes` deferred items needed new `Settings` fields the plan's draft never declared**: `backend_connect_timeout_seconds`, `backend_write_timeout_seconds`, `backend_read_timeout_seconds`, `backend_pool_timeout_seconds` (replacing a single `float` that Task 6 measured as applying independently to each httpx2 phase, not once total) and `max_body_bytes` (Task 5 shipped the mechanism unset on purpose). `BackendClient.__init__`'s `timeout` parameter was widened from `float` to `float | httpx2.Timeout` to accept the composed value; `httpx2.AsyncClient(timeout=...)` already accepted a `Timeout` instance, so this is a type-hint correction, not a behaviour change. Full reasoning in `dev-docs/decisions/0003-composition-root.md`.
+6. **The adversarial pass's `StubTokenMinter`-in-production question needed a `Settings.allow_stub_token_minter` field and a `create_app` guard the plan's draft did not anticipate.** `create_app` now refuses to start with `StubTokenMinter` against a production-shaped configuration (real customer JWT auth configured) unless this flag is set explicitly. See `dev-docs/decisions/0003-composition-root.md`.
 7. **Comparing `Middleware.cls` (typed as the ParamSpec-generic `_MiddlewareFactory[P]` Protocol) against a concrete class fails `mypy --strict`** with "non-overlapping ... check", even though the runtime values are the exact same class object. Fixed with a small `cast(type[object], entry.cls)` helper in the test file rather than suppressing the check.
 
 None of the seven changed the design; all are additive or type-hint corrections needed to make the plan's own stated goals (no import-time environment requirement, a real end-to-end proof, `mypy --strict` passing) actually hold.
@@ -3516,7 +3516,7 @@ docker buildx imagetools inspect ghcr.io/astral-sh/uv:python3.12-bookworm-slim -
 docker buildx imagetools inspect python:3.12-slim --format '{{.Manifest.Digest}}'
 ```
 
-Replace each tag with `image@sha256:<digest>`. Record the date and digests in `docs/decisions/0003-base-images.md`.
+Replace each tag with `image@sha256:<digest>`. Record the date and digests in `dev-docs/decisions/0003-base-images.md`.
 
 - [ ] **Step 4: Write `docker-compose.yml`**
 
@@ -3549,12 +3549,12 @@ Expected: builds. Graviton on Fargate is the deployment target (handoff §12.2),
 
 - [ ] **Step 6: Note the `confirm` target will not build yet**
 
-`services/confirm/main.py` does not exist in this plan. Building `--target confirm` produces an image whose `CMD` fails at start. That is intended and closes in Plan 3. Record it in `docs/decisions/0003-base-images.md` so nobody treats it as a bug.
+`services/confirm/main.py` does not exist in this plan. Building `--target confirm` produces an image whose `CMD` fails at start. That is intended and closes in Plan 3. Record it in `dev-docs/decisions/0003-base-images.md` so nobody treats it as a bug.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add Dockerfile .dockerignore docker-compose.yml stub/backend.py docs/decisions/0003-base-images.md
+git add Dockerfile .dockerignore docker-compose.yml stub/backend.py dev-docs/decisions/0003-base-images.md
 git commit -m "build: two-target image, pinned bases, and a local stub backend"
 ```
 
@@ -3641,14 +3641,14 @@ Do not let any of these read as done because the tests are green.
 
 | Not established | Why it matters | Lands in |
 |---|---|---|
-| Any real authentication | Stale as of Task 13/14: `docker-compose.yml` no longer runs with `auth=None`, and `JWTVerifier` has now been exercised end to end over real HTTP (`docs/decisions/0004-base-images.md`, `docs/verification/2026-09-14-stack-run.md`) -- but only against `stub/backend.py`'s own disposable local JWKS/token-issuer routes, generated fresh on every container start. No genuine customer-facing OAuth 2.1 / RFC 8628 device-grant flow, no real bank-issued identity, and no production JWKS/issuer exist | Plan 4 |
+| Any real authentication | Stale as of Task 13/14: `docker-compose.yml` no longer runs with `auth=None`, and `JWTVerifier` has now been exercised end to end over real HTTP (`dev-docs/decisions/0004-base-images.md`, `docs/verification/2026-09-14-stack-run.md`) -- but only against `stub/backend.py`'s own disposable local JWKS/token-issuer routes, generated fresh on every container start. No genuine customer-facing OAuth 2.1 / RFC 8628 device-grant flow, no real bank-issued identity, and no production JWKS/issuer exist | Plan 4 |
 | The Vault read/write key split | `StubTokenMinter` returns a fake bearer string. The structural argument in handoff §6.2 is currently a lint rule plus tests, not an infrastructure property | Plan 3 |
 | Consent | `banking_start_session` reports hardcoded consent; the tool catalog is not yet filtered by it, so §3.4's leak scenario is not yet testable | Plan 2 |
 | Audit chain | No `audit_log`. The evidence a regulator asks for (handoff §9) does not exist | Plan 2 |
 | Cross-customer enforcement (ZT-2) | Stale as of `316b51c` (16 September 2026), which gave the stub a subject check: all four domain routes now call `stub/backend.py`'s `_subject` and refuse a request carrying no token, so a cross-customer read can fail locally. That is the test double, not ZT-2. **This is the critical path and it is answered by another team, not by this repo** | out of repo |
 | Token issuer must never mint a `sub` shaped like a national id, account number or PAN (alongside ZT-2) | `CustomerRef`'s `^cust[:_][A-Za-z0-9]{1,60}$` still accepts `cust_ES9121000418450200051332` (an IBAN), `cust_12345678Z` (a Spanish DNI shape) and `cust_4111111111114417` (a PAN) as the suffix. This code can only check the namespace prefix; it cannot prove what the issuer mints. Tightening the suffix to the issuer's real minted-token shape is a question for the platform team, worded here as a requirement on them, not a defect in this code | out of repo |
 | PCI DSS scope | `MaskedPan` masks in this process, so the server does hold a full PAN briefly. Handoff §6.5 prefers backend pre-masking to façade masking; §10.17 is a live dependency on backend domain services (`docs/bank-mcp-zero-trust-plan.md` §8). Answering §10.17 would remove only the `Card.pan` path; `FreeText` still covers labels, descriptors and audited tool arguments regardless. | out of repo |
-| Base64 sentinel header decoding | Documented deviation from the spec in `docs/decisions/0002` | Plan 4 |
+| Base64 sentinel header decoding | Documented deviation from the spec in `dev-docs/decisions/0002` | Plan 4 |
 | `Money` per-currency scale/precision enforcement | `Money` rejects more than 4 decimal places (Task 3, second security-review round), which closes every float-artifact shape measured, but not true per-currency precision: `Decimal("1.234")` (3 decimal places) for `"EUR"` (which allows only 2) is still accepted and serialized as given. Closing that needs an ISO 4217 minor-unit table (JPY is 0 decimal places, most currencies are 2, a few are 3), a data commitment beyond Task 3 | unscheduled |
 
 ## Self-review

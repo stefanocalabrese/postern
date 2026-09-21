@@ -2,7 +2,7 @@
 
 Four items earlier tasks explicitly deferred to this one ("Task 12 owns
 composition"), each proven here; full reasoning in
-`docs/decisions/0003-composition-root.md`:
+`dev-docs/decisions/0003-composition-root.md`:
 
 1. `BackendClient.aclose()` on shutdown, without breaking FastMCP's own
    session-manager lifespan --
@@ -18,7 +18,7 @@ composition"), each proven here; full reasoning in
 Plus the adversarial pass: `create_app()` failing clearly on an incomplete
 environment, and full end-to-end proofs (a masked result, a header/body
 mismatch, an oversized body) driven through `httpx2.ASGITransport` --
-`httpx` is not installed in this project (docs/decisions/0001).
+`httpx` is not installed in this project (dev-docs/decisions/0001).
 """
 
 import asyncio

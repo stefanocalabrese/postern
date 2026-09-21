@@ -565,7 +565,7 @@ class AuditEntry(Base):
     # through (the exception monkeypatches a token in, to pin this column on
     # both rows of one call). `NOT
     # NULL` would turn that call into a failed INSERT, which under
-    # docs/decisions/0006-audit-write-failure.md costs the audit row and the
+    # dev-docs/decisions/0006-audit-write-failure.md costs the audit row and the
     # tool call with it: the column would fail closed on a path that is
     # working as designed.
     #
@@ -682,7 +682,7 @@ class AuditEntry(Base):
         # without the migration that widens this constraint.
         #
         # The cost is stated rather than left to be discovered. Under the
-        # fail-closed policy (docs/decisions/0006-audit-write-failure.md) a
+        # fail-closed policy (dev-docs/decisions/0006-audit-write-failure.md) a
         # violation costs the entire audit row and fails the call, and it
         # would land on exactly the refusal rows this column exists to
         # record. That is the same trade that record already made: a loud,
@@ -709,7 +709,7 @@ class AuditEntry(Base):
         # every row that has ever existed carries one.
         #
         # Same cost as the others under the fail-closed policy
-        # (docs/decisions/0006-audit-write-failure.md): a violation costs the
+        # (dev-docs/decisions/0006-audit-write-failure.md): a violation costs the
         # whole audit row and the call. Nothing an agent sends can reach this
         # column -- all three values are literals chosen by
         # `services/api/middleware/audit.py` -- so the only way an unlisted
@@ -767,7 +767,7 @@ class AuditEntry(Base):
         # fails on exactly those rows.
         #
         # Under the fail-closed policy
-        # (docs/decisions/0006-audit-write-failure.md) a violation costs the
+        # (dev-docs/decisions/0006-audit-write-failure.md) a violation costs the
         # row and the call. Nothing an agent sends reaches either column, so
         # only a code change that writes one without the other can trigger
         # it, which is the failure this exists for.
@@ -800,7 +800,7 @@ class AuditEntry(Base):
         # something else entirely rather than as this comparison.
         #
         # The cost, under this repo's fail-closed audit policy
-        # (docs/decisions/0006-audit-write-failure.md): a violation costs the
+        # (dev-docs/decisions/0006-audit-write-failure.md): a violation costs the
         # entire audit row AND fails the tool call, including a call that
         # otherwise succeeded. It can only fire on a future code change,
         # since `_customer_ref` returns exactly one of the two by

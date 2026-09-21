@@ -120,7 +120,7 @@ class Settings:
     # escaped its own deadline, which keeps this from preempting requests the
     # store and the backend would still have served -- and, because a
     # cancelled request loses whichever audit row it was writing
-    # (`request_deadline.py`, and `docs/decisions/0006-audit-write-failure.md`),
+    # (`request_deadline.py`, and `dev-docs/decisions/0006-audit-write-failure.md`),
     # every second shaved off this value buys back latency by trading away
     # audit rows for calls that were merely slow.
     #

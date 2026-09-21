@@ -31,7 +31,7 @@ iban: MaskedIban = "NO93 8601 1117 947"
 bad_pan: str = "4111 1111 1111 4417"  # ← raw value, no masking
 # This compiles fine but is a security risk, the type system cannot prevent this.
 # The convention "Never replace them with a str plus a helper function" is enforced
-# by code review and the [ADR-0008](../../decisions/0008-masking-residuals.md) residual gaps documentation.
+# by code review and the [ADR-0008](../dev-docs/decisions/0008-masking-residuals.md) residual gaps documentation.
 ```
 
 > **Warning:** Validation-failure boundary, not closable by the type alone: a
@@ -157,7 +157,7 @@ exceed the unfixed code's own cost on the same input, with ~25% margin.
 
 ## Masking Residual Gaps (ADR-0008)
 
-See [ADR-0008](../../decisions/0008-masking-residuals.md) for documented residual gaps
+See [ADR-0008](../dev-docs/decisions/0008-masking-residuals.md) for documented residual gaps
 in the masking pipeline that are accepted as trade-offs:
 
 - Invisible character stripping may miss some edge cases in Unicode normalization
@@ -179,4 +179,4 @@ the response model, regardless of masking layer behavior.
 | FreeText type | [`packages/postern-core/src/postern_core/domain/masking.py`](../../../packages/postern-core/src/postern_core/domain/masking.py) |
 | Projection wrapper (catches validation errors) | [`packages/postern-core/src/postern_core/facade/projection.py`](../../../packages/postern-core/src/postern_core/facade/projection.py) |
 | Audit scrub (redacts in tool arguments) | [`services/api/middleware/audit.py`](../../../services/api/middleware/audit.py) (see `_scrub()`) |
-| ADR-0008: Masking residual gaps | [`docs/decisions/0008-masking-residuals.md`](../../decisions/0008-masking-residuals.md) |
+| ADR-0008: Masking residual gaps | [`docs/decisions/0008-masking-residuals.md`](../dev-docs/decisions/0008-masking-residuals.md) |

