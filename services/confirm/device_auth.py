@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime
+from typing import Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -111,8 +112,8 @@ async def device_authorization(request: Request) -> JSONResponse:
 
     scopes: str = body.get("scopes", "accounts:read transactions:read cards:read")
 
-    store: DeviceCodeStoreBase = request.app.state.device_code_store  # type: ignore[attr-defined]
-    settings: ConfirmSettings = request.app.state.settings  # type: ignore[attr-defined]
+    store: DeviceCodeStoreBase = request.app.state.device_code_store
+    settings: ConfirmSettings = request.app.state.settings
 
     code: DeviceCode = await store.create_device_code(
         client_id=client_id,
@@ -168,18 +169,24 @@ async def token_endpoint(request: Request) -> JSONResponse:
         expired_token — device code has passed its TTL.
     """
     form = await request.form()
-    grant_type: str = form.get("grant_type", "")
+    grant_type_raw = form.get("grant_type", "")
+    grant_type: str = (
+        grant_type_raw.file.read().decode() if hasattr(grant_type_raw, "file") else str(grant_type_raw)
+    )
 
     if grant_type != "device_code":
         # Not a device code request — let the 404 handler deal with it.
         return _error(404, "unsupported_grant_type", "only device_code grant is supported")
 
-    device_code_value: str = form.get("device_code", "")
+    device_code_raw = form.get("device_code", "")
+    device_code_value: str = (
+        device_code_raw.file.read().decode() if hasattr(device_code_raw, "file") else str(device_code_raw)
+    )
     if not device_code_value:
         return _error(400, "invalid_request", "device_code is required")
 
-    store: DeviceCodeStoreBase = request.app.state.device_code_store  # type: ignore[attr-defined]
-    settings: ConfirmSettings = request.app.state.settings  # type: ignore[attr-defined]
+    store: DeviceCodeStoreBase = request.app.state.device_code_store
+    settings: ConfirmSettings = request.app.state.settings
 
     code: DeviceCode | None = await store.get_device_code(device_code_value)
     if code is None:
@@ -193,9 +200,9 @@ async def token_endpoint(request: Request) -> JSONResponse:
     # ``interval`` parameter. Only enforced while authorization is pending;
     # once approved the client should get tokens immediately.
     if not code.approved:
-        if not hasattr(request.app.state, "_poll_times"):  # type: ignore[attr-defined]
-            request.app.state._poll_times = {}  # type: ignore[attr-defined]
-        poll_times: dict[str, datetime] = request.app.state._poll_times  # type: ignore[attr-defined]
+        poll_times: dict[str, datetime] = getattr(request.app.state, "_poll_times", {})
+        if not poll_times:
+            request.app.state._poll_times = poll_times
         last_poll = poll_times.get(device_code_value)
         if last_poll is not None:
             elapsed = (datetime.now(UTC) - last_poll).total_seconds()
@@ -221,7 +228,7 @@ async def token_endpoint(request: Request) -> JSONResponse:
         return _error(500, "invalid_state", "approval missing customer identity")
 
     # Mint read token.
-    read_minter: InternalTokenMinter = request.app.state.read_minter  # type: ignore[attr-defined]
+    read_minter: InternalTokenMinter = request.app.state.read_minter
     read_token = read_minter.mint(
         subject=CustomerRef(value=subject_value),
         audience="accounts.svc",
@@ -229,7 +236,7 @@ async def token_endpoint(request: Request) -> JSONResponse:
     )
 
     # Mint write token (for the approval callback / future write operations).
-    write_minter: InternalTokenMinter = request.app.state.write_minter  # type: ignore[attr-defined]
+    write_minter: InternalTokenMinter = request.app.state.write_minter
     write_token = write_minter.mint(
         subject=CustomerRef(value=subject_value),
         audience="payments.svc",
@@ -284,7 +291,7 @@ async def approve_callback(request: Request) -> JSONResponse:
     if not device_code_value or not subject_value:
         return _error(400, "invalid_request", "device_code and subject_value are required")
 
-    store: DeviceCodeStoreBase = request.app.state.device_code_store  # type: ignore[attr-defined]
+    store: DeviceCodeStoreBase = request.app.state.device_code_store
 
     existing: DeviceCode | None = await store.get_device_code(device_code_value)
     if existing is None:
@@ -315,7 +322,7 @@ async def approve_callback(request: Request) -> JSONResponse:
     )
 
 
-def _device_code_to_dict(dc: DeviceCode) -> dict:
+def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
     """Helper to convert frozen dataclass to mutable dict."""
     import dataclasses
 
