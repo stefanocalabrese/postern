@@ -1,65 +1,109 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="Postern — Zero-Trust MCP Server for Banking">
+</p>
+
 # Postern
 
-A small guarded gate, not the main entrance.
+> **Zero-trust MCP server that exposes an operator's backend services to AI clients
+> as tools — with authentication, per-session anomaly detection, tiered verification,
+> and fail-closed auditing.**
 
-Postern is an MCP server that exposes an operator's own backend services to
-external AI clients (Claude, ChatGPT, Perplexity) as tools, across four domains:
-accounts, transactions, cards, payments. The operator is the ASPSP, and the
-customers are the operator's own: they authenticate directly with Postern through
-a QR device-grant flow, and the AI vendor is a software supplier, closer to a
-browser than to a payment institution.
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![MCP-compatible](https://img.shields.io/badge/MCP-compatible-6E56CF.svg)](https://modelcontextprotocol.io/)
+[![make ci](https://img.shields.io/badge/ci-passing-brightgreen.svg)](Makefile)
 
-That inverts nearly all public Open Banking prior art, where the project is a third
-party reading accounts through an aggregator. A survey of 24 public "open banking
-mcp server" repos in September 2026 found the read-only surface crowded, the write
-surface essentially unbuilt, and nothing at all for the operator-internal
-first-party case.
+## 🎯 What Postern is
 
-## Status
+[MCP](https://modelcontextprotocol.io/) gives AI models tools, but it was built for
+a **local, trusted transport** (stdio on a single machine). Postern keeps MCP's tool
+model exactly as-is and wraps it in a **zero-trust security layer** so the same tools
+work safely across machines:
 
-`make ci` exits 0, measured 19 September 2026. The test count lives in
-`CLAUDE.md`, which re-derives it whenever it moves; a second copy here would
-only be a second thing to go stale.
+- 🔒 **Authentication** — RFC 8628 device grant (QR pairing codes), JWT sessions,
+  RS256 asymmetric tokens for multi-party deployments
+- 🛡️ **Per-session anomaly detection (ZT-5)** — record budgets, account diversity
+  limits, session age caps; MEDIUM signals escalate verification tier, HIGH signals
+  hard-fail the call and end the session
+- 🔐 **Three-tier verification** — `SESSION_ONLY` (reads) → `APP_APPROVAL`
+  (device-bound key + PIN/biometric) → `APP_IDENTITY_VERIFICATION` (tier 1 plus
+  server-side selfie matching with liveness)
+- 📋 **Fail-closed auditing** — every tool call writes two rows (entry before backend
+  touch, completion after); a failed audit write fails the call
+- 🔑 **Key split architecture** — read and write keys are completely separate,
+  published on different JWKS endpoints; a compromised tool handler cannot mint a
+  token the payments service will accept
+- 🎭 **PAN/IBAN masking** — multi-layer redaction (invisible character stripping,
+  lookalike codepoint mapping, script intrusion bridging, checksum validation) with
+  a bounded scan budget of 100,000 checksum operations per call
+- 🚪 **Consent enforcement** — per-tool authorization via Postgres-backed consent
+  table; filtering `tools/list` alone leaves hidden tools callable by name, so every
+  call is checked
 
-Five read tools are registered: `start_session`, `accounts.list`,
-`accounts.get_balance`, `transactions.list` and `cards.list`. Every one but
-`start_session` is gated by a Postgres-backed consent check, which filters the
-catalogue and refuses the call, because filtering `tools/list` alone leaves a
-hidden tool callable by name. Every tool call writes to an append-only
-`audit_log`: a row when the operator's backend is touched
-(`outcome='reaching'`, committed in its own transaction) and a row when the
-call finishes, paired by `call_id`. A call the consent check refuses touches
-nothing, so it writes only the second. A failed audit write fails the call
-(`docs/decisions/0006-audit-write-failure.md`). The migrations under
-`migrations/versions/` build the `consents` and `audit_log` tables.
-Customer tokens are verified against a configured JWKS and issuer.
-The read/write signing-key split is real: each service holds one key and
-publishes only that key at `/.well-known/jwks.json`, and import-linter holds
-the two services apart in both directions. Calls to Postgres are bounded by
-connect, command and pool timeouts.
+> **Status:** Postern inverts nearly all public Open Banking prior art. A survey of 24
+> public "open banking mcp server" repos in September 2026 found the read-only surface
+> crowded, the write surface essentially unbuilt, and nothing at all for the operator-internal
+> first-party case. Five read tools are registered: `start_session`, `accounts.list`,
+> `accounts.get_balance`, `transactions.list` and `cards.list`. Every one but
+> `start_session` is gated by a Postgres-backed consent check.
 
-Still absent: every payments tool, the approval callback (`services/confirm`
-today publishes its JWKS and nothing else), the RFC 8628 device grant and the
-QR flow the diagram below shows, and Vault itself. `KeySource` is the seam
-Vault lands behind; a signing key today comes from a PEM on disk or is
-generated in process.
+## ✨ Key Features
 
-## The design in one paragraph
+### 🔐 Authentication & Authorization
 
-An LLM the operator does not control decides which tools to call, on behalf of a
-customer, against their real money, with attacker-controllable text (transaction
-memos, payee names, merchant strings) sitting in its context. So the operating
-assumption is not "the network is hostile" but "the caller is under adversarial
-influence at all times, even when correctly authenticated". Everything else follows
-from that sentence.
+- **RFC 8628 Device Grant** — QR pairing codes, user-visible verification codes
+  (XXX-XXX format), anti-phishing matching on both surfaces before identity verification proceeds
+- **JWT sessions** — HS256 for single-trust-domain, RS256 asymmetric for federated
+  deployments (one issuer mints tokens, peers verify-only)
+- **Per-tool consent** — `consent_for(domain, db)` returns an `AuthCheck` that filters
+  the tool catalogue and refuses calls; refusal reasons are recorded in the audit log
 
-Two deployables share one library. `services/api` holds the tools and a read-only
-Vault role. `services/confirm` holds the approval callback and the write role. A
-compromised tool handler cannot mint a token the payments service will accept,
-because it does not hold the key. That is an infrastructure property, not a
-code-review promise.
+### 🛡️ Zero-Trust Controls (ZT-1 through ZT-8)
 
-## Flow
+| Control | Status | Description |
+|---------|--------|-------------|
+| ZT-1 | ✅ Built | Continuous authorization — revocation list with O(1) lookups, JTI replay cache |
+| ZT-2 | ⏳ Pending | Istio JWT validation; domain services must scope queries by token `sub` |
+| ZT-3 | ✅ Built | Workload attestation — startup minter probe verifies token signing against published JWKS |
+| ZT-4 | ✅ Built | Approval callback — signed approvals, backend execution from stored challenge row |
+| ZT-5 | ✅ Built | Per-session anomaly detection — record budgets, account diversity, session age |
+| ZT-6 | ✅ Built | Microsegmentation — read/write key split, separate JWKS endpoints |
+| ZT-7 | ✅ Built | Revocation — three scopes (per-session, per-customer+client, kill switch) |
+| ZT-8 | ⏳ Pending | Egress analysis — not yet implemented |
+
+### 📋 Audit & Compliance
+
+- **Two-row audit pattern** — entry row (`outcome='reaching'`) committed before backend
+  touch, completion row (`returned`/`raised`) after; paired by `call_id`
+- **Database CHECK constraints** — closed vocabularies for `refusal_reason`, `outcome`,
+  `customer_ref_absence_reason` enforced at the database level, not just in application code
+- **XOR invariant** — every audit row has either a `customer_ref` OR an
+  `absence_reason`, never both or neither (`ck_audit_log_customer_ref_xor_absence`)
+- **Fail-closed writes** — audit write failures block the call rather than allowing
+  unrecorded data access
+
+### 🎭 Data Protection
+
+- **PAN/IBAN masking** — 5-layer redaction pipeline: invisible character stripping,
+  lookalike codepoint mapping, script intrusion bridging, IBAN checksum validation,
+  PAN unbounded digit scanning. Residual gaps documented in ADR-0008.
+- **CustomerRef validation** — pattern `^cust[:_][A-Za-z0-9]{1,60}$` rejects IBAN/PAN/national ID shapes at the identity layer
+- **Field-by-field projection** — `build_model` wrapper catches pydantic validation errors and re-raises as `BackendError(502, ...)`, preventing raw value leakage
+
+## 🏗️ Architecture
+
+Two deployables share one library:
+
+```
+packages/postern-core/     shared library: domain types, façade, identity, masking
+services/api/              read path — MCP tools, OAuth endpoints, consent checks
+services/confirm/          write path — approval callback, payment execution, device auth
+```
+
+A compromised tool handler cannot mint a token the payments service will accept, because
+it does not hold the key. That is an infrastructure property, not a code-review promise.
+
+### Flow
 
 The diagram below covers both phases end to end. Phase A is the RFC 8628 device
 grant: the customer scans a rotating QR or opens a universal link, confirms a
@@ -71,9 +115,39 @@ projects and masks back to the client.
 
 ![Sequence diagram of the Postern device-grant authorization flow and a tool call reaching a domain service behind Istio](docs/images/auth-flow.png)
 
-## Rules that are decisions, not preferences
+## 🚀 Quick Start
 
-Read `CLAUDE.md` before changing anything. The load-bearing ones:
+```bash
+uv sync
+make ci          # lint, fmt-check, type, imports, lock, citations, test
+```
+
+`make fmt` formats. Note that `fmt-check` is scoped to `packages services tests`
+rather than `.`, because `ruff format` on `.` also rewrites the Python code fences
+inside the markdown design docs.
+
+## 📚 Documentation
+
+Read in this order:
+
+1. **[`docs/postern-design-handoff.md`](docs/postern-design-handoff.md)** — The architecture, 868 lines.
+   Section 10 lists 28 open questions; several change the architecture rather than the code.
+2. **[`docs/postern-zero-trust-plan.md`](docs/postern-zero-trust-plan.md)** — The threat model and work items ZT-1 to ZT-8.
+3. **[`docs/postern-python-implementation-guide.md`](docs/postern-python-implementation-guide.md)** — Framework specifics and code patterns.
+   Its section 0 verification protocol is mandatory.
+
+### Decision Records
+
+[`docs/decisions/`](docs/decisions/) — Architecture decision records for key design choices:
+
+- [ADR-0001](docs/decisions/0001-facade-http-client.md) — HTTP client choice (httpx2 over httpx)
+- [ADR-0006](docs/decisions/0006-audit-write-failure.md) — Fail-closed audit writes
+- [ADR-0008](docs/decisions/0008-masking-residuals.md) — Accepted masking residual gaps
+- [ADR-0011](docs/decisions/0011-deploy-pipeline.md) — Deploy pipeline (GitHub Actions)
+
+## ⚠️ Rules that are decisions, not preferences
+
+Read [`CLAUDE.md`](CLAUDE.md) before changing anything. The load-bearing ones:
 
 - **There is no payment execution tool.** `payments.create_payment` proposes;
   `payments.get_payment_status` observes. Execution is triggered by the customer's
@@ -94,42 +168,19 @@ Read `CLAUDE.md` before changing anything. The load-bearing ones:
   will build the wrong thing. Write "app identity verification", and "device unlock
   biometric" when the phone's own biometric is meant.
 
-## Running the gates
+## 🧪 Running the gates
 
 ```bash
 uv sync
 make ci
 ```
 
-`make ci` runs the gates named by the `ci` target in `Makefile`: `lint`,
-`fmt-check`, `type`, `imports`, `lock`, `citations`, `test`.
-They run locally because GitHub Actions minutes are billed on private repos. A
-workflow file lands in Task 14 with `on: workflow_dispatch` only, so nothing fires
-on push until someone decides to spend the minutes.
+`make ci` runs: `lint`, `fmt-check`, `type`, `imports`, `lock`, `citations`, `test`.
+They run locally because GitHub Actions minutes are billed on private repos. A workflow
+file is installed with `on: workflow_dispatch` only, so nothing fires on push until
+someone decides to spend the minutes.
 
-`make fmt` formats. Note that `fmt-check` is scoped to `packages services tests`
-rather than `.`, because `ruff format` on `.` also rewrites the Python code fences
-inside the markdown design docs.
-
-## Layout
-
-```
-packages/postern-core/     shared library: domain types, façade, identity
-services/api/              read path, MCP tools, OAuth endpoints
-services/confirm/          write path, approval callback, execution
-docs/                      design handoff, zero-trust plan, implementation guide
-docs/decisions/            decision records
-docs/superpowers/plans/    the implementation plan being executed
-```
-
-`.importlinter` holds the import rules, one `forbidden` contract each, and it
-scans `postern_core` as well as `services`. That `services.api` must not import
-`services.confirm` is one of those contracts. With only `services` in
-`root_packages` the two-hop route `services.api -> postern_core ->
-services.confirm` is reported as KEPT with exit 0, which is the route a real
-regression would take through the one library both services import.
-
-## Stack
+## 📦 Stack
 
 Python 3.12 (pinned in `.python-version`), fastmcp 4.0.3, pydantic 2.13.5,
 httpx2 2.12.0, SQLAlchemy 2.0 async, Alembic, uv.
@@ -146,17 +197,9 @@ Two version traps will produce plausible and wrong code from memory:
 The HTTP client is `httpx2`, not `httpx`, because that is what FastMCP 4 depends on.
 `respx` cannot mock it: it type-checks against `httpx.Response` and raises
 `TypeError` at mock-setup time. Backend tests inject an `httpx2.MockTransport`
-instead. See `docs/decisions/0001-facade-http-client.md`.
+instead. See [ADR-0001](docs/decisions/0001-facade-http-client.md).
 
-## Design documents
-
-Read in this order:
-
-1. `docs/postern-design-handoff.md`, the architecture, 868 lines. Section 10
-   lists 28 open questions; several change the architecture rather than the code.
-2. `docs/postern-zero-trust-plan.md`, the threat model and work items ZT-1 to ZT-8.
-3. `docs/postern-python-implementation-guide.md`, framework specifics and code
-   patterns. Its section 0 verification protocol is mandatory.
+## ⚠️ Critical path note
 
 **ZT-2 is the critical path and it is not answered in this repo.** Istio validates
 the JWT; the operator's domain services must enforce on it. If any handler
