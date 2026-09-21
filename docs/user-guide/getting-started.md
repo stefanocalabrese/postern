@@ -157,7 +157,7 @@ Before deploying, ensure the following configuration items are set:
 | JWKS / issuer URIs | `POSTERN_JWKS_URI`, `POSTERN_TOKEN_ISSUER` | Customer JWT validation |
 | Strict headers | `POSTERN_STRICT_HEADERS=1` | Enforce MCP Streamable HTTP header compliance |
 | Require PEM key | `POSTERN_REQUIRE_PEM_KEY=1` | Refuse startup with ephemeral keys |
-| Istio JWT validation (ZT-2) | - | Domain services must scope queries by token `sub` |
+| Istio JWT validation | - | Domain services must scope queries by token `sub` |
 | Database migrations | - | Run `alembic upgrade head` before first startup |
 
 ## Next Steps

@@ -5,7 +5,7 @@ Key terms and concepts across the Postern platform.
 ## A
 
 ### Anomaly detection
-See **Risk Engine** (ZT-5). Per-session evaluation of record budgets, account diversity,
+See **Risk Engine**. Per-session evaluation of record budgets, account diversity,
 session age, and IP patterns against configurable thresholds.
 
 ### ASGI
@@ -59,7 +59,7 @@ Pluggable backend for device authorization codes. In-memory (dev/test) or Redis
 
 ### Domain Service
 The operator's backend services (accounts.svc, payments.svc, cards.svc) that Postern
-proxies. Under ZT-2, domain services must scope queries by the JWT `sub` claim.
+proxies. domain services must scope queries by the JWT `sub` claim.
 
 ## E
 
@@ -94,7 +94,7 @@ suggesting the session may be compromised.
 ### Internal JWT
 A short-lived (60-second) RS256-signed token minted by Postern for internal service-to-
 service communication. Includes an `act` claim for actor delegation. Verified by Istio
-(ZT-2) before domain services return data.
+(before domain services return data.
 
 ### IP Tracker
 Per-session tracker of client IP addresses with timestamps (`time.monotonic()`). Bounded
@@ -102,12 +102,12 @@ to 100 entries (FIFO eviction) to prevent unbounded memory growth. Exposes `dist
 `last_ip`, and `time_since_last_change()` for anomaly detection.
 
 ### Istio
-The service mesh that validates JWTs (ZT-2). Domain services must scope queries by the
+The service mesh that validates JWTs. Domain services must scope queries by the
 JWT `sub` claim. Istio JWT validation is **pending**, not yet implemented in this repo.
 
 ### JTI Replay Cache
 In-memory token replay prevention covering the token lifetime (60-second window). Part
-of ZT-1 continuous authorization. Checked after mint to prevent the same token from being
+of continuous authorization. Checked after mint to prevent the same token from being
 used twice within its validity period.
 
 ## J
@@ -139,7 +139,7 @@ Model Context Protocol. The protocol that gives AI models tools, built for a loc
 trusted transport (stdio on a single machine). Postern keeps MCP's tool model exactly as-
 is and wraps it in a zero-trust security layer.
 
-### Microsegmentation (ZT-6)
+### Microsegmentation
 The read/write key split architecture: separate JWKS endpoints, separate minters, and
 separate deployables (API service vs. confirm service). A compromised read path cannot
 reach write endpoints.
@@ -165,7 +165,7 @@ tools. Named after a "postern gate", a small, controlled entrance in a fortified
 ## R
 
 ### Read Token Minter
-Wraps `InternalTokenMinter` with ZT-1 continuous authorization (revocation check + JTI
+Wraps `InternalTokenMinter` with continuous authorization (revocation check + JTI
 replay cache). `READ_SCOPES` maps audiences to scopes; `payments.svc` is deliberately
 absent, read tokens cannot reach write endpoints.
 
@@ -188,11 +188,11 @@ The response to a risk signal: `LOG` (informational), `ESCALATE` (tier escalatio
 `BLOCK` (hard-fail the call). Mapped from `Severity`.
 
 ### Risk Context
-Per-session state for ZT-5 anomaly detection. Tracks records returned, accounts touched,
+Per-session state for anomaly detection. Tracksanomaly detection. Tracks records returned, accounts touched,
 widest time window requested, session age, IP addresses, and current verification tier.
 
 ### Risk Engine
-The core ZT-5 component that evaluates `RiskContext` against `RiskConfig` thresholds and
+The core component that evaluates that evaluates `RiskContext` against `RiskConfig` thresholds and
 emits `RiskSignal`s. Stateless: takes context + config, returns signals. The caller
 decides what to do with them.
 
@@ -231,7 +231,7 @@ The severity level of a risk signal: `LOW` (log only), `MEDIUM` (escalate tier),
 
 ### Startup Minter Probe
 A startup-time verification that mints one token and verifies it against the JWKS this
-process publishes. Refuses to start if there's a mismatch. Part of ZT-3 (workload
+process publishes. Refuses to start if there's a mismatch. Part of workload
 attestation).
 
 ## T
@@ -270,19 +270,12 @@ Three levels of customer verification:
 
 ## Z
 
-### Zero Trust (ZT-1 through ZT-8)
-Postern's eight zero-trust controls:
+### Zero Trust
 
-| Control | Status | Description |
-|---------|--------|-------------|
-| ZT-1 | ✅ Built | Continuous authorization: revocation list + JTI replay cache |
-| ZT-2 | ⏳ Pending | Istio JWT validation; domain services scope queries by token `sub` |
-| ZT-3 | ✅ Built | Workload attestation: startup minter probe verifies token signing |
-| ZT-4 | ✅ Built | Approval callback: signed approvals, backend execution from challenge row |
-| ZT-5 | ✅ Built | Per-session anomaly detection: record budgets, account diversity, session age |
-| ZT-6 | ✅ Built | Microsegmentation: read/write key split, separate JWKS endpoints |
-| ZT-7 | ✅ Built | Revocation: three scopes (per-session, per-customer+client, kill switch) |
-| ZT-8 | ⏳ Pending | Egress analysis: not yet implemented |
+Postern's zero-trust controls cover continuous authorization, workload attestation,
+key split architecture, per-session anomaly detection, fail-closed auditing, and data
+masking. See the [Zero Trust overview](../zero-trust.md) for details on each control
+and what is still pending.
 
 ## Cross-References
 

@@ -22,7 +22,7 @@ work safely across machines:
 
 - 🔒 **Authentication** — RFC 8628 device grant (QR pairing codes), JWT sessions,
   RS256 asymmetric tokens for multi-party deployments
-- 🛡️ **Per-session anomaly detection (ZT-5)** — record budgets, account diversity
+- 🛡️ **Per-session anomaly detection** — record budgets, account diversity
   limits, session age caps; MEDIUM signals escalate verification tier, HIGH signals
   hard-fail the call and end the session
 - 🔐 **Three-tier verification** — `SESSION_ONLY` (reads) → `APP_APPROVAL`
@@ -58,18 +58,11 @@ work safely across machines:
 - **Per-tool consent** — `consent_for(domain, db)` returns an `AuthCheck` that filters
   the tool catalogue and refuses calls; refusal reasons are recorded in the audit log
 
-### 🛡️ Zero-Trust Controls (ZT-1 through ZT-8)
+### 🛡️ Zero-Trust Controls
 
-| Control | Status | Description |
-|---------|--------|-------------|
-| ZT-1 | ✅ Built | Continuous authorization — revocation list with O(1) lookups, JTI replay cache |
-| ZT-2 | ⏳ Pending | Istio JWT validation; domain services must scope queries by token `sub` |
-| ZT-3 | ✅ Built | Workload attestation — startup minter probe verifies token signing against published JWKS |
-| ZT-4 | ✅ Built | Approval callback — signed approvals, backend execution from stored challenge row |
-| ZT-5 | ✅ Built | Per-session anomaly detection — record budgets, account diversity, session age |
-| ZT-6 | ✅ Built | Microsegmentation — read/write key split, separate JWKS endpoints |
-| ZT-7 | ✅ Built | Revocation — three scopes (per-session, per-customer+client, kill switch) |
-| ZT-8 | ⏳ Pending | Egress analysis — not yet implemented |
+Continuous authorization, workload attestation, key split architecture, per-session
+anomaly detection, fail-closed auditing, and data masking. See the [Zero Trust overview](docs/zero-trust.md)
+for details on each control and what is still pending.
 
 ### 📋 Audit & Compliance
 
@@ -147,7 +140,7 @@ Read in this order:
 
 1. **[`docs/postern-design-handoff.md`](docs/postern-design-handoff.md)** — The architecture, 868 lines.
    Section 10 lists 28 open questions; several change the architecture rather than the code.
-2. **[`docs/postern-zero-trust-plan.md`](docs/postern-zero-trust-plan.md)** — The threat model and work items ZT-1 to ZT-8.
+2. **[`docs/postern-zero-trust-plan.md`](docs/postern-zero-trust-plan.md)** — The threat model and implementation plan.
 3. **[`docs/postern-python-implementation-guide.md`](docs/postern-python-implementation-guide.md)** — Framework specifics and code patterns.
    Its section 0 verification protocol is mandatory.
 
@@ -216,8 +209,8 @@ instead. See [ADR-0001](docs/decisions/0001-facade-http-client.md).
 
 ## ⚠️ Critical path note
 
-**ZT-2 is the critical path and it is not answered in this repo.** Istio validates
-the JWT; the operator's domain services must enforce on it. If any handler
-scopes its query by an account ID taken from the request body rather than by
-the token `sub`, the whole authorization layer is decorative and
-cross-customer access is live.
+**Domain service scoping is the critical path and it is not answered in this repo.**
+Istio validates the JWT; the operator's domain services must enforce on it. If any
+handler scopes its query by an account ID taken from the request body rather than by
+the token `sub`, the whole authorization layer is decorative and cross-customer access
+is live.

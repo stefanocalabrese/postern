@@ -1,4 +1,4 @@
-# Risk Engine (ZT-5)
+# Risk Engine
 
 Per-session anomaly detection, tier escalation, and severity model.
 
@@ -6,7 +6,7 @@ Per-session anomaly detection, tier escalation, and severity model.
 
 The risk engine evaluates session context against configurable thresholds and emits
 signals that drive verification tier escalation or call blocking. It is the core of
-ZT-5 (per-session anomaly detection).
+per-session anomaly detection.
 
 ```
 packages/postern-core/src/postern_core/risk/engine.py       RiskEngine + RiskConfig
@@ -72,7 +72,7 @@ class RiskConfig:
   customer has fewer than 10 accounts. Corporate multi-account customers are out of scope.
 - `max_days_per_call = 365` matches `MAX_DAYS` in the transactions façade, a session
   budget wider than one call is pointless.
-- `max_session_age_minutes = 480` (8 hours) is a generous session lifetime; ZT-1's
+- `max_session_age_minutes = 480` (8 hours) is a generous session lifetime; continuous authorization's
   token refresh will be the primary shortening mechanism.
 
 ## RiskEngine, Evaluation

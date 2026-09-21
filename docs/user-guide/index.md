@@ -53,7 +53,7 @@ it does not hold the key. That is an infrastructure property, not a code-review 
    │              └──────┬───────┘
    │                     │ internal JWT (RS256)
    │              ┌──────▼───────┐
-   │              │  Istio /     │◄── JWT validation (ZT-2)
+   │              │  Istio /     │◄── JWT validation
    │              │  Gateway     │
    │              └──────┬───────┘
    │                     │ scoped query by JWT sub
@@ -71,16 +71,9 @@ it does not hold the key. That is an infrastructure property, not a code-review 
 
 ## Zero-Trust Controls
 
-| Control | Status | Description |
-|---------|--------|-------------|
-| ZT-1 | ✅ Built | Continuous authorization: revocation list with O(1) lookups, JTI replay cache |
-| ZT-2 | ⏳ Pending | Istio JWT validation; domain services must scope queries by token `sub` |
-| ZT-3 | ✅ Built | Workload attestation: startup minter probe verifies token signing against published JWKS |
-| ZT-4 | ✅ Built | Approval callback: signed approvals, backend execution from stored challenge row |
-| ZT-5 | ✅ Built | Per-session anomaly detection: record budgets, account diversity, session age |
-| ZT-6 | ✅ Built | Microsegmentation: read/write key split, separate JWKS endpoints |
-| ZT-7 | ✅ Built | Revocation: three scopes (per-session, per-customer+client, kill switch) |
-| ZT-8 | ⏳ Pending | Egress analysis: not yet implemented |
+Continuous authorization, workload attestation, key split architecture, per-session
+anomaly detection, fail-closed auditing, and data masking. See the [Zero Trust overview](../zero-trust.md)
+for details on each control and what is still pending.
 
 ## Prerequisites
 

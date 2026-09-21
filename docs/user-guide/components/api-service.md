@@ -40,8 +40,8 @@ Production starts the process with: `uvicorn services.api.main:app`.
 ### Startup sequence
 
 1. **Key source resolution**, reads `POSTERN_READ_KEY_PEM_PATH` or generates an ephemeral key
-2. **Minter construction**, `ReadTokenMinter` wraps `InternalTokenMinter` with ZT-1
-   (revocation list + JTI replay cache)
+2. **Minter construction**, `ReadTokenMinter` wraps `InternalTokenMinter` with
+   continuous authorization (revocation list + JTI replay cache)
 3. **Startup probe**, mints one token, verifies it against the JWKS this process publishes;
    refuses to start on mismatch ([ADR-0003](../../decisions/0003-composition-root.md))
 4. **Backend client**, `BackendClient` with timeout budgets and audit hook
@@ -122,7 +122,7 @@ but no verification occurs.
 
 ### Internal Token Minting (`packages/postern-core/src/postern_core/auth/read_minter.py`)
 
-The `ReadTokenMinter` wraps `InternalTokenMinter` and adds ZT-1 continuous authorization:
+The `ReadTokenMinter` wraps `InternalTokenMinter` and adds continuous authorization:
 
 ```python
 read_minter = ReadTokenMinter(
