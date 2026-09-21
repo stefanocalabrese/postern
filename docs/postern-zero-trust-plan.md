@@ -4,7 +4,7 @@
 
 **Audience:** a Claude Code session implementing this, with access to the codebase and AWS accounts.
 
-**Status:** assessment complete, ZT-1 to ZT-8 defined. Implemented: ZT-3 (digest drift), ZT-7 (revocation list), ZT-8 (default-deny egress analysis), ZT-1 (continuous authorization and revocation). Resolved by decision record: ZT-6 (DPoP not viable, compensating controls accepted). Remaining open: ZT-2 (subject enforcement in domain services — blocked on backend teams), ZT-5 follow-up (IP/ASN anomaly detection for risk engine).
+**Status:** assessment complete, ZT-1 to ZT-8 defined. Implemented: ZT-3 (digest drift), ZT-7 (revocation list), ZT-8 (default-deny egress analysis), ZT-1 (continuous authorization and revocation), ZT-5 follow-up (IP/ASN anomaly detection, risk engine wiring, risk signals stored in audit_log JSONB column, pluggable session store with Redis backend for production — AWS ElastiCache / Google Memorystore / Azure Cache for Redis compatible via ``POSTERN_REDIS_URL``). Resolved by decision record: ZT-6 (DPoP not viable, compensating controls accepted). Remaining open: ZT-2 (subject enforcement in domain services — blocked on backend teams), payments tool contracts (deferred, read-only actions only).
 
 **Two kinds of content:** §1 to §7 specify the product. The threat model, the eight work items, their acceptance criteria and the §5 residual risks hold for any operator deploying this. §8 and the **Dependency:** lines under ZT-2 and ZT-1 record something else: what one deployment has asked of which named team, and what has not come back. A second operator inherits the first kind and replaces the second with the teams and the answers of its own organization.
 
@@ -152,7 +152,7 @@ Bearer tokens are the classic zero-trust weakness: possession is authorization. 
 - **Audience scoping** (Vault key split) — read minter cannot produce write tokens; Istio enforces issuer-based routing.
 - **Internal JWTs sender-constrained** (Vault key split) — separate read/write keys, issuer-based routing.
 
-**Residual gap:** client IP/ASN anomaly detection is not yet wired into the risk engine. The framework (`RiskContext`, `RiskEngine`) exists; the data collection layer (ASGI middleware reading `X-Forwarded-For` / `remote_addr`) is a ZT-5 follow-up.
+**Residual gap:** client IP/ASN anomaly detection is wired into the risk engine and signals are stored in `audit_log.risk_signals` (JSONB) for Postgres-queryable anomaly tracking. The session store is pluggable — in-memory (dev/test) and Redis-compatible backend (production, via ``POSTERN_REDIS_URL``, works with AWS ElastiCache / Google Memorystore / Azure Cache for Redis). Sessions survive process restarts when backed by Redis with TTL.
 
 **Acceptance:** ✅ satisfied by decision record 0010 (`docs/decisions/0010-dpop-sender-constraint.md`).
 

@@ -7,6 +7,10 @@ is typed `Ref`, never bare `str`: `Ref`'s pattern
 (`^[a-z]{3}_[A-Za-z0-9]{1,32}$`) rejects a masked value outright before any
 request is built, which is what stops a mask copied out of a previous tool
 result being fed back in as a lookup identifier.
+
+ZT-5: each handler records data touches on the current session's
+``RiskContext`` (set by ``RiskMiddleware`` via contextvar) after the
+facade call returns.
 """
 
 from fastmcp import FastMCP
@@ -16,6 +20,7 @@ from postern_core.domain.models import Account, Balance, Ref
 from postern_core.facade import accounts as facade
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerResolver
+from postern_core.risk.session import get_current_session
 
 _READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
@@ -30,7 +35,13 @@ def register(
         Use the returned `ref` for every other account argument. Call
         `start_session` first if you have not already.
         """
-        return await facade.list_accounts(backend, resolver())
+        result = await facade.list_accounts(backend, resolver())
+        ctx = get_current_session()
+        if ctx is not None:
+            ctx.record_records(len(result))
+            for account in result:
+                ctx.record_account(account.ref)
+        return result
 
     @mcp.tool(name="accounts.get_balance", annotations=_READ, auth=check)
     async def accounts_get_balance(account_ref: Ref) -> Balance:
@@ -39,4 +50,9 @@ def register(
         `account_ref` comes from `accounts.list`. Report the amount and currency
         exactly as returned; do not convert or round.
         """
-        return await facade.get_balance(backend, resolver(), account_ref)
+        result = await facade.get_balance(backend, resolver(), account_ref)
+        ctx = get_current_session()
+        if ctx is not None:
+            ctx.record_records(1)
+            ctx.record_account(account_ref)
+        return result

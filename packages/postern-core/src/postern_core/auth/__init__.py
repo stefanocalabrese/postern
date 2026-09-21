@@ -17,12 +17,20 @@ at next refresh.
 See ``postern_core.auth.revocation.RevocationList`` for the API.
 """
 
+from postern_core.auth.device_codes import (
+    DeviceCode,
+    DeviceCodeStoreBase,
+    InMemoryDeviceCodeStore,
+)
 from postern_core.auth.keys import GeneratedKeySource, KeySource
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
 
 __all__ = [
+    "DeviceCode",
+    "DeviceCodeStoreBase",
     "GeneratedKeySource",
+    "InMemoryDeviceCodeStore",
     "JtiReplayCache",
     "KeySource",
     "ReadTokenMinter",

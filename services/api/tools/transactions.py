@@ -6,6 +6,9 @@ model whether `items` is the complete window or whether
 `postern_core.facade.transactions.MAX_ROWS` cut it -- see that module's
 docstring for why a hard cap plus a visible flag was chosen over a `limit`
 argument or cursor pagination.
+
+ZT-5: handler records data touches on the current session's ``RiskContext``
+(set by ``RiskMiddleware`` via contextvar) after the facade call returns.
 """
 
 from typing import Annotated
@@ -17,6 +20,7 @@ from postern_core.domain.models import Ref, TransactionPage
 from postern_core.facade import transactions as facade
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerResolver
+from postern_core.risk.session import get_current_session
 from pydantic import Field
 
 _READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
@@ -44,4 +48,10 @@ def register(
         `true`, narrow `days` (or ask the customer to narrow the period)
         rather than presenting `items` as the whole history for the window.
         """
-        return await facade.list_transactions(backend, resolver(), account_ref, days)
+        result = await facade.list_transactions(backend, resolver(), account_ref, days)
+        ctx = get_current_session()
+        if ctx is not None:
+            ctx.record_records(len(result.items))
+            ctx.record_account(account_ref)
+            ctx.record_days(days)
+        return result

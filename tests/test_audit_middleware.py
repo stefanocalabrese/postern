@@ -1765,6 +1765,7 @@ async def test_the_tools_own_exception_object_still_reaches_the_caller_unchanged
         refusal_reason: object,
         call_id: object,
         client_id: object,
+        risk_signals: object,
     ) -> None:
         written.append(
             {

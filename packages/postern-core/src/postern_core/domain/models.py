@@ -74,3 +74,6 @@ class SessionInfo(_Strict):
     consents: list[ConsentSummary]
     write_enabled: list[str]
     confirmation_note: FreeText
+    session_handle: str
+    """Opaque handle identifying this session. Pass it to all subsequent
+    tool calls so the server can track per-session risk budgets."""

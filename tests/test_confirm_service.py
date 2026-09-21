@@ -61,11 +61,18 @@ async def test_the_write_jwks_never_contains_a_read_key(settings: ConfirmSetting
 
 
 def test_the_confirm_settings_have_no_read_key_field() -> None:
-    """The asymmetry is the point and it should be greppable."""
+    """The asymmetry is the point and it should be greppable.
+
+    The only ``read_*`` fields are for the device-grant exception
+    (both read and write keys needed to mint tokens atomically).
+    """
     import dataclasses
 
     names = {f.name for f in dataclasses.fields(ConfirmSettings)}
-    assert not any("read" in n for n in names), names
+    allowed_read_fields = {"read_key_pem_path", "read_key_kid", "read_token_issuer"}
+    read_fields = {n for n in names if "read" in n}
+    extra = read_fields - allowed_read_fields
+    assert not extra, f"Unexpected read fields: {extra}"
 
 
 def test_a_write_token_is_rejected_by_the_read_key_set(settings: ConfirmSettings) -> None:

@@ -230,6 +230,7 @@ def test_nested_model_construct_bypass_is_remasked_on_parent_construction() -> N
         consents=[ConsentSummary(domain="accounts", granted=True, expires_at=None)],
         write_enabled=[],
         confirmation_note="none",
+        session_handle="",
     )
     assert session.accounts[0].iban == "ES•• •••• 1332"
     assert "9121000418450200051332" not in session.model_dump_json()

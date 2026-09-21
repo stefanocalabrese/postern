@@ -94,6 +94,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
 from postern_core.domain.masking import FreeText, redaction_budget
 from postern_core.identity import CustomerRef
+from postern_core.risk.session import get_current_session
 from postern_core.store import audit
 from postern_core.store.engine import Database
 from postern_core.store.models import (
@@ -716,6 +717,7 @@ class _PendingEntry:
                 # ended, or the pair names two different callers for one
                 # call.
                 client_id=self.client_id,
+                risk_signals=None,  # entry row precedes the tool call; signals are empty.
             )
             # INSIDE the session block, on the line after the commit: see
             # the class docstring for the duplicate row the other placement
@@ -1041,6 +1043,25 @@ class AuditMiddleware(Middleware):
             # logged separately too: `__cause__` only helps someone already
             # looking at a traceback for this one call, and an outage needs
             # to be visible without one.
+            # Extract risk signals from the current session context so they
+            # appear on the completion row.  NULL when there is no active
+            # session handle (no risk tracking for this call); [] when a
+            # session existed but no signals fired.
+            _ctx = get_current_session()
+            if _ctx is not None:
+                # Always serialize — even an empty list means "session ran,
+                # no signals fired" (distinct from NULL = no session).
+                _risk_signals: list[dict] | None = [
+                    {
+                        "code": s.code,
+                        "severity": s.severity.name,
+                        "description": s.description,
+                        "details": s.details,
+                    }
+                    for s in _ctx.risk_signals
+                ]
+            else:
+                _risk_signals = None
             try:
                 await self._write(
                     at,
@@ -1066,6 +1087,7 @@ class AuditMiddleware(Middleware):
                     # answer has to be the one the entry row gave if there
                     # was one.
                     pending.client_id,
+                    _risk_signals,
                 )
             except Exception as audit_exc:
                 logger.error(
@@ -1082,6 +1104,25 @@ class AuditMiddleware(Middleware):
         # tool's latency by any reading, and it is the slowest thing in this
         # function.
         duration_ms = _elapsed_ms(started)
+        # Same extraction as the raised path above: signals were evaluated by
+        # RiskMiddleware after the handler ran, so they are available on the
+        # context for this completion write.  NULL when no session; [] when
+        # session existed but no signals fired.
+        _ctx = get_current_session()
+        if _ctx is not None:
+            # Always serialize — even an empty list means "session ran, no
+            # signals fired" (distinct from NULL = no session).
+            _risk_signals: list[dict] | None = [
+                {
+                    "code": s.code,
+                    "severity": s.severity.name,
+                    "description": s.description,
+                    "details": s.details,
+                }
+                for s in _ctx.risk_signals
+            ]
+        else:
+            _risk_signals = None
         try:
             await self._write(
                 at,
@@ -1114,6 +1155,7 @@ class AuditMiddleware(Middleware):
                 # The same client the entry row named, read once for this
                 # call in the redaction scope above.
                 pending.client_id,
+                _risk_signals,
             )
         except Exception as audit_exc:
             # Fail closed here too, and deliberately rather than by
@@ -1183,6 +1225,13 @@ class AuditMiddleware(Middleware):
         # a call that had one, which on a regulator-facing table is a false
         # statement rather than a gap.
         client_id: str | None,
+        # Required and `list[dict] | None`: NULL means "no risk signals for
+        # this row" (pre-migration or no session handle), while an empty list
+        # means "this call ran and no signals fired". A default would let a
+        # future caller silently record NULL instead of the actual signal data,
+        # which on a regulator-facing table is a gap. Both branches of
+        # `on_call_tool` always have a real value to supply.
+        risk_signals: list[dict] | None,
     ) -> None:
         async with self.db.sessionmaker() as session:
             await audit.append(
@@ -1209,4 +1258,5 @@ class AuditMiddleware(Middleware):
                 refusal_reason=refusal_reason,
                 call_id=call_id,
                 client_id=client_id,
+                risk_signals=risk_signals,
             )

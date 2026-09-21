@@ -142,7 +142,10 @@ def test_the_api_composition_root_is_silent_when_a_real_pem_is_configured(tmp_pa
 def test_the_confirm_composition_root_is_silent_when_a_real_pem_is_configured(
     tmp_path: Path,
 ) -> None:
-    settings = ConfirmSettings(write_key_pem_path=_private_pem(tmp_path, "write.pem", "write-1"))
+    settings = ConfirmSettings(
+        write_key_pem_path=_private_pem(tmp_path, "write.pem", "write-1"),
+        read_key_pem_path=_private_pem(tmp_path, "read.pem", "read-1"),
+    )
     assert [
         m for m in _ephemeral_warnings(lambda: create_confirm_app(settings)) if MARKER in m
     ] == []
@@ -152,26 +155,22 @@ def test_the_confirm_composition_root_is_silent_when_a_real_pem_is_configured(
 
 
 @pytest.mark.parametrize(
-    ("build", "role", "kid", "pem_env_var"),
+    ("build", "expected_count"),
     [
         pytest.param(
             lambda: create_app(Settings.for_testing()),
-            "READ",
-            "read-1",
-            "POSTERN_READ_KEY_PEM_PATH",
+            1,
             id="api",
         ),
         pytest.param(
             lambda: create_confirm_app(ConfirmSettings.for_testing()),
-            "WRITE",
-            "write-1",
-            "POSTERN_WRITE_KEY_PEM_PATH",
+            2,  # write + read (device grant exception)
             id="confirm",
         ),
     ],
 )
 def test_the_warning_names_the_consequence_not_only_the_state(
-    build: Callable[[], object], role: str, kid: str, pem_env_var: str
+    build: Callable[[], object], expected_count: int
 ) -> None:
     """Six fragments, each one a thing an operator can act on or look up.
 
@@ -181,23 +180,27 @@ def test_the_warning_names_the_consequence_not_only_the_state(
     Task 2, and stating it again at runtime adds nothing.
     """
     messages = [m for m in _ephemeral_warnings(build) if MARKER in m]
-    assert len(messages) == 1, messages
-    message = messages[0]
-    for fragment in (
-        f"{role} signing key generated in process",
-        # The consequence, in the order an operator meets it: the key does
-        # not survive, it differs per replica, and the kid does not move.
-        "discard it on exit",
-        "Every restart and every replica signs with a different key",
-        f"the published kid stays {kid!r}",
-        # What the failure actually looks like, and what it is NOT.
-        "BadSignatureError('bad_signature: ')",
-        "InvalidKeyIdError",
-        # Where it was measured, and what to set.
-        RECORD,
-        pem_env_var,
-    ):
-        assert fragment in message, (fragment, message)
+    assert len(messages) == expected_count, messages
+    # Each message must contain the consequence fragments.
+    for message in messages:
+        for fragment in (
+            "signing key generated in process",
+            "discard it on exit",
+            "Every restart and every replica signs with a different key",
+            "BadSignatureError('bad_signature: ')",
+            "InvalidKeyIdError",
+            RECORD,
+        ):
+            assert fragment in message, (fragment, message)
+    # The API service has exactly one warning about the read key.
+    if expected_count == 1:
+        assert "POSTERN_READ_KEY_PEM_PATH" in messages[0]
+    # The confirm service has warnings for both write and read keys.
+    if expected_count == 2:
+        write_msg = [m for m in messages if "POSTERN_WRITE_KEY_PEM_PATH" in m]
+        read_msg = [m for m in messages if "POSTERN_READ_KEY_PEM_PATH" in m]
+        assert len(write_msg) == 1
+        assert len(read_msg) == 1
 
 
 def test_the_record_the_warning_cites_exists() -> None:

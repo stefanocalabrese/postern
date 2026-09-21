@@ -103,6 +103,14 @@ async def append(
     # per-client controls in the design handoff (§"Allowlist clients") act
     # on.
     client_id: str | None,
+    # Required and `list[dict] | None`: NULL means "no risk signals recorded
+    # for this row", which covers both pre-migration rows and calls where
+    # risk tracking was disabled (no session handle). A default would let a
+    # future caller silently record NULL instead of the actual signals, which
+    # on a regulator-facing table is a gap in the data. Both branches of
+    # `AuditMiddleware._write` always have a real value to supply (an empty
+    # list when no signals fired, or the signal data when they did).
+    risk_signals: list[dict] | None,
 ) -> None:
     session.add(
         AuditEntry(
@@ -120,6 +128,7 @@ async def append(
             refusal_reason=refusal_reason,
             call_id=call_id,
             client_id=client_id,
+            risk_signals=risk_signals,
         )
     )
     await session.commit()

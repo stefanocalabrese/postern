@@ -5,28 +5,46 @@ touched, time span requested) and emits risk signals when thresholds are
 exceeded. Signals escalate the tier rather than hard-failing, per the
 zero-trust plan §4.
 
-This is an in-memory tracker — no persistence, no baseline learning.
-Baselines and ZT-1 refresh integration are future work (blocked on the
-fraud/risk platform team for ZT-1).
-
 ZT-5 follow-up: IP/ASN anomaly detection via ``IpAnomalyDetector`` and
 ``IpTracker`` — detects impossible travel, excessive IP diversity, and
 suspicious ASN connections (compensating control for ZT-6).
+
+Session management: pluggable ``SessionStore`` (in-memory or Redis) and
+contextvar so tool handlers can reach the current session's ``RiskContext``
+without threading it through every function.
+
+Production deployments set ``POSTERN_REDIS_URL`` to enable the Redis
+backend (compatible with AWS ElastiCache, Google Memorystore, Azure Cache
+for Redis).  Without it, the in-memory store is used.
 """
 
 from postern_core.risk.context import IpTracker, RecordCount, RiskContext
 from postern_core.risk.engine import RiskConfig, RiskEngine, Severity
 from postern_core.risk.ip_anomaly import IpAnomalyConfig, IpAnomalyDetector
+from postern_core.risk.session import (
+    InMemorySessionStore,
+    RedisSessionStore,
+    SessionHandle,
+    SessionStore,
+    create_session_store,
+    get_current_session,
+)
 from postern_core.risk.types import RiskSignal
 
 __all__ = [
+    "InMemorySessionStore",
     "IpAnomalyConfig",
     "IpAnomalyDetector",
     "IpTracker",
     "RecordCount",
+    "RedisSessionStore",
     "RiskConfig",
     "RiskContext",
     "RiskEngine",
     "RiskSignal",
     "Severity",
+    "SessionHandle",
+    "SessionStore",
+    "create_session_store",
+    "get_current_session",
 ]

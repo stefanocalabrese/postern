@@ -30,6 +30,8 @@ dev = [
     "import-linter>=2.15",
     "testcontainers[postgres]>=4.15",
     "types-docker>=7.2.0.20260827",
+    "redis[hiredis]>=5.2,<6",
+    "fakeredis>=2.20",
 ]
 
 [tool.pytest.ini_options]

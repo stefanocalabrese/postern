@@ -74,6 +74,7 @@ from services.api.asgi.header_validation import HeaderBodyValidation
 from services.api.asgi.request_deadline import RequestDeadline
 from services.api.jwks import jwks_route
 from services.api.middleware.audit import AuditMiddleware, record_data_touch
+from services.api.middleware.risk import RiskMiddleware
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
 
@@ -300,6 +301,13 @@ def create_app(
         settings.customer_jwks_uri is not None and settings.customer_token_issuer is not None
     ) or auth_override is not None
     consent_db = db if has_real_customer_auth else None
+    # ZT-5: per-session risk tracking — factory picks in-memory (dev) or
+    # Redis (production, via POSTERN_REDIS_URL).  Compatible with AWS
+    # ElastiCache, Google Memorystore, Azure Cache for Redis.
+    from postern_core.risk.session import create_session_store
+
+    session_store = create_session_store()
+
     server = build_server(
         settings,
         resolver or token_customer_resolver,
@@ -315,6 +323,9 @@ def create_app(
     # middleware is what makes that hook resolvable at all, so the two go
     # together and neither is conditional.
     server.add_middleware(AuditMiddleware(db))
+    # ZT-5: risk session middleware — pushes per-session RiskContext onto a
+    # contextvar so tool handlers can record data touches and evaluate risk.
+    server.add_middleware(RiskMiddleware(session_store))
     app = server.http_app(
         path="/mcp",
         stateless_http=True,

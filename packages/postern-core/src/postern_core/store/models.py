@@ -655,6 +655,22 @@ class AuditEntry(Base):
     # repository queries this column, and whoever writes the first per-client
     # query should size the index with the write cost in view.
     client_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Risk signals emitted by the risk engine and IP anomaly detector for this
+    # call. Stored as JSONB so an investigator can query which signals fired,
+    # at what severity, and with what details — without parsing log aggregation.
+    #
+    # NULLABLE: a call that predates this column, or one where risk tracking
+    # is disabled (no session handle), carries NULL. Under the fail-closed
+    # policy a missing column would cost the row and the call, so it must be
+    # nullable. NULL means "no signals recorded for this row", told apart from
+    # "row predates the column" by `at` against the migration deploy time.
+    #
+    # JSONB, not Text: a regulator or an alerting system wants to query the
+    # signals (e.g. "show me all calls where a HIGH signal fired"), and JSONB
+    # supports that without parsing. The schema is an array of objects with
+    # `code`, `severity`, and `details` keys — the same shape RiskSignal
+    # carries, serialised via dataclass_asdict.
+    risk_signals: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
         Index("ix_audit_log_customer_at", "customer_ref", "at"),
