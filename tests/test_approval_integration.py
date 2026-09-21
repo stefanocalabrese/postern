@@ -12,7 +12,9 @@ Covers:
 """
 
 import json
+from collections.abc import AsyncGenerator, Generator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx2
 import pytest
@@ -32,7 +34,7 @@ from services.confirm.settings import ConfirmSettings
 
 
 @pytest.fixture(scope="module")
-def pg_url() -> str:
+def pg_url() -> Generator[str]:
     """Session-scoped Postgres for integration tests.
 
     Mirrors ``conftest.py``'s ``pg_url`` but returns the URL directly so we
@@ -81,7 +83,7 @@ def db(settings: ConfirmSettings) -> Database:
 
 
 @pytest.fixture()
-async def session(db: Database):
+async def session(db: Database) -> AsyncGenerator[Any, None]:
     """Function-scoped async session for inserting challenges."""
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -106,7 +108,7 @@ def app(settings: ConfirmSettings) -> Starlette:
 # ---------------------------------------------------------------------------
 
 
-async def post(app: Starlette, path: str, body: dict) -> httpx2.Response:
+async def post(app: Starlette, path: str, body: dict[str, Any]) -> httpx2.Response:
     """POST to the ASGI app."""
     async with httpx2.AsyncClient(
         transport=httpx2.ASGITransport(app=app), base_url="http://t"
@@ -115,10 +117,10 @@ async def post(app: Starlette, path: str, body: dict) -> httpx2.Response:
 
 
 async def _insert_pending_challenge(
-    session,
+    session: Any,
     challenge_id: str = "chal_int_001",
     tool_name: str = "payments.create_payment",
-    payload: dict | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> None:
     """Insert a pending challenge into the test database."""
     await store.create_challenge(
@@ -138,7 +140,7 @@ async def _insert_pending_challenge(
 
 async def test_successful_approval_and_execution(
     app: Starlette,
-    session,
+    session: Any,
 ) -> None:
     """Full happy path: insert challenge → approve → execute → status=executed."""
     # 1. Insert a pending challenge.
@@ -152,7 +154,7 @@ async def test_successful_approval_and_execution(
     # 3. The backend call will fail (no real backend), so we get 207.
     #    But the challenge should be marked "approved" in DB.
     assert resp.status_code == 207, f"Expected 207, got {resp.status_code}: {resp.text}"
-    data = json.loads(resp.body.decode())
+    data = json.loads(resp.content.decode())
     assert data["status"] == "approved"
 
     # 4. Verify the challenge is approved in the database.
@@ -165,7 +167,7 @@ async def test_successful_approval_and_execution(
 
 async def test_approval_of_already_approved_challenge_returns_409(
     app: Starlette,
-    session,
+    session: Any,
 ) -> None:
     """Challenge already approved → 409."""
     await _insert_pending_challenge(session, challenge_id="chal_int_002")
@@ -181,13 +183,13 @@ async def test_approval_of_already_approved_challenge_returns_409(
         "signature": "sig_second",
     })
     assert resp2.status_code == 409
-    data = json.loads(resp2.body.decode())
+    data = json.loads(resp2.content.decode())
     assert data["error"] == "already_terminal"
 
 
 async def test_expired_challenge_returns_410(
     app: Starlette,
-    session,
+    session: Any,
 ) -> None:
     """Expired challenge → 410."""
     # Insert a challenge, then manually set expires_at to the past.
@@ -214,7 +216,7 @@ async def test_expired_challenge_returns_410(
     })
 
     assert resp.status_code == 410
-    data = json.loads(resp.body.decode())
+    data = json.loads(resp.content.decode())
     assert data["error"] == "expired"
 
 
@@ -222,11 +224,11 @@ async def test_missing_challenge_id_returns_400(
     app: Starlette,
 ) -> None:
     """No challenge_id in path → 400."""
-    resp = await post(app, "/challenges//approve", {  # type: ignore[arg-type]
+    resp = await post(app, "/challenges//approve", {
         "signature": "sig_xyz",
     })
     assert resp.status_code == 400
-    data = json.loads(resp.body.decode())
+    data = json.loads(resp.content.decode())
     assert data["error"] == "invalid_request"
 
 
@@ -236,7 +238,7 @@ async def test_missing_signature_returns_400(
     """No signature in body → 400."""
     resp = await post(app, "/challenges/chal_int_003/approve", {})
     assert resp.status_code == 400
-    data = json.loads(resp.body.decode())
+    data = json.loads(resp.content.decode())
     assert data["error"] == "invalid_request"
 
 
@@ -248,13 +250,13 @@ async def test_challenge_not_found_returns_404(
         "signature": "sig_xyz",
     })
     assert resp.status_code == 404
-    data = json.loads(resp.body.decode())
+    data = json.loads(resp.content.decode())
     assert data["error"] == "not_found"
 
 
 async def test_verification_result_passed_through(
     app: Starlette,
-    session,
+    session: Any,
 ) -> None:
     """verification_result in body is recorded on the challenge."""
     await _insert_pending_challenge(session, challenge_id="chal_int_vr")
@@ -265,7 +267,7 @@ async def test_verification_result_passed_through(
     })
 
     assert resp.status_code == 207  # backend not available, but approval recorded.
-    data = json.loads(resp.body.decode())
+    data = json.loads(resp.content.decode())
     assert data["status"] == "approved"
 
     # Verify the verification_result was stored.
@@ -278,7 +280,7 @@ async def test_verification_result_passed_through(
 
 async def test_confirming_device_passed_through(
     app: Starlette,
-    session,
+    session: Any,
 ) -> None:
     """confirming_device in body is recorded on the challenge."""
     await _insert_pending_challenge(session, challenge_id="chal_int_dev")
@@ -289,13 +291,13 @@ async def test_confirming_device_passed_through(
     })
 
     assert resp.status_code == 207
-    data = json.loads(resp.body.decode())
+    data = json.loads(resp.content.decode())
     assert data["status"] == "approved"
 
 
 async def test_backend_write_error_returns_207(
     app: Starlette,
-    session,
+    session: Any,
 ) -> None:
     """Backend execution failure → 207 with backend_status."""
     await _insert_pending_challenge(session, challenge_id="chal_int_be")
@@ -306,14 +308,14 @@ async def test_backend_write_error_returns_207(
 
     # Backend is not available, so we get 207.
     assert resp.status_code == 207
-    data = json.loads(resp.body.decode())
+    data = json.loads(resp.content.decode())
     assert data["status"] == "approved"
     assert "backend_status" in data
 
 
 async def test_standing_orders_cancel_path(
     app: Starlette,
-    session,
+    session: Any,
 ) -> None:
     """Standing orders cancel uses correct path interpolation."""
     await _insert_pending_challenge(

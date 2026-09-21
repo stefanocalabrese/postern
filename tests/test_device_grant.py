@@ -77,13 +77,13 @@ def app(
 ) -> Starlette:
     """Minimal Starlette app with device auth routes for endpoint testing."""
 
-    async def _device_authorization(request) -> Response:
+    async def _device_authorization(request: Request) -> Response:
         return await device_authorization(request)
 
-    async def _token_endpoint(request) -> Response:
+    async def _token_endpoint(request: Request) -> Response:
         return await token_endpoint(request)
 
-    async def _approve_callback(request) -> Response:
+    async def _approve_callback(request: Request) -> Response:
         return await approve_callback(request)
 
     from starlette.responses import JSONResponse
@@ -111,13 +111,13 @@ def app(
 class TestDeviceCodeGeneration:
     """RFC 8628 §3.1 — device_code and user_code properties."""
 
-    def test_device_code_is_40_plus_chars(self):
+    def test_device_code_is_40_plus_chars(self) -> None:
         """device_code must be at least 40 characters (RFC 8628 §3.1)."""
         for _ in range(10):
             code = _generate_device_code()
             assert len(code) >= 40, f"device_code too short: {len(code)}"
 
-    def test_user_code_is_6_chars_uppercase_alphanumeric(self):
+    def test_user_code_is_6_chars_uppercase_alphanumeric(self) -> None:
         """user_code must be 6 uppercase alphanumeric chars, no ambiguous."""
         for _ in range(20):
             code = _generate_user_code()
@@ -127,7 +127,7 @@ class TestDeviceCodeGeneration:
             # No ambiguous characters (0, O, 1, I, l).
             assert set(code) <= set("23456789ABCDEFGHJKLMNPQRSTUVWXYZ")
 
-    def test_user_code_display_format(self):
+    def test_user_code_display_format(self) -> None:
         """user_code_display formats as XXX-XXX."""
         dc = DeviceCode(
             device_code="test",
@@ -137,7 +137,7 @@ class TestDeviceCodeGeneration:
         )
         assert dc.user_code_display == "ABC-DEF"
 
-    def test_user_code_display_short(self):
+    def test_user_code_display_short(self) -> None:
         """Short user codes fall through to raw value."""
         dc = DeviceCode(
             device_code="test",
@@ -147,7 +147,7 @@ class TestDeviceCodeGeneration:
         )
         assert dc.user_code_display == "ABC"
 
-    def test_verification_uri_complete_with_query(self):
+    def test_verification_uri_complete_with_query(self) -> None:
         """URI with existing query params gets &user_code=."""
         dc = DeviceCode(
             device_code="test",
@@ -157,7 +157,7 @@ class TestDeviceCodeGeneration:
         )
         assert dc.verification_uri_complete == "https://example.com/verify?foo=bar&user_code=ABCDEF"
 
-    def test_verification_uri_complete_without_query(self):
+    def test_verification_uri_complete_without_query(self) -> None:
         """URI without query params gets ?user_code=."""
         dc = DeviceCode(
             device_code="test",
@@ -167,7 +167,7 @@ class TestDeviceCodeGeneration:
         )
         assert dc.verification_uri_complete == "https://example.com/verify?user_code=ABCDEF"
 
-    def test_is_expired_true(self):
+    def test_is_expired_true(self) -> None:
         dc = DeviceCode(
             device_code="test",
             user_code="ABCDEF",
@@ -176,7 +176,7 @@ class TestDeviceCodeGeneration:
         )
         assert dc.is_expired is True
 
-    def test_is_expired_false(self):
+    def test_is_expired_false(self) -> None:
         dc = DeviceCode(
             device_code="test",
             user_code="ABCDEF",
@@ -195,7 +195,7 @@ class TestInMemoryDeviceCodeStore:
     """Basic CRUD operations on the in-memory store."""
 
     @pytest.mark.asyncio
-    async def test_create_and_get(self, store: InMemoryDeviceCodeStore):
+    async def test_create_and_get(self, store: InMemoryDeviceCodeStore) -> None:
         code = await store.create_device_code(
             client_id="test-client",
             scopes="accounts:read",
@@ -212,12 +212,12 @@ class TestInMemoryDeviceCodeStore:
         assert found.device_code == code.device_code
 
     @pytest.mark.asyncio
-    async def test_get_nonexistent(self, store: InMemoryDeviceCodeStore):
+    async def test_get_nonexistent(self, store: InMemoryDeviceCodeStore) -> None:
         result = await store.get_device_code("nonexistent")
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_approve(self, store: InMemoryDeviceCodeStore):
+    async def test_approve(self, store: InMemoryDeviceCodeStore) -> None:
         code = await store.create_device_code(
             client_id="test-client",
             scopes="accounts:read",
@@ -229,11 +229,12 @@ class TestInMemoryDeviceCodeStore:
         assert result is True
 
         updated = await store.get_device_code(code.device_code)
+        assert updated is not None
         assert updated.approved is True
         assert updated.approved_at is not None
 
     @pytest.mark.asyncio
-    async def test_double_approve_fails(self, store: InMemoryDeviceCodeStore):
+    async def test_double_approve_fails(self, store: InMemoryDeviceCodeStore) -> None:
         code = await store.create_device_code(
             client_id="test-client",
             scopes="accounts:read",
@@ -244,12 +245,12 @@ class TestInMemoryDeviceCodeStore:
         assert await store.approve_device_code(code.device_code) is False
 
     @pytest.mark.asyncio
-    async def test_approve_nonexistent(self, store: InMemoryDeviceCodeStore):
+    async def test_approve_nonexistent(self, store: InMemoryDeviceCodeStore) -> None:
         result = await store.approve_device_code("nonexistent")
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_revoke(self, store: InMemoryDeviceCodeStore):
+    async def test_revoke(self, store: InMemoryDeviceCodeStore) -> None:
         code = await store.create_device_code(
             client_id="test-client",
             scopes="accounts:read",
@@ -259,12 +260,11 @@ class TestInMemoryDeviceCodeStore:
         assert await store.get_device_code(code.device_code) is None
 
     @pytest.mark.asyncio
-    async def test_revoke_nonexistent(self, store: InMemoryDeviceCodeStore):
-        # Should not raise.
+    async def test_revoke_nonexistent(self, store: InMemoryDeviceCodeStore) -> None:        # Should not raise.
         await store.revoke_device_code("nonexistent")
 
     @pytest.mark.asyncio
-    async def test_update_device_code(self, store: InMemoryDeviceCodeStore):
+    async def test_update_device_code(self, store: InMemoryDeviceCodeStore) -> None:
         code = await store.create_device_code(
             client_id="original",
             scopes="accounts:read",
@@ -298,7 +298,7 @@ class TestDeviceAuthorizationEndpoint:
     """POST /device_authorization — generates device codes."""
 
     @pytest.mark.asyncio
-    async def test_returns_device_code_fields(self, app: Starlette):
+    async def test_returns_device_code_fields(self, app: Starlette) -> None:
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 "/device_authorization",
@@ -317,7 +317,7 @@ class TestDeviceAuthorizationEndpoint:
         assert "interval" in data
 
     @pytest.mark.asyncio
-    async def test_missing_client_id(self, app: Starlette):
+    async def test_missing_client_id(self, app: Starlette) -> None:
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post("/device_authorization", json={})
 
@@ -325,9 +325,9 @@ class TestDeviceAuthorizationEndpoint:
         assert resp.json()["error"] == "invalid_request"
 
     @pytest.mark.asyncio
-    async def test_default_scopes_stored(self, app: Starlette):
+    async def test_default_scopes_stored(self, app: Starlette) -> None:
         """Default scopes are stored on the device code (not returned per RFC 8628)."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 "/device_authorization",
@@ -353,7 +353,7 @@ class TestTokenExchangeEndpoint:
     """POST /token with grant_type=device_code."""
 
     @pytest.mark.asyncio
-    async def test_missing_device_code(self, app: Starlette):
+    async def test_missing_device_code(self, app: Starlette) -> None:
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 "/token",
@@ -364,7 +364,7 @@ class TestTokenExchangeEndpoint:
         assert resp.json()["error"] == "invalid_request"
 
     @pytest.mark.asyncio
-    async def test_invalid_device_code(self, app: Starlette):
+    async def test_invalid_device_code(self, app: Starlette) -> None:
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 "/token",
@@ -375,9 +375,9 @@ class TestTokenExchangeEndpoint:
         assert resp.json()["error"] == "invalid_grant"
 
     @pytest.mark.asyncio
-    async def test_authorization_pending(self, app: Starlette):
+    async def test_authorization_pending(self, app: Starlette) -> None:
         """Device code exists but not yet approved → authorization_pending."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = await store.create_device_code(
             client_id="test-client",
             scopes="accounts:read",
@@ -394,16 +394,16 @@ class TestTokenExchangeEndpoint:
         assert resp.json()["error"] == "authorization_pending"
 
     @pytest.mark.asyncio
-    async def test_expired_device_code(self, app: Starlette):
+    async def test_expired_device_code(self, app: Starlette) -> None:
         """Expired device code → expired_token + revoked."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = DeviceCode(
             device_code="expired-code",
             user_code="ABCDEF",
             verification_uri="https://auth.example.com/verify",
             expires_at=datetime.now(UTC) - timedelta(seconds=1),
         )
-        store._codes["expired-code"] = code  # type: ignore[attr-defined]
+        store._codes["expired-code"] = code
 
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
@@ -417,9 +417,9 @@ class TestTokenExchangeEndpoint:
         assert await store.get_device_code("expired-code") is None
 
     @pytest.mark.asyncio
-    async def test_approved_exchanges_for_tokens(self, app: Starlette):
+    async def test_approved_exchanges_for_tokens(self, app: Starlette) -> None:
         """Approved device code → 200 with read + write tokens."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = await store.create_device_code(
             client_id="cust_123",  # subject_value stored in client_id after approval
             scopes="accounts:read",
@@ -444,9 +444,9 @@ class TestTokenExchangeEndpoint:
         assert len(data["write_token"]) > 0
 
     @pytest.mark.asyncio
-    async def test_approved_but_missing_subject(self, app: Starlette):
+    async def test_approved_but_missing_subject(self, app: Starlette) -> None:
         """Approved code with empty client_id → invalid_state."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = DeviceCode(
             device_code="no-subject",
             user_code="ABCDEF",
@@ -454,7 +454,7 @@ class TestTokenExchangeEndpoint:
             expires_at=datetime.now(UTC) + timedelta(minutes=15),
             client_id="",  # No subject value.
         )
-        store._codes["no-subject"] = code  # type: ignore[attr-defined]
+        store._codes["no-subject"] = code
 
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
@@ -468,9 +468,9 @@ class TestTokenExchangeEndpoint:
         pass
 
     @pytest.mark.asyncio
-    async def test_approved_with_empty_subject_after_approval(self, app: Starlette):
+    async def test_approved_with_empty_subject_after_approval(self, app: Starlette) -> None:
         """Approved code where approval stored empty subject → invalid_state."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = await store.create_device_code(
             client_id="",  # Empty at creation.
             scopes="accounts:read",
@@ -492,9 +492,9 @@ class TestTokenExchangeEndpoint:
         assert resp.json()["error"] == "invalid_state"
 
     @pytest.mark.asyncio
-    async def test_slow_down(self, app: Starlette):
+    async def test_slow_down(self, app: Starlette) -> None:
         """Polling too fast while pending → slow_down."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = await store.create_device_code(
             client_id="cust_123",
             scopes="accounts:read",
@@ -540,8 +540,8 @@ class TestApproveCallback:
     """POST /approve — mobile app approval."""
 
     @pytest.mark.asyncio
-    async def test_approve_success(self, app: Starlette):
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+    async def test_approve_success(self, app: Starlette) -> None:
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = await store.create_device_code(
             client_id="original-client",
             scopes="accounts:read",
@@ -562,11 +562,12 @@ class TestApproveCallback:
 
         # Verify the code is now approved with correct subject.
         updated = await store.get_device_code(code.device_code)
+        assert updated is not None
         assert updated.approved is True
         assert updated.client_id == "cust_123"  # subject_value stored.
 
     @pytest.mark.asyncio
-    async def test_approve_missing_fields(self, app: Starlette):
+    async def test_approve_missing_fields(self, app: Starlette) -> None:
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post("/approve", json={})
 
@@ -574,7 +575,7 @@ class TestApproveCallback:
         assert resp.json()["error"] == "invalid_request"
 
     @pytest.mark.asyncio
-    async def test_approve_nonexistent_code(self, app: Starlette):
+    async def test_approve_nonexistent_code(self, app: Starlette) -> None:
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 "/approve",
@@ -588,8 +589,8 @@ class TestApproveCallback:
         assert resp.json()["error"] == "invalid_grant"
 
     @pytest.mark.asyncio
-    async def test_approve_already_approved(self, app: Starlette):
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+    async def test_approve_already_approved(self, app: Starlette) -> None:
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = await store.create_device_code(
             client_id="test-client",
             scopes="accounts:read",
@@ -619,9 +620,9 @@ class TestFullLifecycle:
     """End-to-end device authorization flow."""
 
     @pytest.mark.asyncio
-    async def test_complete_flow(self, app: Starlette):
+    async def test_complete_flow(self, app: Starlette) -> None:
         """Device code creation → approval → token exchange."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
 
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             # Step 1: Request device code.
@@ -674,9 +675,9 @@ class TestFullLifecycle:
             assert write_token.count(".") == 2
 
     @pytest.mark.asyncio
-    async def test_expired_then_new_code(self, app: Starlette):
+    async def test_expired_then_new_code(self, app: Starlette) -> None:
         """Expired code is rejected; a new code works."""
-        store: InMemoryDeviceCodeStore = app.state.device_code_store  # type: ignore[attr-defined]
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
 
         # Create and expire a code.
         old_code = DeviceCode(
@@ -685,7 +686,7 @@ class TestFullLifecycle:
             verification_uri="https://auth.example.com/verify",
             expires_at=datetime.now(UTC) - timedelta(seconds=1),
         )
-        store._codes["old-expired"] = old_code  # type: ignore[attr-defined]
+        store._codes["old-expired"] = old_code
 
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://test") as client:
             # Old code → expired_token.
@@ -714,7 +715,7 @@ class TestFullLifecycle:
 class TestSerialization:
     """DeviceCode to_dict/from_dict and to_json/from_json."""
 
-    def test_round_trip_dict(self):
+    def test_round_trip_dict(self) -> None:
         dc = DeviceCode(
             device_code="test-123",
             user_code="ABCDEF",
@@ -734,7 +735,7 @@ class TestSerialization:
         assert dc2.scopes == dc.scopes
         assert dc2.approved is True
 
-    def test_round_trip_json(self):
+    def test_round_trip_json(self) -> None:
         dc = DeviceCode(
             device_code="json-test",
             user_code="XYZ123",
@@ -752,7 +753,7 @@ class TestSerialization:
         assert dc2.verification_uri_complete == dc.verification_uri_complete
         assert dc2.approved is False
 
-    def test_round_trip_with_null_approved_at(self):
+    def test_round_trip_with_null_approved_at(self) -> None:
         """Unapproved codes have approved_at=None, which serializes correctly."""
         dc = DeviceCode(
             device_code="no-approve",

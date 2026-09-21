@@ -28,13 +28,13 @@ class _CapturedWrite:
     """What _write received from on_call_tool."""
 
     outcome: str
-    risk_signals: list[dict] | None
+    risk_signals: list[dict[str, Any]] | None
 
 
 class _MockContext:
     """Minimal MiddlewareContext for on_call_tool."""
 
-    def __init__(self, tool_name: str = "test_tool", arguments: dict | None = None):
+    def __init__(self, tool_name: str = "test_tool", arguments: dict[str, Any] | None = None):
         self.message = MagicMock()
         self.message.name = tool_name
         self.message.arguments = arguments or {}
@@ -92,7 +92,7 @@ async def test_session_with_no_signals_yields_empty_list() -> None:
 
     # Create a risk context and push it onto the contextvar.
     ctx = RiskContext(session_id="test-session")
-    token = set_current_session(ctx)
+    set_current_session(ctx)
 
     try:
         async def capture_write(*args: Any, **kwargs: Any) -> None:
@@ -125,7 +125,7 @@ async def test_session_with_risk_signals_serialized_correctly() -> None:
     # Create a risk context that will trigger signals.
     ctx = RiskContext(session_id="test-session")
     ctx.record_records(100)  # Exceeds default budget of 100
-    token = set_current_session(ctx)
+    set_current_session(ctx)
 
     try:
         # Pre-populate risk signals (simulating what RiskMiddleware does).
@@ -187,7 +187,7 @@ async def test_raised_path_includes_risk_signals() -> None:
     # Create a risk context with signals.
     ctx = RiskContext(session_id="test-session")
     ctx.record_records(100)
-    token = set_current_session(ctx)
+    set_current_session(ctx)
 
     try:
         config = RiskConfig(max_records_per_session=100)

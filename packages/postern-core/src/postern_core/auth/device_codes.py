@@ -103,6 +103,24 @@ class DeviceCode:
         separator = "&" if "?" in self.verification_uri else "?"
         return f"{self.verification_uri}{separator}user_code={self.user_code}"
 
+    def to_json(self) -> str:
+        """Serialize to JSON string."""
+        return _json.dumps(_device_code_to_dict(self))
+
+    @classmethod
+    def from_json(cls, data: str) -> DeviceCode:
+        """Deserialize from JSON string."""
+        return _device_code_from_dict(_json.loads(data))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict."""
+        return _device_code_to_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DeviceCode:
+        """Deserialize from a plain dict."""
+        return _device_code_from_dict(data)
+
 
 # ---------------------------------------------------------------------------
 # Abstract base class — the interface all backends must implement.
@@ -330,7 +348,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         if data is None:
             return None
         try:
-            return DeviceCode.from_json(data)  # type: ignore[no-any-return]
+            return DeviceCode.from_json(data)
         except (KeyError, ValueError, TypeError) as exc:  # pragma: no cover
             logger.warning("Failed to deserialize device code %s: %s", device_code, exc)
             return None
@@ -361,7 +379,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             await self._redis.setex(
                 self._key(device_code),
                 ttl_seconds,
-                code.to_json(),  # type: ignore[attr-defined]
+                code.to_json(),
             )
 
     async def close(self) -> None:
@@ -377,6 +395,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
 # This avoids making the class non-frozen while still supporting Redis storage.
 
 import dataclasses
+import json as _json
 from datetime import UTC as _UTC
 
 
@@ -411,25 +430,6 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
         approved=bool(data.get("approved", False)),
         approved_at=approved_at,
     )
-
-
-# Attach serialization methods to the class.
-DeviceCode.to_dict = _device_code_to_dict  # type: ignore[attr-defined]
-DeviceCode.from_dict = staticmethod(_device_code_from_dict)  # type: ignore[attr-defined]
-
-import json as _json
-
-
-def _to_json(self: DeviceCode) -> str:  # type: ignore[no-redef]
-    return _json.dumps(_device_code_to_dict(self))
-
-
-def _from_json(cls: type, data: str) -> DeviceCode:  # type: ignore[no-redef]
-    return _device_code_from_dict(_json.loads(data))
-
-
-DeviceCode.to_json = _to_json  # type: ignore[attr-defined]
-DeviceCode.from_json = classmethod(_from_json)  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

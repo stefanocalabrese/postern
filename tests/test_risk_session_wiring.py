@@ -68,6 +68,7 @@ async def test_session_context_has_id() -> None:
     store = SessionStore()
     h = await store.create_session()
     ctx = await store.get_session(h.value)
+    assert ctx is not None
     assert ctx.session_id == h.value
 
 
@@ -82,10 +83,11 @@ def test_get_current_session_returns_none_initially() -> None:
 def test_set_and_get_current_session() -> None:
     """Setting a session makes it retrievable."""
     ctx = RiskContext(session_id="test-123")
-    token = set_current_session(ctx)
+    set_current_session(ctx)
     try:
-        assert get_current_session() is ctx
-        assert get_current_session().session_id == "test-123"
+        current = get_current_session()
+        assert current is ctx
+        assert current.session_id == "test-123"
     finally:
         set_current_session(None)
 
@@ -129,7 +131,8 @@ def test_context_snapshot_includes_all_fields() -> None:
     assert snap["distinct_accounts"] == 1
     assert snap["max_days_requested"] == 7
     assert snap["session_id"] == "sess-1"
-    assert snap["session_age_seconds"] >= 0
+    age = snap["session_age_seconds"]
+    assert isinstance(age, (int, float)) and age >= 0
 
 
 def test_duplicate_accounts_dont_increase_count() -> None:
@@ -252,7 +255,7 @@ def test_risk_signals_from_engine_are_immutable() -> None:
 
     sig = next(s for s in signals if s.code == "RECORD_BUDGET_EXHAUSTED")
     with pytest.raises(dataclasses.FrozenInstanceError):
-        sig.code = "hacked"  # type: ignore[misc]
+        sig.code = "hacked"  # type: ignore[misc]  # frozen dataclass, assignment should raise
 
 
 # --- Full session lifecycle ---
@@ -313,6 +316,8 @@ async def test_multiple_sessions_are_isolated() -> None:
     ctx1 = await store.get_session(h1.value)
     ctx2 = await store.get_session(h2.value)
 
+    assert ctx1 is not None
+    assert ctx2 is not None
     assert ctx1 is not ctx2
     assert ctx1.session_id != ctx2.session_id
 
@@ -455,10 +460,10 @@ async def test_redis_session_store_creates_and_retrieves() -> None:
     from postern_core.risk.session import RedisSessionStore
 
     # Create a fake async Redis client
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)  # type: ignore[attr-defined]
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
     store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis  # type: ignore[attr-defined]
+    store._redis = fake_redis
     store._prefix = "test:"
     store._ttl = 300
 
@@ -476,10 +481,10 @@ async def test_redis_session_store_removes() -> None:
 
     from postern_core.risk.session import RedisSessionStore
 
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)  # type: ignore[attr-defined]
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
     store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis  # type: ignore[attr-defined]
+    store._redis = fake_redis
     store._prefix = "test:"
     store._ttl = 300
 
@@ -496,15 +501,16 @@ async def test_redis_session_store_serialization_round_trip() -> None:
     from postern_core.risk.engine import RiskConfig, RiskEngine
     from postern_core.risk.session import RedisSessionStore
 
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)  # type: ignore[attr-defined]
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
     store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis  # type: ignore[attr-defined]
+    store._redis = fake_redis
     store._prefix = "test:"
     store._ttl = 300
 
     handle = await store.create_session()
     ctx = await store.get_session(handle.value)
+    assert ctx is not None
 
     # Record data (simulating tool handler behavior)
     ctx.record_records(50)
@@ -535,10 +541,10 @@ async def test_redis_session_store_key_prefix() -> None:
 
     from postern_core.risk.session import RedisSessionStore
 
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)  # type: ignore[attr-defined]
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
     store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis  # type: ignore[attr-defined]
+    store._redis = fake_redis
     store._prefix = "tenant123:"
     store._ttl = 300
 
@@ -546,7 +552,7 @@ async def test_redis_session_store_key_prefix() -> None:
 
     # Verify the key was stored with the prefix
     expected_key = f"tenant123:session:{handle.value}"
-    assert await fake_redis.exists(expected_key) == 1  # type: ignore[attr-defined]
+    assert await fake_redis.exists(expected_key) == 1
 
 
 async def test_redis_session_store_ttl() -> None:
@@ -555,10 +561,10 @@ async def test_redis_session_store_ttl() -> None:
 
     from postern_core.risk.session import RedisSessionStore
 
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)  # type: ignore[attr-defined]
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
     store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis  # type: ignore[attr-defined]
+    store._redis = fake_redis
     store._prefix = "test:"
     store._ttl = 600
 
@@ -566,5 +572,5 @@ async def test_redis_session_store_ttl() -> None:
     key = f"test:session:{handle.value}"
 
     # TTL should be set (fakeredis counts down, so allow 599–600).
-    ttl = await fake_redis.ttl(key)  # type: ignore[attr-defined]
+    ttl = await fake_redis.ttl(key)
     assert 599 <= ttl <= 600

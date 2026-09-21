@@ -1051,7 +1051,7 @@ class AuditMiddleware(Middleware):
             if _ctx is not None:
                 # Always serialize — even an empty list means "session ran,
                 # no signals fired" (distinct from NULL = no session).
-                _risk_signals: list[dict] | None = [
+                _risk_signals: list[dict[str, Any]] | None = [
                     {
                         "code": s.code,
                         "severity": s.severity.name,
@@ -1112,7 +1112,7 @@ class AuditMiddleware(Middleware):
         if _ctx is not None:
             # Always serialize — even an empty list means "session ran, no
             # signals fired" (distinct from NULL = no session).
-            _risk_signals: list[dict] | None = [
+            _risk_signals = [
                 {
                     "code": s.code,
                     "severity": s.severity.name,
@@ -1231,7 +1231,7 @@ class AuditMiddleware(Middleware):
         # future caller silently record NULL instead of the actual signal data,
         # which on a regulator-facing table is a gap. Both branches of
         # `on_call_tool` always have a real value to supply.
-        risk_signals: list[dict] | None,
+        risk_signals: list[dict[str, Any]] | None,
     ) -> None:
         async with self.db.sessionmaker() as session:
             await audit.append(

@@ -52,6 +52,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 from enum import IntEnum
 
 
@@ -128,11 +129,11 @@ class Challenge:
     challenge_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     customer_ref: str = ""
     tool_name: str = ""
-    payload: dict = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
     tier: VerificationTier = VerificationTier.APP_APPROVAL
     status: str = "pending"  # pending | approved | executed | declined | expired
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    expires_at: datetime = field(default=None)  # computed in __post_init__ if None.
+    expires_at: datetime | None = field(default=None)  # computed in __post_init__ if None.
     confirming_device: str | None = None
     verification_result: str | None = None
     signature: str | None = None
@@ -154,7 +155,9 @@ class Challenge:
     @property
     def is_expired(self) -> bool:
         """Whether this challenge has passed its expiry."""
-        return datetime.now(UTC) >= self.expires_at
+        expires = self.expires_at
+        assert expires is not None
+        return datetime.now(UTC) >= expires
 
     @property
     def is_terminal(self) -> bool:
@@ -254,7 +257,7 @@ class Challenge:
         )
         return updated
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize for storage (e.g. Redis or JSON audit)."""
         return {
             "challenge_id": self.challenge_id,
@@ -264,14 +267,14 @@ class Challenge:
             "tier": int(self.tier),
             "status": self.status,
             "created_at": int(self.created_at.timestamp()),
-            "expires_at": int(self.expires_at.timestamp()),
+            "expires_at": int(self.expires_at.timestamp()) if self.expires_at else 0,
             "confirming_device": self.confirming_device,
             "verification_result": self.verification_result,
             "signature": self.signature,
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> Challenge:
+    def from_dict(cls, data: dict[str, Any]) -> Challenge:
         """Deserialize from storage."""
         import datetime as _dt
 

@@ -30,9 +30,9 @@ class TestVerificationTierEnum:
     """The three-tier verification system."""
 
     def test_tier_values(self) -> None:
-        assert VerificationTier.SESSION_ONLY == 0
-        assert VerificationTier.APP_APPROVAL == 1
-        assert VerificationTier.APP_IDENTITY_VERIFICATION == 2
+        assert int(VerificationTier.SESSION_ONLY) == 0
+        assert int(VerificationTier.APP_APPROVAL) == 1
+        assert int(VerificationTier.APP_IDENTITY_VERIFICATION) == 2
 
     def test_requires_selfie(self) -> None:
         assert VerificationTier.SESSION_ONLY.requires_selfie is False
@@ -70,16 +70,19 @@ class TestChallengeCreation:
     def test_tier_0_ttl_is_30_seconds(self) -> None:
         base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         c = Challenge(tier=VerificationTier.SESSION_ONLY, created_at=base)
+        assert c.expires_at is not None
         assert (c.expires_at - base).total_seconds() == 30
 
     def test_tier_1_ttl_is_180_seconds(self) -> None:
         base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         c = Challenge(tier=VerificationTier.APP_APPROVAL, created_at=base)
+        assert c.expires_at is not None
         assert (c.expires_at - base).total_seconds() == 180
 
     def test_tier_2_ttl_is_300_seconds(self) -> None:
         base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         c = Challenge(tier=VerificationTier.APP_IDENTITY_VERIFICATION, created_at=base)
+        assert c.expires_at is not None
         assert (c.expires_at - base).total_seconds() == 300
 
     def test_challenge_generates_unique_id(self) -> None:
@@ -341,7 +344,7 @@ class TestVerificationTierAsInt:
         assert VerificationTier(2) == VerificationTier.APP_IDENTITY_VERIFICATION
 
     def test_challenge_accepts_int_tier(self) -> None:
-        c = Challenge(tier=1)  # int, not enum.
+        c = Challenge(tier=VerificationTier(1))  # int, not enum.
         assert c.tier == VerificationTier.APP_APPROVAL
 
     def test_challenge_from_dict_with_int_tier(self) -> None:

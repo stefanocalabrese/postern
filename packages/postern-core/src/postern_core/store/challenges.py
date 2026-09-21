@@ -22,6 +22,7 @@ Usage::
 """
 
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +41,7 @@ async def create_challenge(
     challenge_id: str,
     customer_ref: str,
     tool_name: str,
-    payload: dict,
+    payload: dict[str, Any],
     tier: VerificationTier | int,
 ) -> ChallengeRecord:
     """Persist a new challenge row and return it.
@@ -76,7 +77,7 @@ async def create_challenge(
         tier_int = tier
     else:
         tier_int = int(tier)
-    ttl = ttl_seconds.get(tier_int, 180)  # default to tier-1 TTL.
+    ttl = ttl_seconds.get(VerificationTier(tier_int), 180)  # default to tier-1 TTL.
 
     record = ChallengeRecord(
         challenge_id=challenge_id,

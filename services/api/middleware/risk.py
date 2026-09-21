@@ -92,7 +92,7 @@ class RiskMiddleware(Middleware):
             ctx.ip_tracker.record_ip(ip)
 
         # Push the context onto the contextvar for this call.
-        token = set_current_session(ctx)
+        set_current_session(ctx)
         try:
             result = await call_next(context)
             # Evaluate risk signals after the handler has recorded data.
@@ -123,19 +123,24 @@ class RiskMiddleware(Middleware):
         Reads ``X-Forwarded-For`` header first, falls back to remote address.
         Returns None if neither is available.
         """
-        headers = context.fastmcp_context.request.headers if context.fastmcp_context else None
-        if headers:
-            xff = headers.get("x-forwarded-for")
-            if xff:
-                return xff.split(",")[0].strip()
-
         if context.fastmcp_context:
-            try:
-                peer = context.fastmcp_context.request.client
-                if peer and hasattr(peer, "host"):
-                    return peer.host
-            except Exception:
-                pass
+            headers = getattr(context.fastmcp_context, "request", None)
+            if headers is not None:
+                headers = getattr(headers, "headers", None)
+            if headers:
+                xff = headers.get("x-forwarded-for")
+                if xff:
+                    return str(xff.split(",")[0].strip())
+
+            if context.fastmcp_context:
+                try:
+                    req = getattr(context.fastmcp_context, "request", None)
+                    if req is not None:
+                        peer = getattr(req, "client", None)
+                        if peer and hasattr(peer, "host"):
+                            return str(peer.host)
+                except Exception:
+                    pass
 
         return None
 

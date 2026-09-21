@@ -9,6 +9,7 @@ other's rows regardless of execution order.
 """
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from postern_core.domain.verification import VerificationTier
@@ -28,7 +29,7 @@ async def _insert_challenge(
     challenge_id: str = "chal_abc123",
     customer_ref: str = "cust_7f3a",
     tool_name: str = "payments.create_payment",
-    payload: dict | None = None,
+    payload: dict[str, Any] | None = None,
     tier: VerificationTier = VerificationTier.APP_APPROVAL,
 ) -> ChallengeRecord:
     """Insert a raw ``ChallengeRecord`` and flush."""

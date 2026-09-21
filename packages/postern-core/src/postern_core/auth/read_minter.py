@@ -52,7 +52,7 @@ class JtiReplayCache:
         now = time.monotonic()
         # Evict expired entries first
         while self._cache and now - next(iter(self._cache.values())) > self._max_age_seconds:
-            self._cache.popitem(last=False)  # type: ignore[arg-type]
+            self._cache.popitem(last=False)
 
         if jti in self._cache:
             raise ValueError(f"jti replay detected: {jti}")
@@ -127,7 +127,7 @@ class ReadTokenMinter:
 
             keyset = _KeySet.import_key_set(self._minter.key_source.public_jwks())
             decoded = _jwt.decode(token, keyset, algorithms=["RS256"])
-            jti: str = decoded.claims["jti"]  # type: ignore[assignment]
+            jti: str = decoded.claims["jti"]
             self._jti_cache.add(jti)
 
         return token

@@ -670,7 +670,7 @@ class AuditEntry(Base):
     # supports that without parsing. The schema is an array of objects with
     # `code`, `severity`, and `details` keys — the same shape RiskSignal
     # carries, serialised via dataclass_asdict.
-    risk_signals: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+    risk_signals: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
         Index("ix_audit_log_customer_at", "customer_ref", "at"),

@@ -75,6 +75,7 @@ async def test_append_with_redaction_budget_exhausted_true_persists_true(
             refusal_reason=None,
             call_id=PROBE_CALL_ID,
             client_id=None,
+            risk_signals=None,
         )
     async with database.sessionmaker() as s:
         row = (await s.execute(select(AuditEntry))).scalar_one()
@@ -107,6 +108,7 @@ async def test_append_with_redaction_budget_exhausted_false_persists_false(
             refusal_reason=None,
             call_id=PROBE_CALL_ID,
             client_id=None,
+            risk_signals=None,
         )
     async with database.sessionmaker() as s:
         row = (await s.execute(select(AuditEntry))).scalar_one()

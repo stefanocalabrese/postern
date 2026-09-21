@@ -23,6 +23,8 @@ from typing import Any
 from postern_core.risk.context import RiskContext
 from postern_core.risk.types import RiskSignal, Severity
 
+__all__ = ["RiskConfig", "RiskEngine", "Severity"]
+
 
 @dataclass(frozen=True)
 class RiskConfig:

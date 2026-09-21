@@ -110,7 +110,7 @@ async def append(
     # on a regulator-facing table is a gap in the data. Both branches of
     # `AuditMiddleware._write` always have a real value to supply (an empty
     # list when no signals fired, or the signal data when they did).
-    risk_signals: list[dict] | None,
+    risk_signals: list[dict[str, Any]] | None,
 ) -> None:
     session.add(
         AuditEntry(
