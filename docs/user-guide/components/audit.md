@@ -28,7 +28,7 @@ await audit.append(
     db=session,
     call_id=call_id,
     tool_name="accounts.list",
-    outcome=OUTCOME_REACHING,       # "reaching" — about to touch backend
+    outcome=OUTCOME_REACHING,       # "reaching", about to touch backend
     reaching_at=datetime.now(UTC),  # timestamp of the entry row
     customer_ref="cust_7f3a",       # from validated access token
     ...
@@ -37,7 +37,7 @@ await audit.append(
 
 ### Completion Row (`outcome='returned'` or `outcome='raised'`)
 
-Written **after** the tool call finishes — either successfully (`returned`) or with an
+Written **after** the tool call finishes, either successfully (`returned`) or with an
 exception (`raised`).
 
 ```python
@@ -46,7 +46,7 @@ await audit.append(
     db=session,
     call_id=call_id,
     tool_name="accounts.list",
-    outcome=OUTCOME_RETURNED,       # "returned" — completed successfully
+    outcome=OUTCOME_RETURNED,       # "returned", completed successfully
     returned_at=datetime.now(UTC),  # timestamp of completion
     duration_ms=42,                 # time from entry to completion
     customer_ref="cust_7f3a",
@@ -58,7 +58,7 @@ await audit.append(
     db=session,
     call_id=call_id,
     tool_name="accounts.list",
-    outcome=OUTCOME_RAISED,         # "raised" — exception occurred
+    outcome=OUTCOME_RAISED,         # "raised", exception occurred
     raised_at=datetime.now(UTC),
     detail="NotFoundError",         # exception TYPE only (never message)
     customer_ref="cust_7f3a",
@@ -103,7 +103,7 @@ backend is never reached at all, rather than data being touched with nothing rec
 | Cancellation (deadline fires) | ✅ committed | ❌ never written | True statement: "touched, no outcome" |
 | Normal success | ✅ committed | ✅ committed | Full audit trail |
 
-### `_PendingEntry` — At-most-once guard
+### `_PendingEntry`, At-most-once guard
 
 The entry row uses an `asyncio.Lock` to prevent duplicate writes under concurrent
 cancellation:
@@ -131,7 +131,7 @@ application code:
 | `ck_audit_log_call_id_present` | `call_id` | NOT NULL (every row must have a call_id) |
 | `ck_audit_log_reaching_at_matches_outcome` | `reaching_at` | Present when outcome='reaching', absent otherwise |
 | `ck_audit_log_customer_ref_absence_reason` | `absence_reason` | `no_access_token`, `no_string_subject`, `subject_not_customer_ref` |
-| `ck_audit_log_customer_ref_xor_absence` | — | XOR: every row has EITHER customer_ref OR absence_reason, never both or neither |
+| `ck_audit_log_customer_ref_xor_absence` | - | XOR: every row has EITHER customer_ref OR absence_reason, never both or neither |
 
 ### XOR Invariant
 
@@ -148,25 +148,25 @@ This ensures that every row explains why there is (or isn't) a customer referenc
 
 ## Field-Level Details
 
-### `detail` — Exception type only, never message
+### `detail`, Exception type only, never message
 
 A `pydantic.ValidationError` message embeds the raw offending value, which is the
 leak path. The audit table is a long-lived store, so only the exception TYPE is recorded:
 
 ```python
-detail="NotFoundError"    # ✅ correct — type name only
+detail="NotFoundError"    # ✅ correct, type name only
 # NOT:
 detail="NotFoundError: account 'acc_123' not found"  # ❌ leaks raw value
 ```
 
-### `refusal_reason` — Transcribed, never inferred
+### `refusal_reason`, Transcribed, never inferred
 
 A consent denial and a mistyped tool name both arrive as one `NotFoundError`, so this
 module cannot tell them apart from what it can see. The refusal reason is transcribed
 from `services/api/consent.py`, which is the only place that knows it refused and which
 of its refusals it made.
 
-### `customer_ref_absence_reason` — Derived here
+### `customer_ref_absence_reason`, Derived here
 
 This is the only place that sees the access token at all. It records which of three
 things left `customer_ref` NULL:
@@ -193,13 +193,13 @@ clamped = value[:63] + "…" if len(value) > 64 else value
 Same pattern for the `request_id` column (`VARCHAR(128)`). A truncated ID still
 correlates with a client-side log whose ID shares the first 127 characters.
 
-### `_scrub()` — PAN/IBAN redaction in arguments
+### `_scrub()`, PAN/IBAN redaction in arguments
 
 Redacts PAN- and IBAN-shaped substrings anywhere in the argument tree, including dict
 keys:
 
 ```python
-# Keys matter as much as values — arguments are captured before call_next validates them:
+# Keys matter as much as values, arguments are captured before call_next validates them:
 _scrub({"4111111111114417": "x"})  # → {"•••• 4417": "x"}
 _scrub("pay to NO9386011117947")   # → "pay to NO•• •••• 7947"
 ```

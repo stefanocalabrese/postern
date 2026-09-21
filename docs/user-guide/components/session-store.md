@@ -35,7 +35,7 @@ class SessionStoreBase(ABC):
     async def close(self) -> None: ...  # Cleanup resources (Redis connection pool)
 ```
 
-All methods are `async def` — even the in-memory store uses async so callers can
+All methods are `async def`, even the in-memory store uses async so callers can
 uniformly `await store.xxx()` regardless of backend.
 
 ### Factory Function
@@ -52,7 +52,7 @@ def create_session_store() -> SessionStoreBase:
 ## In-Memory Backend (`InMemorySessionStore`)
 
 Thread-safe enough for FastMCP's in-process test client (single-threaded async).
-Not safe across processes — use Redis for that.
+Not safe across processes, use Redis for that.
 
 ```python
 class InMemorySessionStore(SessionStoreBase):
@@ -114,7 +114,7 @@ class RedisSessionStore(SessionStoreBase):
         try:
             return RiskContext.from_json(data)
         except (KeyError, ValueError, TypeError):
-            return None  # Corrupted data — treat as absent
+            return None  # Corrupted data, treat as absent
 
     async def set_session(self, session_id: str, context: RiskContext) -> None:
         ttl_seconds = max(0, int(self._default_ttl - (time.time() - context.session_start)))

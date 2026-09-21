@@ -38,9 +38,9 @@ signal = RiskSignal(
 )
 ```
 
-## RiskConfig — Thresholds
+## RiskConfig, Thresholds
 
-All values are **hard limits** — exceeding them triggers a HIGH signal that ends the
+All values are **hard limits**, exceeding them triggers a HIGH signal that ends the
 session. Sub-thresholds (80% of hard limit) trigger MEDIUM signals that escalate tier.
 
 ```python
@@ -70,12 +70,12 @@ class RiskConfig:
   on all accounts plus a wide transaction window.
 - `max_distinct_accounts = 10` matches the implicit assumption that a personal banking
   customer has fewer than 10 accounts. Corporate multi-account customers are out of scope.
-- `max_days_per_call = 365` matches `MAX_DAYS` in the transactions façade — a session
+- `max_days_per_call = 365` matches `MAX_DAYS` in the transactions façade, a session
   budget wider than one call is pointless.
 - `max_session_age_minutes = 480` (8 hours) is a generous session lifetime; ZT-1's
   token refresh will be the primary shortening mechanism.
 
-## RiskEngine — Evaluation
+## RiskEngine, Evaluation
 
 The engine is **stateless**: it takes context + config and returns a list of signals.
 The caller decides what to do with them (log, escalate tier, hard-fail).
@@ -96,12 +96,12 @@ for signal in signals:
 
 ### Checks performed (in order)
 
-1. **Record budget sub-threshold** — 80% reached → MEDIUM (escalate tier)
-2. **Record budget hard limit** — exhausted → HIGH (end session)
-3. **Account diversity sub-threshold** — 80% reached → MEDIUM (escalate tier)
-4. **Account diversity hard limit** — exhausted → HIGH (end session)
-5. **Session age** — exceeds max → HIGH (end session)
-6. **Time window** — days requested exceeds max → HIGH (reject call)
+1. **Record budget sub-threshold**, 80% reached → MEDIUM (escalate tier)
+2. **Record budget hard limit**, exhausted → HIGH (end session)
+3. **Account diversity sub-threshold**, 80% reached → MEDIUM (escalate tier)
+4. **Account diversity hard limit**, exhausted → HIGH (end session)
+5. **Session age**, exceeds max → HIGH (end session)
+6. **Time window**, days requested exceeds max → HIGH (reject call)
 
 ### Signal codes
 
@@ -114,7 +114,7 @@ for signal in signals:
 | `SESSION_AGE_EXCEEDED` | HIGH | Session age exceeds maximum (8 hours) |
 | `TIME_WINDOW_EXCEEDED` | HIGH | Time window exceeds maximum days per call |
 
-## RiskContext — Per-Session State
+## RiskContext, Per-Session State
 
 Tracks how many records have been returned, which accounts were touched, the widest
 time span requested in one call, and client IP addresses with timestamps.
@@ -164,7 +164,7 @@ The `IpAnomalyConfig` defines thresholds for IP-based anomaly detection:
 ```python
 @dataclass(frozen=True)
 class IpAnomalyConfig:
-    impossible_travel_window: float = 300.0   # Seconds — IP change within this window
+    impossible_travel_window: float = 300.0   # Seconds, IP change within this window
     max_distinct_ips: int = 3                  # Hard limit on distinct IPs per session
 ```
 
@@ -174,7 +174,7 @@ class IpAnomalyConfig:
 |-------|----------|-------------|
 | `_impossible_travel_detected()` | MEDIUM | IP changed within `impossible_travel_window` seconds |
 | `_ip_diversity_hard_limit()` | HIGH | Distinct IPs >= `max_distinct_ips` (3) |
-| `_suspicious_asn_detected()` | — | **Always returns False** — ASN enrichment not yet wired |
+| `_suspicious_asn_detected()` | - | **Always returns False**: ASN enrichment not yet wired |
 
 ## RiskMiddleware (`services/api/middleware/risk.py`)
 

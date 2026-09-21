@@ -14,7 +14,7 @@ Postern's Starlette/FastMCP stack runs on. Middleware is installed as ASGI layer
 wrapping the FastMCP HTTP app.
 
 ### ASN
-Autonomous System Number. Used for IP-based anomaly detection (currently not wired —
+Autonomous System Number. Used for IP-based anomaly detection (currently not wired;
 `_suspicious_asn_detected()` always returns `False`).
 
 ## C
@@ -103,7 +103,7 @@ to 100 entries (FIFO eviction) to prevent unbounded memory growth. Exposes `dist
 
 ### Istio
 The service mesh that validates JWTs (ZT-2). Domain services must scope queries by the
-JWT `sub` claim. Istio JWT validation is **pending** — not yet implemented in this repo.
+JWT `sub` claim. Istio JWT validation is **pending**, not yet implemented in this repo.
 
 ### JTI Replay Cache
 In-memory token replay prevention covering the token lifetime (60-second window). Part
@@ -160,14 +160,14 @@ Primary Account Number. The card number on a payment card (12-19 digits). Masked
 
 ### Postern
 The zero-trust MCP server that exposes an operator's backend services to AI clients as
-tools. Named after a "postern gate" — a small, controlled entrance in a fortified wall.
+tools. Named after a "postern gate", a small, controlled entrance in a fortified wall.
 
 ## R
 
 ### Read Token Minter
 Wraps `InternalTokenMinter` with ZT-1 continuous authorization (revocation check + JTI
 replay cache). `READ_SCOPES` maps audiences to scopes; `payments.svc` is deliberately
-absent — read tokens cannot reach write endpoints.
+absent, read tokens cannot reach write endpoints.
 
 ### Record Count
 Immutable snapshot of how many records a session has returned (`RecordCount.total`).
@@ -208,7 +208,7 @@ and details dict. Examples: `RECORD_BUDGET_80PCT`, `ACCOUNT_DIVERSITY_EXHAUSTED`
 ### Revocation List
 Three-scope revocation with O(1) set lookups: per-session (ends that session),
 per-customer+client (ends all sessions for a pair), and kill switch (ends ALL sessions
-for a client). In-memory only — production requires Redis (`POSTERN_REQUIRE_REDIS=1`).
+for a client). In-memory only, production requires Redis (`POSTERN_REQUIRE_REDIS=1`).
 
 ## S
 
@@ -275,26 +275,26 @@ Postern's eight zero-trust controls:
 
 | Control | Status | Description |
 |---------|--------|-------------|
-| ZT-1 | ✅ Built | Continuous authorization — revocation list + JTI replay cache |
+| ZT-1 | ✅ Built | Continuous authorization: revocation list + JTI replay cache |
 | ZT-2 | ⏳ Pending | Istio JWT validation; domain services scope queries by token `sub` |
-| ZT-3 | ✅ Built | Workload attestation — startup minter probe verifies token signing |
-| ZT-4 | ✅ Built | Approval callback — signed approvals, backend execution from challenge row |
-| ZT-5 | ✅ Built | Per-session anomaly detection — record budgets, account diversity, session age |
-| ZT-6 | ✅ Built | Microsegmentation — read/write key split, separate JWKS endpoints |
-| ZT-7 | ✅ Built | Revocation — three scopes (per-session, per-customer+client, kill switch) |
-| ZT-8 | ⏳ Pending | Egress analysis — not yet implemented |
+| ZT-3 | ✅ Built | Workload attestation: startup minter probe verifies token signing |
+| ZT-4 | ✅ Built | Approval callback: signed approvals, backend execution from challenge row |
+| ZT-5 | ✅ Built | Per-session anomaly detection: record budgets, account diversity, session age |
+| ZT-6 | ✅ Built | Microsegmentation: read/write key split, separate JWKS endpoints |
+| ZT-7 | ✅ Built | Revocation: three scopes (per-session, per-customer+client, kill switch) |
+| ZT-8 | ⏳ Pending | Egress analysis: not yet implemented |
 
 ## Cross-References
 
 | Term | See Also |
 |------|----------|
-| Device Code | [Confirm Service](components/confirm-service.md) — Device Authorization |
-| Risk Context | [Risk Engine](components/risk-engine.md) — Per-Session State |
-| MaskedPan / MaskedIban | [Masking](components/masking.md) — Type-Level Enforcement |
-| Two-Row Audit | [Audit System](components/audit.md) — Two-Row Pattern |
-| Verification Tier | [Confirm Service](components/confirm-service.md) — Approval Callback |
-| Key Split | [API Service](components/api-service.md) — Internal Token Minting |
-| Scan Budget | [Masking](components/masking.md) — Scan Budget |
+| Device Code | [Confirm Service](components/confirm-service.md): Device Authorization |
+| Risk Context | [Risk Engine](components/risk-engine.md): Per-Session State |
+| MaskedPan / MaskedIban | [Masking](components/masking.md): Type-Level Enforcement |
+| Two-Row Audit | [Audit System](components/audit.md): Two-Row Pattern |
+| Verification Tier | [Confirm Service](components/confirm-service.md): Approval Callback |
+| Key Split | [API Service](components/api-service.md): Internal Token Minting |
+| Scan Budget | [Masking](components/masking.md): Scan Budget |
 | Fail-closed | ADR-0006: [Audit Write Failure](../decisions/0006-audit-write-failure.md) |
 | Startup Probe | ADR-0003: [Composition Root](../decisions/0003-composition-root.md) |
 | Masking Residuals | ADR-0008: [Masking Residual Gaps](../decisions/0008-masking-residuals.md) |

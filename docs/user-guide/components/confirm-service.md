@@ -1,6 +1,6 @@
 # Confirm Service (Write Path)
 
-Device authorization, approval callbacks, and payment execution — the write-facing deployable.
+Device authorization, approval callbacks, and payment execution, the write-facing deployable.
 
 ## Overview
 
@@ -37,19 +37,19 @@ Production starts the process with: `uvicorn services.confirm.main:app`.
 
 ### Startup sequence
 
-1. **Write key source** — reads `POSTERN_WRITE_KEY_PEM_PATH` or generates ephemeral
-2. **Write minter** — `build_write_minter()` wraps the write key for token minting
-3. **Read key source** — reads `POSTERN_READ_KEY_PEM_PATH` (needed for device grant)
-4. **Read minter** — `InternalTokenMinter` with read key (device grant exception)
-5. **Device code store** — in-memory (dev) or Redis (production) via `create_device_code_store()`
-6. **Database** — async SQLAlchemy engine for challenges table
+1. **Write key source**, reads `POSTERN_WRITE_KEY_PEM_PATH` or generates ephemeral
+2. **Write minter**, `build_write_minter()` wraps the write key for token minting
+3. **Read key source**, reads `POSTERN_READ_KEY_PEM_PATH` (needed for device grant)
+4. **Read minter**, `InternalTokenMinter` with read key (device grant exception)
+5. **Device code store**, in-memory (dev) or Redis (production) via `create_device_code_store()`
+6. **Database**, async SQLAlchemy engine for challenges table
 
 ### Key split exception
 
 The confirm service holds **both** read and write keys. This is a deliberate, documented
 exception: the device grant flow mints both read and write tokens atomically when a user
 approves pairing on their mobile device. No other code path hands one process both keys
-for general use — the separation is preserved at startup.
+for general use, the separation is preserved at startup.
 
 ## Device Authorization (`services/confirm/device_auth.py`)
 
@@ -141,7 +141,7 @@ Handles verification challenge approvals for write operations (payments, card wr
 ### Challenge Model (`packages/postern-core/src/postern_core/store/challenges.py`)
 
 Challenges are **append-only by construction**: `create_challenge` inserts a new row;
-`update_challenge_status` transitions the status. There is no delete — expired rows
+`update_challenge_status` transitions the status. There is no delete, expired rows
 remain for audit trail.
 
 ```python

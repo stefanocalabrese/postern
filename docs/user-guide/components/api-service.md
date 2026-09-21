@@ -1,6 +1,6 @@
 # API Service (Read Path)
 
-MCP tools, OAuth endpoints, consent checks — the read-facing deployable.
+MCP tools, OAuth endpoints, consent checks, the read-facing deployable.
 
 ## Overview
 
@@ -14,11 +14,11 @@ packages/postern-core/src/postern_core/facade/     HTTP client to operator backe
 services/api/main.py                                Composition root (create_app)
 services/api/server.py                              FastMCP server builder
 services/api/tools/                                 MCP tool handlers (accounts, transactions, cards)
-services/api/asgi/request_deadline.py               Outermost ASGI middleware — request deadline
+services/api/asgi/request_deadline.py               Outermost ASGI middleware, request deadline
 services/api/asgi/header_validation.py              MCP Streamable HTTP header/body validation
 services/api/consent.py                             Per-tool consent authorization
-services/api/middleware/risk.py                     Risk middleware — per-session context tracking
-services/api/middleware/audit.py                    Two-row audit pattern — fail-closed writes
+services/api/middleware/risk.py                     Risk middleware, per-session context tracking
+services/api/middleware/audit.py                    Two-row audit pattern, fail-closed writes
 ```
 
 ## Composition Root
@@ -28,7 +28,7 @@ The function is called lazily via PEP 562 `__getattr__` so that `import services
 does not require a full production environment at import time.
 
 ```python
-# Lazy module attribute — create_app() called only when `app` is accessed
+# Lazy module attribute, create_app() called only when `app` is accessed
 def __getattr__(name: str) -> object:
     if name == "app":
         return create_app()
@@ -39,17 +39,17 @@ Production starts the process with: `uvicorn services.api.main:app`.
 
 ### Startup sequence
 
-1. **Key source resolution** — reads `POSTERN_READ_KEY_PEM_PATH` or generates an ephemeral key
-2. **Minter construction** — `ReadTokenMinter` wraps `InternalTokenMinter` with ZT-1
+1. **Key source resolution**, reads `POSTERN_READ_KEY_PEM_PATH` or generates an ephemeral key
+2. **Minter construction**, `ReadTokenMinter` wraps `InternalTokenMinter` with ZT-1
    (revocation list + JTI replay cache)
-3. **Startup probe** — mints one token, verifies it against the JWKS this process publishes;
+3. **Startup probe**, mints one token, verifies it against the JWKS this process publishes;
    refuses to start on mismatch ([ADR-0003](../../decisions/0003-composition-root.md))
-4. **Backend client** — `BackendClient` with timeout budgets and audit hook
-5. **Database** — async SQLAlchemy engine with per-phase timeouts
-6. **Consent DB** — wired only when real customer auth is configured
-7. **Session store** — in-memory (dev) or Redis (production) via `create_session_store()`
-8. **Server builder** — FastMCP server with middleware chain
-9. **JWKS route** — appended to router at `/.well-known/jwks.json`
+4. **Backend client**, `BackendClient` with timeout budgets and audit hook
+5. **Database**, async SQLAlchemy engine with per-phase timeouts
+6. **Consent DB**, wired only when real customer auth is configured
+7. **Session store**, in-memory (dev) or Redis (production) via `create_session_store()`
+8. **Server builder**, FastMCP server with middleware chain
+9. **JWKS route**, appended to router at `/.well-known/jwks.json`
 
 ## ASGI Middleware Chain
 
@@ -89,7 +89,7 @@ Postgres-backed consent check:
 
 | Tool | Domain | Consent Required | Description |
 |------|--------|-----------------|-------------|
-| `start_session` | — | No | Initiates an RFC 8628 device grant flow |
+| `start_session` | - | No | Initiates an RFC 8628 device grant flow |
 | `accounts.list` | accounts.svc | Yes | Lists customer accounts |
 | `accounts.get_balance` | accounts.svc | Yes | Returns balance for a specific account |
 | `transactions.list` | transactions.svc | Yes | Lists transactions with date range filter |
@@ -116,7 +116,7 @@ for the `build_model` wrapper that catches pydantic validation errors and re-rai
 When `POSTERN_JWKS_URI` and `POSTERN_TOKEN_ISSUER` are both set, the server builds a
 `JWTVerifier` and requires every tool call to carry a validated customer access token.
 
-When either is unset (or both are `""`), the server runs in **no-auth mode** — suitable
+When either is unset (or both are `""`), the server runs in **no-auth mode**, suitable
 for local development and testing. A token is still minted internally for the stub IdP,
 but no verification occurs.
 
@@ -133,12 +133,12 @@ read_minter = ReadTokenMinter(
 ```
 
 `READ_SCOPES` maps audiences to OAuth scopes. The `payments.svc` audience is
-**deliberately absent** — read tokens cannot reach write endpoints.
+**deliberately absent**, read tokens cannot reach write endpoints.
 
 ### JWKS Endpoint
 
 The public half of the signing key is published at `/.well-known/jwks.json` on the
-API service router. This route is **unauthenticated** — any gateway or client fetching
+API service router. This route is **unauthenticated**, any gateway or client fetching
 the key set must reach it without a valid token.
 
 ## Consent Enforcement (`services/api/consent.py`)
@@ -150,7 +150,7 @@ returns an `AuthCheck` that:
 2. Filters the tool catalogue (hides tools without consent from `tools/list`)
 3. Refuses calls to hidden tools with a recorded refusal reason
 
-> **Warning:** Filtering `tools/list` alone is insufficient — hidden tools are still
+> **Warning:** Filtering `tools/list` alone is insufficient, hidden tools are still
 > callable by name. Every tool call passes through `AuthCheck` regardless of catalogue
 > visibility.
 
@@ -161,10 +161,10 @@ lookups.
 
 The `BackendClient` is the HTTP façade to the operator's backend services:
 
-- **Path validation** — rejects absolute URLs, protocol-relative URLs, and `..` segments
-- **Error scrubbing** — passes backend error bodies through `FreeText` redaction before
+- **Path validation**: rejects absolute URLs, protocol-relative URLs, and `..` segments
+- **Error scrubbing**: passes backend error bodies through `FreeText` redaction before
   truncating to 200 characters (prevents PAN/IBAN leakage in error responses)
-- **Timeout budgets** — four independent timeouts per phase (connect, write, read, pool)
+- **Timeout budgets**: four independent timeouts per phase (connect, write, read, pool)
   summing to a worst-case 10.0s per backend request
 
 ## Timeout Architecture

@@ -1,6 +1,6 @@
 # Masking (PAN/IBAN Redaction)
 
-Multi-layer redaction pipeline for card PANs and IBANs — type-level enforcement.
+Multi-layer redaction pipeline for card PANs and IBANs, type-level enforcement.
 
 ## Overview
 
@@ -19,17 +19,17 @@ packages/postern-core/src/postern_core/domain/masking.py    FreeText type (autom
 ```python
 from postern_core.domain.masking import MaskedPan, MaskedIban
 
-# MaskedPan — card PAN, last four digits only. Cannot represent a full PAN.
+# MaskedPan, card PAN, last four digits only. Cannot represent a full PAN.
 pan: MaskedPan = "4111 1111 1111 4417"
 # → "•••• 4417"
 
-# MaskedIban — own IBAN, country code plus last four. Counterparty IBANs are omitted entirely.
+# MaskedIban, own IBAN, country code plus last four. Counterparty IBANs are omitted entirely.
 iban: MaskedIban = "NO93 8601 1117 947"
 # → "NO•• •••• 7947"
 
 # A handler that forgets to use the type:
 bad_pan: str = "4111 1111 1111 4417"  # ← raw value, no masking
-# This compiles fine but is a security risk — the type system cannot prevent this.
+# This compiles fine but is a security risk, the type system cannot prevent this.
 # The convention "Never replace them with a str plus a helper function" is enforced
 # by code review and the [ADR-0008](../../decisions/0008-masking-residuals.md) residual gaps documentation.
 ```
@@ -60,7 +60,7 @@ that look identical to Latin ones.
 ### Layer 3: Bridged Run Masking (`_mask_bridged_runs()`)
 
 Handles digit runs that span across separators (spaces, hyphens) in free text.
-For example: `"pay 4111 1111 1111 4417 now"` — the PAN is split by spaces but forms
+For example: `"pay 4111 1111 1111 4417 now"`, the PAN is split by spaces but forms
 a contiguous 16-digit run when separators are removed.
 
 The pattern is deliberately **unbounded above** (`\d{12,}`, not `\d{12,19}`) because
@@ -71,7 +71,7 @@ the mask to form a complete card number.
 ### Layer 4: IBAN Checksum Validation (`_mod97_ok()`)
 
 Validates ISO 7064 mod-97 checksum before masking. An IBAN is only masked if it
-passes the checksum — this prevents false positives on random digit sequences that
+passes the checksum, this prevents false positives on random digit sequences that
 happen to look like IBANs.
 
 ```python
@@ -142,7 +142,7 @@ def redaction_budget(total: int = _IBAN_SCAN_BUDGET) -> Iterator[RedactionScope]
     ...
 ```
 
-The `ContextVar` is local to the current async task — two concurrently-running requests
+The `ContextVar` is local to the current async task, two concurrently-running requests
 never observe each other's budget.
 
 ### Measured performance
@@ -167,7 +167,7 @@ in the masking pipeline that are accepted as trade-offs:
 
 ## Counterparty Account Numbers
 
-Counterparty account numbers are **omitted entirely** from responses — only the name is
+Counterparty account numbers are **omitted entirely** from responses, only the name is
 returned. This prevents any counterparty IBAN or PAN from reaching the client through
 the response model, regardless of masking layer behavior.
 

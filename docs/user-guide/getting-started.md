@@ -49,13 +49,13 @@ The table below lists every variable, grouped by service.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `POSTERN_BACKEND_BASE_URL` | **Yes** | — | Base URL of the operator's backend (accounts.svc, payments.svc) |
+| `POSTERN_BACKEND_BASE_URL` | **Yes** | - | Base URL of the operator's backend (accounts.svc, payments.svc) |
 | `POSTERN_DATABASE_URL` | No | `postgresql+asyncpg://postern:postern@localhost:5432/postern` | Postgres connection string for audit + consent tables |
-| `POSTERN_READ_KEY_PEM_PATH` | No | — | Path to the PEM file for signing internal read tokens. If unset, an ephemeral key is generated in-process (not suitable for production) |
+| `POSTERN_READ_KEY_PEM_PATH` | No | - | Path to the PEM file for signing internal read tokens. If unset, an ephemeral key is generated in-process (not suitable for production) |
 | `POSTERN_READ_KEY_KID` | No | `read-1` | Key ID published in the read JWKS |
 | `POSTERN_READ_TOKEN_ISSUER` | No | `https://mcp-read.internal` | `iss` claim on internal read tokens |
-| `POSTERN_JWKS_URI` | No | — | URL where customer JWTs were signed (for consent enforcement). Leave unset for no-auth mode |
-| `POSTERN_TOKEN_ISSUER` | No | — | Expected issuer of customer JWTs. Leave unset for no-auth mode |
+| `POSTERN_JWKS_URI` | No | - | URL where customer JWTs were signed (for consent enforcement). Leave unset for no-auth mode |
+| `POSTERN_TOKEN_ISSUER` | No | - | Expected issuer of customer JWTs. Leave unset for no-auth mode |
 | `POSTERN_AUDIENCE` | No | `postern` | Expected `aud` claim on customer JWTs |
 | `POSTERN_STRICT_HEADERS` | No | `0` | Enable strict MCP Streamable HTTP header validation (Mcp-Method/Mcp-Name must match body) |
 | `POSTERN_CACHE_TTL_SECONDS` | No | `60` | Consent domain cache TTL per request |
@@ -68,21 +68,21 @@ The table below lists every variable, grouped by service.
 | `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds) |
 | `POSTERN_MAX_BODY_BYTES` | No | `1048576` (1 MiB) | Maximum request body size in bytes |
 | `POSTERN_REQUEST_DEADLINE_SECONDS` | No | `101.0` | Wall-clock bound on the whole HTTP request (see [Audit System](components/audit.md)) |
-| `POSTERN_REQUIRE_PEM_KEY` | No | — | Set to `"1"` to refuse startup with an ephemeral read key |
-| `POSTERN_REQUIRE_REDIS` | No | — | Set to `"1"` to refuse startup without `POSTERN_REDIS_URL` |
-| `POSTERN_REDIS_URL` | No | — | Redis connection string (for sessions, device codes, revocation lists) |
+| `POSTERN_REQUIRE_PEM_KEY` | No | - | Set to `"1"` to refuse startup with an ephemeral read key |
+| `POSTERN_REQUIRE_REDIS` | No | - | Set to `"1"` to refuse startup without `POSTERN_REDIS_URL` |
+| `POSTERN_REDIS_URL` | No | - | Redis connection string (for sessions, device codes, revocation lists) |
 
 ### Confirm Service (`services/confirm/settings.py`)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `POSTERN_WRITE_KEY_PEM_PATH` | No | — | Path to the PEM file for signing internal write tokens |
+| `POSTERN_WRITE_KEY_PEM_PATH` | No | - | Path to the PEM file for signing internal write tokens |
 | `POSTERN_WRITE_KEY_KID` | No | `write-1` | Key ID published in the write JWKS |
 | `POSTERN_WRITE_TOKEN_ISSUER` | No | `https://mcp-write.internal` | `iss` claim on internal write tokens |
 | `POSTERN_DEVICE_VERIFICATION_URI` | No | `https://auth.postern.internal/verify` | Base URI for the user verification page (QR code target) |
 | `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code |
 | `POSTERN_DEVICE_POLL_INTERVAL_SECONDS` | No | `5` | Minimum seconds between token polls |
-| `POSTERN_READ_KEY_PEM_PATH` | No | — | Read key PEM path (needed for device grant token exchange) |
+| `POSTERN_READ_KEY_PEM_PATH` | No | - | Read key PEM path (needed for device grant token exchange) |
 | `POSTERN_READ_KEY_KID` | No | `read-1` | Read key ID (must match API service) |
 | `POSTERN_READ_TOKEN_ISSUER` | No | `https://mcp-read.internal` | Read token issuer (must match API service) |
 | `POSTERN_BACKEND_BASE_URL` | No | `https://backend.internal` | Base URL for backend write endpoints (payments.svc, cards.svc) |
@@ -108,8 +108,8 @@ The project ships a `docker-compose.yml` that brings up:
 |---------|------|---------|
 | `db` (PostgreSQL) | 5432 | Audit log, consents, challenges tables |
 | `backend-stub` | 8081 | Stub operator backend with local IdP (JWKS + token minting) |
-| `api` | 8080 | MCP read path — tools, OAuth endpoints |
-| `confirm` | 8082 (mapped to 8080 inside container) | Write path — device auth, approval callback |
+| `api` | 8080 | MCP read path: tools, OAuth endpoints |
+| `confirm` | 8082 (mapped to 8080 inside container) | Write path: device auth, approval callback |
 
 ### Start the stack
 
@@ -151,14 +151,14 @@ Before deploying, ensure the following configuration items are set:
 
 | Item | Variable(s) | Purpose |
 |------|-------------|---------|
-| Persisted read key | `POSTERN_READ_KEY_PEM_PATH` | Not ephemeral — survives restarts |
-| Persisted write key | `POSTERN_WRITE_KEY_PEM_PATH` | Not ephemeral — survives restarts |
+| Persisted read key | `POSTERN_READ_KEY_PEM_PATH` | Not ephemeral: survives restarts |
+| Persisted write key | `POSTERN_WRITE_KEY_PEM_PATH` | Not ephemeral: survives restarts |
 | Redis backend | `POSTERN_REDIS_URL`, `POSTERN_REQUIRE_REDIS=1` | Session store and device code persistence |
 | JWKS / issuer URIs | `POSTERN_JWKS_URI`, `POSTERN_TOKEN_ISSUER` | Customer JWT validation |
 | Strict headers | `POSTERN_STRICT_HEADERS=1` | Enforce MCP Streamable HTTP header compliance |
 | Require PEM key | `POSTERN_REQUIRE_PEM_KEY=1` | Refuse startup with ephemeral keys |
-| Istio JWT validation (ZT-2) | — | Domain services must scope queries by token `sub` |
-| Database migrations | — | Run `alembic upgrade head` before first startup |
+| Istio JWT validation (ZT-2) | - | Domain services must scope queries by token `sub` |
+| Database migrations | - | Run `alembic upgrade head` before first startup |
 
 ## Next Steps
 
