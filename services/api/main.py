@@ -332,8 +332,10 @@ def create_app(
         if not redis_url:
             raise RuntimeError(
                 "POSTERN_REQUIRE_REDIS=1 but POSTERN_REDIS_URL is not set. "
-                "Production deployments require Redis for session persistence, "
-                "revocation lists, and JTI replay protection."
+                "This guard only checks that POSTERN_REDIS_URL is configured, "
+                "which backs the session store; revocation lists and JTI "
+                "replay protection remain in-process per replica regardless "
+                "of this setting."
             )
 
     server = build_server(

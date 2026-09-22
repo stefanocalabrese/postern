@@ -3,7 +3,7 @@ name = "postern"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "postern-core",
+    "postern-core[redis]",
     "fastmcp>=4.0.3,<5",
     "uvicorn[standard]>=0.34",
     "structlog>=25.1",
@@ -30,7 +30,6 @@ dev = [
     "import-linter>=2.15",
     "testcontainers[postgres]>=4.15",
     "types-docker>=7.2.0.20260827",
-    "redis[hiredis]>=5.2,<6",
     "fakeredis>=2.20",
 ]
 
