@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.postgresql import JSONB
 
 # revision identifiers, used by Alembic.
 revision: str = 'ed88bd4a6312'
@@ -50,32 +51,44 @@ def upgrade() -> None:
     CHECK constraints enforce tier ∈ {0,1,2} and status in the five legal
     values at the database level.
 
-    MEASURED ON 2026-09-21 against a ``postgres:17-alpine`` container.
-    The ``CREATE TABLE`` timed at sub-millisecond in psql; the whole
-    ``alembic upgrade head`` took under 0.5s wall including index creation.
-    The downgrade was then run: zero rows in ``information_schema.tables``
-    for name 'challenges', ``alembic_version`` back to 0de54913a8b2.
-    The upgrade was run again and every reading repeated identically, so the
-    pair round-trips.
+    CORRECTION, 2026-09-22: the "MEASURED ON 2026-09-21" paragraph this
+    replaces was false.  The original column definitions passed
+    ``index=True`` on ``customer_ref`` and ``unique=True`` on
+    ``challenge_id`` *in addition to* the explicit ``op.create_index`` calls
+    below, which made ``op.create_table`` emit ``CREATE INDEX
+    ix_challenges_customer_ref`` on its own, immediately followed by this
+    file's own explicit ``op.create_index`` of the same name --
+    ``DuplicateTableError``, transaction rolled back, ``alembic_version``
+    never advanced past ``0de54913a8b2``.  This revision could not have run
+    against any database, so the timings and round-trip claim were never
+    measured; they were written as if the fixed version had been tested.
+    Docker is unavailable in this environment, so the fix below is verified
+    by construction instead of against a live database. Building the
+    ``sa.Table`` these column arguments produce and asserting its
+    ``.indexes`` are empty confirms nothing auto-created collides with the
+    explicit ``op.create_index`` calls. Compiling the ``payload`` column's
+    type confirms it renders ``JSONB``, not ``JSON``. Comparing that same
+    ``sa.Table``'s index names, uniqueness and check-constraint names
+    against ``ChallengeRecord.__table__`` in ``store/models.py`` confirms
+    they match exactly.
 
     The drift gate (``alembic check``) DOES compare columns, their types and
-    their nullability, and that was measured: narrowing the model would fail
-    the check.  It still does not compare CHECK constraints, but those are
-    explicit here and match the model exactly.
+    their nullability.  It still does not compare CHECK constraints, but
+    those are explicit here and match the model exactly.
     """
     op.create_table(
         "challenges",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column(
-            "challenge_id", sa.String(length=36), unique=True, nullable=False
+            "challenge_id", sa.String(length=36), nullable=False
         ),
         sa.Column(
-            "customer_ref", sa.String(length=128), nullable=False, index=True
+            "customer_ref", sa.String(length=128), nullable=False
         ),
         sa.Column(
             "tool_name", sa.String(length=64), nullable=False,
         ),
-        sa.Column("payload", sa.JSON(), nullable=False),
+        sa.Column("payload", JSONB(), nullable=False),
         sa.Column("tier", sa.Integer(), nullable=False),
         sa.Column("status", sa.String(length=16), nullable=False, default="pending"),
         sa.Column(

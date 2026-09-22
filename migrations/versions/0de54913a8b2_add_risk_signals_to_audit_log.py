@@ -10,6 +10,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.postgresql import JSONB
 
 # revision identifiers, used by Alembic.
 revision: str = "0de54913a8b2"
@@ -47,26 +48,32 @@ def upgrade() -> None:
     Adding a nullable column with no default is catalog-only in PostgreSQL:
     no table rewrite, whatever the row count.
 
-    MEASURED ON 2026-09-20 against a ``postgres:17-alpine`` container.
-    The ``ALTER TABLE`` itself timed at sub-millisecond in psql; the whole
-    ``alembic upgrade head`` took under 0.3s wall. Both seeded rows from
-    earlier migrations came through untouched: still there, NULL in the new
-    column. ``risk_signals`` reads ``jsonb``, ``is_nullable`` YES,
-    ``column_default`` NULL.
-
-    The downgrade was then run: zero columns named ``risk_signals`` in
-    ``information_schema``, both seeded rows still present,
-    ``alembic_version`` back to c91f79e6d34a. The upgrade was run again and
-    every reading above repeated identically, so the pair round trips.
+    CORRECTION, 2026-09-22: the "MEASURED ON 2026-09-20" paragraph this
+    replaces claimed ``risk_signals`` read ``jsonb`` in
+    ``information_schema``, but the column was declared ``sa.JSON()``, which
+    compiles to Postgres ``json``, not ``jsonb`` -- and the ``@>`` containment
+    operator this migration's docstring advertises above does not exist for
+    ``json``. That claim could not have been measured against this code.
+    The one persisted database on record -- found via the anonymous-volume
+    forensic note in ``9a7d4e51c6f8`` -- sits at
+    ``alembic_version = 3186c04c018c``, four revisions behind this one, so
+    it has never reached this column. Type drift on a database that
+    has applied this revision would be caught by ``alembic check``
+    (``compare_type`` defaults to ``True``; `migrations/env.py`'s
+    `do_run_migrations` sets ``compare_server_default=True`` explicitly),
+    which is deliberately not part of ``make ci`` (the ``migrations``
+    target's own comment in the ``Makefile``) -- that catch happens by hand
+    or in the manually dispatched workflow, not on every commit. The column
+    is now declared ``JSONB()``, matching ``AuditEntry.risk_signals`` in
+    ``store/models.py`` and making the ``@>`` query above valid.
 
     The drift gate (``alembic check``) DOES compare columns, their types and
-    their nullability, and that was measured: narrowing the model would fail
-    the check. It still does not compare CHECK constraints, but this column
-    adds none.
+    their nullability. It still does not compare CHECK constraints, but this
+    column adds none.
     """
     op.add_column(
         "audit_log",
-        sa.Column("risk_signals", sa.JSON(), nullable=True),
+        sa.Column("risk_signals", JSONB(), nullable=True),
     )
 
 
