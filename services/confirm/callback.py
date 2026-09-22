@@ -66,7 +66,6 @@ anything the caller supplies.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
 from typing import Any
 
 from postern_core.store.challenges import get_challenge, update_challenge_status
@@ -93,13 +92,20 @@ async def approve_challenge(request: Request) -> JSONResponse:
         0. Verify the app assertion; the customer is its ``sub``.
         1. Look up the challenge by ID (from stored row, not agent input).
         2. Reject unless the challenge belongs to that customer.
-        3. Validate it is pending and not expired.
-        4. Mark as approved (records the unverified signature +
-           verification_result).
-        5. Execute the backend write endpoint server-side via execute.py.
+        3. Claim it: one conditional ``UPDATE`` that carries "still pending"
+           and "not yet expired" in its ``WHERE`` and records the unverified
+           signature + verification_result. Winning it is what authorizes
+           step 4; zero rows goes to ``_refused_transition_response``.
+        4. Execute the backend write endpoint server-side via execute.py,
+           then mark the row executed, conditional on ``approved``.
 
     The confirmation payload is built server-side from the stored challenge
     row — never re-sent or re-specified by the agent (handoff §6.3).
+
+    Steps 2 and 3 read the row twice, and only step 3's read decides
+    anything. Step 2's is a plain ``SELECT``, but the column it tests --
+    ``customer_ref`` -- is written once at challenge creation and never
+    updated, so there is no version of it that a lock would protect.
     """
     subject = verified_subject(request)
     if subject is None:
@@ -151,31 +157,23 @@ async def approve_challenge(request: Request) -> JSONResponse:
             )
             return _error(404, "not_found", f"challenge {challenge_id} not found")
 
-        # --- 3. Validate state ---
-        if challenge_record.status != "pending":
-            return _error(
-                409,
-                "already_terminal",
-                f"challenge is already {challenge_record.status}",
-            )
-
-        # Check expiry — the store layer does not filter on this for get_challenge.
-        if datetime.now(UTC) >= challenge_record.expires_at:
-            # Mark as expired before returning.
-            await update_challenge_status(
-                session,
-                challenge_id,
-                status="expired",
-            )
-            await session.commit()
-            return _error(410, "expired", f"challenge {challenge_id} has expired")
-
-        # --- 4. Mark as approved ---
+        # --- 3. Claim the challenge: pending -> approved, in one statement ---
+        #
+        # There is no ``if status != "pending"`` and no ``if now >=
+        # expires_at`` here any more (audit finding C-03). Both were Python
+        # checks against a snapshot taken by an unlocked ``SELECT``, so N
+        # concurrent approvals all passed them and all reached the backend.
+        # Both preconditions are now inside the ``UPDATE``'s ``WHERE``, which
+        # PostgreSQL re-evaluates under the row lock: exactly one caller gets
+        # a row back, and losing is indistinguishable from never having been
+        # eligible. Claiming the row IS the authorization to execute.
         try:
             updated = await update_challenge_status(
                 session,
                 challenge_id,
                 status="approved",
+                expected_status="pending",
+                expiry="unexpired",
                 confirming_device=body.get("confirming_device"),
                 verification_result=verification_result,
                 signature=unverified_signature,
@@ -184,18 +182,21 @@ async def approve_challenge(request: Request) -> JSONResponse:
             return _error(500, "internal_error", f"approval update failed: {exc}")
 
         if updated is None:
-            return _error(500, "internal_error", "approval update returned no row")
+            return await _refused_transition_response(session, challenge_id)
 
         await session.commit()
 
-        # --- 5. Execute the backend write endpoint (server-side, not agent) ---
+        # --- 4. Execute the backend write endpoint (server-side, not agent) ---
+        #
+        # Everything below reads ``updated``, the row the statement above
+        # proved was ``pending`` and unexpired at the instant it was claimed,
+        # rather than ``challenge_record``, which is only what a ``SELECT``
+        # saw some microseconds earlier.
         settings = request.app.state.settings
         minter = request.app.state.write_minter
 
         try:
-            audience, path, body_payload = resolve_endpoint(
-                challenge_record.tool_name, challenge_record.payload
-            )
+            audience, path, body_payload = resolve_endpoint(updated.tool_name, updated.payload)
 
             write_client = BackendWriteClient(
                 base_url=settings.backend_base_url,
@@ -204,7 +205,7 @@ async def approve_challenge(request: Request) -> JSONResponse:
 
             try:
                 await write_client.execute(
-                    customer_ref=challenge_record.customer_ref,
+                    customer_ref=updated.customer_ref,
                     audience=audience,
                     path=path,
                     body=body_payload,
@@ -213,12 +214,30 @@ async def approve_challenge(request: Request) -> JSONResponse:
             finally:
                 await write_client.aclose()
 
-            # Mark as executed on success.
-            await update_challenge_status(
+            # Mark as executed on success. Conditional on ``approved`` like
+            # every other transition, and deliberately NOT conditional on the
+            # deadline: the money has moved, so a clock that ran out while the
+            # backend was answering must not be able to strand the row in
+            # ``approved`` and leave the execution unrecorded.
+            executed = await update_challenge_status(
                 session,
                 challenge_id,
                 status="executed",
+                expected_status="approved",
             )
+            if executed is None:
+                # Unreachable while this handler is the only writer of the
+                # approved -> executed edge: nothing else moves a row out of
+                # ``approved``. Logged rather than returned, because the
+                # backend write already succeeded and the caller must not be
+                # told otherwise -- what is wrong here is the audit trail, and
+                # silence is how that goes unnoticed.
+                logger.error(
+                    "challenge %s executed at the backend but was not in 'approved' "
+                    "when the executed transition ran; the row does not record the "
+                    "execution",
+                    challenge_id,
+                )
             await session.commit()
 
             return _json(
@@ -226,7 +245,7 @@ async def approve_challenge(request: Request) -> JSONResponse:
                 {
                     "challenge_id": challenge_id,
                     "status": "executed",
-                    "message": f"{challenge_record.tool_name} executed successfully",
+                    "message": f"{updated.tool_name} executed successfully",
                 },
             )
 
@@ -252,6 +271,80 @@ async def approve_challenge(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
+
+
+async def _refused_transition_response(session: Any, challenge_id: str) -> JSONResponse:
+    """Name the reason a conditional ``pending`` -> ``approved`` matched no row.
+
+    The statement that refused carried three predicates -- the id, ``status =
+    'pending'`` and ``expires_at > now()`` -- and a rowcount of zero does not
+    say which one failed. This handler owes three different answers (409
+    already terminal, 410 expired, 404 gone), so it reads the row once more
+    to tell them apart.
+
+    THAT READ IS NOT A SECOND RACE, and it is worth saying why rather than
+    leaving the next reader to work it out. Every reason the ``UPDATE`` can
+    refuse is permanent once it has happened:
+
+    - ``status`` is no longer ``pending``. The four other values are terminal
+      and no transition in this tree leads back, so the status this read
+      returns is the status it will have forever.
+    - the deadline has passed. ``expires_at`` is written once at challenge
+      creation and never updated, and time does not run backwards.
+
+    So the row cannot become eligible again between the refusal and this
+    read, and no answer derived from it can be stale. This would NOT hold in
+    the other direction -- reading first and then deciding, which is the
+    defect (audit finding C-03) this function exists behind.
+
+    ``refresh=True`` is not optional here. This session has already loaded
+    this row (the ownership check did), and without it the ORM answers from
+    its identity map and reports the status this session saw BEFORE the
+    winner committed -- measured: five of six concurrent losers answered 500
+    instead of 409 until it was passed.
+    """
+    current = await get_challenge(session, challenge_id, refresh=True)
+
+    if current is None:
+        # The row was there for the ownership check and is gone now. Nothing
+        # deletes challenges, so this is a real anomaly rather than a routine
+        # 404, but the answer a caller gets is the ordinary one: the same body
+        # as "no such challenge", because splitting it would be the existence
+        # oracle the ownership check above is careful not to be.
+        logger.error(
+            "challenge %s vanished between the ownership read and the update",
+            challenge_id,
+        )
+        return _error(404, "not_found", f"challenge {challenge_id} not found")
+
+    if current.status != "pending":
+        return _error(409, "already_terminal", f"challenge is already {current.status}")
+
+    # Still pending, so the deadline is what refused the claim. Record that,
+    # conditionally and in SQL like every other transition: ``expiry="expired"``
+    # asserts ``expires_at <= now()``, the exact negation of the predicate that
+    # just failed, so this cannot retire a challenge that is actually live.
+    expired = await update_challenge_status(
+        session,
+        challenge_id,
+        status="expired",
+        expected_status="pending",
+        expiry="expired",
+    )
+    if expired is not None:
+        await session.commit()
+        return _error(410, "expired", f"challenge {challenge_id} has expired")
+
+    # Pending, unexpired, and yet a statement whose only other predicate was
+    # the primary key matched nothing. There is no state of the table that
+    # produces this, so it is a defect in this file or in the store layer, not
+    # a condition the caller can act on.
+    logger.error(
+        "challenge %s: the conditional approval matched no row while the row reads "
+        "pending and unexpired",
+        challenge_id,
+    )
+    return _error(500, "internal_error", "approval update matched no row")
 
 
 def _error(status: int, code: str, description: str) -> JSONResponse:

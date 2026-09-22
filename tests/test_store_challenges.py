@@ -8,6 +8,7 @@ The session fixture rolls back per test, so these tests never see each
 other's rows regardless of execution order.
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -15,6 +16,7 @@ import pytest
 from postern_core.domain.verification import VerificationTier
 from postern_core.store import challenges
 from postern_core.store.models import ChallengeRecord
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
@@ -152,6 +154,7 @@ async def test_update_challenge_status_approves(session: AsyncSession) -> None:
         session,
         "chal_update",
         status="approved",
+        expected_status="pending",
         confirming_device="dev_abc123",
         signature="sig_xyz",
     )
@@ -169,6 +172,7 @@ async def test_update_challenge_status_with_verification_result(session: AsyncSe
         session,
         "chal_tier2",
         status="approved",
+        expected_status="pending",
         confirming_device="dev_abc",
         signature="sig",
         verification_result="vr_match_001",
@@ -180,7 +184,7 @@ async def test_update_challenge_status_with_verification_result(session: AsyncSe
 
 async def test_update_challenge_status_returns_none_for_missing(session: AsyncSession) -> None:
     result = await challenges.update_challenge_status(
-        session, "chal_nonexistent", status="approved"
+        session, "chal_nonexistent", status="approved", expected_status="pending"
     )
     assert result is None
 
@@ -310,3 +314,304 @@ async def test_rollback_isolation_row_from_other_test_is_not_visible(
     mean the rollback did nothing."""
     rows = await challenges.list_customer_challenges(session, "cust_7f3a", limit=50)
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# The conditional transition (audit finding C-03).
+#
+# `update_challenge_status` used to be `get_challenge`, attribute assignment,
+# `flush()` -- an unlocked SELECT followed by an UPDATE with no predicate on
+# the old status. The tests below pin the two properties that replaced it:
+# the precondition travels inside the statement, and losing is reported as
+# `None` rather than silently applied.
+# ---------------------------------------------------------------------------
+
+
+async def test_update_challenge_status_refuses_a_status_it_did_not_expect(
+    session: AsyncSession,
+) -> None:
+    """Wrong ``expected_status`` → no row, and no write."""
+    await _insert_challenge(session, challenge_id="chal_wrong_expected")
+
+    result = await challenges.update_challenge_status(
+        session,
+        "chal_wrong_expected",
+        status="executed",
+        expected_status="approved",  # the row is pending.
+    )
+
+    assert result is None
+    row = await challenges.get_challenge(session, "chal_wrong_expected")
+    assert row is not None
+    assert row.status == "pending"  # untouched, not just unreported.
+
+
+async def test_update_challenge_status_does_not_overwrite_a_terminal_row(
+    session: AsyncSession,
+) -> None:
+    """A second ``pending`` → ``approved`` on an approved row writes nothing.
+
+    The pre-fix shape applied this unconditionally, so the second caller's
+    ``signature`` landed on a row another caller had already approved and
+    executed.
+    """
+    await _insert_challenge(session, challenge_id="chal_second_approval")
+    first = await challenges.update_challenge_status(
+        session,
+        "chal_second_approval",
+        status="approved",
+        expected_status="pending",
+        signature="sig_first",
+    )
+    assert first is not None
+
+    second = await challenges.update_challenge_status(
+        session,
+        "chal_second_approval",
+        status="approved",
+        expected_status="pending",
+        signature="sig_second",
+    )
+
+    assert second is None
+    row = await challenges.get_challenge(session, "chal_second_approval")
+    assert row is not None
+    assert row.signature == "sig_first"
+
+
+async def test_update_challenge_status_unexpired_refuses_a_row_past_its_deadline(
+    session: AsyncSession,
+) -> None:
+    """``expiry="unexpired"`` puts the deadline in the ``WHERE`` clause."""
+    record = await _insert_challenge(session, challenge_id="chal_deadline_passed")
+    record.expires_at = datetime.now(UTC) - timedelta(minutes=5)
+    await session.flush()
+
+    result = await challenges.update_challenge_status(
+        session,
+        "chal_deadline_passed",
+        status="approved",
+        expected_status="pending",
+        expiry="unexpired",
+    )
+
+    assert result is None
+    row = await challenges.get_challenge(session, "chal_deadline_passed")
+    assert row is not None
+    assert row.status == "pending"
+
+
+async def test_update_challenge_status_expired_refuses_a_row_still_inside_its_deadline(
+    session: AsyncSession,
+) -> None:
+    """``expiry="expired"`` is the exact negation — it cannot retire a live row."""
+    await _insert_challenge(session, challenge_id="chal_still_live")
+
+    result = await challenges.update_challenge_status(
+        session,
+        "chal_still_live",
+        status="expired",
+        expected_status="pending",
+        expiry="expired",
+    )
+
+    assert result is None
+    row = await challenges.get_challenge(session, "chal_still_live")
+    assert row is not None
+    assert row.status == "pending"
+
+
+async def test_update_challenge_status_expired_accepts_a_row_past_its_deadline(
+    session: AsyncSession,
+) -> None:
+    record = await _insert_challenge(session, challenge_id="chal_retire_me")
+    record.expires_at = datetime.now(UTC) - timedelta(minutes=5)
+    await session.flush()
+
+    result = await challenges.update_challenge_status(
+        session,
+        "chal_retire_me",
+        status="expired",
+        expected_status="pending",
+        expiry="expired",
+    )
+
+    assert result is not None
+    assert result.status == "expired"
+
+
+async def test_update_challenge_status_ignores_the_deadline_by_default(
+    session: AsyncSession,
+) -> None:
+    """The default is ``expiry="ignore"``: the deadline is the caller's to assert.
+
+    ``mark_expired`` relies on this, and so does the ``approved`` →
+    ``executed`` transition in ``services/confirm/callback.py``, which must
+    not be defeated by a clock that ran out while the backend was answering.
+    """
+    record = await _insert_challenge(session, challenge_id="chal_ignore_deadline")
+    record.expires_at = datetime.now(UTC) - timedelta(minutes=5)
+    await session.flush()
+
+    result = await challenges.update_challenge_status(
+        session,
+        "chal_ignore_deadline",
+        status="approved",
+        expected_status="pending",
+    )
+
+    assert result is not None
+    assert result.status == "approved"
+
+
+async def test_mark_expired_refuses_a_row_that_is_already_terminal(
+    session: AsyncSession,
+) -> None:
+    """The guard ``mark_expired`` used to evaluate in Python is now a predicate.
+
+    Pre-fix it read the row, compared ``status != "pending"`` against that
+    snapshot, and then wrote — so a sweep racing an approval could stamp
+    ``expired`` on top of an ``approved`` row.
+    """
+    await _insert_challenge(session, challenge_id="chal_sweep_race")
+    approved = await challenges.update_challenge_status(
+        session,
+        "chal_sweep_race",
+        status="approved",
+        expected_status="pending",
+    )
+    assert approved is not None
+
+    result = await challenges.mark_expired(session, "chal_sweep_race")
+
+    assert result is None
+    row = await challenges.get_challenge(session, "chal_sweep_race")
+    assert row is not None
+    assert row.status == "approved"
+
+
+# ---------------------------------------------------------------------------
+# The row lock itself, across two real connections.
+#
+# Everything above runs inside one transaction, where the statement's
+# predicate is checked against this transaction's own uncommitted writes. That
+# is not the case the finding is about. This one uses two connections so the
+# loser's UPDATE genuinely blocks on the winner's row lock and PostgreSQL
+# re-evaluates the predicate against the committed row afterwards, which is
+# the behaviour the whole fix rests on.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_second_connection_blocks_on_the_row_lock_and_then_matches_nothing(
+    database: Any,
+) -> None:
+    challenge_id = "chal_lock_001"
+    try:
+        async with database.sessionmaker() as setup:
+            await challenges.create_challenge(
+                setup,
+                challenge_id=challenge_id,
+                customer_ref="cust_7f3a",
+                tool_name="payments.create_payment",
+                payload={},
+                tier=VerificationTier.APP_APPROVAL,
+            )
+            await setup.commit()
+
+        async with database.sessionmaker() as winner, database.sessionmaker() as loser:
+            claimed = await challenges.update_challenge_status(
+                winner,
+                challenge_id,
+                status="approved",
+                expected_status="pending",
+                expiry="unexpired",
+                signature="sig_winner",
+            )
+            assert claimed is not None  # winner holds the row lock, uncommitted.
+
+            contender = asyncio.create_task(
+                challenges.update_challenge_status(
+                    loser,
+                    challenge_id,
+                    status="approved",
+                    expected_status="pending",
+                    expiry="unexpired",
+                    signature="sig_loser",
+                )
+            )
+            # Not an arbitrary wait: this asserts the second statement is
+            # genuinely blocked. If it were free to apply on its own snapshot
+            # — the pre-fix behaviour — it would have finished by now.
+            await asyncio.sleep(0.2)
+            assert not contender.done(), "the second UPDATE did not block on the row lock"
+
+            await winner.commit()
+            assert await contender is None
+            await loser.commit()
+
+        async with database.sessionmaker() as check:
+            row = await challenges.get_challenge(check, challenge_id)
+            assert row is not None
+            assert row.status == "approved"
+            assert row.signature == "sig_winner"
+    finally:
+        async with database.sessionmaker() as cleanup:
+            await cleanup.execute(
+                sa_text("DELETE FROM challenges WHERE challenge_id LIKE 'chal_lock_%'")
+            )
+            await cleanup.commit()
+
+
+async def test_get_challenge_without_refresh_answers_from_the_identity_map(
+    database: Any,
+) -> None:
+    """The stale-read trap ``refresh`` exists for, pinned in both directions.
+
+    A session that has already loaded a row and reads it again gets its own
+    copy back, not the database's, even though the ``SELECT`` runs and even
+    though READ COMMITTED would have shown it the other connection's
+    committed write. ``services/confirm/callback.py`` classifies a refused
+    transition with exactly this second read, and answered 500 instead of 409
+    for every loser of a race until ``refresh=True`` was passed.
+    """
+    challenge_id = "chal_lock_stale"
+    try:
+        async with database.sessionmaker() as setup:
+            await challenges.create_challenge(
+                setup,
+                challenge_id=challenge_id,
+                customer_ref="cust_7f3a",
+                tool_name="payments.create_payment",
+                payload={},
+                tier=VerificationTier.APP_APPROVAL,
+            )
+            await setup.commit()
+
+        async with database.sessionmaker() as reader:
+            first = await challenges.get_challenge(reader, challenge_id)
+            assert first is not None
+            assert first.status == "pending"
+
+            async with database.sessionmaker() as writer:
+                claimed = await challenges.update_challenge_status(
+                    writer,
+                    challenge_id,
+                    status="approved",
+                    expected_status="pending",
+                )
+                assert claimed is not None
+                await writer.commit()
+
+            stale = await challenges.get_challenge(reader, challenge_id)
+            assert stale is not None
+            assert stale.status == "pending", "expected the identity map's copy"
+
+            fresh = await challenges.get_challenge(reader, challenge_id, refresh=True)
+            assert fresh is not None
+            assert fresh.status == "approved"
+    finally:
+        async with database.sessionmaker() as cleanup:
+            await cleanup.execute(
+                sa_text("DELETE FROM challenges WHERE challenge_id LIKE 'chal_lock_%'")
+            )
+            await cleanup.commit()

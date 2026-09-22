@@ -339,6 +339,103 @@ async def test_execute_includes_challenge_id_in_token_mint() -> None:
 
 
 # ---------------------------------------------------------------------------
+# BackendWriteClient — idempotency key (audit finding C-03).
+#
+# Defence in depth behind the conditional `pending -> approved` transition in
+# `postern_core.store.challenges.update_challenge_status`, never a substitute
+# for it. The transition stops a duplicate execution while this process and
+# its database agree; the header is what the backend has to work with when
+# they do not -- a transport-level retry after a lost response, a process
+# killed between the POST and the `executed` transition.
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_sends_the_challenge_id_as_the_idempotency_key() -> None:
+    """``Idempotency-Key`` carries the challenge id verbatim.
+
+    Verbatim, not hashed: the backend already receives the same value as a
+    verified ``challenge_id`` JWT claim, so a derivation conceals nothing it
+    does not hold, and an access log entry and an ``audit_log`` row can be
+    joined on the identical string.
+    """
+    seen: list[str | None] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request.headers.get("idempotency-key"))
+        return httpx2.Response(201, json={})
+
+    client = BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=_transport(handler),
+    )
+    await client.execute(
+        customer_ref="cust_7f3a",
+        audience="payments.svc",
+        path="/payments",
+        body={"amount": "EUR 340.00"},
+        challenge_id="chal_idem_001",
+    )
+    assert seen == ["chal_idem_001"]
+    await client.aclose()
+
+
+async def test_two_executions_of_one_challenge_carry_the_same_idempotency_key() -> None:
+    """The key is derived from the challenge, not from the attempt.
+
+    A key that varied per call — a UUID minted here, a timestamp — would be
+    syntactically an idempotency key and would deduplicate nothing, which is
+    the failure mode worth pinning.
+    """
+    seen: list[str | None] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request.headers.get("idempotency-key"))
+        return httpx2.Response(201, json={})
+
+    client = BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=_transport(handler),
+    )
+    for _ in range(2):
+        await client.execute(
+            customer_ref="cust_7f3a",
+            audience="payments.svc",
+            path="/payments",
+            body={"amount": "EUR 340.00"},
+            challenge_id="chal_idem_002",
+        )
+    assert seen == ["chal_idem_002", "chal_idem_002"]
+    await client.aclose()
+
+
+async def test_distinct_challenges_carry_distinct_idempotency_keys() -> None:
+    """Two different operations must not be deduplicated into one."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request.headers.get("idempotency-key"))
+        return httpx2.Response(201, json={})
+
+    client = BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=_transport(handler),
+    )
+    for challenge_id in ("chal_idem_003", "chal_idem_004"):
+        await client.execute(
+            customer_ref="cust_7f3a",
+            audience="payments.svc",
+            path="/payments",
+            body={"amount": "EUR 1.00"},
+            challenge_id=challenge_id,
+        )
+    assert seen == ["chal_idem_003", "chal_idem_004"]
+    await client.aclose()
+
+
+# ---------------------------------------------------------------------------
 # BackendWriteClient — response scrubbing (PAN/IBAN).
 # ---------------------------------------------------------------------------
 

@@ -153,7 +153,8 @@ class BackendWriteClient:
             audience: Backend service audience (e.g., "payments.svc").
             path: The backend endpoint path.
             body: The operation payload (stored server-side at challenge creation).
-            challenge_id: The challenge ID — included in the JWT claim.
+            challenge_id: The challenge ID — sent as the JWT ``challenge_id``
+                claim and as the ``Idempotency-Key`` header.
 
         Returns:
             The backend response. Raises BackendWriteError on non-2xx.
@@ -166,10 +167,35 @@ class BackendWriteClient:
             challenge_id=challenge_id,
         )
 
+        # `Idempotency-Key` is defence in depth behind the conditional
+        # `pending -> approved` transition in
+        # `postern_core.store.challenges.update_challenge_status`, not a
+        # substitute for it (audit finding C-03). The transition is what makes
+        # a duplicate execution impossible when this process and its database
+        # agree; the header is what stops one when they do not -- a request
+        # retried at the transport layer after the response was lost, a
+        # process killed between the backend call and the `executed`
+        # transition, a second replica resuming work it could not tell had
+        # finished.
+        #
+        # WHY THE CHALLENGE ID ITSELF, unhashed and underived. It is already
+        # exactly one-per-operation: the row is the unit of work, the backend
+        # is called at most once per row, and no two operations share an id.
+        # A hash or a salted derivation would buy nothing -- the backend
+        # already receives this same value as a JWT claim it verifies, so
+        # nothing is concealed from it that it does not already hold -- and
+        # would cost the property that matters when someone is reading a
+        # backend access log next to this table: the key in the log and the
+        # `challenge_id` in the audit row are the same string, so the two
+        # sides of one payment can be joined by eye. The value is opaque, not
+        # a secret shared with anyone but the operator's own backend.
         response = await self._client.post(
             path,
             json=body,
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Idempotency-Key": challenge_id,
+            },
         )
 
         if response.status_code not in (200, 201, 202):

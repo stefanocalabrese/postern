@@ -164,9 +164,19 @@ def _make_state(
         return challenge_record
 
     # --- update_challenge_status ---
+    #
+    # Models the real conditional transition (audit finding C-03), not a
+    # rubber stamp: it honours `expected_status` and `expiry` against the
+    # record, returns None when either refuses, and mutates the record when
+    # both hold. A mock that returned the record unconditionally would let
+    # `approve_challenge` pass this file's 409 and 410 cases while failing
+    # them against Postgres, which is the whole thing those cases exist to
+    # catch.
     async def mock_update_status(
         *args: Any,
         status: str = "",
+        expected_status: str = "",
+        expiry: str = "ignore",
         confirming_device: str | None = None,
         verification_result: str | None = None,
         signature: str = "",
@@ -174,12 +184,28 @@ def _make_state(
         update_status_calls.append(
             {
                 "status": status,
+                "expected_status": expected_status,
+                "expiry": expiry,
                 "confirming_device": confirming_device,
                 "verification_result": verification_result,
                 "signature": signature,
             }
         )
-        # Return a record so the handler's `if updated is None` check passes.
+        if challenge_record is None or challenge_record.status != expected_status:
+            return None
+        past_deadline = datetime.now(UTC) >= challenge_record.expires_at
+        if expiry == "unexpired" and past_deadline:
+            return None
+        if expiry == "expired" and not past_deadline:
+            return None
+
+        challenge_record.status = status
+        if confirming_device is not None:
+            challenge_record.confirming_device = confirming_device
+        if verification_result is not None:
+            challenge_record.verification_result = verification_result
+        if signature:
+            challenge_record.signature = signature
         return challenge_record
 
     # --- Stub minter ---
@@ -553,7 +579,18 @@ async def test_approval_update_failure_returns_500() -> None:
 
 
 async def test_update_returns_none_returns_500() -> None:
-    """If update_challenge_status returns None, return 500."""
+    """A conditional transition that matches nothing on a live row → 500.
+
+    What this pins changed with audit finding C-03. ``None`` from
+    ``update_challenge_status`` no longer means "the row vanished"; it is the
+    ordinary answer for losing the race or arriving after the deadline, and
+    ``approve_challenge`` classifies it by reading the row once more. 500 is
+    what is left when that read says the row is still ``pending`` and still
+    inside its deadline — a statement whose only remaining predicate was the
+    primary key matched nothing, which no state of the table produces. The
+    patch below forces exactly that by refusing every transition, including
+    the ``pending`` → ``expired`` one the 410 branch attempts.
+    """
     rec = _pending_record()
 
     async def mock_update_none(*args: Any, **kwargs: Any) -> None:
