@@ -93,6 +93,8 @@ import ast
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import sysconfig
 from collections.abc import Iterator
@@ -103,14 +105,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = REPO_ROOT / "tools" / "citations-baseline.json"
 
-# Directories never walked. Not everything `.gitignore` lists -- this set is
-# maintained by hand and has drifted from it before (`dev-docs/` was added to
-# `.gitignore` by e1527a7 without a matching entry here, which let bare
-# citations in the untracked design docs and decision records fail the gate
-# in the primary checkout while every worktree, missing that gitignored
-# directory, stayed green). Includes `.git` and `.claude`: in the primary
-# checkout `.claude/worktrees/` holds entire copies of this repository, and
-# walking those would scan every file twice or more.
+# Directories never walked, by name, regardless of what git reports. This is
+# NOT a mirror of `.gitignore` -- an earlier version of this comment claimed
+# it was, which let `dev-docs/` drift silently out of sync: e1527a7 added the
+# directory to `.gitignore` without adding it here, and nothing caught the
+# gap until the gate went red in the one checkout where the directory
+# actually exists on disk. What's left is universal build/VCS/vendor noise
+# this tool must prune even outside a work tree, since
+# `tests/test_citation_gate.py` builds its fixture trees under a bare
+# `tmp_path` that git knows nothing about. `.git` and `.claude` earn their
+# place the same way `.venv` does: in the primary checkout
+# `.claude/worktrees/` holds entire copies of this repository, and walking
+# those would scan every file twice or more. Everything git actually ignores
+# -- `dev-docs/` included -- is pruned separately in `iter_source_files`, by
+# asking git rather than by keeping a second list in sync with the first.
 SKIP_DIRS = frozenset(
     {
         ".git",
@@ -125,7 +133,6 @@ SKIP_DIRS = frozenset(
         "dist",
         "build",
         "node_modules",
-        "dev-docs",
     }
 )
 
@@ -206,15 +213,69 @@ class Report:
         self.by_form[citation.form] = self.by_form.get(citation.form, 0) + 1
 
 
+@cache
+def _gitignored_dirs(root: Path) -> frozenset[Path]:
+    """Every directory under `root` that git ignores; empty when it cannot tell.
+
+    One process for the whole tree, not one per candidate, and not one per
+    file inside a match: `--directory` reports an ignored directory as a
+    single entry instead of listing everything it holds, so `dev-docs/` costs
+    one line here rather than one `check-ignore` call per decision record it
+    carries. `@cache` keeps that to one subprocess per `root` per process,
+    since both `check()` and `_repo_python_files` walk the same tree.
+
+    Any failure degrades to "ignore nothing extra", never "skip everything":
+    git not installed, `root` outside a work tree (raises via a non-zero
+    exit, caught below), a timeout, or anything else all return empty.
+    `check()` is called against a bare `tmp_path` in tests, which is not a
+    git work tree at all, and must still be walked in full.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return frozenset()
+    try:
+        result = subprocess.run(  # noqa: S603 -- fixed argv, no shell, git resolved via shutil.which above
+            [
+                git,
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ],
+            cwd=root,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    if result.returncode != 0:
+        return frozenset()
+    dirs: set[Path] = set()
+    for entry in result.stdout.decode("utf-8", errors="replace").split("\0"):
+        if entry.endswith("/"):
+            dirs.add((root / entry[:-1]).resolve())
+    return frozenset(dirs)
+
+
 def iter_source_files(root: Path) -> Iterator[Path]:
     """Yield every readable text file under `root`, skipping caches and binaries.
 
     `SKIP_DIRS` is pruned from `dirnames` rather than filtered afterwards:
     `.venv` alone holds about 21,000 files, and walking into it cost 0.33s of
-    the 0.52s this gate first took.
+    the 0.52s this gate first took. Gitignored directories are pruned the
+    same way, at the same point, using `_gitignored_dirs` resolved once per
+    `root` rather than asked again for every file a directory holds.
     """
+    ignored = _gitignored_dirs(root)
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in SKIP_DIRS and (Path(dirpath) / d).resolve() not in ignored
+        )
         for name in sorted(filenames):
             path = Path(dirpath) / name
             if path.is_symlink() or not path.is_file():
