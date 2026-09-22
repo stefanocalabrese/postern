@@ -149,7 +149,7 @@ async def update_challenge_status(
     confirming_device: str | None = None,
     verification_result: str | None = None,
     signature: str | None = None,
-) -> ChallengeRecord:
+) -> ChallengeRecord | None:
     """Transition a challenge to a new status.
 
     This is called by the approval callback (``services/confirm/callback.py``)
@@ -165,14 +165,20 @@ async def update_challenge_status(
         signature: Device-bound key signature over the payload.
 
     Returns:
-        The updated ``ChallengeRecord``.
-
-    Raises:
-        ChallengeNotFoundError: If the challenge does not exist.
+        The updated ``ChallengeRecord``, or ``None`` if the challenge does
+        not exist. This matches every other lookup in this module
+        (``get_challenge``, ``get_active_challenge``, ``mark_expired``): the
+        caller decides whether a missing row is an error, this layer never
+        raises for one. ``services/confirm/callback.py`` already checks for
+        ``None`` here and turns it into a 500, since it always calls this
+        after its own ``get_challenge``, so the only way to observe ``None``
+        today is a row that vanished between those two calls.
+        ``ChallengeNotFoundError`` stays exported for callers that prefer an
+        exception; this function just does not raise it.
     """
     record = await get_challenge(session, challenge_id)
     if record is None:
-        raise ChallengeNotFoundError(f"Challenge {challenge_id} not found")
+        return None
 
     record.status = status
     if confirming_device is not None:

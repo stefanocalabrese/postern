@@ -155,6 +155,7 @@ async def test_update_challenge_status_approves(session: AsyncSession) -> None:
         confirming_device="dev_abc123",
         signature="sig_xyz",
     )
+    assert record is not None  # the challenge exists — see the "missing" test below.
     assert record.status == "approved"
     assert record.confirming_device == "dev_abc123"
     assert record.signature == "sig_xyz"
@@ -172,6 +173,7 @@ async def test_update_challenge_status_with_verification_result(session: AsyncSe
         signature="sig",
         verification_result="vr_match_001",
     )
+    assert record is not None  # the challenge exists — see the "missing" test below.
     assert record.status == "approved"
     assert record.verification_result == "vr_match_001"
 

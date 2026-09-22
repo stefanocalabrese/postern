@@ -14,6 +14,7 @@ Covers:
 import json
 from collections.abc import AsyncGenerator, Generator
 from typing import Any
+from unittest.mock import patch
 
 import httpx2
 import pytest
@@ -22,6 +23,7 @@ from postern_core.store import challenges as store
 from postern_core.store.engine import Database
 from starlette.applications import Starlette
 
+from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
 
@@ -32,10 +34,17 @@ from services.confirm.settings import ConfirmSettings
 
 @pytest.fixture(scope="module")
 def pg_url() -> Generator[str]:
-    """Session-scoped Postgres for integration tests.
+    """Module-scoped Postgres for integration tests.
 
     Mirrors ``conftest.py``'s ``pg_url`` but returns the URL directly so we
     can pass it to both the store layer and ``create_confirm_app``.
+
+    Sets ``POSTERN_DATABASE_URL`` for the duration of this module (some
+    fixtures elsewhere build ``Settings``/``ConfirmSettings`` via
+    ``from_env()``, which reads it) and restores whatever was there before —
+    or unsets it if nothing was — once this module's tests finish. Leaving
+    it pointed at a container that is about to be torn down would poison
+    ``from_env()`` calls in whatever test module runs next in the session.
     """
     import os
 
@@ -47,6 +56,7 @@ def pg_url() -> Generator[str]:
     except docker.errors.DockerException as exc:
         pytest.skip(f"Docker is not reachable, skipping integration tests: {exc}")
 
+    previous_database_url = os.environ.get("POSTERN_DATABASE_URL")
     with PostgresContainer("postgres:17-alpine", driver="asyncpg") as pg:
         url = pg.get_connection_url()
         os.environ["POSTERN_DATABASE_URL"] = url
@@ -56,7 +66,13 @@ def pg_url() -> Generator[str]:
         cfg = Config("alembic.ini")
         cfg.set_main_option("sqlalchemy.url", url)
         command.upgrade(cfg, "head")
-        yield url
+        try:
+            yield url
+        finally:
+            if previous_database_url is None:
+                os.environ.pop("POSTERN_DATABASE_URL", None)
+            else:
+                os.environ["POSTERN_DATABASE_URL"] = previous_database_url
 
 
 @pytest.fixture()
@@ -81,21 +97,79 @@ def db(settings: ConfirmSettings) -> Database:
 
 @pytest.fixture()
 async def session(db: Database) -> AsyncGenerator[Any, None]:
-    """Function-scoped async session for inserting challenges."""
-    from sqlalchemy.ext.asyncio import async_sessionmaker
+    """Function-scoped async session for inserting challenges.
 
-    async with db.engine.connect() as conn:
-        trans = await conn.begin()
-        maker = async_sessionmaker(bind=conn, expire_on_commit=False)
-        async with maker() as s:
+    ``app`` (below) is a full ``create_confirm_app(settings)``, which builds
+    its own ``Database`` and therefore its own connection pool — a different
+    Postgres connection from this fixture's. A session whose writes are
+    rolled back at teardown (the usual test-isolation trick: begin a
+    connection-level transaction, bind a session to it, roll back instead of
+    closing) never lets those writes leave this fixture's own connection, so
+    the app under test — reading through its own pool — cannot see rows this
+    fixture inserted: every approval call 404s on a challenge that, from
+    this fixture's point of view, was inserted successfully. Postgres does
+    not show one connection's uncommitted work to another regardless of how
+    the first connection's session objects are wired.
+
+    So this session commits for real, and teardown deletes the rows it
+    created (by the ``chal_int_`` prefix every test in this module uses)
+    instead of rolling them back, so no row survives into the next test in
+    the module-scoped container.
+    """
+    from sqlalchemy import text
+
+    try:
+        async with db.sessionmaker() as s:
             yield s
-        await trans.rollback()
+            await s.commit()
+    finally:
+        async with db.sessionmaker() as cleanup:
+            await cleanup.execute(
+                text("DELETE FROM challenges WHERE challenge_id LIKE 'chal_int_%'")
+            )
+            await cleanup.commit()
 
 
 @pytest.fixture()
 def app(settings: ConfirmSettings) -> Starlette:
     """Full confirm service app wired to the test database."""
     return create_confirm_app(settings)
+
+
+@pytest.fixture(autouse=True)
+def _mock_backend_transport() -> Generator[None]:
+    """Route every ``BackendWriteClient`` call through a mock transport.
+
+    ``settings.backend_base_url`` here is ``https://backend.test`` — a
+    deliberately unreachable placeholder, since there is no real backend for
+    these tests to write to. Without this fixture, ``BackendWriteClient``
+    makes a real outbound call and DNS resolution fails with
+    ``httpx2.ConnectError`` before any HTTP response exists; ``callback.py``
+    only catches ``BackendWriteError`` (a non-2xx *response*), not a
+    transport-level connection failure, so that exception propagates
+    unhandled out of the ASGI app instead of producing the 207 these tests
+    expect. Patching ``BackendWriteClient.__init__`` to inject an
+    ``httpx2.MockTransport`` that answers with a non-2xx response reproduces
+    "the backend is unreachable" the way it is handled in production — a
+    real response, just a bad one — the same pattern
+    ``tests/test_callback.py`` already uses for the same client.
+    """
+
+    def _unreachable_backend(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(503, json={"detail": "no backend in this test environment"})
+
+    original_init = BackendWriteClient.__init__
+
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(
+            self,
+            *args,
+            transport=httpx2.MockTransport(_unreachable_backend),
+            **kwargs,
+        )
+
+    with patch.object(BackendWriteClient, "__init__", patched_init):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +191,13 @@ async def _insert_pending_challenge(
     tool_name: str = "payments.create_payment",
     payload: dict[str, Any] | None = None,
 ) -> None:
-    """Insert a pending challenge into the test database."""
+    """Insert a pending challenge into the test database.
+
+    Commits immediately: the test that calls this POSTs to ``app`` right
+    after, and ``app`` reads through its own connection (see the ``session``
+    fixture's docstring). An uncommitted insert is invisible there even
+    though it is visible to ``session`` itself.
+    """
     await store.create_challenge(
         session,
         challenge_id=challenge_id,
@@ -126,6 +206,7 @@ async def _insert_pending_challenge(
         payload=payload or {"amount": "EUR 340.00"},
         tier=VerificationTier.APP_APPROVAL,
     )
+    await session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -236,16 +317,45 @@ async def test_expired_challenge_returns_410(
 async def test_missing_challenge_id_returns_400(
     app: Starlette,
 ) -> None:
-    """No challenge_id in path → 400."""
-    resp = await post(
-        app,
-        "/challenges//approve",
-        {
-            "signature": "sig_xyz",
-        },
-    )
-    assert resp.status_code == 400
-    data = json.loads(resp.content.decode())
+    """No challenge_id in path → 400.
+
+    ``POST /challenges//approve`` can never reach ``approve_challenge``
+    through ``app`` as an ASGI transport: Starlette's default path convertor
+    for ``{challenge_id}`` requires at least one non-slash character, so the
+    router itself returns a bare ``text/plain`` 404 ("Not Found") for the
+    empty segment (verified directly against this app), before the handler
+    runs at all. ``tests/test_callback.py::test_missing_challenge_id_returns_400``
+    already exercises the handler's real 400 branch by calling
+    ``approve_challenge`` directly with an empty ``path_params`` — do the
+    same here, wired to the real ``app`` this module builds, so this is
+    still a case for the handler's defensive check rather than one that can
+    never fire behind the real route.
+    """
+    from starlette.requests import Request
+
+    from services.confirm.callback import approve_challenge
+
+    body = json.dumps({"signature": "sig_xyz"}).encode()
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": "/challenges//approve",
+        "raw_path": b"/challenges//approve",
+        "headers": [],
+        "path_params": {},
+        "app": app,
+    }
+    request = Request(scope)
+    request._receive = receive
+
+    resp = await approve_challenge(request)
+    assert resp.status_code == 400, f"Expected 400, got {resp.status_code}"
+    resp_body = resp.body if isinstance(resp.body, bytes) else bytes(resp.body)
+    data = json.loads(resp_body.decode())
     assert data["error"] == "invalid_request"
 
 
