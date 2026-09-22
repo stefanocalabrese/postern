@@ -22,7 +22,6 @@ Usage::
 """
 
 import datetime as _dt
-
 from datetime import UTC, datetime
 from typing import Any
 

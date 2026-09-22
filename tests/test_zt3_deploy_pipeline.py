@@ -46,9 +46,7 @@ def test_workflow_signs_api_image() -> None:
     assert re.search(r"cosign\s+sign", content), (
         "Deploy workflow must sign the api image with cosign."
     )
-    assert "postern-api" in content, (
-        "Cosign sign step must target the postern-api image."
-    )
+    assert "postern-api" in content, "Cosign sign step must target the postern-api image."
 
 
 def test_workflow_signs_confirm_image() -> None:
@@ -57,9 +55,7 @@ def test_workflow_signs_confirm_image() -> None:
     assert re.search(r"cosign\s+sign", content), (
         "Deploy workflow must sign the confirm image with cosign."
     )
-    assert "postern-confirm" in content, (
-        "Cosign sign step must target the postern-confirm image."
-    )
+    assert "postern-confirm" in content, "Cosign sign step must target the postern-confirm image."
 
 
 def test_workflow_uses_keyless_cosign() -> None:
@@ -71,8 +67,7 @@ def test_workflow_uses_keyless_cosign() -> None:
         "COSIGN_EXPERIMENTAL" in content and "cosign sign" in content
     )
     assert has_oidc, (
-        "Cosign signing must use keyless mode (OIDC from GitHub Actions), "
-        "not static keys."
+        "Cosign signing must use keyless mode (OIDC from GitHub Actions), not static keys."
     )
 
 
@@ -93,9 +88,7 @@ def test_workflow_verifies_api_signature() -> None:
     content = _read_workflow()
     assert re.search(r"cosign\s+verify.*postern-api", content) or (
         "cosign verify" in content and "postern-api" in content
-    ), (
-        "Cosign verify step must target the postern-api image."
-    )
+    ), "Cosign verify step must target the postern-api image."
 
 
 def test_workflow_verifies_confirm_signature() -> None:
@@ -103,17 +96,14 @@ def test_workflow_verifies_confirm_signature() -> None:
     content = _read_workflow()
     assert re.search(r"cosign\s+verify.*postern-confirm", content) or (
         "cosign verify" in content and "postern-confirm" in content
-    ), (
-        "Cosign verify step must target the postern-confirm image."
-    )
+    ), "Cosign verify step must target the postern-confirm image."
 
 
 def test_workflow_verifies_against_sigstore_transparency_log() -> None:
     """Verification checks the Sigstore Rekor transparency log."""
     content = _read_workflow()
     assert "rekor.sigstore.dev" in content or "rekor-url" in content, (
-        "Cosign verification must check the Sigstore Rekor transparency log "
-        "(not just a local key)."
+        "Cosign verification must check the Sigstore Rekor transparency log (not just a local key)."
     )
 
 
@@ -131,9 +121,7 @@ def test_workflow_generates_sbom_with_syft() -> None:
 def test_workflow_uses_spdx_format() -> None:
     """SBOMs are generated in SPDX format (industry standard)."""
     content = _read_workflow()
-    assert "spdx" in content.lower(), (
-        "SBOMs must be in SPDX format for auditor compatibility."
-    )
+    assert "spdx" in content.lower(), "SBOMs must be in SPDX format for auditor compatibility."
 
 
 def test_workflow_uploads_sbom_as_artifacts() -> None:
@@ -149,9 +137,7 @@ def test_workflow_checks_sbom_presence_before_deploy() -> None:
     content = _read_workflow()
     # The deploy stage must verify SBOM artifacts are present.
     has_download = "download-artifact" in content
-    has_sbom_check = ("sbom-" in content and "test -f" in content) or (
-        "SBOM missing" in content
-    )
+    has_sbom_check = ("sbom-" in content and "test -f" in content) or ("SBOM missing" in content)
     assert has_download and has_sbom_check, (
         "Deploy stage must download SBOM artifacts and verify their presence. "
         "A missing SBOM blocks deployment."
@@ -189,12 +175,8 @@ def test_workflow_blocks_on_high_severity() -> None:
 def test_workflow_has_build_and_deploy_stages() -> None:
     """The workflow has separate build and deploy jobs."""
     content = _read_workflow()
-    assert "build:" in content, (
-        "Deploy workflow must have a 'build' job."
-    )
-    assert "deploy:" in content, (
-        "Deploy workflow must have a 'deploy' job."
-    )
+    assert "build:" in content, "Deploy workflow must have a 'build' job."
+    assert "deploy:" in content, "Deploy workflow must have a 'deploy' job."
 
 
 def test_deploy_requires_environment_approval() -> None:
@@ -210,17 +192,13 @@ def test_workflow_dispatch_only() -> None:
     """The workflow triggers only on workflow_dispatch (no auto-triggers)."""
     content = _read_workflow()
     # Must have workflow_dispatch and must NOT have push/PR triggers.
-    assert "workflow_dispatch" in content, (
-        "Deploy workflow must trigger on workflow_dispatch."
-    )
+    assert "workflow_dispatch" in content, "Deploy workflow must trigger on workflow_dispatch."
     # Extract the 'on:' section (first 500 chars should cover it).
     on_section = content[:500]
     assert "push:" not in on_section, (
         "Deploy workflow must NOT trigger on push (billed minutes on private repo)."
     )
-    assert "pull_request:" not in on_section, (
-        "Deploy workflow must NOT trigger on pull_request."
-    )
+    assert "pull_request:" not in on_section, "Deploy workflow must NOT trigger on pull_request."
 
 
 def test_workflow_uses_digest_not_tag_for_ecr() -> None:
@@ -239,14 +217,11 @@ def test_workflow_uses_digest_not_tag_for_ecr() -> None:
 def test_workflow_file_exists() -> None:
     """The deploy workflow file must exist at the expected path."""
     assert _WORKFLOW_PATH.exists(), (
-        f"Deploy workflow not found at {_WORKFLOW_PATH}. "
-        "Create .github/workflows/deploy.yml."
+        f"Deploy workflow not found at {_WORKFLOW_PATH}. Create .github/workflows/deploy.yml."
     )
 
 
 def test_workflow_file_is_non_empty() -> None:
     """The deploy workflow file must not be empty."""
     content = _read_workflow()
-    assert len(content) > 100, (
-        "Deploy workflow file is too small — likely empty or incomplete."
-    )
+    assert len(content) > 100, "Deploy workflow file is too small — likely empty or incomplete."

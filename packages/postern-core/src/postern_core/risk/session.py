@@ -221,14 +221,22 @@ class RedisSessionStore(SessionStoreBase):
         # elapsed = now - start_time, and remaining = ttl - elapsed.
         import time as _time
 
-        start_time = float(ctx.to_dict()["_start_time"])
+        raw_start_time = ctx.to_dict()["_start_time"]
+        if not isinstance(raw_start_time, int | float):
+            raise TypeError(
+                f"RiskContext.to_dict()['_start_time'] must be numeric, "
+                f"got {type(raw_start_time).__name__}"
+            )
+        start_time = float(raw_start_time)
         elapsed = _time.time() - start_time
         remaining_ttl = max(0, int(self._ttl - elapsed))
 
         if remaining_ttl <= 0:
             # Session has expired — clean up and return None.
             await self._redis.delete(self._key(session_handle))
-            logger.info("Session %s expired (elapsed=%.1fs > ttl=%ds)", session_handle, elapsed, self._ttl)
+            logger.info(
+                "Session %s expired (elapsed=%.1fs > ttl=%ds)", session_handle, elapsed, self._ttl
+            )
             return None
 
         # Refresh the key with the computed remaining TTL so it doesn't
