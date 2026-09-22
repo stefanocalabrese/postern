@@ -36,8 +36,8 @@ from tests.fixtures import backend_responses as fx
 ES_IBAN = fx.FULL_IBAN  # 24 characters
 MT_IBAN = "MT92MALT01100ABCDEFGH1234IJKL56"  # 31
 NO_IBAN = "NO9386011117947"  # 15, the registry's shortest
-PAN = fx.FULL_PAN  # 16 digits, NOT Luhn-valid
-LUHN_PAN = fx.LUHN_PAN  # 16 digits, Luhn-valid
+PAN = fx.FULL_PAN  # 16 digits, Luhn-valid
+NON_LUHN_PAN = "4111111111114417"  # `FULL_PAN` before C-07 corrected it
 
 # Sorted by codepoint so a failure names the same member every run, and
 # bound to a typed name because `pytest.mark.parametrize` takes
@@ -65,7 +65,7 @@ def _insertions(value: str, char: str) -> list[str]:
 
 def test_the_audit_s_own_two_reproductions() -> None:
     """Both were unchanged, byte for byte, before this change."""
-    assert redact(f"PAGO TARJETA {fx.ORDINAL_PAN}") == f"PAGO TARJETA {_MASK} 4417"
+    assert redact(f"PAGO TARJETA {fx.ORDINAL_PAN}") == f"PAGO TARJETA {_MASK} 1111"
     assert redact(f"ref {fx.ORDINAL_IBAN}") == f"ref ES•• {_MASK} 1332"
 
 
@@ -75,7 +75,12 @@ def test_the_audit_s_own_two_reproductions() -> None:
 @pytest.mark.parametrize("char", EXEMPTIONS)
 @pytest.mark.parametrize(
     ("label", "value"),
-    [("PAN-16", PAN), ("PAN-16-luhn", LUHN_PAN), ("IBAN-15", NO_IBAN), ("IBAN-24", ES_IBAN)],
+    [
+        ("PAN-16", PAN),
+        ("PAN-16-non-luhn", NON_LUHN_PAN),
+        ("IBAN-15", NO_IBAN),
+        ("IBAN-24", ES_IBAN),
+    ],
 )
 def test_no_exemption_member_leaks_at_any_interior_offset(
     char: str, label: str, value: str
@@ -180,6 +185,6 @@ def test_two_qualifying_digit_runs_in_one_span_disclose_nothing() -> None:
     """Which run's last four would be disclosed is not knowable, so none is
     -- the same refusal `_find_iban_in_token` makes for two checksumming
     starts."""
-    text = f"{PAN}º{LUHN_PAN}"
+    text = f"{PAN}º{NON_LUHN_PAN}"
     out = redact(text)
     assert out == _MASK, out

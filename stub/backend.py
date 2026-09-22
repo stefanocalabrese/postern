@@ -35,7 +35,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
-FULL_PAN = "4111111111114417"
+# Luhn-valid, corrected from 4111111111114417 by audit finding C-07 along
+# with its mirror in `tests/fixtures/backend_responses.py`, which explains
+# why an impossible card number could not stand in for a real one once a
+# checksum entered the redaction path.
+FULL_PAN = "4111111111111111"
 FULL_IBAN = "ES9121000418450200051332"
 COUNTERPARTY_IBAN = "DE89370400440532013000"
 
@@ -45,13 +49,11 @@ COUNTERPARTY_IBAN = "DE89370400440532013000"
 # shape is here; the short version is that a card number typed with spaces
 # is as much a leak as one typed without, and the compose stack has to put
 # both in front of the running server, not just the contiguous one.
-LUHN_PAN = "4111111111111111"
-GROUPED_PAN = "4111 1111 1111 4417"
-HYPHEN_PAN = "4111-1111-1111-4417"
-DOTTED_PAN = "4111.1111.1111.4417"
-NBSP_PAN = "4111 1111 1111 4417"
-GROUPED_LUHN_PAN = "4111 1111 1111 1111"
-ORDINAL_PAN = "41111111º11114417"
+GROUPED_PAN = "4111 1111 1111 1111"
+HYPHEN_PAN = "4111-1111-1111-1111"
+DOTTED_PAN = "4111.1111.1111.1111"
+NBSP_PAN = "4111 1111 1111 1111"
+ORDINAL_PAN = "41111111º11111111"
 
 GROUPED_IBAN = "ES91 2100 0418 4502 0005 1332"
 HYPHEN_IBAN = "ES91-2100-0418-4502-0005-1332"
@@ -75,8 +77,7 @@ BALANCE = {
 LEAKY_DESCRIPTION = (
     f"Card {FULL_PAN} purchase, ref {COUNTERPARTY_IBAN}"
     f" grouped {GROUPED_PAN} hyphen {HYPHEN_PAN} dotted {DOTTED_PAN}"
-    f" nbsp {NBSP_PAN} luhn {LUHN_PAN} grouped-luhn {GROUPED_LUHN_PAN}"
-    f" ordinal {ORDINAL_PAN}"
+    f" nbsp {NBSP_PAN} ordinal {ORDINAL_PAN}"
     f" iban {GROUPED_IBAN} hyphen {HYPHEN_IBAN}"
     f" lower {LOWERCASE_IBAN} ordinal {ORDINAL_IBAN}"
 )

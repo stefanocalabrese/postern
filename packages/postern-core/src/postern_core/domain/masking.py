@@ -102,127 +102,22 @@ def _luhn_ok(digits: str) -> bool:
 
 
 def _ascii_digits(value: str) -> str:
-    """`value`'s digits as ASCII, for the checksum and prefix tests below.
+    """`value`'s digits as ASCII, for `_luhn_ok`.
 
     `_PAN_IN_TEXT_RE` matches Unicode `\\d` on purpose (see its own
     comment: an Arabic-Indic PAN is masked, last four preserved in the
-    original script), so a matched span can carry digits `_luhn_ok` and
-    `_has_payment_card_prefix` cannot read as ASCII. `int()` accepts every
-    `Nd` codepoint, which is exactly the set `\\d` matches, so this is
-    total over anything those patterns can hand it.
+    original script), so a matched span can carry digits `_luhn_ok`
+    cannot read as ASCII. `int()` accepts every `Nd` codepoint, which is
+    exactly the set `\\d` matches, so this is total over anything that
+    pattern can hand it.
 
-    Only the GATES see this normalised form. The last four actually
+    Only the GATE sees this normalised form. The last four actually
     disclosed still comes from the original span, so the Arabic-Indic
     behaviour that comment documents is unchanged.
     """
     if value.isascii():
         return value
     return "".join(str(int(ch)) for ch in value)
-
-
-# ISO/IEC 7812-1's major industry identifier: the first digit of the IIN,
-# naming the industry the card is issued for. Consumer payment cards live
-# in 3 (travel and entertainment -- American Express, Diners, JCB), 4
-# (banking and financial -- Visa), 5 (banking and financial -- Mastercard)
-# and 6 (merchandising and banking -- Discover, UnionPay, Maestro).
-#
-# Plus Mastercard's 2-series, 222100-272099, which has been live since
-# 14 October 2016 and is processed exactly like the 51-55 series. It is
-# the reason this cannot be "first digit in 3456" and stop there: an MII
-# of 2 is otherwise airlines-and-future-assignments, and admitting all of
-# it would pull in every four-digit year -- 2024, 2026 -- that opens a
-# grouped date. The window is narrow enough to exclude those (2026 is
-# below 2221) and is checked as a window, not as a digit.
-_PAYMENT_CARD_MIIS = frozenset("3456")
-_MASTERCARD_TWO_SERIES = (2221, 2720)
-
-
-def _has_payment_card_prefix(digits: str) -> bool:
-    """Whether `digits` (ASCII, already length-checked) opens with an IIN a
-    payment card can actually be issued under.
-
-    A structural gate, not a checksum, and it exists for a measured reason
-    rather than a theoretical one: `tests/fixtures/backend_responses.py`'s
-    `FULL_PAN`, the value every row of the C-07 audit's leak table is
-    written with, IS NOT LUHN-VALID (4111111111114417 sums to 45). Neither
-    are most test PANs that are not lifted straight from a scheme's own
-    published list. Gating the grouped path on Luhn alone would therefore
-    close the leak for every real card and leave the audit's own
-    reproduction untouched, which is a fix that passes its own test only
-    by changing the test.
-
-    Measured on 61 ordinary Spanish/Catalan memos carrying everyday digit
-    shapes (dates, amounts, phone numbers, order and contract references),
-    against the grouped-run rule this gates:
-
-        gate                                    masked  of 61
-        12..19 digits, no gate                    21     34%
-        12..19 digits, every group >= 3 digits    15     25%
-        12..19 digits and Luhn                     1    1.6%
-        12..19 digits and this prefix test         4    6.6%
-        12..19 digits, prefix test and Luhn        1    1.6%
-
-    and on the seven-script false-positive corpus plus the mixed-script
-    corpus (113 entries), zero for every row.
-
-    6.6% is the cost, and it buys catching every card-shaped grouped run
-    including the ones that do not checksum. The four are Spanish contract
-    and order numbers that open with 4 and are 12 to 19 digits long --
-    `4512 8899 0021 7766` grouped four-by-four is not distinguishable from
-    a Visa by any rule that does not read the checksum, and this module
-    already masks the contiguous spelling of all four unconditionally.
-    That last point is the whole argument for accepting the rate: one
-    space away, at `4512889900217766`, today's code masks 100% of them.
-
-    Which way the disclosure goes is decided separately and by the
-    checksum, not here -- see `_redact_pan_match`.
-    """
-    if digits[0] in _PAYMENT_CARD_MIIS:
-        return True
-    low, high = _MASTERCARD_TWO_SERIES
-    return low <= int(digits[:4]) <= high
-
-
-def _is_uniformly_grouped(span: str) -> bool:
-    """Whether every separator-delimited group in `span` is the same width.
-
-    The second half of the non-checksumming grouped-PAN gate, and it is a
-    heuristic rather than a standard -- said plainly, because everything
-    else in this file that decides "is this a card" cites a standard.
-
-    It is only ever reached when `_luhn_ok` has already said no, which is
-    what makes it safe: a real card ALWAYS passes Luhn (ISO/IEC 7812-1
-    Annex B makes the check digit mandatory), so nothing this test
-    excludes can be a genuine card number. Its entire job is the
-    card-shaped-but-not-checksumming case -- test PANs, the repo's own
-    `FULL_PAN`, a transcription with a typo -- and for that case the
-    question "was this printed the way a card is printed" is the only
-    evidence left.
-
-    Measured, on 61 ordinary Spanish/Catalan memos carrying everyday
-    digit shapes, through the real `_redact_free_text`:
-
-        prefix test alone                     5 of 61 masked   8.2%
-        prefix test and this uniformity test  3 of 61 masked   4.9%
-
-    The two it removes are both the same shape, a long order number with
-    irregular grouping ("405 1234567 8901234", 17 digits opening with 4),
-    which no card is ever printed as. The three that remain are 12- and
-    16-digit contract and tracking numbers grouped four-by-four and
-    opening with 4 or 5 -- genuinely indistinguishable from a Visa or a
-    Mastercard without reading the checksum, and all three already masked
-    by this module in their contiguous spelling.
-    """
-    lengths = set()
-    current = 0
-    for char in span:
-        if char in _FREE_TEXT_GROUP_SEPARATORS:
-            lengths.add(current)
-            current = 0
-        else:
-            current += 1
-    lengths.add(current)
-    return len(lengths) == 1
 
 
 def _mask_pan(value: str) -> str:
@@ -270,6 +165,13 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 #   Card 4111-1111-1111-4417 x           ->  unchanged        FULL PAN OUT
 #   Card 4111.1111.1111.4417 x           ->  unchanged        FULL PAN OUT
 #   IBAN ES91 2100 0418 4502 0005 1332 x ->  unchanged        FULL IBAN OUT
+#
+# That table is left in the digits it was measured with, which are NOT the
+# current fixture: 4111111111114417 is not Luhn-valid, and correcting it to
+# 4111111111111111 was part of the same finding, because the grouped gate
+# below is a checksum and an impossible card cannot exercise one. See
+# `tests/fixtures/backend_responses.py`'s `FULL_PAN`. Rewriting a
+# measurement to match a later fixture would be inventing a measurement.
 #
 # The asymmetry was structural rather than accidental: `_SEPARATORS` above
 # already accepts exactly these groupings for `MaskedPan`/`MaskedIban`,
@@ -340,7 +242,7 @@ _PAN_MIN_DIGITS = 12
 # The contiguous pattern this module shipped with, kept verbatim and still
 # load-bearing: `_redact_pan_match` falls back to substituting with it
 # INSIDE a grouped span it decides is not a card, which is what makes the
-# grouped path incapable of removing redaction anywhere. "4111111111114417
+# grouped path incapable of removing redaction anywhere. "4111111111111111
 # 2026" is one grouped run of 20 digits; without the fallback the grouped
 # rule would decline it (20 is over `_PAN_MAX_DIGITS`) and the contiguous
 # sixteen inside it -- masked by this module before C-07 -- would walk out.
@@ -985,40 +887,63 @@ def _redact_pan_match(match: re.Match[str]) -> str:
     span = match.group(0)
     compact = span.translate(_GROUP_SEPARATOR_STRIP)
     if len(compact) != len(span):
-        # A GROUPED run (audit finding C-07). Gated, where the contiguous
-        # branch below is not, and the asymmetry is deliberate rather than
-        # an inconsistency to tidy away. A contiguous digit run is ONE
-        # number: masking every 12-to-19-digit one costs a long reference
-        # number here and there, which this module has always accepted. A
-        # grouped run is not necessarily one number -- the separator is
-        # exactly what a reader uses to tell two numbers apart -- so the
-        # same rule applied to it welds a date to an amount and calls the
-        # result a card. "2026-09-22 1234.56" is fourteen digits under a
-        # rule that only counts them. Measured on 61 ordinary
-        # Spanish/Catalan memos: an ungated grouped rule masks 34% of
-        # them, against 6.6% for the gate below. See
-        # `_has_payment_card_prefix` for the full table and for why Luhn
-        # alone is not that gate.
+        # A GROUPED run (audit finding C-07), gated on Luhn where the
+        # contiguous branch below is gated on nothing.
         #
-        # The disclosure split follows this module's existing rule, not a
-        # new one: `_redact_pan_match`'s contiguous branch discloses a
-        # last four for a length-plausible run and refuses one for an
-        # over-long run, because the over-long run is definitionally not a
-        # card and has no approved last four. Same here, one step finer --
-        # Luhn positively identifies a card, so the last four it ends with
-        # really is a card's last four and `MaskedPan` is approved to
-        # disclose it. The prefix test only says "card-shaped", which is
-        # not an identification, so that branch emits the bare marker and
-        # asserts nothing about what the number ends with.
+        # THE ASYMMETRY IS THE DECISION, so read it here rather than
+        # inferring it from the code. A non-Luhn 16-digit string is masked
+        # written as "4111111111114417" and NOT masked written as
+        # "4111 1111 1111 4417". That looks backwards until you ask what
+        # each spelling is evidence OF.
+        #
+        # Contiguous stays permissive because an unbroken run of twelve to
+        # nineteen digits is already a strong signal on its own: almost
+        # nothing in ordinary memo text is a bare sixteen-digit number that
+        # is not an account or card identifier, so the cost of masking
+        # every one of them is a long reference number here and there, and
+        # this module has always paid it. Tightening that branch would
+        # REMOVE redaction from a shape already covered, which is the one
+        # direction no change here is allowed to go.
+        #
+        # Grouped requires Luhn because grouping is what ordinary reference
+        # numbers, dates, amounts and phone numbers do all the time, and
+        # because a separator is exactly what a reader uses to tell two
+        # numbers apart -- so a rule that only counts digits across one
+        # welds a date to an amount and calls the result a card.
+        # "2026-09-22 1234.56" is fourteen digits. Measured on 61 ordinary
+        # Spanish/Catalan memos carrying everyday digit shapes: an ungated
+        # grouped rule masks 34% of them (21 of 61), a Luhn-gated one masks
+        # 3.3% (2 of 61). The signal is weak, so it has to be corroborated;
+        # the contiguous signal is strong, so it does not.
+        #
+        # ISO/IEC 7812-1 Annex B makes the check digit mandatory, so a real
+        # card ALWAYS passes Luhn and nothing this gate excludes can be a
+        # genuine PAN. The honest residual, stated rather than implied: a
+        # closed-loop or private-label card number that is not 7812
+        # conformant, and a real card transcribed with a typo, are both
+        # card-shaped, both fail Luhn, and are both left as written in
+        # their grouped spelling. Neither is a PAN a payment network would
+        # accept.
+        #
+        # An earlier revision of this branch also accepted a payment-card
+        # IIN plus uniform grouping as a second, weaker gate, to catch
+        # card-shaped runs that do not checksum. It was removed by
+        # decision of the repository owner rather than by measurement: at
+        # 4.9% it cost more false positives than Luhn alone, and the only
+        # thing it caught that Luhn does not was a number no card scheme
+        # would issue. The fixture that motivated it was corrected instead
+        # -- see `tests/fixtures/backend_responses.py`'s `FULL_PAN`.
         digits = _ascii_digits(compact)
-        if _PAN_MIN_DIGITS <= len(digits) <= _PAN_MAX_DIGITS:
-            if _luhn_ok(digits):
-                return f"{_MASK} {compact[-4:]}"
-            if _has_payment_card_prefix(digits) and _is_uniformly_grouped(span):
-                return _MASK
-        # Not a card by either test -- but the span may still CONTAIN a
-        # contiguous run this module masked before C-07, and nothing here
-        # is allowed to take that away. Re-run the original contiguous
+        if _PAN_MIN_DIGITS <= len(digits) <= _PAN_MAX_DIGITS and _luhn_ok(digits):
+            # Luhn positively identifies a card, so the last four it ends
+            # with really is a card's last four and `MaskedPan` is approved
+            # to disclose it -- the same rule the contiguous branch follows
+            # when it discloses for a length-plausible run and refuses for
+            # an over-long one.
+            return f"{_MASK} {compact[-4:]}"
+        # Not a card -- but the span may still CONTAIN a contiguous run
+        # this module masked before C-07, and nothing here is allowed to
+        # take that away. Re-run the original contiguous
         # pattern inside the span and emit exactly what it emitted before
         # this branch existed. Every piece it leaves alone is separated
         # from every mask it writes by the separator that made this a
@@ -3021,34 +2946,34 @@ def _redact_free_text(value: str) -> str:
     # trials, 1 MiB payloads):
     #
     #   1 MiB payload                       before (ms)   after (ms)
-    #   ASCII adversarial (module's own)       171.9        168.7
-    #   homoglyphed, catalogued А              259.8        260.3
-    #   grouped four-digit groups               13.9         28.0
-    #   ordinal-bridged (letters and digits)    69.0        107.7
-    #   ordinal-bridged, 22-digit runs         148.5        176.7
-    #   ordinal-bridged at max scan density    282.2        341.6
-    #   ordinary prose                          12.6         15.2
-    #   83-byte ASCII memo (us)                  2.75         3.14
-    #   61-byte accented memo (us)               9.55        11.56
+    #   ASCII adversarial (module's own)       168.6        170.4
+    #   homoglyphed, catalogued А              258.5        258.3
+    #   grouped four-digit groups               13.0         26.5
+    #   ordinal-bridged (letters and digits)    66.9        104.4
+    #   ordinal-bridged, 22-digit runs         143.9        169.1
+    #   ordinal-bridged at max scan density    280.6        340.1
+    #   ordinary prose                          12.5         14.9
+    #   83-byte ASCII memo (us)                  2.68         3.06
+    #   61-byte accented memo (us)               9.23        11.21
     #
     # Read the last-but-three row as the headline and do not soften it:
-    # the worst case this module has is now 342ms of synchronous
-    # event-loop stall for one 1 MiB value, up 21% from 282ms. That
+    # the worst case this module has is now 340ms of synchronous
+    # event-loop stall for one 1 MiB value, up 21% from 281ms. That
     # payload is 128-character spans at maximum qualifying-start density
     # with one ordinal indicator in each, so every span bridges and every
     # span is scannable -- and it was ALREADY the worst shape before this
     # change, ahead of both the ASCII adversarial shape the budget was
     # derived against and the homoglyphed one. C-07 makes an existing
     # worst case 21% worse; it does not create a new class of one. The
-    # checksum budget is what keeps 342ms from being 3 seconds, and the
+    # checksum budget is what keeps 340ms from being 3 seconds, and the
     # rest is the same unbudgeted O(length) preprocessing class
     # `_delookalike`'s own docstring already names as the obvious next
     # place to look. It is still not closed. It is still only measured.
     #
-    # The +101% on the grouped-digits row is the separator-tolerant PAN
+    # The +104% on the grouped-digits row is the separator-tolerant PAN
     # pattern paying for a payload that is nothing but four-digit groups,
-    # and it is the largest RELATIVE cost here while being 28ms in
-    # absolute terms -- an eighth of the worst case, because a digit run
+    # and it is the largest RELATIVE cost here while being 27ms in
+    # absolute terms -- a twelfth of the worst case, because a digit run
     # buys no checksums at all.
     bridged = _mask_bridged_runs(value, iban_skeleton)
     if bridged is not value:

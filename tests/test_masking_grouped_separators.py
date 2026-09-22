@@ -13,6 +13,10 @@ attacker-controllable memo text -- lost. Measured through the real
     Card 4111.1111.1111.4417 x
     IBAN ES91 2100 0418 4502 0005 1332 x
 
+(The PAN in that table is the fixture as it then stood; it was corrected to
+a Luhn-valid card in the same finding, for the reason
+`tests/fixtures/backend_responses.py` records.)
+
 The counterweight is `test_ordinary_grouped_digits_are_not_masked` and the
 corpora in `tests/test_masking_homoglyph_measurement.py`: bridging a
 separator is bridging a break a reader uses to tell two numbers apart, so
@@ -32,6 +36,13 @@ from postern_core.domain.masking import (
 from pydantic import BaseModel, ConfigDict
 
 from tests.fixtures import backend_responses as fx
+
+# `FULL_PAN`'s value before audit finding C-07 corrected it. Not a card --
+# its check digits sum to 45 -- and kept here under a name that says so,
+# because the grouped/contiguous asymmetry below can only be stated with a
+# sixteen-digit string that fails Luhn.
+NON_LUHN_PAN = "4111111111114417"
+NON_LUHN_GROUPED = "4111 1111 1111 4417"
 
 
 class Memo(BaseModel):
@@ -59,7 +70,6 @@ def redact(text: str) -> str:
         (f"Card {fx.HYPHEN_PAN} x", fx.HYPHEN_PAN),
         (f"Card {fx.DOTTED_PAN} x", fx.DOTTED_PAN),
         (f"Card {fx.NBSP_PAN} x", fx.NBSP_PAN),
-        (f"Card {fx.GROUPED_LUHN_PAN} x", fx.GROUPED_LUHN_PAN),
         (f"IBAN {fx.GROUPED_IBAN} x", fx.GROUPED_IBAN),
         (f"IBAN {fx.HYPHEN_IBAN} x", fx.HYPHEN_IBAN),
     ],
@@ -75,8 +85,8 @@ def test_the_contiguous_forms_are_unchanged_by_the_grouped_path() -> None:
     shape must produce byte-identically what it produced before C-07,
     including the last four the module discloses for a length-plausible run
     and the bare marker it refuses to decorate for an over-long one."""
-    assert redact(f"Card {fx.FULL_PAN} purchase") == f"Card {_MASK} 4417 purchase"
-    assert redact(f"Card {fx.LUHN_PAN} purchase") == f"Card {_MASK} 1111 purchase"
+    assert redact(f"Card {fx.FULL_PAN} purchase") == f"Card {_MASK} 1111 purchase"
+    assert redact(f"Card {NON_LUHN_PAN} purchase") == f"Card {_MASK} 4417 purchase"
     assert redact(f"ref {fx.FULL_IBAN} end") == f"ref ES•• {_MASK} 1332 end"
     assert redact(f"ref {fx.LOWERCASE_IBAN} end") == f"ref ES•• {_MASK} 1332 end"
     # 30 digits: the reported leak that made the run pattern unbounded.
@@ -85,14 +95,14 @@ def test_the_contiguous_forms_are_unchanged_by_the_grouped_path() -> None:
 
 def test_a_contiguous_run_inside_a_grouped_span_is_still_masked() -> None:
     """The regression the grouped path could most easily have introduced.
-    "4111111111114417 2026" is ONE grouped run of twenty digits, which the
+    "4111111111111111 2026" is ONE grouped run of twenty digits, which the
     grouped rule declines (over `_PAN_MAX_DIGITS`). Declining must mean
     falling back to the contiguous pattern inside the span, not leaving the
     span alone -- the sixteen contiguous digits in it were masked before
     this change existed."""
     out = redact(f"Card {fx.FULL_PAN} 2026 x")
     assert fx.FULL_PAN not in out, out
-    assert out == f"Card {_MASK} 4417 2026 x", out
+    assert out == f"Card {_MASK} 1111 2026 x", out
 
 
 def test_grouped_masking_leaves_no_digit_against_the_mask() -> None:
@@ -102,8 +112,9 @@ def test_grouped_masking_leaves_no_digit_against_the_mask() -> None:
     for text in (
         f"{fx.GROUPED_PAN} 2026",
         f"2026 {fx.GROUPED_PAN}",
-        f"x{fx.GROUPED_LUHN_PAN}x",
-        "4111 1111 1111 4417 4111 1111 1111 4417",
+        f"x{fx.GROUPED_PAN}x",
+        f"{fx.GROUPED_PAN} {fx.GROUPED_PAN}",
+        f"{NON_LUHN_GROUPED} {fx.GROUPED_PAN}",
     ):
         out = redact(text)
         for index, char in enumerate(out):
@@ -118,28 +129,37 @@ def test_grouped_masking_leaves_no_digit_against_the_mask() -> None:
 # --- The gate, and what it deliberately does not catch ----------------------
 
 
-def test_the_fixture_pan_is_not_luhn_valid() -> None:
-    """The fact the whole grouped-PAN gate design turns on, pinned so it
-    cannot be rediscovered as a surprise. `FULL_PAN` is the value every row
-    of the C-07 leak table is written with, and no payment network would
-    accept it -- so a Luhn-only gate would have closed the leak for real
-    cards while leaving the audit's own reproduction wide open."""
-    assert not _luhn_ok(fx.FULL_PAN)
-    assert _luhn_ok(fx.LUHN_PAN)
+def test_the_fixture_pan_is_luhn_valid_and_the_counterexample_is_not() -> None:
+    """The fixture correction that came with this finding, pinned so it
+    cannot be undone by accident. `FULL_PAN` was 4111111111114417 until
+    C-07, which is not a number any payment network would accept, so it
+    could not exercise a checksum-gated path at all. `NON_LUHN_PAN` keeps
+    that exact value available as what it actually is: a counterexample."""
+    assert _luhn_ok(fx.FULL_PAN)
+    assert not _luhn_ok(NON_LUHN_PAN)
 
 
 def test_a_luhn_valid_card_discloses_its_last_four() -> None:
     """Positive identification earns the disclosure `MaskedPan` is approved
     to make; nothing weaker does."""
-    assert redact(f"pago {fx.GROUPED_LUHN_PAN} gracias") == f"pago {_MASK} 1111 gracias"
+    assert redact(f"pago {fx.GROUPED_PAN} gracias") == f"pago {_MASK} 1111 gracias"
 
 
-def test_a_card_shaped_run_that_does_not_checksum_discloses_nothing() -> None:
-    """`FULL_PAN` grouped: card-shaped (opens with MII 4, sixteen digits,
-    printed four-by-four) but not checksumming, so it is masked without a
-    last four. Asserting anything about what it ends with would be the
-    confident-and-wrong disclosure this module refuses elsewhere."""
-    assert redact(f"pago {fx.GROUPED_PAN} gracias") == f"pago {_MASK} gracias"
+def test_the_contiguous_grouped_asymmetry_stated_as_a_test() -> None:
+    """THE DELIBERATE ASYMMETRY, pinned at both halves so neither can drift.
+
+    The same sixteen non-Luhn digits are masked written contiguously and
+    left as written when grouped. That is the decision recorded at
+    `_redact_pan_match`'s grouped branch, not an oversight: a bare
+    sixteen-digit run is a strong signal by itself and this module has
+    always masked one, while grouping is what ordinary reference numbers,
+    dates and phone numbers do, so the grouped signal has to be
+    corroborated by a checksum before it is acted on. ISO/IEC 7812-1 Annex
+    B makes the check digit mandatory, so nothing excluded here is a card
+    a payment network would accept.
+    """
+    assert redact(f"pago {NON_LUHN_PAN} gracias") == f"pago {_MASK} 4417 gracias"
+    assert redact(f"pago {NON_LUHN_GROUPED} gracias") == f"pago {NON_LUHN_GROUPED} gracias"
 
 
 @pytest.mark.parametrize(

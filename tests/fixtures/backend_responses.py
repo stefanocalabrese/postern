@@ -1,6 +1,16 @@
 """Backend responses carrying values that MUST NOT reach a tool result."""
 
-FULL_PAN = "4111111111114417"
+# Luhn-valid (ISO/IEC 7812-1 Annex B), and that is a property of this
+# fixture rather than a detail of it. Until audit finding C-07 this was
+# 4111111111114417, whose check digits sum to 45 -- a sixteen-digit string
+# no payment network would accept, standing in for a card in every test
+# that asserts a card cannot escape. That mattered the moment a checksum
+# entered the redaction path: the grouped-PAN gate in `masking.py` is
+# Luhn, so an impossible card cannot demonstrate the leak it was being
+# used to demonstrate. It is also why this module no longer carries a
+# separate `LUHN_PAN` -- with `FULL_PAN` corrected the two were the same
+# sixteen digits.
+FULL_PAN = "4111111111111111"
 FULL_IBAN = "ES9121000418450200051332"
 COUNTERPARTY_IBAN = "DE89370400440532013000"
 
@@ -10,20 +20,13 @@ COUNTERPARTY_IBAN = "DE89370400440532013000"
 # instead of them: the contiguous shapes are what `_PAN_IN_TEXT_RE` and
 # `_IBAN_IN_TEXT_RE` were built for and must keep catching, and a golden
 # test that swapped them for the grouped forms would stop proving that.
-#
-# `FULL_PAN` IS NOT LUHN-VALID (measured: 4111111111114417 sums to 45).
-# That is load-bearing rather than trivia -- it is why the grouped-PAN path
-# in `masking.py` cannot be gated on Luhn alone, and why `LUHN_PAN` exists
-# next to it. See `_looks_like_a_card_number` there for the full reasoning.
-LUHN_PAN = "4111111111111111"
-GROUPED_PAN = "4111 1111 1111 4417"
-HYPHEN_PAN = "4111-1111-1111-4417"
-DOTTED_PAN = "4111.1111.1111.4417"
-NBSP_PAN = "4111 1111 1111 4417"
-GROUPED_LUHN_PAN = "4111 1111 1111 1111"
+GROUPED_PAN = "4111 1111 1111 1111"
+HYPHEN_PAN = "4111-1111-1111-1111"
+DOTTED_PAN = "4111.1111.1111.1111"
+NBSP_PAN = "4111 1111 1111 1111"
 # U+00BA MASCULINE ORDINAL INDICATOR, one of the 18 `_LATIN_SCRIPT_EXEMPTIONS`
 # members. On a Spanish keyboard, so this reads as ordinary local text.
-ORDINAL_PAN = "41111111º11114417"
+ORDINAL_PAN = "41111111º11111111"
 
 GROUPED_IBAN = "ES91 2100 0418 4502 0005 1332"
 HYPHEN_IBAN = "ES91-2100-0418-4502-0005-1332"
@@ -50,8 +53,7 @@ BALANCE = {
 LEAKY_DESCRIPTION = (
     f"Card {FULL_PAN} purchase, ref {COUNTERPARTY_IBAN}"
     f" grouped {GROUPED_PAN} hyphen {HYPHEN_PAN} dotted {DOTTED_PAN}"
-    f" nbsp {NBSP_PAN} luhn {LUHN_PAN} grouped-luhn {GROUPED_LUHN_PAN}"
-    f" ordinal {ORDINAL_PAN}"
+    f" nbsp {NBSP_PAN} ordinal {ORDINAL_PAN}"
     f" iban {GROUPED_IBAN} hyphen {HYPHEN_IBAN}"
     f" lower {LOWERCASE_IBAN} ordinal {ORDINAL_IBAN}"
 )

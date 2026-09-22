@@ -47,7 +47,7 @@ def test_the_fixtures_publish_the_names_compared_below() -> None:
     not a failure. The names are spelled out once, here, where losing one is
     loud.
 
-    Grew from seven to nineteen when the golden gate was widened to cover
+    Grew from seven to seventeen when the golden gate was widened to cover
     separator-grouped, lowercase and ordinal-split PAN/IBAN forms (audit
     finding C-07): each new shape is a constant on both sides, because a
     grouped card number reaching the compose stack must fail the same way a
@@ -57,12 +57,10 @@ def test_the_fixtures_publish_the_names_compared_below() -> None:
         "FULL_PAN",
         "FULL_IBAN",
         "COUNTERPARTY_IBAN",
-        "LUHN_PAN",
         "GROUPED_PAN",
         "HYPHEN_PAN",
         "DOTTED_PAN",
         "NBSP_PAN",
-        "GROUPED_LUHN_PAN",
         "ORDINAL_PAN",
         "GROUPED_IBAN",
         "HYPHEN_IBAN",

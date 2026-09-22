@@ -73,7 +73,7 @@ async def test_cards_list_masks_the_pan_to_last_four(server: FastMCP) -> None:
     async with Client(transport=server) as client:
         result = await client.call_tool("cards.list", {})
     assert result.structured_content is not None
-    assert result.structured_content["result"][0]["pan"] == "•••• 4417"
+    assert result.structured_content["result"][0]["pan"] == "•••• 1111"
 
 
 async def test_cards_list_never_returns_expiry_or_cvv(server: FastMCP) -> None:
