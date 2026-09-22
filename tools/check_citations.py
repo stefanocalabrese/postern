@@ -103,9 +103,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = REPO_ROOT / "tools" / "citations-baseline.json"
 
-# Directories never walked. Everything `.gitignore` lists, plus `.git` and
-# `.claude`: in the primary checkout `.claude/worktrees/` holds entire copies
-# of this repository, and walking those would scan every file twice or more.
+# Directories never walked. Not everything `.gitignore` lists -- this set is
+# maintained by hand and has drifted from it before (`dev-docs/` was added to
+# `.gitignore` by e1527a7 without a matching entry here, which let bare
+# citations in the untracked design docs and decision records fail the gate
+# in the primary checkout while every worktree, missing that gitignored
+# directory, stayed green). Includes `.git` and `.claude`: in the primary
+# checkout `.claude/worktrees/` holds entire copies of this repository, and
+# walking those would scan every file twice or more.
 SKIP_DIRS = frozenset(
     {
         ".git",
@@ -120,6 +125,7 @@ SKIP_DIRS = frozenset(
         "dist",
         "build",
         "node_modules",
+        "dev-docs",
     }
 )
 
