@@ -15,8 +15,23 @@ The device authorization flow (§7.3 of the handoff):
 5. After approval, the browser polls ``/token`` with
    ``grant_type=device_code`` to receive access tokens.
 
-The pairing code (``user_code``) is the critical anti-phishing control:
-it must match on both surfaces before identity verification proceeds.
+The pairing code (``user_code``) carries the anti-phishing control for
+A2 (QR relay), and it is worth being precise about which half lives where,
+because the two halves are not interchangeable:
+
+- The HUMAN half is the control against a relayed QR. The user compares the
+  code their own trusted screen shows against the code the app shows, and
+  refuses if they differ. That comparison happens on the operator's app
+  pairing screen, which is not in this repository and is still an open
+  question (handoff §10.10). Nothing here can perform it or verify that it
+  happened.
+- The SERVER half, ``services/confirm/device_auth.py::approve_callback``,
+  makes the approving app PROVE it holds the ``user_code`` before an approval
+  is accepted. That turns a stolen or leaked ``device_code`` on its own into
+  an insufficient credential, and it bounds guessing through
+  ``user_code_attempts`` below (RFC 8628 §5.2 asks for exactly that). It does
+  NOT detect a relay, because a relaying attacker who obtained the QR holds
+  both codes.
 
 Usage::
 
@@ -72,17 +87,28 @@ class DeviceCode:
         verification_uri: URI the user visits on mobile (e.g. auth page).
         expires_at: When this device code expires (UTC).
         interval: Seconds between token polls (default 5).
-        client_id: OAuth client identifier. After approval, the callback
-            updates this field with the customer reference (subject_value).
+        client_id: OAuth client identifier, as supplied at
+            ``/device_authorization``. Caller-controlled and never an
+            identity: it stays what the request said it was for the whole
+            life of the code.
         scopes: Space-separated scope list from the request.
         approved: Whether mobile app has approved this session.
         approved_at: When approval happened (None until approved).
+        customer_ref: The customer this code was approved FOR, taken from the
+            verified ``sub`` of the banking app's assertion at approval time
+            and from nowhere else. Empty until approved.
+        user_code_attempts: Failed ``user_code`` comparisons at ``/approve``.
 
-    .. warning:: Technical debt (known): ``client_id`` is reused to store
-       the customer reference after approval. The field name is misleading
-       post-approval and a future refactor should introduce a dedicated
-       ``customer_ref`` field. See ``services/confirm/settings.py`` for the
-       parallel note about ``client_id`` field reuse.
+    ``customer_ref`` used to be ``client_id``, reused for two purposes: the
+    OAuth client id before approval and the customer reference after it. That
+    overload was the enabling half of audit finding C-01. It meant the value
+    ``/token`` minted a token from was a field a caller had populated at
+    ``/device_authorization``, so a caller who sent ``client_id=cust_victim``
+    and then reached any state where approval had been recorded but the
+    identity had not yet been overwritten got a token for ``cust_victim``.
+    Separate fields close that: ``/token`` reads ``customer_ref``, which no
+    request body can reach and which only a verified approval ever sets, and
+    a half-written approval therefore mints nothing at all.
     """
 
     device_code: str
@@ -94,6 +120,8 @@ class DeviceCode:
     scopes: str = ""
     approved: bool = False
     approved_at: datetime | None = None
+    customer_ref: str = ""
+    user_code_attempts: int = 0
 
     @property
     def user_code_display(self) -> str:
@@ -177,7 +205,8 @@ class DeviceCodeStoreBase(ABC):
         """Replace a device code with an updated version.
 
         Used by the approval callback to attach the customer identity
-        (subject_value) after the user approves on mobile.
+        (``customer_ref``, from the verified assertion) after the user
+        approves on mobile, and to record a failed ``user_code`` comparison.
         """
 
 
@@ -416,6 +445,8 @@ def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
         "scopes": dc.scopes,
         "approved": dc.approved,
         "approved_at": dc.approved_at.timestamp() if dc.approved_at else None,
+        "customer_ref": dc.customer_ref,
+        "user_code_attempts": dc.user_code_attempts,
     }
 
 
@@ -434,6 +465,14 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
         scopes=data.get("scopes", ""),
         approved=bool(data.get("approved", False)),
         approved_at=approved_at,
+        # `.get` with a default, not `data[...]`: a Redis-backed store can be
+        # holding codes serialized by the previous release when this one rolls
+        # out, and a `KeyError` there would fail every in-flight device grant.
+        # Defaulting `customer_ref` to "" is the fail-closed direction -- an
+        # old code deserializes with no identity, so `/token` refuses it
+        # rather than minting from a stale `client_id`.
+        customer_ref=str(data.get("customer_ref", "")),
+        user_code_attempts=int(data.get("user_code_attempts", 0)),
     )
 
 

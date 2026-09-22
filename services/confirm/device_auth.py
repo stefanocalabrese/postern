@@ -8,10 +8,10 @@ Endpoints:
   approved).
 
 The confirm service is the right home for these because:
-1. It already holds both read and write signing keys (a controlled exception
-   to the key-split architecture — see ``ConfirmSettings`` docstring).
-2. Device code exchange mints both read and write tokens atomically.
-3. The approval callback needs to update device code state, which lives in
+1. It holds the READ key the device grant needs to mint the browser's access
+   token (a controlled exception to the key-split architecture — see
+   ``ConfirmSettings`` docstring).
+2. The approval callback needs to update device code state, which lives in
    the same service as the token minting.
 
 QR data encoding: the verification URI with ``user_code`` as a query
@@ -19,8 +19,31 @@ parameter (``verification_uri_complete``). The mobile app deep-links to this
 URI; the browser shows a QR encoding it.
 
 Pairing code (``user_code``): 6 uppercase alphanumeric chars, displayed as
-XXX-XXX on both surfaces. The user must confirm they match before identity
-verification proceeds (§7.3, anti-phishing control A2).
+XXX-XXX on both surfaces. ``POST /approve`` REQUIRES it and compares it, in
+constant time, against the code stored for that device code
+(``postern_core.auth.device_codes`` records which half of the A2 control that
+is and which half only the operator's app can perform).
+
+WHO IS AUTHENTICATED, AND WHO IS NOT. ``POST /approve`` is the banking app,
+and it must present a bearer assertion the operator's app backend minted;
+``services/confirm/auth.py`` verifies it and this module takes the customer
+from the verified ``sub``. ``POST /device_authorization`` and ``POST /token``
+are the BROWSER, which by the device grant's premise holds no credential at
+all, and they are named in that module's ``PUBLIC_PATHS`` with the reason.
+
+WHAT THIS MODULE NO LONGER DOES. It used to take the customer identity from
+``/approve``'s request body (``subject_value``) and it used to return a
+WRITE-signed token from ``/token``. Together those made three unauthenticated
+calls sufficient to obtain ``aud=payments.svc scope=payments:execute`` for any
+customer named in a JSON body. Both are gone: the identity comes from a
+verified assertion, and ``/token`` returns a read token only. A write token is
+minted inside the approval path in ``services/confirm/callback.py``, where it
+is used and discarded, and is never serialized to an HTTP client.
+
+That is also why ``device_auth_routes`` takes no ``write_minter`` any more.
+Nothing on the device grant path signs with the write key, so this module is
+not handed it — the key split is better expressed by not passing the key than
+by passing it and not using it.
 
 Usage in ``main.py``::
 
@@ -34,14 +57,16 @@ Usage in ``main.py``::
         store=store,
         settings=settings,
         read_minter=read_minter,
-        write_minter=write_minter,
     )
 """
 
 from __future__ import annotations
 
+import dataclasses
+import hmac
+import json
+import logging
 from datetime import UTC, datetime
-from typing import Any
 
 from postern_core.auth.device_codes import (
     DeviceCode,
@@ -50,11 +75,15 @@ from postern_core.auth.device_codes import (
 )
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.identity import CustomerRef
+from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from services.confirm.auth import unauthenticated_response, verified_subject
 from services.confirm.settings import ConfirmSettings
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Error responses — RFC 8628 §3.3 and §3.4 error codes.
@@ -154,11 +183,17 @@ async def token_endpoint(request: Request) -> JSONResponse:
     Response after approval (200):
         {
             "access_token": "<read token>",
-            "refresh_token": null,  # not yet implemented
             "token_type": "Bearer",
             "expires_in": 60,
-            "write_token": "<write token>",  # for the approval callback
         }
+
+    There is no ``write_token`` in that response and there must never be one
+    again (audit finding C-01). This endpoint is public and its only
+    credential is the ``device_code``, so anything it returns is reachable by
+    whoever holds that value; a token with ``aud=payments.svc`` and
+    ``scope=payments:execute`` is not something to put behind a single bearer
+    secret polled over HTTP. The write path mints its own token inside
+    ``services/confirm/callback.py``, per request, and never hands one out.
 
     Error codes per RFC 8628 §3.4:
         authorization_pending — not yet approved, keep polling.
@@ -220,29 +255,33 @@ async def token_endpoint(request: Request) -> JSONResponse:
     if not code.approved:
         return _error(400, "authorization_pending", "waiting for user approval on mobile app")
 
-    # Approved — mint read + write tokens.
-    # The device_code carries the customer identity via the approval callback;
-    # we store it in the DeviceCode at approval time. For now, the approval
-    # callback stores the subject_value on the code's client_id field.
-    # In production, this would be a dedicated field.
-    subject_value: str = code.client_id
-    if not subject_value:
+    # Approved — mint the read token, and only the read token.
+    #
+    # `customer_ref` is written by `approve_callback` from a VERIFIED
+    # assertion `sub` and by nothing else. Reading `client_id` here instead
+    # was half of C-01: that field is whatever the caller of
+    # `/device_authorization` put in it.
+    stored_customer_ref: str = code.customer_ref
+    if not stored_customer_ref:
         return _error(500, "invalid_state", "approval missing customer identity")
 
-    # Mint read token.
+    try:
+        customer = CustomerRef(value=stored_customer_ref)
+    except ValidationError:
+        # Never let this one propagate. `CustomerRef` sets
+        # `hide_input_in_errors=True`, which covers `str()` and `repr()` of the
+        # exception but NOT its `errors()` output or `.json()` -- both still
+        # carry the raw offending value, and an unhandled exception here is
+        # logged by whatever sits above us. A fixed string keeps that value out
+        # of the log and off the wire.
+        logger.warning("device grant: stored customer reference is not well-formed")
+        return _error(500, "invalid_state", "approval identity is not a customer reference")
+
     read_minter: InternalTokenMinter = request.app.state.read_minter
     read_token = read_minter.mint(
-        subject=CustomerRef(value=subject_value),
+        subject=customer,
         audience="accounts.svc",
         scope="accounts:read",
-    )
-
-    # Mint write token (for the approval callback / future write operations).
-    write_minter: InternalTokenMinter = request.app.state.write_minter
-    write_token = write_minter.mint(
-        subject=CustomerRef(value=subject_value),
-        audience="payments.svc",
-        scope="payments:execute",
     )
 
     return JSONResponse(
@@ -251,73 +290,146 @@ async def token_endpoint(request: Request) -> JSONResponse:
             "access_token": read_token,
             "token_type": "Bearer",
             "expires_in": 60,
-            "write_token": write_token,
         },
     )
 
 
 # ---------------------------------------------------------------------------
 # Approval callback — POST /approve.
+#
+# Called by the operator's banking app after the user completes identity
+# verification and confirms the device pairing. It marks the device code
+# approved so the browser can exchange it for tokens.
+#
+# The app sends:
+#   device_code — the opaque device code, from the scanned QR.
+#   user_code   — the pairing code, from the same QR. REQUIRED and compared.
+#
+# It does NOT send the customer. That is audit finding C-01: the handler used
+# to read `subject_value` from this body, write it onto the device code, and
+# `/token` then minted from it, with a comment claiming the value came "from
+# the app's authenticated session" while nothing authenticated at all. The
+# customer now comes from the `sub` of the verified bearer assertion and from
+# nowhere else. There is deliberately no body field a caller could use to
+# influence it, so there is nothing here to forget to ignore.
 
-# This is called by the mobile app after the user completes identity
-# verification and approves the device pairing. It marks the device code
-# as approved so the browser can exchange it for tokens.
 
-# The mobile app sends:
-#   device_code — the opaque device code.
-#   subject_value — the customer identity (from the app's authenticated session).
-#   approval_signature — a signature proving the user approved (optional,
-#                        for audit trail; the actual auth comes from the
-#                        app's own session).
+def _normalize_user_code(raw: str) -> str:
+    """Fold a pairing code to the stored form.
+
+    Stored codes are six characters drawn from
+    ``23456789ABCDEFGHJKLMNPQRSTUVWXYZ``; both surfaces show them as
+    ``XXX-XXX`` (``DeviceCode.user_code_display``). RFC 8628 §6.1 asks a
+    server to accept the code the way a human would type or paste it, so the
+    separator and surrounding whitespace come out and the case is folded up.
+
+    Nothing else is stripped. Being liberal here would widen what counts as a
+    match, and this value is a credential.
+    """
+    return raw.strip().replace("-", "").replace(" ", "").upper()
 
 
 async def approve_callback(request: Request) -> JSONResponse:
-    """Mobile app approval callback.
+    """Banking app approval callback for a device pairing.
 
-    Called by the banking app after the user completes identity verification
-    and confirms the device pairing. Marks the device code as approved so
-    the browser can exchange it for tokens.
+    Requires a verified app assertion (``services/confirm/auth.py``). The
+    customer is the assertion's ``sub``.
 
     Request body:
         device_code: The opaque device code (required).
-        subject_value: Customer identity / sub claim (required).
-        approval_signature: Optional signature for audit trail.
+        user_code: The pairing code shown in the QR, ``XXX-XXX`` or bare
+            (required — audit finding C-04).
 
-    Response (200): {"status": "approved"}
-    Response (400): error if device code not found or already approved.
+    Response (200): ``{"status": "approved"}``
+    Response (400): device code unknown, already approved, or pairing code
+        wrong.
+    Response (401): no verified assertion.
+    Response (403): the assertion verified but its ``sub`` is not a customer
+        reference.
     """
-    body = await request.json()
+    subject = verified_subject(request)
+    if subject is None:
+        # Unreachable through the assembled app: `AppAssertionMiddleware`
+        # already refused. Reachable if a future route table forgets to wire
+        # it, which is how this control would silently stop applying.
+        return unauthenticated_response()
 
-    device_code_value: str = body.get("device_code", "")
-    subject_value: str = body.get("subject_value", "")
+    try:
+        customer = CustomerRef(value=subject)
+    except ValidationError:
+        # The assertion is genuine but its subject is not the opaque
+        # `cust_...` reference handoff §7.2 requires. That is the operator's
+        # app backend minting the wrong claim, not an attacker, and it is
+        # worth a distinct status. The raw value is never echoed or logged:
+        # see the matching note in `token_endpoint`.
+        logger.warning("device approve: assertion subject is not a customer reference")
+        return _error(403, "invalid_subject", "assertion subject is not a customer reference")
 
-    if not device_code_value or not subject_value:
-        return _error(400, "invalid_request", "device_code and subject_value are required")
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error(400, "invalid_request", "body must be JSON")
+    if not isinstance(body, dict):
+        return _error(400, "invalid_request", "body must be a JSON object")
+
+    device_code_value = body.get("device_code", "")
+    user_code_value = body.get("user_code", "")
+
+    # `isinstance`, not just truthiness. JSON gives a caller ints, lists and
+    # objects as easily as strings, and `{"user_code": 123}` would otherwise
+    # reach `_normalize_user_code` and raise `AttributeError` -- a 500 from an
+    # endpoint that should answer 400. On an authenticated write path a 500 is
+    # also the shape that gets "fixed" by relaxing something.
+    if not isinstance(device_code_value, str) or not isinstance(user_code_value, str):
+        return _error(400, "invalid_request", "device_code and user_code must be strings")
+
+    if not device_code_value or not user_code_value:
+        return _error(400, "invalid_request", "device_code and user_code are required")
 
     store: DeviceCodeStoreBase = request.app.state.device_code_store
+    settings: ConfirmSettings = request.app.state.settings
 
     existing: DeviceCode | None = await store.get_device_code(device_code_value)
     if existing is None:
         return _error(400, "invalid_grant", "device code not found")
 
+    # Checked BEFORE anything is written. A second approval of an already
+    # approved code must not reach the write below, or an attacker holding a
+    # valid assertion of their own could re-approve a code the victim already
+    # approved and swap `customer_ref` to themselves in the window before the
+    # browser polls `/token`.
+    #
+    # This sits BEFORE the `user_code` comparison, and that ordering is a
+    # deliberate trade of a small oracle against a real denial of service.
+    # Ordered this way, a caller who holds a `device_code` can learn whether
+    # it is already approved without proving they hold the pairing code.
+    # Ordered the other way, that same caller could burn the attempt budget
+    # below on an approved-but-not-yet-exchanged code and REVOKE it, denying
+    # the legitimate user the token they are already waiting on. Both
+    # presuppose the caller somehow has the 256-bit `device_code`; only one
+    # of them destroys a session in flight. Leaking "this code is approved"
+    # to someone who already holds the code is the cheaper loss.
     if existing.approved:
         return _error(400, "already_approved", "device code already approved")
 
-    # Mark as approved and attach the customer identity.
-    # We update client_id to carry the subject_value (it was the OAuth client
-    # ID at creation; after approval it becomes the customer identity).
-    approved: bool = await store.approve_device_code(device_code_value)
-    if not approved:
-        return _error(500, "approval_failed", "could not mark device code as approved")
+    if not _user_code_matches(user_code_value, existing.user_code):
+        return await _record_user_code_failure(store, settings, existing)
 
-    # Fetch the now-approved code and update client_id with subject_value.
-    approved_code: DeviceCode | None = await store.get_device_code(device_code_value)
-    if approved_code is None:
-        return _error(500, "approval_failed", "approved code disappeared")
-    updated = approved_code.__class__(
-        **{**_device_code_to_dict(approved_code), "client_id": subject_value},
+    # ONE store write carrying approval and identity together. The previous
+    # shape was `approve_device_code` and then `update_device_code`, which
+    # left a window in which the code read as approved while the identity on
+    # it was still the caller-supplied `client_id` -- and `/token` minted
+    # from exactly that field. There is no such window now, and `/token`
+    # reads `customer_ref`, which is empty until this line runs.
+    await store.update_device_code(
+        device_code_value,
+        dataclasses.replace(
+            existing,
+            approved=True,
+            approved_at=datetime.now(UTC),
+            customer_ref=customer.value,
+        ),
     )
-    await store.update_device_code(device_code_value, updated)
 
     return JSONResponse(
         status_code=200,
@@ -325,11 +437,57 @@ async def approve_callback(request: Request) -> JSONResponse:
     )
 
 
-def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
-    """Helper to convert frozen dataclass to mutable dict."""
-    import dataclasses
+def _user_code_matches(presented: str, stored: str) -> bool:
+    """Constant-time pairing-code comparison.
 
-    return {f.name: getattr(dc, f.name) for f in dataclasses.fields(dc)}
+    ``hmac.compare_digest`` on ``bytes`` rather than ``str``: the ``str``
+    overload raises ``TypeError`` on any non-ASCII character, and ``presented``
+    is attacker-controlled, so the ``str`` form turns a hostile body into a
+    500 instead of a 400.
+
+    Normalizing first is not constant time and leaks the presented length.
+    That is accepted: the length of a six-character code from a published
+    alphabet is not the secret.
+    """
+    return hmac.compare_digest(
+        _normalize_user_code(presented).encode("utf-8"),
+        stored.encode("utf-8"),
+    )
+
+
+async def _record_user_code_failure(
+    store: DeviceCodeStoreBase,
+    settings: ConfirmSettings,
+    existing: DeviceCode,
+) -> JSONResponse:
+    """Count a wrong pairing code and revoke the device code once over budget.
+
+    RFC 8628 §5.2 asks the authorization server to rate-limit ``user_code``
+    attempts. The budget is small (``user_code_max_attempts``, default 3)
+    because a legitimate app is comparing a code it just scanned: the only
+    benign cause of a mismatch is a user typing it by hand and slipping.
+
+    Revocation rather than a lockout timer, because the recovery the user
+    needs is a fresh QR anyway, and a fresh QR is what re-anchors the human
+    code comparison that is the real A2 control. A lockout would leave the
+    same phishable code on screen.
+    """
+    attempts = existing.user_code_attempts + 1
+    if attempts >= settings.user_code_max_attempts:
+        await store.revoke_device_code(existing.device_code)
+        logger.warning(
+            "device approve: device code revoked after %d incorrect pairing codes", attempts
+        )
+        return _error(
+            400,
+            "invalid_user_code",
+            "pairing code incorrect; device code revoked, start a new pairing",
+        )
+    await store.update_device_code(
+        existing.device_code,
+        dataclasses.replace(existing, user_code_attempts=attempts),
+    )
+    return _error(400, "invalid_user_code", "pairing code does not match this device code")
 
 
 # ---------------------------------------------------------------------------
@@ -341,18 +499,21 @@ def device_auth_routes(
     store: DeviceCodeStoreBase,
     settings: ConfirmSettings,
     read_minter: InternalTokenMinter,
-    write_minter: InternalTokenMinter,
 ) -> list[Route]:
     """Build the device authorization route list.
 
     Args:
         store: Device code storage backend.
-        settings: Service settings (TTL, URIs).
+        settings: Service settings (TTL, URIs, pairing-code attempt budget).
         read_minter: Minter for read tokens (during device code exchange).
-        write_minter: Minter for write tokens (during device code exchange).
 
     Returns:
         Starlette Route objects to mount on the confirm service app.
+
+    No ``write_minter``. Since ``/token`` stopped returning a write token
+    (audit finding C-01), nothing on this path signs with the write key, and
+    the argument went with the code that used it. ``main.py`` no longer
+    reaches through ``WriteTokenMinter._minter`` to build this list either.
     """
     return [
         Route(

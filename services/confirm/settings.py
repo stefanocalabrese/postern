@@ -20,6 +20,26 @@ Approval callback (§6.3, §8.3) adds:
 - ``backend_base_url`` — base URL for backend write endpoints (payments.svc,
   cards.svc). The callback POSTs to these after marking a challenge approved.
 - ``database_url`` — Postgres connection for the challenges table.
+
+Inbound authentication (audit findings C-01, C-02) adds the three
+``app_assertion_*`` fields. They configure the ``JWTVerifier`` that
+``services/confirm/auth.py`` checks the banking app's bearer assertion with,
+and all three are REQUIRED: ``create_confirm_app`` refuses to build an app
+without them. ``services/api`` may legitimately run with ``auth=None`` for
+local development, and this service may not — the read path serves masked
+balances to a process that cannot mint a write token, and this one holds the
+write key and approves money movement. Making the unauthenticated
+configuration unrepresentable is cheaper than remembering not to deploy it.
+
+``app_assertion_audience`` has no default on purpose. A default would be a
+value an operator never typed, and the value that matters here is the one
+that must NOT collide with ``services/api/settings.py``'s ``audience``
+(``"postern"``, the customer tokens third-party AI clients present). If the
+two matched, a token good enough to read a balance would be good enough to
+approve a payment. Nothing in this process can check that — the other service
+is a different deployment with a different environment, and ``.importlinter``
+forbids reading its settings — so the requirement is stated in
+``services/confirm/auth.py``'s docstring and enforced only by an operator.
 """
 
 import os
@@ -45,6 +65,17 @@ class ConfirmSettings:
     database_connect_timeout_seconds: float = 2.0
     database_command_timeout_seconds: float = 3.0
     database_pool_timeout_seconds: float = 1.0
+    # Inbound app assertion (C-01, C-02). All three required; see the module
+    # docstring for why there is no audience default and why this service,
+    # unlike `services/api`, has no no-auth path at all.
+    app_assertion_jwks_uri: str | None = None
+    app_assertion_issuer: str | None = None
+    app_assertion_audience: str | None = None
+    # RFC 8628 §5.2: bound `user_code` guessing. Three tolerates a user
+    # mistyping the pairing code on the app's screen; the fourth failure
+    # revokes the device code outright, which forces a fresh QR and so
+    # re-anchors the human code comparison that is the actual A2 control.
+    user_code_max_attempts: int = 3
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -81,8 +112,41 @@ class ConfirmSettings:
             database_pool_timeout_seconds=float(
                 os.environ.get("POSTERN_DATABASE_POOL_TIMEOUT_SECONDS", "1.0")
             ),
+            app_assertion_jwks_uri=os.environ.get("POSTERN_APP_ASSERTION_JWKS_URI") or None,
+            app_assertion_issuer=os.environ.get("POSTERN_APP_ASSERTION_ISSUER") or None,
+            app_assertion_audience=os.environ.get("POSTERN_APP_ASSERTION_AUDIENCE") or None,
+            user_code_max_attempts=int(os.environ.get("POSTERN_USER_CODE_MAX_ATTEMPTS", "3")),
         )
 
     @classmethod
     def for_testing(cls) -> "ConfirmSettings":
-        return cls()
+        """Settings that build an app which authenticates NOBODY successfully.
+
+        The three ``app_assertion_*`` values point at
+        ``app.postern-local-dev.invalid``. RFC 2606 reserves ``.invalid``, so
+        the name cannot resolve and no request leaves the machine, and the
+        ``postern-local-dev.invalid`` suffix is the placeholder host this
+        repository already uses (``docker-compose.yml``), which is what keeps
+        ``tests/test_zt8_no_hardcoded_external_endpoints.py`` passing without
+        widening that gate's allowlist for a test fixture.
+
+        ``JWTVerifier`` does no network at construction — it fetches a JWKS
+        lazily, inside ``load_access_token`` — so the app builds, every route
+        that needs an assertion refuses every token, and that is the correct
+        default for a fixture.
+
+        This is deliberately NOT a generated key pair. Generating RSA material
+        per call would put a key generation in the path of every test that
+        merely wants an app object (``tests/test_ephemeral_key_warning.py``
+        builds one three times over), and it would make the default fixture
+        one that CAN authenticate somebody, which is the wrong direction for a
+        service whose finding was that it authenticated everybody. A test that
+        needs a working assertion passes ``assertion_verifier=`` to
+        ``create_confirm_app`` with a ``JWTVerifier(public_key=...)`` over an
+        ``RSAKeyPair.generate()``, mirroring ``auth_override`` on the api side.
+        """
+        return cls(
+            app_assertion_jwks_uri=("https://app.postern-local-dev.invalid/.well-known/jwks.json"),
+            app_assertion_issuer="https://app.postern-local-dev.invalid",
+            app_assertion_audience="postern-confirm",
+        )

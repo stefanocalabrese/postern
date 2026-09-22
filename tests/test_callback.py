@@ -5,12 +5,22 @@ with a mock ``starlette.requests.Request``, avoiding ASGI transport and real
 DB connections.
 
 Covers:
+- 401 when no verified app assertion is in scope (audit finding C-02): the
+  handler's own fail-closed backstop for the case where a caller reaches it
+  without ``AppAssertionMiddleware`` having run first — which is exactly how
+  this file invokes the handler.
+- 404 when a challenge belongs to a different customer than the verified
+  assertion, byte-identical to the "no such challenge" body (no ownership
+  oracle for ids that leak into the model's channel), including the ordering
+  guarantee that ownership is checked before the expiry branch that writes.
 - 400 when challenge_id is missing from path / signature from body.
 - 404 when challenge not found in DB.
 - 409 when challenge is already terminal (approved/executed/declined/expired).
 - 410 when challenge is expired (marks it as expired in DB via update_challenge_status).
 - 200 on successful approval + backend execution.
 - 207 on successful approval + backend execution failure (BackendWriteError).
+- The ``signature`` field is checked for PRESENCE only, never verified —
+  pinned explicitly so a real per-device check landing later breaks this test.
 - Verification result and confirming device passthrough.
 - JWT injection, PAN scrubbing, standing-orders path interpolation.
 - BackendWriteClient always closed (success and error paths).
@@ -19,6 +29,8 @@ Covers:
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,6 +41,7 @@ from postern_core.domain.verification import VerificationTier
 from postern_core.store.models import ChallengeRecord
 from starlette.requests import Request
 
+from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
 from services.confirm.callback import approve_challenge
 from services.confirm.execute import BackendWriteClient
 from services.confirm.settings import ConfirmSettings
@@ -50,6 +63,29 @@ def _resp_body(resp: Any) -> bytes:
     return body
 
 
+@contextmanager
+def _applied(patches: list[_Patcher]) -> Iterator[None]:
+    """Start every patch, guaranteeing ``stop()`` even when the body raises.
+
+    The previous shape in this file started every patch, ran the test body,
+    then stopped every patch, with none of it inside a ``try``/``finally``.
+    A single failing assertion mid-body skipped every ``stop()`` call and
+    left that patch active for the rest of the pytest session, corrupting
+    whichever test ran next. This wraps the same start-in-order,
+    stop-in-reverse-order shape in a ``finally`` so a raised assertion or
+    exception still unwinds every patch before propagating.
+    """
+    started: list[_Patcher] = []
+    try:
+        for p in patches:
+            p.start()
+            started.append(p)
+        yield
+    finally:
+        for p in reversed(started):
+            p.stop()
+
+
 # ---------------------------------------------------------------------------
 # Helpers — build a mock Request for approve_challenge.
 # ---------------------------------------------------------------------------
@@ -58,8 +94,23 @@ def _resp_body(resp: Any) -> bytes:
 def _make_request(
     challenge_id: str = "chal_abc123",
     body: dict[str, Any] | None = None,
+    subject: str | None = "cust_7f3a",
 ) -> Request:
-    """Build a Starlette ``Request`` with mock scope and receive."""
+    """Build a Starlette ``Request`` with mock scope and receive.
+
+    ``subject`` seeds ``scope["state"][ASSERTION_STATE_KEY]`` with a verified
+    ``AppAssertion``, which is what ``AppAssertionMiddleware`` would already
+    have done before the handler ran in the assembled app. Pass ``subject=None``
+    to build a request as if no middleware ever verified anything, which is
+    what every call site in this file did before the write-path
+    authentication fix (audit finding C-02) — the handler's own 401 backstop
+    is what must fire then.
+
+    Defaults to ``"cust_7f3a"``, the default ``customer_ref`` in
+    ``_pending_record``, so call sites that are not testing identity keep
+    exercising a caller who owns the challenge, same as before this
+    parameter existed.
+    """
     raw_body = json.dumps(body if body is not None else {"signature": "sig_xyz"}).encode()
 
     scope: dict[str, Any] = {
@@ -69,6 +120,9 @@ def _make_request(
         "raw_path": f"/challenges/{challenge_id}/approve".encode(),
         "headers": [],
     }
+
+    if subject is not None:
+        scope["state"] = {ASSERTION_STATE_KEY: AppAssertion(subject=subject, claims={})}
 
     # path_params comes from the routing layer.
     if challenge_id:
@@ -210,6 +264,105 @@ def _pending_record(
 
 
 # ---------------------------------------------------------------------------
+# 401 — no verified app assertion (audit finding C-02).
+# ---------------------------------------------------------------------------
+
+
+async def test_no_app_assertion_returns_401() -> None:
+    """No verified app assertion in scope → the handler's own fail-closed
+    backstop fires: 401, the uniform body shared with ``AppAssertionMiddleware``.
+
+    In the assembled app, ``AppAssertionMiddleware`` would already have
+    refused the request before routing. This file calls the handler
+    directly, which is exactly the invocation shape that bypasses the
+    middleware — precisely why this branch exists and must be covered.
+    """
+    req = _make_request(subject=None)
+    resp = await approve_challenge(req)
+
+    assert resp.status_code == 401
+    data = json.loads(_resp_body(resp).decode())
+    assert data == {
+        "error": "invalid_token",
+        "error_description": "a verified app assertion is required",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 404 — cross-customer challenge access (no ownership oracle).
+# ---------------------------------------------------------------------------
+
+
+async def test_cross_customer_approval_returns_404_matching_not_found_body() -> None:
+    """cust_bob approving cust_alice's challenge gets the byte-identical 404
+    body as a nonexistent challenge id.
+
+    A distinct 403 would be an existence oracle: challenge ids travel back
+    through the model's channel into a third-party vendor's chat history, so
+    anyone who got hold of one could otherwise learn whether it is real.
+    """
+    challenge_id = "chal_owned_by_alice"
+    owned_rec = _pending_record(challenge_id=challenge_id, customer_ref="cust_alice")
+
+    state_owned, patches_owned = _make_state(challenge_record=owned_rec)
+    with _applied(patches_owned):
+        req = _make_request(challenge_id=challenge_id, subject="cust_bob")
+        req.scope["app"] = type("FakeApp", (), {"state": state_owned})()
+        cross_customer_resp = await approve_challenge(req)
+
+    state_missing, patches_missing = _make_state(challenge_record=None)
+    with _applied(patches_missing):
+        req2 = _make_request(challenge_id=challenge_id, subject="cust_bob")
+        req2.scope["app"] = type("FakeApp", (), {"state": state_missing})()
+        not_found_resp = await approve_challenge(req2)
+
+    assert cross_customer_resp.status_code == 404
+    assert not_found_resp.status_code == 404
+    assert _resp_body(cross_customer_resp) == _resp_body(not_found_resp)
+    data = json.loads(_resp_body(cross_customer_resp).decode())
+    assert data == {
+        "error": "not_found",
+        "error_description": f"challenge {challenge_id} not found",
+    }
+
+
+async def test_cross_customer_approval_does_not_mutate_challenge_state() -> None:
+    """A stranger's approval attempt must not drive any state transition."""
+    rec = _pending_record(customer_ref="cust_alice")
+    update_status_calls: list[dict[str, Any]] = []
+
+    state, patches = _make_state(challenge_record=rec, update_status_calls=update_status_calls)
+    with _applied(patches):
+        req = _make_request(subject="cust_bob")
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
+
+    assert resp.status_code == 404
+    assert update_status_calls == []
+
+
+async def test_cross_customer_approval_on_expired_challenge_returns_404_not_mutating() -> None:
+    """Ownership is checked before expiry: a stranger gets 404, not the 410
+    that would write an "expired" status transition on someone else's
+    challenge.
+    """
+    rec = _pending_record(customer_ref="cust_alice")
+    rec.expires_at = datetime.now(UTC) - timedelta(minutes=5)
+    update_status_calls: list[dict[str, Any]] = []
+
+    state, patches = _make_state(challenge_record=rec, update_status_calls=update_status_calls)
+    with _applied(patches):
+        req = _make_request(subject="cust_bob")
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
+
+    assert resp.status_code == 404
+    data = json.loads(_resp_body(resp).decode())
+    assert data["error"] == "not_found"
+    assert update_status_calls == []
+
+
+# ---------------------------------------------------------------------------
 # 400 — invalid_request.
 # ---------------------------------------------------------------------------
 
@@ -217,15 +370,11 @@ def _pending_record(
 async def test_missing_challenge_id_returns_400() -> None:
     """No challenge_id in path → 400."""
     state, patches = _make_state()
-    for p in patches:
-        p.start()
 
     req = _make_request(challenge_id="")  # empty → no path_params in scope
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 400
     data = json.loads(_resp_body(resp).decode())
@@ -236,15 +385,11 @@ async def test_missing_signature_returns_400() -> None:
     """No signature in body → 400."""
     rec = _pending_record()
     state, patches = _make_state(challenge_record=rec)
-    for p in patches:
-        p.start()
 
     req = _make_request(challenge_id="chal_abc", body={})
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 400
     data = json.loads(_resp_body(resp).decode())
@@ -259,15 +404,11 @@ async def test_missing_signature_returns_400() -> None:
 async def test_challenge_not_found_returns_404() -> None:
     """get_challenge returns None → 404."""
     state, patches = _make_state(challenge_record=None)
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 404
     data = json.loads(_resp_body(resp).decode())
@@ -289,15 +430,11 @@ async def test_terminal_challenge_returns_409(status: str) -> None:
     rec.status = status
 
     state, patches = _make_state(challenge_record=rec)
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 409
     data = json.loads(_resp_body(resp).decode())
@@ -317,15 +454,11 @@ async def test_expired_challenge_returns_410_and_marks_expired() -> None:
     rec.expires_at = datetime.now(UTC) - timedelta(minutes=5)
 
     state, patches = _make_state(challenge_record=rec)
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 410
     data = json.loads(_resp_body(resp).decode())
@@ -347,15 +480,11 @@ async def test_successful_approval_and_execution() -> None:
         update_status_calls=update_status_calls,
         backend_response=httpx2.Response(201, json={"id": "pay_99"}),
     )
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 200
     data = json.loads(_resp_body(resp).decode())
@@ -379,15 +508,11 @@ async def test_approval_recorded_but_backend_execution_fails() -> None:
         update_status_calls=update_status_calls,
         backend_response=httpx2.Response(500, json={"detail": "internal server error"}),
     )
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 207
     data = json.loads(_resp_body(resp).decode())
@@ -411,15 +536,11 @@ async def test_approval_update_failure_returns_500() -> None:
     import services.confirm.callback as cb
 
     patches.append(patch.object(cb, "update_challenge_status", mock_update_raises))
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 500
     data = json.loads(_resp_body(resp).decode())
@@ -442,15 +563,11 @@ async def test_update_returns_none_returns_500() -> None:
     import services.confirm.callback as cb
 
     patches.append(patch.object(cb, "update_challenge_status", mock_update_none))
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 500
     data = json.loads(_resp_body(resp).decode())
@@ -467,15 +584,11 @@ async def test_unknown_tool_returns_500() -> None:
     rec = _pending_record(tool_name="nonexistent.tool")
 
     state, patches = _make_state(challenge_record=rec)
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 500
     data = json.loads(_resp_body(resp).decode())
@@ -497,15 +610,11 @@ async def test_verification_result_passed_to_update() -> None:
         update_status_calls=update_status_calls,
         backend_response=httpx2.Response(200, json={}),
     )
-    for p in patches:
-        p.start()
 
     req = _make_request(body={"signature": "sig", "verification_result": "vr_match_001"})
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 200
     # The update call should include the verification_result.
@@ -527,15 +636,11 @@ async def test_confirming_device_passed_to_update() -> None:
         update_status_calls=update_status_calls,
         backend_response=httpx2.Response(200, json={}),
     )
-    for p in patches:
-        p.start()
 
     req = _make_request(body={"signature": "sig", "confirming_device": "dev_ios_abc"})
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 200
     assert any(c.get("confirming_device") == "dev_ios_abc" for c in update_status_calls)
@@ -580,15 +685,11 @@ async def test_backend_write_receives_correct_jwt_claims() -> None:
         )
 
     patches.append(patch.object(BackendWriteClient, "__init__", patched_init))
-    for p in patches:
-        p.start()
 
-    req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    req = _make_request(subject="cust_special")
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 200
     # The stub minter produces "stub.write.{subject}.{audience}".
@@ -607,15 +708,11 @@ async def test_response_includes_challenge_id() -> None:
     state, patches = _make_state(
         challenge_record=rec, backend_response=httpx2.Response(200, json={})
     )
-    for p in patches:
-        p.start()
 
     req = _make_request(challenge_id="chal_unique_99")
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 200
     data = json.loads(_resp_body(resp).decode())
@@ -635,15 +732,11 @@ async def test_207_response_includes_backend_status() -> None:
         challenge_record=rec,
         backend_response=httpx2.Response(502, json={"detail": "bad gateway"}),
     )
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 207
     data = json.loads(_resp_body(resp).decode())
@@ -664,15 +757,11 @@ async def test_backend_error_detail_scrubs_pan() -> None:
         challenge_record=rec,
         backend_response=httpx2.Response(400, json={"detail": f"card {TEST_PAN} declined"}),
     )
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 207
     data = json.loads(_resp_body(resp).decode())
@@ -715,15 +804,11 @@ async def test_standing_orders_cancel_execution() -> None:
         )
 
     patches.append(patch.object(BackendWriteClient, "__init__", patched_init))
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 200
     assert seen_path == ["/standing-orders/so_99/cancel"]
@@ -742,15 +827,11 @@ async def test_missing_path_param_returns_500() -> None:
     )
 
     state, patches = _make_state(challenge_record=rec)
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 500
     data = json.loads(_resp_body(resp).decode())
@@ -781,15 +862,11 @@ async def test_backend_write_client_closed_on_success() -> None:
         await original_aclose(self)
 
     patches.append(patch.object(BackendWriteClient, "aclose", patched_aclose))
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 200
     assert closed
@@ -814,15 +891,11 @@ async def test_backend_write_client_closed_on_error() -> None:
         await original_aclose(self)
 
     patches.append(patch.object(BackendWriteClient, "aclose", patched_aclose))
-    for p in patches:
-        p.start()
 
     req = _make_request()
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 207
     assert closed
@@ -843,16 +916,40 @@ async def test_signature_passed_to_update() -> None:
         update_status_calls=update_status_calls,
         backend_response=httpx2.Response(200, json={}),
     )
-    for p in patches:
-        p.start()
 
     req = _make_request(body={"signature": "sig_device_42"})
-    req.scope["app"] = type("FakeApp", (), {"state": state})()
-    resp = await approve_challenge(req)
-
-    for p in reversed(patches):
-        p.stop()
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
 
     assert resp.status_code == 200
     # The first update call should include the signature.
     assert any(c.get("signature") == "sig_device_42" for c in update_status_calls)
+
+
+async def test_unverified_signature_junk_value_is_accepted_and_stored() -> None:
+    """Presence, not validity, is the whole check today: a junk string with no
+    relationship to any device key is accepted and stored verbatim.
+
+    ``services/confirm/callback``'s module docstring records why there is no
+    real check — no device public-key registry, no enrolment flow, no
+    key-rotation story, and none of those are this repository's to invent.
+    When a real per-device signature check lands, this test must fail and
+    force an update here, not silently keep passing.
+    """
+    rec = _pending_record()
+    update_status_calls: list[dict[str, Any]] = []
+
+    state, patches = _make_state(
+        challenge_record=rec,
+        update_status_calls=update_status_calls,
+        backend_response=httpx2.Response(200, json={}),
+    )
+
+    req = _make_request(body={"signature": "not-a-real-signature"})
+    with _applied(patches):
+        req.scope["app"] = type("FakeApp", (), {"state": state})()
+        resp = await approve_challenge(req)
+
+    assert resp.status_code == 200
+    assert update_status_calls[0]["signature"] == "not-a-real-signature"

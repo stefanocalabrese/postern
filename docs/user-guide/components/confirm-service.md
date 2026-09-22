@@ -37,19 +37,37 @@ Production starts the process with: `uvicorn services.confirm.main:app`.
 
 ### Startup sequence
 
-1. **Write key source**, reads `POSTERN_WRITE_KEY_PEM_PATH` or generates ephemeral
-2. **Write minter**, `build_write_minter()` wraps the write key for token minting
-3. **Read key source**, reads `POSTERN_READ_KEY_PEM_PATH` (needed for device grant)
-4. **Read minter**, `InternalTokenMinter` with read key (device grant exception)
-5. **Device code store**, in-memory (dev) or Redis (production) via `create_device_code_store()`
-6. **Database**, async SQLAlchemy engine for challenges table
+1. **Assertion verifier**, a `JWTVerifier` over `POSTERN_APP_ASSERTION_JWKS_URI`,
+   `POSTERN_APP_ASSERTION_ISSUER` and `POSTERN_APP_ASSERTION_AUDIENCE`
+2. **Write key source**, reads `POSTERN_WRITE_KEY_PEM_PATH` or generates ephemeral
+3. **Write minter**, `build_write_minter()` wraps the write key for token minting
+4. **Read key source**, reads `POSTERN_READ_KEY_PEM_PATH` (needed for device grant)
+5. **Read minter**, `InternalTokenMinter` with read key (device grant exception)
+6. **Device code store**, in-memory (dev) or Redis (production) via `create_device_code_store()`
+7. **Database**, async SQLAlchemy engine for challenges table
+
+Step 1 **raises `ValueError` and the process does not start** if any of the three
+is unset. Unlike the API service, which may run with `auth=None` for local
+development, this service has no unauthenticated mode: it holds the write
+signing key and its endpoints approve money movement. See
+[`services/confirm/auth.py`](../../../services/confirm/auth.py).
+
+`POSTERN_APP_ASSERTION_AUDIENCE` must **not** equal the API service's
+`POSTERN_AUDIENCE`. If both services accepted one audience from one issuer, a
+customer token good enough to read a balance would be good enough to approve a
+payment. Neither process can detect the collision, so it is an operator
+requirement.
 
 ### Key split exception
 
 The confirm service holds **both** read and write keys. This is a deliberate, documented
-exception: the device grant flow mints both read and write tokens atomically when a user
-approves pairing on their mobile device. No other code path hands one process both keys
-for general use, the separation is preserved at startup.
+exception: the device grant needs the read key to mint the browser's access token. No
+other code path hands one process both keys for general use, the separation is preserved
+at startup.
+
+The device grant does **not** touch the write key. `/token` used to return a
+write-scoped token alongside the read one; that was audit finding C-01 and it is
+gone, so `device_auth_routes()` is no longer passed a write minter at all.
 
 ## Device Authorization (`services/confirm/device_auth.py`)
 
@@ -57,11 +75,18 @@ Implements RFC 8628 Device Authorization Grant with QR pairing codes.
 
 ### Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/device_authorization` | Generate device code + user_code (pairing code) |
-| `POST` | `/token` | Exchange device code for tokens (polling; returns error until approved) |
-| `POST` | `/approve` | Mobile app approval callback (signed approval) |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/device_authorization` | public | Generate device code + user_code (pairing code) |
+| `POST` | `/token` | public | Exchange device code for a read token (polling; error until approved) |
+| `POST` | `/approve` | **app assertion** | Banking app approval callback |
+
+`/device_authorization` and `/token` are public because the caller is the
+**browser**, which holds no credential — that is the premise of RFC 8628, not an
+oversight. The `device_code` (43 characters from `secrets.token_urlsafe(32)`) is
+the authority at `/token`. Both are listed in `PUBLIC_PATHS` in
+[`services/confirm/auth.py`](../../../services/confirm/auth.py); every other
+route on this service is denied by default.
 
 ### Flow
 
@@ -72,13 +97,22 @@ Implements RFC 8628 Device Authorization Grant with QR pairing codes.
 2. QR code encodes: verification_uri + user_code
    User scans with mobile app → bank app shows pairing code
 
-3. Mobile app → POST /approve (signed approval with customer_ref)
+3. Mobile app → POST /approve
+     Authorization: Bearer <assertion from the operator's app backend>
+     { "device_code": "...", "user_code": "ABC-DEF" }
    ← 200 OK
+   The customer is the assertion's verified `sub`. There is NO body field
+   naming the customer; `user_code` is required and compared in constant time.
 
 4. Browser → POST /token (grant_type=device_code, device_code=...)
-   ← 401 authorization_pending (until approved)
-   ← 200 { access_token, refresh_token } (after approval)
+   ← 400 authorization_pending (until approved)
+   ← 200 { access_token, token_type, expires_in } (after approval)
 ```
+
+`/approve` returns **401** for a missing or unverifiable assertion, **403** if the
+assertion's `sub` is not a `cust_...` reference, and **400** `invalid_user_code`
+for a wrong pairing code. Three wrong pairing codes revoke the device code
+(`POSTERN_USER_CODE_MAX_ATTEMPTS`, default 3) per RFC 8628 §5.2.
 
 ### Device Code Model (`packages/postern-core/src/postern_core/auth/device_codes.py`)
 
@@ -90,11 +124,18 @@ class DeviceCode:
     verification_uri: str     # URI for mobile deep-linking
     expires_at: datetime      # UTC expiry (default 900s = 15 min)
     interval: int             # Seconds between token polls (default 5)
-    client_id: str            # OAuth client ID → reused for customer_ref after approval
+    client_id: str            # OAuth client ID, caller-supplied, NEVER an identity
     scopes: str               # Space-separated scope list
     approved: bool            # Whether mobile app has approved
     approved_at: datetime | None  # Approval timestamp
+    customer_ref: str         # Verified assertion `sub`, empty until approved
+    user_code_attempts: int   # Failed pairing-code comparisons at /approve
 ```
+
+`customer_ref` used to be `client_id`, reused for two purposes. That overload was
+the enabling half of audit finding C-01: `/token` minted from a field the caller
+of `/device_authorization` had populated. They are separate fields now, and
+`/token` reads `customer_ref`, which only a verified approval ever writes.
 
 The `user_code` uses an ambiguous-character-free alphabet:
 `23456789ABCDEFGHJKLMNPQRSTUVWXYZ` (no I, L, O, 0, 1 to prevent confusion).
@@ -114,9 +155,9 @@ Handles verification challenge approvals for write operations (payments, card wr
 
 ### Endpoint
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/challenges/{challenge_id}/approve` | Signed approval for a verification challenge |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/challenges/{challenge_id}/approve` | **app assertion** | Approve a verification challenge |
 
 ### Flow
 
@@ -128,11 +169,25 @@ Handles verification challenge approvals for write operations (payments, card wr
    Mobile app → POST /challenges/{challenge_id}/approve (signed)
 
 3. Callback handler:
-   a. Looks up challenge by ID
-   b. Validates state (must be "pending" + not expired)
-   c. Marks challenge as "approved" in Postgres
-   d. Executes backend write endpoint server-side (POST to payments.svc)
-   e. Marks challenge as "executed"
+   a. Verifies the app assertion; the customer is its `sub` (401 if absent/invalid)
+   b. Looks up challenge by ID
+   c. Rejects with 404 unless `challenge.customer_ref` equals that `sub`
+   d. Validates state (must be "pending" + not expired)
+   e. Marks challenge as "approved" in Postgres
+   f. Executes backend write endpoint server-side (POST to payments.svc)
+   g. Marks challenge as "executed"
+
+Step (c) returns the **same 404 body** as an unknown challenge id, deliberately:
+a distinct 403 would be an existence oracle for ids that travel back through the
+model's channel into a third-party AI vendor's chat history. It runs before the
+expiry branch, which writes, so a stranger cannot drive a state transition on
+another customer's challenge.
+
+The `signature` body field is **recorded, never verified** — presence is the whole
+check. Verifying it needs a per-customer device public-key registry, which this
+repository does not have. The local variable is named `unverified_signature` at
+every use site, and `services/confirm/callback.py`'s module docstring states the
+residual risk and what would close it.
 
 4. Agent polls GET /challenges/{challenge_id}/status
    ← returns challenge status (pending/approved/executed/declined/expired)

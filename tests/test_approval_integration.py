@@ -5,10 +5,18 @@ Exercises the full path: ``create_confirm_app`` → real Postgres (testcontainer
 transport → DB state verification.
 
 Covers:
+- 401 with no bearer assertion, and that an unauthenticated call changes
+  nothing in the database (audit finding C-02, the vulnerability this test
+  module exists to pin dead).
+- 404 when the challenge belongs to a different customer than the verified
+  assertion names, including the expired-and-cross-customer case, and that
+  neither leaves a state change or a backend call behind.
 - 200 on successful approval + backend execution (mocked transport).
 - 409 when challenge is already terminal.
-- 410 when challenge is expired.
+- 410 when challenge is expired for its own owner.
 - Challenge state transitions in the database.
+- ``create_confirm_app`` refuses to build at all without inbound
+  authentication configured.
 """
 
 import json
@@ -18,14 +26,23 @@ from unittest.mock import patch
 
 import httpx2
 import pytest
+from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from postern_core.domain.verification import VerificationTier
 from postern_core.store import challenges as store
 from postern_core.store.engine import Database
 from starlette.applications import Starlette
 
+from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+
+# ---------------------------------------------------------------------------
+# App-assertion fixture constants (audit findings C-01, C-02).
+# ---------------------------------------------------------------------------
+
+ISSUER = "https://app.test.invalid"
+AUDIENCE = "postern-confirm"
 
 # ---------------------------------------------------------------------------
 # Fixtures.
@@ -77,7 +94,14 @@ def pg_url() -> Generator[str]:
 
 @pytest.fixture()
 def settings(pg_url: str) -> ConfirmSettings:
-    """ConfirmSettings wired to the test database."""
+    """ConfirmSettings wired to the test database.
+
+    Deliberately leaves the three ``app_assertion_*`` fields at their
+    ``None`` default: every test that builds a working app passes
+    ``assertion_verifier=`` explicitly (see the ``app`` fixture below), and
+    ``test_create_confirm_app_raises_without_app_assertion_settings`` relies
+    on this fixture staying incomplete to exercise the refusal-to-start path.
+    """
     return ConfirmSettings(
         backend_base_url="https://backend.test",  # mocked transport
         database_url=pg_url,
@@ -130,10 +154,29 @@ async def session(db: Database) -> AsyncGenerator[Any, None]:
             await cleanup.commit()
 
 
+@pytest.fixture(scope="module")
+def key_pair() -> RSAKeyPair:
+    """RSA key pair backing the app-assertion bearer tokens.
+
+    Module-scoped: RSA generation is slow and nothing about it is
+    test-specific, matching the ``pg_url`` fixture's scope reasoning.
+    """
+    return RSAKeyPair.generate()
+
+
 @pytest.fixture()
-def app(settings: ConfirmSettings) -> Starlette:
-    """Full confirm service app wired to the test database."""
-    return create_confirm_app(settings)
+def app(settings: ConfirmSettings, key_pair: RSAKeyPair) -> Starlette:
+    """Full confirm service app wired to the test database and a real verifier.
+
+    Passes ``assertion_verifier=`` explicitly rather than setting the three
+    ``app_assertion_*`` fields on ``settings``: this needs no JWKS server, a
+    ``JWTVerifier(public_key=...)`` over ``key_pair`` checks tokens signed by
+    the same in-process key, matching the pattern
+    ``services/confirm/main.py::create_confirm_app``'s own docstring
+    prescribes for tests.
+    """
+    verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
+    return create_confirm_app(settings, assertion_verifier=verifier)
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +196,11 @@ def _mock_backend_transport() -> Generator[None]:
     "the backend is unreachable" the way it is handled in production — a
     real response, just a bad one — the same pattern
     ``tests/test_callback.py`` already uses for the same client.
+
+    Tests that must prove the backend was never called (the cross-customer
+    cases) install their own narrower patch inside the test body — that
+    inner ``patch.object`` nests correctly over this outer one and is
+    restored to it on exit, per ``unittest.mock``'s own stacking behaviour.
     """
 
     def _unreachable_backend(request: httpx2.Request) -> httpx2.Response:
@@ -177,12 +225,23 @@ def _mock_backend_transport() -> Generator[None]:
 # ---------------------------------------------------------------------------
 
 
-async def post(app: Starlette, path: str, body: dict[str, Any]) -> httpx2.Response:
+def bearer(key_pair: RSAKeyPair, subject: str) -> dict[str, str]:
+    """A verified-assertion ``Authorization`` header for ``subject``."""
+    token = key_pair.create_token(subject=subject, issuer=ISSUER, audience=AUDIENCE)
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def post(
+    app: Starlette,
+    path: str,
+    body: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> httpx2.Response:
     """POST to the ASGI app."""
     async with httpx2.AsyncClient(
         transport=httpx2.ASGITransport(app=app), base_url="http://t"
     ) as c:
-        return await c.post(path, json=body)
+        return await c.post(path, json=body, headers=headers)
 
 
 async def _insert_pending_challenge(
@@ -190,6 +249,7 @@ async def _insert_pending_challenge(
     challenge_id: str = "chal_int_001",
     tool_name: str = "payments.create_payment",
     payload: dict[str, Any] | None = None,
+    customer_ref: str = "cust_7f3a",
 ) -> None:
     """Insert a pending challenge into the test database.
 
@@ -201,7 +261,7 @@ async def _insert_pending_challenge(
     await store.create_challenge(
         session,
         challenge_id=challenge_id,
-        customer_ref="cust_7f3a",
+        customer_ref=customer_ref,
         tool_name=tool_name,
         payload=payload or {"amount": "EUR 340.00"},
         tier=VerificationTier.APP_APPROVAL,
@@ -217,18 +277,21 @@ async def _insert_pending_challenge(
 async def test_successful_approval_and_execution(
     app: Starlette,
     session: Any,
+    key_pair: RSAKeyPair,
 ) -> None:
     """Full happy path: insert challenge → approve → execute → status=executed."""
     # 1. Insert a pending challenge.
     await _insert_pending_challenge(session, challenge_id="chal_int_001")
 
-    # 2. POST the approval (backend will be called, but we mock via transport).
+    # 2. POST the approval, authenticated as the challenge's own customer.
+    #    (Backend will be called, but we mock via transport.)
     resp = await post(
         app,
         "/challenges/chal_int_001/approve",
         {
             "signature": "sig_mobile_app_xyz",
         },
+        headers=bearer(key_pair, "cust_7f3a"),
     )
 
     # 3. The backend call will fail (no real backend), so we get 207.
@@ -238,18 +301,19 @@ async def test_successful_approval_and_execution(
     assert data["status"] == "approved"
 
     # 4. Verify the challenge is approved in the database.
-    async with httpx2.AsyncClient(  # noqa: F841
-        transport=httpx2.ASGITransport(app=app), base_url="http://t"
-    ) as _:
-        pass  # noqa: F841
+    row = await store.get_challenge(session, "chal_int_001")
+    assert row is not None
+    assert row.status == "approved"
 
 
 async def test_approval_of_already_approved_challenge_returns_409(
     app: Starlette,
     session: Any,
+    key_pair: RSAKeyPair,
 ) -> None:
     """Challenge already approved → 409."""
     await _insert_pending_challenge(session, challenge_id="chal_int_002")
+    auth = bearer(key_pair, "cust_7f3a")
 
     # First approval succeeds (returns 207 due to no backend).
     resp1 = await post(
@@ -258,6 +322,7 @@ async def test_approval_of_already_approved_challenge_returns_409(
         {
             "signature": "sig_first",
         },
+        headers=auth,
     )
     assert resp1.status_code == 207
 
@@ -268,6 +333,7 @@ async def test_approval_of_already_approved_challenge_returns_409(
         {
             "signature": "sig_second",
         },
+        headers=auth,
     )
     assert resp2.status_code == 409
     data = json.loads(resp2.content.decode())
@@ -277,8 +343,9 @@ async def test_approval_of_already_approved_challenge_returns_409(
 async def test_expired_challenge_returns_410(
     app: Starlette,
     session: Any,
+    key_pair: RSAKeyPair,
 ) -> None:
-    """Expired challenge → 410."""
+    """Expired challenge → 410, for its own owner."""
     # Insert a challenge, then manually set expires_at to the past.
     from sqlalchemy import text
 
@@ -307,6 +374,7 @@ async def test_expired_challenge_returns_410(
         {
             "signature": "sig_xyz",
         },
+        headers=bearer(key_pair, "cust_7f3a"),
     )
 
     assert resp.status_code == 410
@@ -330,6 +398,12 @@ async def test_missing_challenge_id_returns_400(
     same here, wired to the real ``app`` this module builds, so this is
     still a case for the handler's defensive check rather than one that can
     never fire behind the real route.
+
+    Calling the handler directly also bypasses ``AppAssertionMiddleware``
+    entirely, so the scope's ``state`` is seeded with a verified
+    ``AppAssertion`` by hand — otherwise ``verified_subject`` would return
+    ``None`` and the handler would 401 before ever reaching the path check
+    this test exists to pin.
     """
     from starlette.requests import Request
 
@@ -347,6 +421,7 @@ async def test_missing_challenge_id_returns_400(
         "raw_path": b"/challenges//approve",
         "headers": [],
         "path_params": {},
+        "state": {ASSERTION_STATE_KEY: AppAssertion(subject="cust_7f3a", claims={})},
         "app": app,
     }
     request = Request(scope)
@@ -361,9 +436,15 @@ async def test_missing_challenge_id_returns_400(
 
 async def test_missing_signature_returns_400(
     app: Starlette,
+    key_pair: RSAKeyPair,
 ) -> None:
     """No signature in body → 400."""
-    resp = await post(app, "/challenges/chal_int_003/approve", {})
+    resp = await post(
+        app,
+        "/challenges/chal_int_003/approve",
+        {},
+        headers=bearer(key_pair, "cust_7f3a"),
+    )
     assert resp.status_code == 400
     data = json.loads(resp.content.decode())
     assert data["error"] == "invalid_request"
@@ -371,6 +452,7 @@ async def test_missing_signature_returns_400(
 
 async def test_challenge_not_found_returns_404(
     app: Starlette,
+    key_pair: RSAKeyPair,
 ) -> None:
     """Non-existent challenge → 404."""
     resp = await post(
@@ -379,6 +461,7 @@ async def test_challenge_not_found_returns_404(
         {
             "signature": "sig_xyz",
         },
+        headers=bearer(key_pair, "cust_7f3a"),
     )
     assert resp.status_code == 404
     data = json.loads(resp.content.decode())
@@ -388,6 +471,7 @@ async def test_challenge_not_found_returns_404(
 async def test_verification_result_passed_through(
     app: Starlette,
     session: Any,
+    key_pair: RSAKeyPair,
 ) -> None:
     """verification_result in body is recorded on the challenge."""
     await _insert_pending_challenge(session, challenge_id="chal_int_vr")
@@ -399,6 +483,7 @@ async def test_verification_result_passed_through(
             "signature": "sig_xyz",
             "verification_result": "vr_selfie_match_001",
         },
+        headers=bearer(key_pair, "cust_7f3a"),
     )
 
     assert resp.status_code == 207  # backend not available, but approval recorded.
@@ -406,15 +491,15 @@ async def test_verification_result_passed_through(
     assert data["status"] == "approved"
 
     # Verify the verification_result was stored.
-    async with httpx2.AsyncClient(  # noqa: F841
-        transport=httpx2.ASGITransport(app=app), base_url="http://t"
-    ) as _:
-        pass  # noqa: F841
+    row = await store.get_challenge(session, "chal_int_vr")
+    assert row is not None
+    assert row.verification_result == "vr_selfie_match_001"
 
 
 async def test_confirming_device_passed_through(
     app: Starlette,
     session: Any,
+    key_pair: RSAKeyPair,
 ) -> None:
     """confirming_device in body is recorded on the challenge."""
     await _insert_pending_challenge(session, challenge_id="chal_int_dev")
@@ -426,6 +511,7 @@ async def test_confirming_device_passed_through(
             "signature": "sig_xyz",
             "confirming_device": "device_abc123",
         },
+        headers=bearer(key_pair, "cust_7f3a"),
     )
 
     assert resp.status_code == 207
@@ -436,6 +522,7 @@ async def test_confirming_device_passed_through(
 async def test_backend_write_error_returns_207(
     app: Starlette,
     session: Any,
+    key_pair: RSAKeyPair,
 ) -> None:
     """Backend execution failure → 207 with backend_status."""
     await _insert_pending_challenge(session, challenge_id="chal_int_be")
@@ -446,6 +533,7 @@ async def test_backend_write_error_returns_207(
         {
             "signature": "sig_xyz",
         },
+        headers=bearer(key_pair, "cust_7f3a"),
     )
 
     # Backend is not available, so we get 207.
@@ -458,6 +546,7 @@ async def test_backend_write_error_returns_207(
 async def test_standing_orders_cancel_path(
     app: Starlette,
     session: Any,
+    key_pair: RSAKeyPair,
 ) -> None:
     """Standing orders cancel uses correct path interpolation."""
     await _insert_pending_challenge(
@@ -473,6 +562,166 @@ async def test_standing_orders_cancel_path(
         {
             "signature": "sig_xyz",
         },
+        headers=bearer(key_pair, "cust_7f3a"),
     )
 
     assert resp.status_code == 207  # backend not available.
+
+
+# ---------------------------------------------------------------------------
+# Inbound authentication (audit findings C-01, C-02).
+#
+# These are the integration-level proof that the finding is dead: possession
+# of a challenge id alone — no assertion, or an assertion for the wrong
+# customer — must not move a challenge out of "pending", and must not reach
+# the backend write client at all.
+# ---------------------------------------------------------------------------
+
+
+async def test_approve_without_bearer_returns_401_and_challenge_unchanged(
+    app: Starlette,
+    session: Any,
+) -> None:
+    """No Authorization header at all → 401, and the row is untouched.
+
+    This is the case the audit finding was about: before
+    ``AppAssertionMiddleware`` existed, this exact request — a bare POST
+    naming a real, pending challenge id — was sufficient to approve it.
+    """
+    await _insert_pending_challenge(session, challenge_id="chal_int_noauth")
+
+    resp = await post(
+        app,
+        "/challenges/chal_int_noauth/approve",
+        {
+            "signature": "sig_xyz",
+        },
+        headers=None,
+    )
+
+    assert resp.status_code == 401
+    data = json.loads(resp.content.decode())
+    assert data["error"] == "invalid_token"
+
+    row = await store.get_challenge(session, "chal_int_noauth")
+    assert row is not None
+    assert row.status == "pending"
+
+
+async def test_cross_customer_approval_returns_404_and_challenge_unchanged(
+    app: Starlette,
+    session: Any,
+    key_pair: RSAKeyPair,
+) -> None:
+    """A verified assertion for the wrong customer → 404, no state change.
+
+    Same body as "no such challenge" (``callback.py``'s own reasoning: a
+    distinct 403 would let a caller learn whether an id exists at all, and
+    challenge ids travel through the model's channel into a third party's
+    chat history). Also asserts the backend write client is never reached —
+    a stranger's request must not just fail to *record* an approval, it must
+    not attempt to *execute* anything either.
+    """
+    await _insert_pending_challenge(
+        session, challenge_id="chal_int_xcust", customer_ref="cust_alice"
+    )
+
+    backend_calls: list[httpx2.Request] = []
+
+    def _record(request: httpx2.Request) -> httpx2.Response:
+        backend_calls.append(request)
+        return httpx2.Response(200, json={"detail": "should never be reached"})
+
+    original_init = BackendWriteClient.__init__
+
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, transport=httpx2.MockTransport(_record), **kwargs)
+
+    with patch.object(BackendWriteClient, "__init__", patched_init):
+        resp = await post(
+            app,
+            "/challenges/chal_int_xcust/approve",
+            {
+                "signature": "sig_xyz",
+            },
+            headers=bearer(key_pair, "cust_bob"),
+        )
+
+    assert resp.status_code == 404
+    data = json.loads(resp.content.decode())
+    assert data["error"] == "not_found"
+    assert backend_calls == []
+
+    row = await store.get_challenge(session, "chal_int_xcust")
+    assert row is not None
+    assert row.status == "pending"
+
+
+async def test_expired_challenge_owned_by_another_customer_returns_404_not_expired(
+    app: Starlette,
+    session: Any,
+    key_pair: RSAKeyPair,
+) -> None:
+    """Expired challenge, wrong customer → 404, and the row stays "pending".
+
+    Pins that ownership is checked before the expiry branch, which writes
+    ``status="expired"``. A stranger must not be able to drive that state
+    transition on someone else's challenge merely by knowing its id and
+    presenting a valid assertion for an unrelated account.
+    """
+    from sqlalchemy import text
+
+    await store.create_challenge(
+        session,
+        challenge_id="chal_int_xcust_expired",
+        customer_ref="cust_alice",
+        tool_name="payments.create_payment",
+        payload={"amount": "EUR 10.00"},
+        tier=VerificationTier.APP_APPROVAL,
+    )
+    await session.execute(
+        text(
+            "UPDATE challenges SET expires_at = created_at - INTERVAL '1 hour' "
+            "WHERE challenge_id = :cid",
+        ),
+        {"cid": "chal_int_xcust_expired"},
+    )
+    await session.commit()
+
+    resp = await post(
+        app,
+        "/challenges/chal_int_xcust_expired/approve",
+        {
+            "signature": "sig_xyz",
+        },
+        headers=bearer(key_pair, "cust_bob"),
+    )
+
+    assert resp.status_code == 404
+    data = json.loads(resp.content.decode())
+    assert data["error"] == "not_found"
+
+    row = await store.get_challenge(session, "chal_int_xcust_expired")
+    assert row is not None
+    assert row.status == "pending"
+
+
+def test_create_confirm_app_raises_without_app_assertion_settings(
+    settings: ConfirmSettings,
+) -> None:
+    """No verifier, incomplete app_assertion_* settings → ValueError.
+
+    Pins "an unauthenticated confirm service is unreachable by construction"
+    (``services/confirm/main.py::_assertion_verifier``'s own docstring): the
+    ``settings`` fixture deliberately leaves the three ``app_assertion_*``
+    fields at their ``None`` default, and no ``assertion_verifier=`` is
+    passed, so this must fail before the app is built at all — before any
+    route, any minter and any database connection exists.
+    """
+    with pytest.raises(ValueError) as exc_info:
+        create_confirm_app(settings)
+
+    message = str(exc_info.value)
+    assert "app_assertion_jwks_uri" in message
+    assert "app_assertion_issuer" in message
+    assert "app_assertion_audience" in message

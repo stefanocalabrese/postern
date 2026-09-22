@@ -145,6 +145,13 @@ def test_the_confirm_composition_root_is_silent_when_a_real_pem_is_configured(
     settings = ConfirmSettings(
         write_key_pem_path=_private_pem(tmp_path, "write.pem", "write-1"),
         read_key_pem_path=_private_pem(tmp_path, "read.pem", "read-1"),
+        # Required since the confirm service gained inbound authentication:
+        # `create_confirm_app` refuses to build without all three (there is no
+        # unauthenticated mode on the write path). This test is about signing
+        # keys, so the values only have to be present and unreachable.
+        app_assertion_jwks_uri="https://app.postern.invalid/.well-known/jwks.json",
+        app_assertion_issuer="https://app.postern.invalid",
+        app_assertion_audience="postern-confirm",
     )
     assert [
         m for m in _ephemeral_warnings(lambda: create_confirm_app(settings)) if MARKER in m

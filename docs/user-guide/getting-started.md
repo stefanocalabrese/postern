@@ -76,6 +76,10 @@ The table below lists every variable, grouped by service.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
+| `POSTERN_APP_ASSERTION_JWKS_URI` | **Yes** | - | JWKS of the operator's banking-app backend, used to verify inbound assertions |
+| `POSTERN_APP_ASSERTION_ISSUER` | **Yes** | - | Expected `iss` on inbound app assertions |
+| `POSTERN_APP_ASSERTION_AUDIENCE` | **Yes** | - | Expected `aud` on inbound app assertions. Must **not** equal the API service's `POSTERN_AUDIENCE` |
+| `POSTERN_USER_CODE_MAX_ATTEMPTS` | No | `3` | Wrong pairing codes at `/approve` before the device code is revoked (RFC 8628 §5.2) |
 | `POSTERN_WRITE_KEY_PEM_PATH` | No | - | Path to the PEM file for signing internal write tokens |
 | `POSTERN_WRITE_KEY_KID` | No | `write-1` | Key ID published in the write JWKS |
 | `POSTERN_WRITE_TOKEN_ISSUER` | No | `https://mcp-write.internal` | `iss` claim on internal write tokens |
@@ -90,6 +94,18 @@ The table below lists every variable, grouped by service.
 | `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Database connection timeout (seconds) |
 | `POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS` | No | `3.0` | Database statement timeout (seconds) |
 | `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds) |
+
+The three `POSTERN_APP_ASSERTION_*` variables are the only **required** settings on
+either service. `create_confirm_app()` raises `ValueError` and the process does not
+start without all three. The API service may run with no authentication for local
+development; the confirm service may not, because it holds the write signing key and
+its endpoints approve money movement.
+
+Setting `POSTERN_APP_ASSERTION_AUDIENCE` to the same value as the API service's
+`POSTERN_AUDIENCE` would mean a customer token good enough to list a balance is also
+good enough to approve a payment. Neither process can detect that — they are separate
+deployments reading separate environments — so keeping them distinct is an operator
+requirement, not something a gate here will catch.
 
 ### Environment variable conventions
 
@@ -141,9 +157,16 @@ uv run pytest -m "not db"       # skip database-backed tests (no Docker needed)
 # API service (read path)
 uv run uvicorn services.api.main:app --reload --port 8080
 
-# Confirm service (write path)
-uv run uvicorn services.confirm.main:app --reload --port 8082
+# Confirm service (write path) — the three assertion variables are REQUIRED;
+# without them the process exits at startup instead of serving unauthenticated.
+POSTERN_APP_ASSERTION_JWKS_URI=http://localhost:8081/.well-known/jwks.json \
+POSTERN_APP_ASSERTION_ISSUER=https://postern-local-dev.invalid \
+POSTERN_APP_ASSERTION_AUDIENCE=postern-confirm \
+  uv run uvicorn services.confirm.main:app --reload --port 8082
 ```
+
+`docker compose up` sets all three for the `confirm` container already; only the
+bare `uvicorn` invocation above needs them spelled out.
 
 ## Production Deployment
 

@@ -11,13 +11,20 @@ Today this process does three things:
    module never imports ``services.api``, and nothing in ``services.api`` can
    reach the key this module holds.
 2. Handle RFC 8628 device authorization (§7.3 of the handoff): generate
-   device codes, accept mobile app approvals, and exchange device codes for
-   read + write tokens. The confirm service needs both read and write keys
-   here because device code exchange mints both token types atomically — a
-   controlled exception to the key-split architecture.
-3. Handle verification challenge approvals (§6.3, §8.3): receive signed
-   approvals from the mobile app, mark challenges approved in Postgres, and
-   execute backend write endpoints server-side.
+   device codes, accept banking app approvals, and exchange device codes for
+   a read token. The read key here is a controlled exception to the key-split
+   architecture; the write key is NOT used on this path at all since audit
+   finding C-01 removed the write token from the ``/token`` response.
+3. Handle verification challenge approvals (§6.3, §8.3): receive approvals
+   from the banking app, mark challenges approved in Postgres, and execute
+   backend write endpoints server-side.
+
+Everything except ``/.well-known/jwks.json``, ``/device_authorization`` and
+``/token`` requires a verified banking-app assertion. ``services/confirm/auth.py``
+holds that middleware, the reasoning for each public path, and the audience
+requirement an operator owns. Until 2026-09-22 this app was built as
+``Starlette(routes=routes)`` with no ``middleware=`` argument at all and
+authenticated nobody on any route.
 
 The device authorization endpoints are:
 - ``POST /device_authorization`` — Generate device code + QR pairing data.
@@ -33,13 +40,16 @@ See ``services.confirm.device_auth`` for device auth endpoint implementations
 and ``services.confirm.callback`` for the challenge approval handler.
 """
 
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.auth.device_codes import create_device_code_store
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource, warn_ephemeral_signing_key
 from postern_core.store.engine import Database
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.routing import Route
 
+from services.confirm.auth import AppAssertionMiddleware, AssertionVerifier
 from services.confirm.callback import callback_routes
 from services.confirm.device_auth import device_auth_routes
 from services.confirm.jwks import jwks_route
@@ -47,17 +57,82 @@ from services.confirm.minter import build_write_minter
 from services.confirm.settings import ConfirmSettings
 
 
-def create_confirm_app(settings: ConfirmSettings | None = None) -> Starlette:
+def _assertion_verifier(settings: ConfirmSettings) -> AssertionVerifier:
+    """The verifier for inbound banking-app assertions, or refuse to start.
+
+    ``services/api/server.py`` guards the same shape and stops one step
+    short of this: exactly one of its ``customer_jwks_uri`` /
+    ``customer_token_issuer`` pair set is a typo and raises, but NEITHER set
+    is a documented no-auth path that returns ``auth=None``, because that
+    service must still run under ``docker compose`` with no identity provider
+    to serve masked reads.
+
+    This service has no such path and must not grow one. It holds the WRITE
+    signing key and its endpoints approve money movement, so "started with no
+    authentication" is not a mode worth supporting for convenience -- it is
+    the audit finding. All three settings are therefore required, and an
+    incomplete configuration fails at startup rather than serving.
+    ``ConfirmSettings.for_testing()`` supplies three ``.invalid`` values,
+    which build a verifier that refuses every token.
+    """
+    missing = [
+        name
+        for name, value in (
+            ("app_assertion_jwks_uri", settings.app_assertion_jwks_uri),
+            ("app_assertion_issuer", settings.app_assertion_issuer),
+            ("app_assertion_audience", settings.app_assertion_audience),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            "the confirm service cannot start without inbound authentication: "
+            f"{', '.join(missing)} must be set "
+            "(POSTERN_APP_ASSERTION_JWKS_URI, POSTERN_APP_ASSERTION_ISSUER, "
+            "POSTERN_APP_ASSERTION_AUDIENCE). There is no unauthenticated mode "
+            "on this service; see services/confirm/auth.py."
+        )
+    return JWTVerifier(
+        jwks_uri=settings.app_assertion_jwks_uri,
+        issuer=settings.app_assertion_issuer,
+        audience=settings.app_assertion_audience,
+        required_scopes=None,
+    )
+
+
+def create_confirm_app(
+    settings: ConfirmSettings | None = None,
+    *,
+    assertion_verifier: AssertionVerifier | None = None,
+) -> Starlette:
     """Assemble the write-path ASGI app with device authorization and callback endpoints.
 
-    Builds both read and write minters (the confirm service needs both for
-    device code exchange). The read key path is a controlled exception to the
-    architecture's key-split rule — see ``ConfirmSettings`` docstring.
+    Builds both read and write minters. The read key path is a controlled
+    exception to the architecture's key-split rule — see ``ConfirmSettings``
+    docstring.
 
-    Also creates a database connection for the challenges table and wires
-    the approval callback routes.
+    Also creates a database connection for the challenges table, wires the
+    approval callback routes, and puts ``AppAssertionMiddleware`` in front of
+    all of them.
+
+    Args:
+        settings: Service configuration. ``from_env()`` when omitted.
+        assertion_verifier: Overrides the verifier built from ``settings``.
+            The test seam, mirroring ``auth_override`` on
+            ``services/api/server.py::build_server``: a test passes a
+            ``JWTVerifier(public_key=...)`` over an ``RSAKeyPair.generate()``
+            and needs no JWKS server. It is a keyword argument with no
+            environment variable behind it, so no deployment can reach it by
+            configuration.
+
+    Raises:
+        ValueError: if no verifier is given and the ``app_assertion_*``
+            settings are incomplete. Refusing to build is the point: it makes
+            an unauthenticated confirm service unreachable by construction
+            rather than by remembering to configure one.
     """
     settings = settings or ConfirmSettings.from_env()
+    verifier = assertion_verifier or _assertion_verifier(settings)
 
     # --- Write key / minter (existing path) ---
     _write_minter, write_key_source = build_write_minter(settings)
@@ -98,12 +173,14 @@ def create_confirm_app(settings: ConfirmSettings | None = None) -> Starlette:
             store=device_code_store,
             settings=settings,
             read_minter=read_minter,
-            write_minter=_write_minter._minter,  # InternalTokenMinter behind the wrapper.
         )
         + callback_routes()
     )
 
-    app = Starlette(routes=routes)
+    app = Starlette(
+        routes=routes,
+        middleware=[Middleware(AppAssertionMiddleware, verifier=verifier)],
+    )
     # Expose key sources on ``app.state`` for external consumers.
     app.state.postern_write_key_source = write_key_source
     app.state.postern_read_key_source = read_key_source

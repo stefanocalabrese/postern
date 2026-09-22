@@ -91,3 +91,26 @@ services:
       context: .
       target: confirm
     ports: ["8082:8080"]
+    # Required since the confirm service gained inbound authentication (audit
+    # findings C-01, C-02): `create_confirm_app` REFUSES to start without all
+    # three, because there is no unauthenticated mode on the write path.
+    # Without these three lines this container crash-loops, which is the
+    # intended behaviour of that guard and the reason they are here.
+    #
+    # The audience is `postern-confirm` and NOT `postern`, which is what the
+    # `api` service above uses. That is the one value worth getting right: if
+    # both services took the same audience from the same issuer, a customer
+    # token good enough to list a balance would also be good enough to approve
+    # a payment, and the read/write split would hold at the signing layer
+    # while being void at the identity layer. Nothing in either process can
+    # detect that -- they are separate deployments with separate environments
+    # -- so the split lives here and in the operator's Terraform.
+    #
+    # The JWKS points at `backend-stub` only because it is the one thing in
+    # this stack that publishes a key set. There is still no `depends_on`: the
+    # fetch is lazy, inside `load_access_token`, so a `confirm` that starts
+    # before the stub is up simply refuses tokens until it is.
+    environment:
+      POSTERN_APP_ASSERTION_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
+      POSTERN_APP_ASSERTION_ISSUER: "https://postern-local-dev.invalid"
+      POSTERN_APP_ASSERTION_AUDIENCE: "postern-confirm"
