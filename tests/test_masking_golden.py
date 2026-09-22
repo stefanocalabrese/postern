@@ -42,8 +42,42 @@ from tests.fixtures import backend_responses as fx
 # test's job is to search loosely and over-flag; masking.py's job is to
 # fullmatch narrowly and validate. Same underlying facts (PAN/IBAN shape,
 # mod-97), different purpose -- so two patterns, not shared ones.
-PAN_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
-IBAN_RE = re.compile(r"(?<![A-Z0-9])[A-Z]{2}\d{2}[A-Z0-9]{10,30}(?![A-Z0-9])")
+# Separators a PAN or IBAN legitimately carries when typed with grouping or
+# copy-pasted off a rendered statement. The same set `masking._SEPARATORS`
+# strips for `MaskedPan`/`MaskedIban`, minus the vertical whitespace: a value
+# broken across a LINE is a different question from one grouped along one,
+# and admitting `\n` here would weld a column of unrelated numbers into a
+# single candidate and make this gate flag its own fixtures' JSON.
+_SEP = r"[   \-‐-―.]"
+
+# Four holes this gate carried until audit finding C-07, each of which made
+# it blind to a leak `masking.py` itself was measured to have:
+#
+# 1. The floor was 13 against `masking._PAN_MIN_DIGITS`'s 12, so the
+#    module's own sharpest documented PAN residual -- a 12-digit card, the
+#    length with NO slack under either floor -- was invisible to the gate
+#    that exists to catch it. 11 repetitions after the leading `\d` is 12
+#    digits, and the two numbers now agree.
+# 2. No `re.IGNORECASE` and an `[A-Z]`-only class, so `es9121000418450200051332`
+#    passed. Fixed with explicit `[A-Za-z]` classes rather than the flag,
+#    because `IGNORECASE` would also silently loosen `\d` and the bullet-
+#    bearing negative assertions below in ways nobody would notice.
+# 3. `IBAN_RE` required contiguity, so `ES91 2100 0418 4502 0005 1332` --
+#    the canonical ISO 13616 print format, i.e. how every rendered statement
+#    in Europe writes one -- passed.
+# 4. `PAN_RE`'s separator class was `[ -]` only, so the dot- and NBSP-grouped
+#    forms passed.
+#
+# Deliberately unbounded above (`{11,}` / `{10,30}` with no `(?!\d)`-driven
+# ceiling on the PAN side): a gate's job is to over-flag. A bounded upper
+# limit does not merely miss a 20-digit run, it fails to match it AT ALL --
+# the trailing `(?!\d)` rejects every backtrack -- which is the exact shape
+# `masking._PAN_IN_TEXT_RE`'s own comment records as having reconstituted an
+# AmEx number out of its own mask.
+PAN_RE = re.compile(rf"(?<!\d)\d(?:{_SEP}?\d){{11,}}(?!\d)")
+IBAN_RE = re.compile(
+    rf"(?<![A-Za-z0-9])[A-Za-z]{{2}}\d{{2}}(?:{_SEP}?[A-Za-z0-9]){{10,30}}(?![A-Za-z0-9])"
+)
 
 ROUTES = {
     "/accounts": fx.ACCOUNTS,
@@ -135,8 +169,16 @@ async def _assert_no_tool_output_leaks_a_pan_or_iban(
             # never gets scanned at all because the loop stopped early.
             result = await client.call_tool(name, arguments, raise_on_error=False)
             rendered = _render_result(result)
-            assert not PAN_RE.search(rendered), f"{name} leaked a PAN: {rendered[:400]}"
+            # IBAN first, PAN second, matching `_redact_free_text`'s own pass
+            # order and for the same reason it gives: an IBAN's numeric body
+            # (ES9121000418450200051332 is 22 digits) is long enough for the
+            # widened `PAN_RE` to claim, so a PAN-first scan would report a
+            # leaked IBAN as "leaked a PAN" and send whoever reads the
+            # failure looking in the wrong pass. Neither assertion is
+            # weakened by the order: both still run on every case that
+            # survives the first.
             assert not IBAN_RE.search(rendered), f"{name} leaked an IBAN: {rendered[:400]}"
+            assert not PAN_RE.search(rendered), f"{name} leaked a PAN: {rendered[:400]}"
 
 
 async def test_every_registered_tool_has_a_masking_case(server: FastMCP) -> None:
@@ -158,6 +200,36 @@ def test_the_regexes_actually_catch_the_fixtures() -> None:
     # off a statement, or entered with spaces in a memo) as in its bare form.
     assert PAN_RE.search("4111 1111 1111 4417")
     assert PAN_RE.search("4111-1111-1111-4417")
+
+
+def test_the_regexes_catch_every_grouped_and_disguised_fixture() -> None:
+    """The four holes named above `PAN_RE`, each pinned at the fixture that
+    walked through it. Every one of these strings passed the previous gate
+    untouched while `masking.py` was measured to emit it verbatim.
+
+    The ordinal fixtures are here for the PAN/IBAN *shape* they carry after
+    the one exempt codepoint is removed, which is what an analyst reading
+    the leaked text gets: the gate itself does not delete codepoints, so it
+    sees them only via the grouped/contiguous forms they decompose to. They
+    are asserted through the tool-output scan (`test_no_tool_output_contains_
+    a_pan_or_iban`) rather than here, and the dedicated masking tests in
+    `tests/test_masking_exemption_bypass.py` pin the redaction itself.
+    """
+    for grouped in (fx.GROUPED_PAN, fx.HYPHEN_PAN, fx.DOTTED_PAN, fx.NBSP_PAN):
+        assert PAN_RE.search(grouped), f"grouped PAN invisible to the gate: {grouped!r}"
+    assert PAN_RE.search(fx.LUHN_PAN)
+    assert PAN_RE.search(fx.GROUPED_LUHN_PAN)
+    for grouped in (fx.GROUPED_IBAN, fx.HYPHEN_IBAN):
+        assert IBAN_RE.search(grouped), f"grouped IBAN invisible to the gate: {grouped!r}"
+    assert IBAN_RE.search(fx.LOWERCASE_IBAN), "a lowercase IBAN walked through the gate"
+    # The floor now agrees with `masking._PAN_MIN_DIGITS`: 12, not 13.
+    assert PAN_RE.search("869926608025"), "the 12-digit card the module's residual 6 names"
+    assert not PAN_RE.search("86992660802"), "11 digits is under every PAN length"
+    # Nothing the module legitimately emits may look like a leak to the gate,
+    # or the gate fails the build on a correct redaction.
+    for masked in ("•••• 4417", "ES•• •••• 1332", "•••• ", "2026-09-11T08:30:00Z", "-34.20"):
+        assert not PAN_RE.search(masked), f"gate flags its own masked output: {masked!r}"
+        assert not IBAN_RE.search(masked), f"gate flags its own masked output: {masked!r}"
 
 
 # --- Self-check: proof that the harness above is a control, not a decoration ---

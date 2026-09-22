@@ -39,6 +39,25 @@ FULL_PAN = "4111111111114417"
 FULL_IBAN = "ES9121000418450200051332"
 COUNTERPARTY_IBAN = "DE89370400440532013000"
 
+# Separator-grouped, lowercase and ordinal-split forms of the same two
+# values, mirrored from `tests/fixtures/backend_responses.py` and held equal
+# to it by `tests/test_stub_fixture_parity.py`. See that module for why each
+# shape is here; the short version is that a card number typed with spaces
+# is as much a leak as one typed without, and the compose stack has to put
+# both in front of the running server, not just the contiguous one.
+LUHN_PAN = "4111111111111111"
+GROUPED_PAN = "4111 1111 1111 4417"
+HYPHEN_PAN = "4111-1111-1111-4417"
+DOTTED_PAN = "4111.1111.1111.4417"
+NBSP_PAN = "4111 1111 1111 4417"
+GROUPED_LUHN_PAN = "4111 1111 1111 1111"
+ORDINAL_PAN = "41111111º11114417"
+
+GROUPED_IBAN = "ES91 2100 0418 4502 0005 1332"
+HYPHEN_IBAN = "ES91-2100-0418-4502-0005-1332"
+LOWERCASE_IBAN = "es9121000418450200051332"
+ORDINAL_IBAN = "ES91210004184ª50200051332"
+
 ACCOUNTS = {
     "accounts": [
         {"id": "acc_7f3a", "label": "Joint expenses", "iban": FULL_IBAN},
@@ -53,6 +72,15 @@ BALANCE = {
     "as_of": "2026-09-12T10:00:00Z",
 }
 
+LEAKY_DESCRIPTION = (
+    f"Card {FULL_PAN} purchase, ref {COUNTERPARTY_IBAN}"
+    f" grouped {GROUPED_PAN} hyphen {HYPHEN_PAN} dotted {DOTTED_PAN}"
+    f" nbsp {NBSP_PAN} luhn {LUHN_PAN} grouped-luhn {GROUPED_LUHN_PAN}"
+    f" ordinal {ORDINAL_PAN}"
+    f" iban {GROUPED_IBAN} hyphen {HYPHEN_IBAN}"
+    f" lower {LOWERCASE_IBAN} ordinal {ORDINAL_IBAN}"
+)
+
 TRANSACTIONS = {
     "transactions": [
         {
@@ -63,7 +91,7 @@ TRANSACTIONS = {
             "currency": "EUR",
             "counterparty_name": "Acme Ltd",
             "counterparty_iban": COUNTERPARTY_IBAN,
-            "description": f"Card {FULL_PAN} purchase, ref {COUNTERPARTY_IBAN}",
+            "description": LEAKY_DESCRIPTION,
         }
     ]
 }

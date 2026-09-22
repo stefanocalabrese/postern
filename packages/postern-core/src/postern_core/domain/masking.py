@@ -75,6 +75,156 @@ def _mod97_ok(compact: str) -> bool:
     return int(digits) % 97 == 1
 
 
+def _luhn_ok(digits: str) -> bool:
+    """ISO/IEC 7812-1 Annex B check digit (the card-number checksum).
+
+    ASCII digits only -- every caller normalises first, see
+    `_ascii_digits`. Double every second digit counting leftwards from the
+    rightmost, subtract 9 from any result over 9, and require the total to
+    be a multiple of ten.
+
+    Used ONLY by the separator-grouped PAN path and the exemption-bridged
+    path, never by the contiguous one. `_redact_pan_match`'s contiguous
+    branch masks any 12-to-19-digit run without asking whether it
+    checksums, and that stays true: adding a Luhn gate there would REMOVE
+    redaction from a shape this module already covers, which is the one
+    direction no change here is allowed to go.
+    """
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = ord(char) - 48
+        if index % 2:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def _ascii_digits(value: str) -> str:
+    """`value`'s digits as ASCII, for the checksum and prefix tests below.
+
+    `_PAN_IN_TEXT_RE` matches Unicode `\\d` on purpose (see its own
+    comment: an Arabic-Indic PAN is masked, last four preserved in the
+    original script), so a matched span can carry digits `_luhn_ok` and
+    `_has_payment_card_prefix` cannot read as ASCII. `int()` accepts every
+    `Nd` codepoint, which is exactly the set `\\d` matches, so this is
+    total over anything those patterns can hand it.
+
+    Only the GATES see this normalised form. The last four actually
+    disclosed still comes from the original span, so the Arabic-Indic
+    behaviour that comment documents is unchanged.
+    """
+    if value.isascii():
+        return value
+    return "".join(str(int(ch)) for ch in value)
+
+
+# ISO/IEC 7812-1's major industry identifier: the first digit of the IIN,
+# naming the industry the card is issued for. Consumer payment cards live
+# in 3 (travel and entertainment -- American Express, Diners, JCB), 4
+# (banking and financial -- Visa), 5 (banking and financial -- Mastercard)
+# and 6 (merchandising and banking -- Discover, UnionPay, Maestro).
+#
+# Plus Mastercard's 2-series, 222100-272099, which has been live since
+# 14 October 2016 and is processed exactly like the 51-55 series. It is
+# the reason this cannot be "first digit in 3456" and stop there: an MII
+# of 2 is otherwise airlines-and-future-assignments, and admitting all of
+# it would pull in every four-digit year -- 2024, 2026 -- that opens a
+# grouped date. The window is narrow enough to exclude those (2026 is
+# below 2221) and is checked as a window, not as a digit.
+_PAYMENT_CARD_MIIS = frozenset("3456")
+_MASTERCARD_TWO_SERIES = (2221, 2720)
+
+
+def _has_payment_card_prefix(digits: str) -> bool:
+    """Whether `digits` (ASCII, already length-checked) opens with an IIN a
+    payment card can actually be issued under.
+
+    A structural gate, not a checksum, and it exists for a measured reason
+    rather than a theoretical one: `tests/fixtures/backend_responses.py`'s
+    `FULL_PAN`, the value every row of the C-07 audit's leak table is
+    written with, IS NOT LUHN-VALID (4111111111114417 sums to 45). Neither
+    are most test PANs that are not lifted straight from a scheme's own
+    published list. Gating the grouped path on Luhn alone would therefore
+    close the leak for every real card and leave the audit's own
+    reproduction untouched, which is a fix that passes its own test only
+    by changing the test.
+
+    Measured on 61 ordinary Spanish/Catalan memos carrying everyday digit
+    shapes (dates, amounts, phone numbers, order and contract references),
+    against the grouped-run rule this gates:
+
+        gate                                    masked  of 61
+        12..19 digits, no gate                    21     34%
+        12..19 digits, every group >= 3 digits    15     25%
+        12..19 digits and Luhn                     1    1.6%
+        12..19 digits and this prefix test         4    6.6%
+        12..19 digits, prefix test and Luhn        1    1.6%
+
+    and on the seven-script false-positive corpus plus the mixed-script
+    corpus (113 entries), zero for every row.
+
+    6.6% is the cost, and it buys catching every card-shaped grouped run
+    including the ones that do not checksum. The four are Spanish contract
+    and order numbers that open with 4 and are 12 to 19 digits long --
+    `4512 8899 0021 7766` grouped four-by-four is not distinguishable from
+    a Visa by any rule that does not read the checksum, and this module
+    already masks the contiguous spelling of all four unconditionally.
+    That last point is the whole argument for accepting the rate: one
+    space away, at `4512889900217766`, today's code masks 100% of them.
+
+    Which way the disclosure goes is decided separately and by the
+    checksum, not here -- see `_redact_pan_match`.
+    """
+    if digits[0] in _PAYMENT_CARD_MIIS:
+        return True
+    low, high = _MASTERCARD_TWO_SERIES
+    return low <= int(digits[:4]) <= high
+
+
+def _is_uniformly_grouped(span: str) -> bool:
+    """Whether every separator-delimited group in `span` is the same width.
+
+    The second half of the non-checksumming grouped-PAN gate, and it is a
+    heuristic rather than a standard -- said plainly, because everything
+    else in this file that decides "is this a card" cites a standard.
+
+    It is only ever reached when `_luhn_ok` has already said no, which is
+    what makes it safe: a real card ALWAYS passes Luhn (ISO/IEC 7812-1
+    Annex B makes the check digit mandatory), so nothing this test
+    excludes can be a genuine card number. Its entire job is the
+    card-shaped-but-not-checksumming case -- test PANs, the repo's own
+    `FULL_PAN`, a transcription with a typo -- and for that case the
+    question "was this printed the way a card is printed" is the only
+    evidence left.
+
+    Measured, on 61 ordinary Spanish/Catalan memos carrying everyday
+    digit shapes, through the real `_redact_free_text`:
+
+        prefix test alone                     5 of 61 masked   8.2%
+        prefix test and this uniformity test  3 of 61 masked   4.9%
+
+    The two it removes are both the same shape, a long order number with
+    irregular grouping ("405 1234567 8901234", 17 digits opening with 4),
+    which no card is ever printed as. The three that remain are 12- and
+    16-digit contract and tracking numbers grouped four-by-four and
+    opening with 4 or 5 -- genuinely indistinguishable from a Visa or a
+    Mastercard without reading the checksum, and all three already masked
+    by this module in their contiguous spelling.
+    """
+    lengths = set()
+    current = 0
+    for char in span:
+        if char in _FREE_TEXT_GROUP_SEPARATORS:
+            lengths.add(current)
+            current = 0
+        else:
+            current += 1
+    lengths.add(current)
+    return len(lengths) == 1
+
+
 def _mask_pan(value: str) -> str:
     if _PAN_MASKED_RE.fullmatch(value):
         return value
@@ -103,10 +253,49 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 # sentence with a PAN or IBAN embedded in it (unstructured remittance
 # information is exactly where a counterparty IBAN or a card reference
 # appears in ISO 20022 traffic), not a value that is entirely a PAN or IBAN.
-# No separator handling here (no grouped "4111 1111 1111 4417" detection):
-# `MaskedPan`/`MaskedIban` own that job for a value that IS a PAN/IBAN; this
-# only has to stop a contiguous run reaching a client, which is what a
-# memo/description field actually carries in practice.
+#
+# SEPARATOR HANDLING, ADDED BY AUDIT FINDING C-07, REVERSING THIS COMMENT'S
+# OWN EARLIER CLAIM. What stood here said there was no grouped
+# "4111 1111 1111 4417" detection, that `MaskedPan`/`MaskedIban` owned that
+# job for a value that IS a PAN/IBAN, and that a contiguous run was "what a
+# memo/description field actually carries in practice". The first two were
+# true and are still true; the third was an assumption, and it was wrong in
+# the direction that costs a card. A human typing a card number into a memo
+# GROUPS it -- that is how every rendered statement in Europe prints one --
+# so the grouped form is not the exotic case this comment treated it as, it
+# is the likely one. Measured through this function before the change:
+#
+#   Card 4111111111114417 purchase       ->  'Card •••• 4417 purchase'
+#   Card 4111 1111 1111 4417 x           ->  unchanged        FULL PAN OUT
+#   Card 4111-1111-1111-4417 x           ->  unchanged        FULL PAN OUT
+#   Card 4111.1111.1111.4417 x           ->  unchanged        FULL PAN OUT
+#   IBAN ES91 2100 0418 4502 0005 1332 x ->  unchanged        FULL IBAN OUT
+#
+# The asymmetry was structural rather than accidental: `_SEPARATORS` above
+# already accepts exactly these groupings for `MaskedPan`/`MaskedIban`,
+# while both patterns here required an UNINTERRUPTED run, so the two halves
+# of this module disagreed about what a card number looks like and the
+# free-text half lost.
+#
+# The separator set here is `_SEPARATORS` MINUS the vertical whitespace
+# (TAB, LF, VT, FF, CR). That subtraction is the one judgement in this
+# change, and it is not about what a reader can see -- every separator in
+# both sets renders as a visible break -- but about what a break JOINS. A
+# value grouped along one line is one value with spaces in it. Two values on
+# adjacent lines are two values, and bridging a newline would weld a column
+# of four-digit numbers into a sixteen-digit "card". TAB goes with the
+# vertical set for the same reason: its job in real text is column
+# separation, not digit grouping, and no statement anywhere prints a PAN
+# with tabs in it.
+#
+# Exactly ONE separator between digits, never a run of them. A real
+# grouping uses one; allowing two or more buys nothing against a human
+# typing a card and widens what an arbitrary pair of numbers can be welded
+# into.
+_FREE_TEXT_GROUP_SEPARATORS = " \xa0 -‐‑‒–—."
+_GROUP_SEPARATOR_CLASS = "[" + re.escape(_FREE_TEXT_GROUP_SEPARATORS) + "]"
+_GROUP_SEPARATOR_STRIP = str.maketrans("", "", _FREE_TEXT_GROUP_SEPARATORS)
+
 #
 # The run pattern is deliberately UNBOUNDED above (`{12,}`, not `{12,19}`).
 # An upper bound here is not a harmless approximation, it reconstitutes
@@ -147,7 +336,23 @@ MaskedIban = Annotated[str, AfterValidator(_mask_iban)]
 # is used against a span that has already been established to be mostly
 # ASCII.
 _PAN_MIN_DIGITS = 12
-_PAN_IN_TEXT_RE = re.compile(rf"\d{{{_PAN_MIN_DIGITS},}}")
+
+# The contiguous pattern this module shipped with, kept verbatim and still
+# load-bearing: `_redact_pan_match` falls back to substituting with it
+# INSIDE a grouped span it decides is not a card, which is what makes the
+# grouped path incapable of removing redaction anywhere. "4111111111114417
+# 2026" is one grouped run of 20 digits; without the fallback the grouped
+# rule would decline it (20 is over `_PAN_MAX_DIGITS`) and the contiguous
+# sixteen inside it -- masked by this module before C-07 -- would walk out.
+_CONTIGUOUS_PAN_IN_TEXT_RE = re.compile(rf"\d{{{_PAN_MIN_DIGITS},}}")
+
+# The same run, tolerant of ONE separator between digits. Maximal by
+# construction (greedy, and every alternative start is inside a match it
+# already consumed), which is the property the unbounded-above note above
+# is about: the whole run is consumed first and what to emit is decided
+# afterwards, so no unconsumed digit can ever end up sitting against the
+# mask this module just wrote.
+_PAN_IN_TEXT_RE = re.compile(rf"\d(?:{_GROUP_SEPARATOR_CLASS}?\d){{{_PAN_MIN_DIGITS - 1},}}")
 
 # ISO/IEC 7812-1 caps a PAN at 19 digits; no scheme issues a longer one.
 _PAN_MAX_DIGITS = 19
@@ -473,7 +678,52 @@ _AMBIGUOUS = _Ambiguous()
 # glued to the END or in the MIDDLE of a reference like "REF_MT92MALT...")
 # for the same reason, in the same change: the assertion is checked on both
 # sides of every candidate span, not just the leading one.
-_IBAN_IN_TEXT_RE = re.compile(rf"(?<![A-Za-z0-9])[A-Za-z0-9]{{{_IBAN_MIN_LEN},}}(?![A-Za-z0-9])")
+# The grouped alternative (audit finding C-07), and why it is SHAPED rather
+# than general. The obvious symmetry with the PAN side -- let a separator sit
+# between any two alphanumerics -- is catastrophic here and the difference is
+# arithmetic, not taste. A PAN run is digits, and a letter ends it, so
+# "Card 4111 1111 1111 4417 x" bridges the card and stops at "x". An IBAN
+# token is ALPHANUMERIC, so the same rule makes "the quick brown fox jumps
+# over" one token: every sentence in every memo becomes a single candidate
+# handed to `_find_iban_in_token`, which scans every qualifying start at
+# every length. This file's own measured table (see the rejected-wildcard
+# analysis below `_delookalike`) gives the result of that directly: a full
+# scan of an arbitrary 31-character token masks 19.8% of them. A rule that
+# bare-masks a fifth of all prose is not a redaction, it is an outage.
+#
+# So the grouped alternative matches only the PRINT FORMAT ISO 13616
+# actually defines: the country code and check digits, then groups of four,
+# with an optional short final group. That is how every statement, invoice
+# and bank website in Europe renders an IBAN, it is what a human copying one
+# produces, and it is a shape ordinary prose essentially never takes --
+# clearing it requires "LLDD" followed by two or more four-character
+# alphanumeric groups.
+#
+# Capped at eight four-character groups rather than left unbounded. ISO
+# 13616 caps an IBAN at `_IBAN_MAX_LEN` characters, which is eight groups
+# plus a two-character tail, so nothing longer can be one. The cap is not
+# decoration: without it a greedy match runs on through every following
+# four-letter word, and `_redact_iban_match` replaces the WHOLE matched
+# span, so each extra word is a word deleted from the customer's memo.
+# "ES91 2100 0418 4502 0005 1332 pago alquiler" still costs "pago" -- that
+# over-redaction is real, accepted, and bounded at one word by this cap
+# plus the checksum having to succeed on what the compaction contains.
+_IBAN_GROUPED_IN_TEXT = (
+    rf"[A-Za-z]{{2}}[0-9]{{2}}"
+    rf"(?:{_GROUP_SEPARATOR_CLASS}[A-Za-z0-9]{{4}}){{2,8}}"
+    rf"(?:{_GROUP_SEPARATOR_CLASS}[A-Za-z0-9]{{1,3}})?"
+)
+
+# Grouped alternative FIRST. Python's alternation is ordered, and the
+# contiguous branch would otherwise match the leading "ES91" of a grouped
+# IBAN... it would not, in fact, because `_IBAN_MIN_LEN` is 14 and "ES91" is
+# four -- but the ordering is still the one to keep, because it is the one
+# that stays correct if either bound ever moves.
+_IBAN_IN_TEXT_RE = re.compile(
+    rf"(?<![A-Za-z0-9])"
+    rf"(?:{_IBAN_GROUPED_IN_TEXT}|[A-Za-z0-9]{{{_IBAN_MIN_LEN},}})"
+    rf"(?![A-Za-z0-9])"
+)
 
 
 def _find_iban_in_token(token: str, budget: _ScanBudget) -> str | None | _Ambiguous:
@@ -593,7 +843,23 @@ def _has_qualifying_start(token: str) -> bool:
 
 
 def _redact_iban_match(match: re.Match[str], budget: _ScanBudget) -> str:
-    candidate = match.group(0)
+    span = match.group(0)
+    # Compact FIRST, then run every existing decision against the
+    # compaction. A grouped match's separators are not part of the
+    # candidate IBAN, so the length bound, the qualifying-start test and
+    # the checksum all have to see the value without them -- and the
+    # branches below are unchanged otherwise, which is the point: the
+    # grouped shape reuses the front-glue scan, the ambiguity rule, the
+    # over-length refusal and the budget exactly as they already are.
+    #
+    # `span` and `candidate` diverge only for a grouped match, and every
+    # `return candidate` path below is a LEAVE-AS-WRITTEN path, so it has
+    # to return `span` -- the text as the caller actually wrote it.
+    # `_sub_preserving_original` detects a no-op by comparing the returned
+    # string against `match.group(0)`; returning the compaction there
+    # would silently rewrite a customer's grouped reference into an
+    # ungrouped one and, worse, read as a MASK to that comparison.
+    candidate = span.translate(_GROUP_SEPARATOR_STRIP)
     if len(candidate) > _IBAN_SCAN_MAX_TOKEN:
         # Not scanned at all, checksum or no checksum: a token this long
         # cannot be a real IBAN regardless of what any slice of it computes
@@ -650,13 +916,13 @@ def _redact_iban_match(match: re.Match[str], budget: _ScanBudget) -> str:
         # with this extra linear pass added; see `_redact_free_text`.
         if _has_qualifying_start(candidate):
             return _MASK
-        return candidate
+        return span
     compact = _find_iban_in_token(candidate.upper(), budget)
     if compact is None:
         # IBAN-shaped but nothing in it checksums: not a real IBAN (e.g. a
         # merchant reference that happens to look like one). Leave it as
         # written rather than mangling ordinary text on a false positive.
-        return candidate
+        return span
     if isinstance(compact, _Ambiguous):
         # Either more than one start position in this token checksummed
         # (see `_find_iban_in_token`'s docstring for why picking one would
@@ -677,10 +943,92 @@ def _redact_iban_match(match: re.Match[str], budget: _ScanBudget) -> str:
     # digit run, which is definitionally not a card and so has no approved
     # last-four at all, or an ambiguous token, which has one but does not
     # say which.
+    #
+    # A GROUPED span discloses NOTHING, and this is the one place the
+    # C-07 grouped path is deliberately weaker than the contiguous one.
+    # The checksum here identifies a value; it does not DELIMIT one, and a
+    # disclosure needs both. Where a token's boundaries are drawn by
+    # non-alphanumerics, the next word cannot be mistaken for part of the
+    # value; where they are drawn by SEPARATORS, it can -- a following
+    # word of one to three characters is indistinguishable from an IBAN's
+    # own short final group, which real 21-character formats (CH, HR, LV,
+    # LI) genuinely have, so it cannot simply be excluded from the
+    # pattern without leaving twenty of their twenty-one characters
+    # unmasked.
+    #
+    # Not hypothetical, and found by running the audit's own leak table
+    # against the first version of this change:
+    #
+    #   'IBAN ES91 2100 0418 4502 0005 1332 x'  ->  'IBAN ES•• •••• 332X'
+    #
+    # The trailing " x" was consumed as a final group, and
+    # ES9121000418450200051332X mod-97-checksums as readily as the real
+    # ES9121000418450200051332 does (both verified directly), so
+    # `_find_iban_in_token`'s longest-at-a-start rule -- correct for the
+    # SC18SSCB prefix case it was written for -- took the 25-character
+    # reading and published "332X" as an account's last four. That is the
+    # confident-and-wrong disclosure this module refuses everywhere else,
+    # arrived at through a checksum rather than around one.
+    #
+    # The bare marker costs the country code and last four on the most
+    # common way an IBAN is written. That is a real loss and it is
+    # accepted: free text is not the `MaskedIban` field path, nothing
+    # leaks either way, and a reader who is told "account ending 332X"
+    # has been told something false, which is worse than being told
+    # nothing.
+    if len(candidate) != len(span):
+        return _MASK
     return f"{compact[:2]}•• {_MASK} {compact[-4:]}"
 
 
 def _redact_pan_match(match: re.Match[str]) -> str:
+    span = match.group(0)
+    compact = span.translate(_GROUP_SEPARATOR_STRIP)
+    if len(compact) != len(span):
+        # A GROUPED run (audit finding C-07). Gated, where the contiguous
+        # branch below is not, and the asymmetry is deliberate rather than
+        # an inconsistency to tidy away. A contiguous digit run is ONE
+        # number: masking every 12-to-19-digit one costs a long reference
+        # number here and there, which this module has always accepted. A
+        # grouped run is not necessarily one number -- the separator is
+        # exactly what a reader uses to tell two numbers apart -- so the
+        # same rule applied to it welds a date to an amount and calls the
+        # result a card. "2026-09-22 1234.56" is fourteen digits under a
+        # rule that only counts them. Measured on 61 ordinary
+        # Spanish/Catalan memos: an ungated grouped rule masks 34% of
+        # them, against 6.6% for the gate below. See
+        # `_has_payment_card_prefix` for the full table and for why Luhn
+        # alone is not that gate.
+        #
+        # The disclosure split follows this module's existing rule, not a
+        # new one: `_redact_pan_match`'s contiguous branch discloses a
+        # last four for a length-plausible run and refuses one for an
+        # over-long run, because the over-long run is definitionally not a
+        # card and has no approved last four. Same here, one step finer --
+        # Luhn positively identifies a card, so the last four it ends with
+        # really is a card's last four and `MaskedPan` is approved to
+        # disclose it. The prefix test only says "card-shaped", which is
+        # not an identification, so that branch emits the bare marker and
+        # asserts nothing about what the number ends with.
+        digits = _ascii_digits(compact)
+        if _PAN_MIN_DIGITS <= len(digits) <= _PAN_MAX_DIGITS:
+            if _luhn_ok(digits):
+                return f"{_MASK} {compact[-4:]}"
+            if _has_payment_card_prefix(digits) and _is_uniformly_grouped(span):
+                return _MASK
+        # Not a card by either test -- but the span may still CONTAIN a
+        # contiguous run this module masked before C-07, and nothing here
+        # is allowed to take that away. Re-run the original contiguous
+        # pattern inside the span and emit exactly what it emitted before
+        # this branch existed. Every piece it leaves alone is separated
+        # from every mask it writes by the separator that made this a
+        # grouped span in the first place, so no digit can end up against
+        # a mask.
+        return _CONTIGUOUS_PAN_IN_TEXT_RE.sub(_redact_contiguous_pan_run, span)
+    return _redact_contiguous_pan_run(match)
+
+
+def _redact_contiguous_pan_run(match: re.Match[str]) -> str:
     candidate = match.group(0)
     if len(candidate) > _PAN_MAX_DIGITS:
         # Longer than any PAN, so this run is not a card and its last four
@@ -1767,16 +2115,28 @@ def _mask_bridged_runs(value: str, skeleton: str) -> str:
     unchanged and identity-comparable, when nothing qualifies -- which is
     what lets `_redact_free_text` skip rebuilding its skeleton.
 
-    THE RESIDUAL. FIVE open shapes (one closed: the 590 spacing marks,
+    THE RESIDUAL. SEVEN open shapes (one closed: the 590 spacing marks,
     resolved by widening `_is_script_intrusion`). The count has been wrong
     twice before: this docstring first said "two", which read as exhaustive
     when it was a list of the two that had been thought about, and then
-    said "five" while a seventh-of-a-card case sat untested next door. Each
-    of the five open shapes now has a test in tests/test_masking_confusables.py,
-    so none can be lost by a
-    later edit to this comment, and a number stated here is a number some
-    test will defend. Counts are against Unicode 15.0.0, the version
-    `unicodedata.unidata_version` reports here.
+    said "five" while a seventh-of-a-card case sat untested next door, and
+    then said "five" again while `_LATIN_SCRIPT_EXEMPTIONS` sat below it as
+    an 18-codepoint universal bypass that appeared nowhere on the list at
+    all -- the list read as exhaustive while the sharpest shape in the
+    module was missing from it. Each of the seven open shapes now has a
+    test, in tests/test_masking_confusables.py or (for 7 and 8, added with
+    audit finding C-07) tests/test_masking_exemption_bypass.py, so none can
+    be lost by a later edit to this comment, and a number stated here is a
+    number some test will defend. Counts are against Unicode 15.0.0, the
+    version `unicodedata.unidata_version` reports here.
+
+    NOT ON THIS LIST ANY MORE, because it is closed rather than accepted:
+    an exempt codepoint INSERTED into a PAN or an IBAN. That was the
+    18-codepoint bypass above, measured as leaking a full PAN and a full
+    IBAN for all 18 members at every interior offset;
+    `_mask_exemption_bridged_runs` closes it by deletion plus a real
+    checksum. Separator-grouped values are likewise closed rather than
+    accepted, by `_PAN_IN_TEXT_RE`/`_IBAN_IN_TEXT_RE` above.
 
     1. A splitter whose Unicode NAME contains "LATIN".
        "MT92MALT01100ÀBCDEFGH1234IJKL56" still reaches the output verbatim,
@@ -1834,6 +2194,32 @@ def _mask_bridged_runs(value: str, skeleton: str) -> str:
        written with insertion passes while substitution leaks. That is how
        this shape stayed hidden behind a green test.
 
+    7. ONE `_LATIN_SCRIPT_EXEMPTIONS` member SUBSTITUTED into a
+       letter-dense IBAN. Deletion recovers an INSERTED codepoint exactly
+       -- that is what `_mask_exemption_bridged_runs` closes -- but a
+       substitution has genuinely removed one of the value's own
+       characters, so nothing that remains can checksum. Malta's
+       31-character format is where this survives: its longest digit run
+       is five, so the over-long-digit-run rule that closes the same
+       mutation on the 24-character Spanish format (22 contiguous digits,
+       which strip to 21 or 22 and are refused for being over
+       `_PAN_MAX_DIGITS`) has nothing to fire on. Swept across all 18
+       members at every interior offset: MT leaks at every one, ES at
+       none, and the 15-character Norwegian format at none. This is
+       residual 1's argument with an exempt codepoint in place of an
+       accented one, and it needs the same fix -- the 36-way wildcard
+       expansion measured and rejected below `_delookalike`.
+
+    8. A span carrying BOTH a script intrusion and an exemption member.
+       `_mask_bridged_runs` bridges the intrusions and runs a structural
+       count that the exempt codepoint's own fragment is not part of;
+       `_mask_exemption_bridged_runs` bridges the exemptions and runs a
+       checksum that the intrusion makes unreadable. Neither pass's test
+       sees the whole value, so a splitter of each kind in one run evades
+       both. Sharing one walk between the two passes would not fix it:
+       the tests are what differ, and they differ for the reason
+       `_redact_exemption_bridged_span` opens with.
+
     None of these is closable by this module's own means. See ADR-0008 for
     the full analysis, acceptance, and upstream closure path. The earlier
     version of this docstring said "handoff §10.17 will close them" — that
@@ -1884,6 +2270,207 @@ def _mask_bridged_runs(value: str, skeleton: str) -> str:
             continue
         pieces.append(value[last_end:start])
         pieces.append(_MASK)
+        last_end = end
+    if not pieces:
+        return value
+    pieces.append(value[last_end:])
+    return "".join(pieces)
+
+
+_EXEMPTION_STRIP = str.maketrans("", "", "".join(sorted(_LATIN_SCRIPT_EXEMPTIONS)))
+
+_MAX_QUALIFYING_DIGIT_RUNS = 1
+
+
+def _exemption_bridged_runs(skeleton: str) -> Iterator[tuple[int, int]]:
+    """`_bridged_runs`, with `_LATIN_SCRIPT_EXEMPTIONS` membership in place
+    of `_is_script_intrusion` as the thing a run bridges across.
+
+    Same walk, same both-sides-ASCII-alphanumeric requirement, same
+    whole-blocks-at-once consumption, and therefore the same residual 2
+    (an exemption at a token EDGE is not bridged). Written as a second
+    generator rather than a predicate parameter on `_bridged_runs`
+    because the two feed completely different tests -- that one hands its
+    spans to `_could_be_an_identifier`, a structural count, and this one
+    hands them to a checksum. Sharing the walk would invite sharing the
+    test, and the test is the one thing these two must not share; see
+    `_mask_exemption_bridged_runs`.
+    """
+    length = len(skeleton)
+    index = 0
+    while index < length:
+        if skeleton[index] not in _ASCII_ALNUM:
+            index += 1
+            continue
+        start = index
+        bridged = False
+        while True:
+            while index < length and skeleton[index] in _ASCII_ALNUM:
+                index += 1
+            after = index
+            while after < length and skeleton[after] in _LATIN_SCRIPT_EXEMPTIONS:
+                after += 1
+            if after > index and after < length and skeleton[after] in _ASCII_ALNUM:
+                bridged = True
+                index = after
+                continue
+            break
+        if bridged:
+            yield start, index
+
+
+def _redact_exemption_bridged_span(span: str, budget: _ScanBudget) -> str | None:
+    """What one exemption-bridged span becomes, or `None` to leave it as
+    written.
+
+    THE TEST IS A CHECKSUM, NEVER `_could_be_an_identifier`. That is the
+    whole difference between this pass and `_mask_bridged_runs`, and
+    getting it wrong re-breaks the exact thing `_LATIN_SCRIPT_EXEMPTIONS`
+    was created to fix: `FACTURANº20240912` is 17 ASCII alphanumerics of
+    which 8 are digits, which clears `_could_be_an_identifier`'s IBAN
+    route (14 alphanumerics, 2 digits) comfortably. Running the
+    structural test here would bare-mask ordinary Spanish invoice
+    references, which is the regression recorded above the exemption set.
+    A checksum cannot: `FACTURA20240912` is not an IBAN and has no
+    12-digit run.
+
+    DELETION, NOT WILDCARD EXPANSION. Every exempt codepoint is removed
+    and the real test runs on what remains -- ONE candidate per span, not
+    the 36-per-splitter expansion the rejected-wildcard analysis below
+    `_delookalike` measured at ~34% of arbitrary spans satisfiable and
+    95% of arbitrary 31-character tokens masked. Deletion is sound
+    because every one of these characters is COMPATIBILITY-equivalent to
+    an ASCII alphanumeric or to nothing, never canonically equivalent to
+    one (`test_no_exemption_is_canonically_equivalent_to_ascii` holds
+    that for the whole set), so an attacker uses them by INSERTION --
+    "41111111º11114417" is a complete 16-digit PAN with one character
+    pushed into it. Deleting recovers exactly the value a reader sees.
+    SUBSTITUTION, where the exempt character stands in place of a digit,
+    is not recovered by deletion and is not closed here: it is residual 7
+    on `_mask_bridged_runs`.
+
+    IBAN route first, mirroring `_redact_free_text`'s own pass order and
+    for the same reason: an IBAN's numeric body is long enough for the
+    PAN route to claim, and the country code would be the casualty.
+
+    The PAN route needs no gate beyond length, where the grouped path in
+    `_redact_pan_match` does, and the difference is the one that pass's
+    own comment draws: a separator is a break a reader uses to tell two
+    numbers apart, so bridging one can weld two numbers together, while
+    an exempt codepoint inserted mid-number is not a break at all -- a
+    reader sees one continuous run either way, so deleting it cannot
+    invent a number that was not already written as one. Measured
+    against the seven-script false-positive corpus, the mixed-script
+    corpus and 61 ordinary Spanish/Catalan digit-bearing memos (174
+    entries): zero spans reach either route.
+    """
+    stripped = span.translate(_EXEMPTION_STRIP)
+    if _IBAN_MIN_LEN <= len(stripped) <= _IBAN_SCAN_MAX_TOKEN:
+        if budget.exhausted:
+            # The same narrowing `_redact_iban_match` applies, for the same
+            # reason and at the same cost. Without it, budget exhaustion is
+            # a denial-of-audit primitive against this pass specifically:
+            # `_find_iban_in_token` returns `_AMBIGUOUS` the instant it
+            # cannot spend, so every later ordinal-bearing span in the same
+            # request -- an invoice reference, a floor number, a square
+            # metre count -- would come back as a bare marker,
+            # indistinguishable from a real redaction, in the attacker's
+            # own audit row. A span with no letter-letter-digit-digit start
+            # could never have reached `_mod97_ok` with any budget, so
+            # masking it buys no safety at all. Fails closed for spans that
+            # could have matched, spends nothing either way, and falls
+            # through to the PAN route below for the rest.
+            if _has_qualifying_start(stripped):
+                return _MASK
+        else:
+            compact = _find_iban_in_token(stripped.upper(), budget)
+            if isinstance(compact, _Ambiguous):
+                return _MASK
+            if compact is not None:
+                return f"{compact[:2]}•• {_MASK} {compact[-4:]}"
+    runs = _CONTIGUOUS_PAN_IN_TEXT_RE.findall(stripped)
+    if not runs:
+        return None
+    if len(runs) > _MAX_QUALIFYING_DIGIT_RUNS:
+        # Two or more qualifying runs in one span, so which one's last four
+        # would be disclosed is a guess. Same refusal `_find_iban_in_token`
+        # makes for two checksumming starts.
+        return _MASK
+    if len(runs[0]) > _PAN_MAX_DIGITS:
+        # Over-long, so not a card and with no approved last four --
+        # `_redact_contiguous_pan_run`'s own branch, reached here for the
+        # same reason and emitting the same marker. It is also what closes
+        # SUBSTITUTION into a long IBAN, which deletion alone does not:
+        # ES9121000418450200051332 carries 22 contiguous digits, so
+        # replacing any one of its 24 characters with an exempt codepoint
+        # leaves 21 or 22 digits after the strip -- a run no checksum here
+        # can identify, but one this module has never let through in its
+        # contiguous spelling either. Swept across all 18 members at every
+        # interior offset, this takes the 24-character Spanish IBAN from
+        # leaking at every one of them to clean at every one of them.
+        return _MASK
+    return f"{_MASK} {runs[0][-4:]}"
+
+
+def _mask_exemption_bridged_runs(value: str, skeleton: str, budget: _ScanBudget) -> str:
+    """Close the `_LATIN_SCRIPT_EXEMPTIONS` bypass (audit finding C-07).
+
+    THE BYPASS. Every member of that set splits an alphanumeric token for
+    `_IBAN_IN_TEXT_RE` and `_PAN_IN_TEXT_RE` -- it is not `[A-Za-z0-9]` --
+    while being excluded from `_is_script_intrusion` and therefore from
+    `_bridged_runs`. So one substituted character defeated every pass in
+    this module at once. Swept across every interior offset of a
+    24-character Spanish IBAN, a 31-character Maltese IBAN and a
+    16-digit PAN, all 18 members leaked both a full PAN and a full IBAN,
+    at every offset. Two of the eighteen:
+
+        PAGO TARJETA 41111111º11114417   -> unchanged, whole PAN
+        ref ES91210004184ª50200051332    -> unchanged, whole IBAN
+
+    and `º`/`ª` sit on a Spanish keyboard, in the market this deployment
+    serves, so the carrier text reads as ordinary rather than as an
+    attack.
+
+    The set is not the bug and is not narrowed here. It exists because
+    `unicodedata` exposes no Script property and the name test that
+    stands in for it gets these eighteen wrong, and removing any of them
+    bare-masks `FACTURANº20240912` and its corpus siblings again. What
+    was wrong was the SCOPE of the exemption: it was written to answer
+    "does this character make a run suspicious", which is a question
+    about `_could_be_an_identifier`'s structural counts, and it was
+    applied to "does this character end a token", which is a question
+    about whether a value is even looked at. This pass restores the
+    first meaning: exempt from the structural test, not from arithmetic.
+
+    Same position-preserving contract as `_mask_bridged_runs`, same
+    identity-comparable return when nothing qualifies, same
+    `skeleton.isascii()` short circuit -- every member of the set is
+    non-ASCII (lowest is U+00AA), so an all-ASCII skeleton cannot contain
+    one and this pass costs a single `str.isascii` call on the traffic
+    that makes up almost all of it.
+
+    THE BUDGET INVARIANT CHANGES HERE, and the claim on `_redact_free_text`
+    that bridging "spends no checksums" no longer covers this file. This
+    pass DOES spend them, through `_find_iban_in_token`, from the same
+    `_ScanBudget` every other checksum draws on -- so the bound is
+    unchanged in KIND (a call-wide allowance over checksum operations)
+    while the spend on a given value can now be higher than before. What
+    keeps that from mattering is the gate in front of it: a span only
+    reaches `_find_iban_in_token` if it bridges an exemption character at
+    all, and `_IBAN_SCAN_MAX_TOKEN` bounds it exactly as it bounds an
+    ordinary token. The measured effect on every shape in
+    `_redact_free_text`'s cost table is on that table.
+    """
+    if skeleton.isascii():
+        return value
+    pieces: list[str] = []
+    last_end = 0
+    for start, end in _exemption_bridged_runs(skeleton):
+        replacement = _redact_exemption_bridged_span(skeleton[start:end], budget)
+        if replacement is None:
+            continue
+        pieces.append(value[last_end:start])
+        pieces.append(replacement)
         last_end = end
     if not pieces:
         return value
@@ -2406,19 +2993,81 @@ def _redact_free_text(value: str) -> str:
     # 59ns uncached, measured, so the cache is worth about 10% and losing
     # it entirely is not a cliff).
     #
-    # CHECKSUM BUDGET: unchanged, and structurally incapable of rising.
-    # This pass spends no checksums, and the only thing it does to the
-    # value is replace an alphanumeric span with four bullets -- which are
-    # not `[A-Za-z0-9]` -- so the tokens `_IBAN_IN_TEXT_RE` finds
-    # afterwards are always a subset of the ones it would have found
-    # before. Measured on every shape above: identical spend, and the two
-    # Ж rows now spend ZERO where the unfixed code also spent zero. No
-    # value that did not already exhaust `_IBAN_SCAN_BUDGET` starts doing
-    # so, so `audit_log.redaction_budget_exhausted` fires on exactly the
-    # shapes it fired on before this change and on no new ones.
+    # CHECKSUM BUDGET, for THIS pass: unchanged, and structurally
+    # incapable of rising. `_mask_bridged_runs` spends no checksums, and
+    # the only thing it does to the value is replace an alphanumeric span
+    # with four bullets -- which are not `[A-Za-z0-9]` -- so the tokens
+    # `_IBAN_IN_TEXT_RE` finds afterwards are always a subset of the ones
+    # it would have found before. Measured on every shape above: identical
+    # spend, and the two Ж rows now spend ZERO where the unfixed code also
+    # spent zero.
+    #
+    # THAT PARAGRAPH NO LONGER COVERS THE FILE, and the correction belongs
+    # here rather than only next to the new code. Audit finding C-07 added
+    # `_mask_exemption_bridged_runs` immediately below, and it DOES spend
+    # checksums -- `_find_iban_in_token`, on the stripped form of every
+    # exemption-bridged span. So a value can now exhaust
+    # `_IBAN_SCAN_BUDGET` that did not before, and
+    # `audit_log.redaction_budget_exhausted` can fire on a shape it did
+    # not fire on before this change. The bound is unchanged in KIND: the
+    # same call-wide allowance over the same operation, drawn from the
+    # same `_ScanBudget`, with `_IBAN_SCAN_MAX_TOKEN` capping any one span
+    # exactly as it caps any one token, and the same
+    # `_has_qualifying_start` narrowing on the exhausted branch so that
+    # exhaustion does not become a denial-of-audit primitive.
+    #
+    # THE WALL-CLOCK COST OF C-07, measured the same way as the table
+    # above (both versions in one process, timed interleaved, min of 3
+    # trials, 1 MiB payloads):
+    #
+    #   1 MiB payload                       before (ms)   after (ms)
+    #   ASCII adversarial (module's own)       171.9        168.7
+    #   homoglyphed, catalogued А              259.8        260.3
+    #   grouped four-digit groups               13.9         28.0
+    #   ordinal-bridged (letters and digits)    69.0        107.7
+    #   ordinal-bridged, 22-digit runs         148.5        176.7
+    #   ordinal-bridged at max scan density    282.2        341.6
+    #   ordinary prose                          12.6         15.2
+    #   83-byte ASCII memo (us)                  2.75         3.14
+    #   61-byte accented memo (us)               9.55        11.56
+    #
+    # Read the last-but-three row as the headline and do not soften it:
+    # the worst case this module has is now 342ms of synchronous
+    # event-loop stall for one 1 MiB value, up 21% from 282ms. That
+    # payload is 128-character spans at maximum qualifying-start density
+    # with one ordinal indicator in each, so every span bridges and every
+    # span is scannable -- and it was ALREADY the worst shape before this
+    # change, ahead of both the ASCII adversarial shape the budget was
+    # derived against and the homoglyphed one. C-07 makes an existing
+    # worst case 21% worse; it does not create a new class of one. The
+    # checksum budget is what keeps 342ms from being 3 seconds, and the
+    # rest is the same unbudgeted O(length) preprocessing class
+    # `_delookalike`'s own docstring already names as the obvious next
+    # place to look. It is still not closed. It is still only measured.
+    #
+    # The +101% on the grouped-digits row is the separator-tolerant PAN
+    # pattern paying for a payload that is nothing but four-digit groups,
+    # and it is the largest RELATIVE cost here while being 28ms in
+    # absolute terms -- an eighth of the worst case, because a digit run
+    # buys no checksums at all.
     bridged = _mask_bridged_runs(value, iban_skeleton)
     if bridged is not value:
         value = bridged
+        iban_skeleton = _delookalike(value)
+
+    # The exemption-bridged pass, second, for the same before-the-scans
+    # reason and with the same rebuild-only-if-something-changed identity
+    # check. AFTER `_mask_bridged_runs` rather than before it, on the
+    # narrow ground that that pass never cuts a token in half (its own
+    # docstring's invariant) and writes bullets, which are not
+    # `_ASCII_ALNUM`, so a span it masked cannot be half-consumed by the
+    # walk below -- whereas running this one first would hand it spans
+    # whose intrusions are still present and unreadable by any checksum.
+    # A span carrying BOTH an intrusion and an exemption is covered by
+    # neither pass's test and is residual 8 on `_mask_bridged_runs`.
+    exempted = _mask_exemption_bridged_runs(value, iban_skeleton, budget)
+    if exempted is not value:
+        value = exempted
         iban_skeleton = _delookalike(value)
 
     after_iban = _sub_preserving_original(_IBAN_IN_TEXT_RE, _redact_iban, iban_skeleton, value)

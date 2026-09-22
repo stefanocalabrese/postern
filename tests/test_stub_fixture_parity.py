@@ -41,16 +41,34 @@ SHARED: tuple[str, ...] = tuple(
 )
 
 
-def test_the_fixtures_publish_the_seven_names_compared_below() -> None:
+def test_the_fixtures_publish_the_names_compared_below() -> None:
     """`SHARED` is derived, so an emptied fixtures module would leave the
     parametrized test below with zero cases, which pytest reports as a skip,
     not a failure. The names are spelled out once, here, where losing one is
     loud.
+
+    Grew from seven to nineteen when the golden gate was widened to cover
+    separator-grouped, lowercase and ordinal-split PAN/IBAN forms (audit
+    finding C-07): each new shape is a constant on both sides, because a
+    grouped card number reaching the compose stack must fail the same way a
+    contiguous one does, and the stub is the only thing that puts one there.
     """
     assert set(SHARED) == {
         "FULL_PAN",
         "FULL_IBAN",
         "COUNTERPARTY_IBAN",
+        "LUHN_PAN",
+        "GROUPED_PAN",
+        "HYPHEN_PAN",
+        "DOTTED_PAN",
+        "NBSP_PAN",
+        "GROUPED_LUHN_PAN",
+        "ORDINAL_PAN",
+        "GROUPED_IBAN",
+        "HYPHEN_IBAN",
+        "LOWERCASE_IBAN",
+        "ORDINAL_IBAN",
+        "LEAKY_DESCRIPTION",
         "ACCOUNTS",
         "BALANCE",
         "TRANSACTIONS",
