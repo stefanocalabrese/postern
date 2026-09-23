@@ -31,6 +31,7 @@ from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource, KeySource
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import ReadTokenMinter
+from postern_core.auth.revocation import unchecked_revocation
 from postern_core.facade.client import StubTokenMinter
 from postern_core.identity import CustomerRef
 
@@ -59,7 +60,14 @@ SETTINGS_SHAPES = [
 
 
 def _read_minter(key_source: KeySource) -> ReadTokenMinter:
-    return ReadTokenMinter(InternalTokenMinter(issuer=READ_ISSUER, key_source=key_source))
+    # `unchecked_revocation` because this file measures the startup probe, not
+    # ZT-7: the minter's default provider refuses when no revocation decision
+    # has been published for the call, and there is no request here to publish
+    # one. See `postern_core.auth.revocation`'s `require_revocation_decision`.
+    return ReadTokenMinter(
+        InternalTokenMinter(issuer=READ_ISSUER, key_source=key_source),
+        revocation_decision=unchecked_revocation,
+    )
 
 
 # --- The answer follows the minter, in both settings shapes ----------------

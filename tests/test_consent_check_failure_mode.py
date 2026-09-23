@@ -88,6 +88,7 @@ from fastmcp.server.http import StarletteWithLifespan
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource
 from postern_core.auth.read_minter import ReadTokenMinter
+from postern_core.auth.revocation import unchecked_revocation
 from postern_core.facade.client import BackendClient
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry, ConsentRecord
@@ -234,7 +235,10 @@ def _app(
             InternalTokenMinter(
                 issuer=settings.read_token_issuer,
                 key_source=GeneratedKeySource(kid=settings.read_key_kid),
-            )
+            ),
+            # Consent, not ZT-7: this server is assembled here rather than by
+            # `create_app`, so nothing publishes a revocation decision.
+            revocation_decision=unchecked_revocation,
         ),
         transport=httpx2.MockTransport(backend_handler),
         before_backend_request=None,

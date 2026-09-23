@@ -13,6 +13,7 @@ from joserfc.jwt import Claims
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource, KeySource
 from postern_core.auth.read_minter import READ_SCOPES, ReadTokenMinter
+from postern_core.auth.revocation import unchecked_revocation
 from postern_core.identity import CustomerRef
 
 from services.confirm.minter import WriteTokenMinter, build_write_minter
@@ -55,7 +56,9 @@ def write_jwks(write_service: tuple[WriteTokenMinter, KeySource]) -> KeySetSeria
 def api_minter() -> ReadTokenMinter:
     source = GeneratedKeySource(kid="read-1")
     return ReadTokenMinter(
-        InternalTokenMinter(issuer="https://mcp-read.internal", key_source=source)
+        InternalTokenMinter(issuer="https://mcp-read.internal", key_source=source),
+        # The key split, not ZT-7. No request, so no revocation decision.
+        revocation_decision=unchecked_revocation,
     )
 
 
@@ -122,7 +125,10 @@ def test_miswiring_the_write_key_into_the_api_is_caught(
     API's minter on the WRITE key source. The write endpoint then accepts it,
     so this test asserts the failure is detectable rather than silent."""
     _, write_source = write_service
-    miswired = ReadTokenMinter(InternalTokenMinter(issuer=WRITE_ISS, key_source=write_source))
+    miswired = ReadTokenMinter(
+        InternalTokenMinter(issuer=WRITE_ISS, key_source=write_source),
+        revocation_decision=unchecked_revocation,
+    )
     accepted = istio_write_endpoint(miswired(CUST, "accounts.svc"), write_jwks)
     assert accepted["iss"] == WRITE_ISS
 

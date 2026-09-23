@@ -61,6 +61,7 @@ from mcp.types import REQUEST_TIMEOUT
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource
 from postern_core.auth.read_minter import ReadTokenMinter
+from postern_core.auth.revocation import unchecked_revocation
 from postern_core.facade.client import BackendClient
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry, ConsentRecord
@@ -733,7 +734,11 @@ def _deadline_app(
             InternalTokenMinter(
                 issuer=settings.read_token_issuer,
                 key_source=GeneratedKeySource(kid=settings.read_key_kid),
-            )
+            ),
+            # This file measures deadlines, not ZT-7, and builds its own
+            # server rather than `create_app`'s, so no `RevocationMiddleware`
+            # publishes a decision for the minter's default provider to read.
+            revocation_decision=unchecked_revocation,
         ),
         transport=httpx2.MockTransport(backend_handler),
         # Wired exactly as `create_app` wires it

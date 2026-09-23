@@ -65,7 +65,7 @@ from postern_core.auth.keys import (
 )
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
-from postern_core.auth.revocation import RevocationList
+from postern_core.auth.revocation import create_revocation_store, decision_scope
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
@@ -75,6 +75,7 @@ from services.api.asgi.header_validation import HeaderBodyValidation
 from services.api.asgi.request_deadline import RequestDeadline
 from services.api.jwks import jwks_route
 from services.api.middleware.audit import AuditMiddleware, record_data_touch
+from services.api.middleware.revocation import RevocationMiddleware
 from services.api.middleware.risk import RiskMiddleware
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
@@ -217,18 +218,24 @@ def create_app(
     # plumbing a later task owns rather than a value that could be guessed
     # here.
     read_key_source = _read_key_source(settings)
-    # ZT-1: continuous authorization — revocation list and jti replay cache.
-    # The revocation list is checked before mint (customer+client, kill-switch);
-    # the jti cache is checked after mint (session replay, A10). Both are
-    # in-memory and stateless — a production deployment would back them with
-    # Redis or a database table.
-    revocation_list = RevocationList()
+    # ZT-7: the shared revocation store, Redis-backed whenever
+    # `POSTERN_REDIS_URL` is set and per-replica-and-forgotten-on-restart
+    # otherwise. Until 2026-09-23 this line built a bare `RevocationList`,
+    # kept it in a local, and gave nothing a way to write to it: no route, no
+    # CLI, no persistence, and not even a handle on `app.state`. The operator
+    # surface is `postern_core.auth.revoke_cli` and the check that enforces it
+    # is `services/api/middleware/revocation.py`'s `RevocationMiddleware`,
+    # installed below.
+    revocation_store = create_revocation_store()
+    # ZT-1 A10: the jti replay cache, checked after mint. Still in-memory and
+    # per replica, which is a narrower claim than it looks -- it catches a
+    # duplicate jti this process minted, within one token lifetime.
     jti_cache = JtiReplayCache(max_age_seconds=_LIFETIME.total_seconds())
     read_minter = ReadTokenMinter(
         InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source),
-        revocation_list=revocation_list,
         jti_cache=jti_cache,
     )
+
     # Before that minter reaches anything that could send one of its tokens:
     # mint one, and refuse to start unless it verifies against the key set
     # `jwks_route` below publishes from this same `read_key_source`. Keyed on
@@ -243,8 +250,25 @@ def create_app(
     # are closed only by `_close_resources_after_fastmcp_shutdown`, which a
     # `RuntimeError` out of this function means never runs. Refusing before
     # either exists abandons no open resource.
+    #
+    # The `decision_scope(False)` is what lets this probe run at all. The
+    # minter refuses when no revocation decision has been published for the
+    # call, and at startup there is no request and therefore no middleware to
+    # publish one -- that refusal is the point of the default (see
+    # `postern_core.auth.revocation`'s `require_revocation_decision`), so the
+    # one call that legitimately has no decision states so rather than
+    # softening the default for every other caller. `_STARTUP_PROBE` is a
+    # reference to nobody and the token is verified in process and discarded.
+    # The scope is exited before this function returns, so nothing inherits
+    # it: `decision_scope` resets the ContextVar through the token `set`
+    # returned, and a value left set here would become the standing default
+    # for every request task spawned from this context.
+    def _probe_token() -> str:
+        with decision_scope(False):
+            return read_minter(_STARTUP_PROBE, "accounts.svc")
+
     refuse_unverifiable_minter(
-        lambda: read_minter(_STARTUP_PROBE, "accounts.svc"),
+        _probe_token,
         built=read_minter,
         key_source=read_key_source,
         role="READ",
@@ -360,6 +384,19 @@ def create_app(
     # middleware is what makes that hook resolvable at all, so the two go
     # together and neither is conditional.
     server.add_middleware(AuditMiddleware(db))
+    # ZT-7: the revocation check, INSIDE `AuditMiddleware` and OUTSIDE
+    # `RiskMiddleware`. Inside audit, because a refused call is exactly the
+    # event an operator wants a row for -- it is how they confirm the
+    # revocation they just wrote took effect. Outside risk, because a revoked
+    # caller should be refused before spending any budget or touching the risk
+    # session store: there is no reason to charge a session that is not
+    # allowed to run at all.
+    #
+    # `customer_resolver` is the SAME object the risk layer and the tools
+    # read, for the reason stated where it is built below: two separate reads
+    # of the identity can disagree, and refusing one customer while returning
+    # another's data is not a revocation.
+    server.add_middleware(RevocationMiddleware(revocation_store, customer_resolver))
     # ZT-5: the risk layer. INSIDE `AuditMiddleware` (added second, so it
     # runs nested within it), which is what lets the audit row carry this
     # call's risk signals: `AuditMiddleware` reads `get_current_session()`
@@ -415,6 +452,12 @@ def create_app(
     # driving 500 records' worth of real calls to reach the threshold -- would
     # measure the fixtures rather than the control.
     app.state.postern_session_store = session_store
+    # ZT-7, and the defect this commit exists to close: the revocation list
+    # used to be a local in this function with no handle anywhere, so nothing
+    # -- not a test, not an operator, not another process -- could reach it.
+    # It is on `app.state` now for the same reason the four above are, and the
+    # store it names is shared across replicas whenever Redis is configured.
+    app.state.postern_revocation_store = revocation_store
     # The public half of the key the minter above signs with. Task 3's JWKS
     # route serves it, and it is the only handle on that key outside the
     # `BackendClient` the minter is buried in.

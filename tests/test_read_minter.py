@@ -4,6 +4,7 @@ from joserfc.jwk import KeySet
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource
 from postern_core.auth.read_minter import READ_SCOPES, ReadTokenMinter
+from postern_core.auth.revocation import unchecked_revocation
 from postern_core.identity import CustomerRef
 
 CUST = CustomerRef(value="cust_7f3a")
@@ -17,7 +18,14 @@ def source() -> GeneratedKeySource:
 
 @pytest.fixture
 def minter(source: GeneratedKeySource) -> ReadTokenMinter:
-    return ReadTokenMinter(InternalTokenMinter(issuer=ISS, key_source=source))
+    # This file measures scope derivation and the audience refusal, not ZT-7.
+    # `unchecked_revocation` is the explicit opt-out the minter's refusing
+    # default requires; see `postern_core.auth.revocation`'s
+    # `require_revocation_decision` for why the default refuses instead.
+    return ReadTokenMinter(
+        InternalTokenMinter(issuer=ISS, key_source=source),
+        revocation_decision=unchecked_revocation,
+    )
 
 
 def test_it_satisfies_the_token_minter_protocol(

@@ -36,6 +36,7 @@ from fastmcp.server.http import StarletteWithLifespan
 from joserfc import jwt as jose_jwt
 from joserfc.jwk import KeySet, RSAKey
 from postern_core.auth.read_minter import ReadTokenMinter
+from postern_core.auth.revocation import decision_scope
 from postern_core.identity import CustomerRef
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry, ConsentRecord
@@ -613,7 +614,15 @@ def _mint(app: StarletteWithLifespan, audience: str) -> str:
     prove only that a token was sent, since the `MockTransport` handler
     above never reads the `Authorization` header.
     """
-    return cast(str, app.state.backend_client._minter(TEST_CUSTOMER, audience))
+    # `decision_scope(False)` because this reaches the minter with no request
+    # and therefore no `RevocationMiddleware` to publish a revocation decision
+    # for the call, and the minter's default provider refuses rather than
+    # assuming one (`postern_core.auth.revocation`'s
+    # `require_revocation_decision`). ZT-7 is measured in
+    # `tests/test_zt7_revocation_reachable.py`; what this function measures is
+    # the key the token is signed with.
+    with decision_scope(False):
+        return cast(str, app.state.backend_client._minter(TEST_CUSTOMER, audience))
 
 
 def test_the_backend_client_mints_a_real_read_token_signed_by_the_stashed_key() -> None:
