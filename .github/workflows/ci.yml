@@ -8,24 +8,26 @@ name: ci
 # consent-repository tests (measured ~2s added, session-scoped so paid once),
 # so `make ci` is no longer fully offline; it degrades to an explicit skip,
 # not a crash, when a local machine has no Docker running (see `pg_url` in
-# tests/conftest.py). The `alembic check` step is still the one gate `make
-# ci` does not run, because it needs a fixed, externally reachable Postgres
-# URL rather than a container it owns and tears down itself; this manually
-# dispatched workflow gets one for free via the service container below.
+# tests/conftest.py). `alembic check` is NO LONGER a gate `make ci` misses:
+# `tests/test_schema_drift.py` runs the same drift check inside `make test`,
+# against that disposable container, and blocks on it. What this workflow's
+# final step adds is the same check against a Postgres whose URL is fixed in
+# advance, which is a different thing to have exercised and costs nothing on a
+# manually dispatched run.
 on:
   workflow_dispatch:
 
 jobs:
   gates:
     runs-on: ubuntu-latest
-    # `alembic check` (the `migrations` target) is not one of `make ci`'s six
-    # local gates: it needs a database URL fixed in advance, which is a
-    # different requirement from `test`'s own disposable `testcontainers`
-    # Postgres (Task 3). Here, a Postgres service container costs nothing on
-    # a manually dispatched run, so the drift check runs as an extra step
-    # instead; `make test` also runs against a second, independent container
-    # that `testcontainers` starts and tears down itself, which this service
-    # container does not replace.
+    # `alembic check` runs in two places now. `make test` runs it locally via
+    # `tests/test_schema_drift.py`, against the disposable `testcontainers`
+    # Postgres that fixture owns, so schema drift already blocks `make ci`
+    # (commit 1808c24). The `migrations` target below is the same check
+    # against a database URL fixed in advance -- what an operator points at a
+    # staging replica by hand, and what this workflow gets for free from the
+    # service container. `make test` still starts its own second, independent
+    # container, which this service container does not replace.
     services:
       postgres:
         image: postgres:17-alpine
