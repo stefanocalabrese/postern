@@ -19,7 +19,7 @@ import string
 import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import AfterValidator
 
@@ -3005,3 +3005,78 @@ FreeText = Annotated[str, AfterValidator(_redact_free_text)]
 PAN-shaped substring on validation, rather than requiring every caller to
 remember to scrub it (handoff §3.4's leak scenario, security review of
 Task 3). Ordinary text passes through unchanged."""
+
+
+def scrub_text(value: str) -> str:
+    """Redact PAN- and IBAN-shaped substrings in one string, NUL bytes first.
+
+    PROMOTED HERE 2026-09-23 from `services/api/middleware/audit.py`, where it
+    was the `isinstance(value, str)` branch of that module's private `_scrub`.
+    It moved because a THIRD copy was about to be written: the write path
+    (`services/confirm/audit.py`) needs exactly this, and
+    `services/confirm/execute.py` already carried a second, weaker copy that
+    validated through `FreeText` WITHOUT the NUL strip below -- so a NUL-split
+    PAN in a backend error body reached `BackendWriteError.detail` unmasked.
+    Both now call this. In a codebase whose thesis is that masking is a type
+    property rather than a function someone remembers to call, three
+    hand-maintained maskers was the wrong shape, and the weakest of the three
+    was the one on the money path.
+
+    NUL BYTES ARE STRIPPED BEFORE REDACTION, NOT AFTER, and the order is
+    load-bearing. `_PAN_IN_TEXT_RE` (`\\d{12,}`) matches a CONTIGUOUS run of 12
+    or more digits, with the 19-digit PAN length cap applied separately when
+    deciding what to emit, so a NUL planted inside a PAN splits it into two
+    shorter runs that individually fail to match, and validation finds nothing
+    to redact. Stripping the NUL afterwards then reassembles the full,
+    unmasked PAN in the value that gets written -- one byte of attacker input
+    surviving as a raw PAN in a long-lived store. Stripping first removes the
+    split before `_redact_free_text` ever sees the string, so the contiguous
+    run is there to match. Measured directly against every split position; do
+    not swap this back to validate-then-strip, even though that reads more
+    natural (validate the input, then clean it) -- it is the specific ordering
+    this function must not have.
+
+    `_redact_free_text` not handling other separators (spaces, hyphens) is a
+    separate, documented limitation with its own rationale elsewhere in this
+    module; NUL is different only because this line is what reassembles it.
+
+    Calls `_redact_free_text` directly rather than through
+    `TypeAdapter(FreeText).validate_python`, which is what the call site in
+    `services/api` used. For a `str` argument the two are the same operation
+    -- pydantic's non-strict `str` schema passes a `str` through unchanged and
+    then applies the `AfterValidator` -- and this module owns the validator,
+    so the round trip through pydantic bought nothing but a layer.
+    """
+    return _redact_free_text(value.replace("\x00", ""))
+
+
+def scrub_tree(value: Any) -> Any:
+    """`scrub_text` applied through a dict/list tree, INCLUDING dict keys.
+
+    Promoted alongside `scrub_text` above, from the same private function, and
+    for the same reason.
+
+    KEYS MATTER AS MUCH AS VALUES. Arguments are captured before anything
+    validates them, so a key is just as caller-controlled as a value (e.g.
+    `{"4111111111114417": "x"}`), and an unmasked key would persist a full PAN
+    into a long-lived table exactly like an unmasked value would.
+
+    Two distinct keys can collide onto the same masked string
+    (`"41111111111111"` and `"241111111111111"` both end in `1111`); that
+    silently drops one during the dict comprehension. That is the right trade
+    for an audit log -- it must never hold the raw value either key started as
+    -- but a reader needs to know it was a deliberate choice, not an
+    oversight.
+
+    Anything that is not a `str`, `dict` or `list` is returned as it arrived:
+    an `int`, a `bool`, `None`. Nothing in those shapes can carry a PAN that
+    `_PAN_IN_TEXT_RE` would match, and coercing them to text to find out would
+    change what the caller stores.
+    """
+    if isinstance(value, str):
+        return scrub_text(value)
+    if isinstance(value, dict):
+        return {scrub_tree(k): scrub_tree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub_tree(v) for v in value]
+    return value

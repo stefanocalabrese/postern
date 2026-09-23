@@ -61,18 +61,49 @@ their phone. What closes it is a per-customer device public key, registered
 at enrolment, with this handler verifying a signature over the stored
 challenge row's own fields (id, amount, payee, nonce) rather than over
 anything the caller supplies.
+
+WHAT IS RECORDED. Until 2026-09-23 this handler wrote nothing to
+``audit_log``. The only trace an approval left was the ``challenges`` row it
+mutated -- whose ``confirming_device`` and ``signature`` are both
+caller-supplied, whose ``signature`` is unverified, and which carries no
+instant for the approval distinct from its own. Meanwhile ``services/api``
+recorded two rows for reading a balance. The asymmetry ran backwards: the
+highest-consequence action in the system was the least recorded one.
+
+Every path below now writes at least one ``audit_log`` row, and the paths
+that reach the operator's backend write two, correlated by ``call_id``, the
+first committed BEFORE the backend is touched.
+``services/confirm/audit.py`` owns every decision about those rows and is
+where to read about them; what matters here is that the writes FAIL CLOSED
+(``dev-docs/decisions/0006-audit-write-failure.md``), so an audit store that
+is down or merely slow stops money from moving rather than letting it move
+unrecorded.
 """
 
 from __future__ import annotations
 
 import logging
+import time
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from postern_core.store.challenges import get_challenge, update_challenge_status
+from postern_core.store.engine import Database
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from services.confirm.auth import unauthenticated_response, verified_subject
+from services.confirm.audit import (
+    DETAIL_ALREADY_TERMINAL,
+    DETAIL_CHALLENGE_NOT_FOUND,
+    DETAIL_CHALLENGE_NOT_OWNED,
+    DETAIL_CHALLENGE_VANISHED,
+    DETAIL_EXPIRED,
+    DETAIL_MISSING_SIGNATURE,
+    DETAIL_UPDATE_MATCHED_NO_ROW,
+    ApprovalAudit,
+)
+from services.confirm.auth import unauthenticated_response, verified_claims, verified_subject
 from services.confirm.execute import BackendWriteClient, BackendWriteError, resolve_endpoint
 
 logger = logging.getLogger(__name__)
@@ -83,7 +114,8 @@ logger = logging.getLogger(__name__)
 
 
 async def approve_challenge(request: Request) -> JSONResponse:
-    """Handle a verification challenge approval from the mobile app.
+    """Handle a verification challenge approval from the mobile app, and
+    record what it did in ``audit_log``.
 
     This is called by the confirmation service (the operator's banking app)
     after the user completes identity verification and approves the operation.
@@ -106,17 +138,61 @@ async def approve_challenge(request: Request) -> JSONResponse:
     anything. Step 2's is a plain ``SELECT``, but the column it tests --
     ``customer_ref`` -- is written once at challenge creation and never
     updated, so there is no version of it that a lock would protect.
+
+    WHAT THIS FUNCTION OWNS IN THE AUDIT TRAIL, and what it delegates.
+    ``services/confirm/audit.py`` holds every decision about the rows -- which
+    columns carry what, which requests get one row and which get two, and why
+    ``refusal_reason`` is NULL throughout. This function owns only the two
+    instants at the top, the correlation id, and the mapping from each exit to
+    an outcome. Both instants are read as the FIRST statements of the handler,
+    before the subject is looked at: everything this function does is then
+    inside the measurement, and the only thing outside it is
+    ``AppAssertionMiddleware``'s verification, which is the same boundary the
+    read path's ``context.timestamp`` sits behind.
+
+    FAIL CLOSED, per ``dev-docs/decisions/0006-audit-write-failure.md``. An
+    audit write that fails fails the request, which means a failed completion
+    write turns a 200 into a 500 AFTER the backend write succeeded and the
+    money moved. That is deliberate and it is the same bargain the read path
+    already makes (it fails a call whose tool returned). What makes it safe to
+    retry is the ``Idempotency-Key: <challenge_id>`` header
+    ``BackendWriteClient`` sends, plus the ``approved -> executed`` transition
+    being conditional: the backend sees the same key and the row is already
+    out of ``pending``. Do not "fix" this into a logged warning.
     """
+    # FIRST TWO STATEMENTS, before anything is inspected. `at` is a wall clock
+    # because it has to be comparable with `reaching_at`; `started` is
+    # monotonic because it measures an interval and a clock that steps
+    # backwards under an NTP correction would write a negative duration into
+    # an append-only table.
+    at = datetime.now(UTC)
+    started = time.monotonic()
+
     subject = verified_subject(request)
     if subject is None:
         # Unreachable through the assembled app: `AppAssertionMiddleware`
         # refused before routing. Kept because a handler that derives
         # authority from ambient state must fail closed when that state is
         # absent, not proceed with none.
+        #
+        # NO AUDIT ROW, and this is the first of the two places that write
+        # none. There is no verified subject here, so a row would have to
+        # invent a class of absence that `CUSTOMER_REF_ABSENCE_REASONS` does
+        # not name -- the middleware's own refusal is already logged, and that
+        # is the record of this event.
         return unauthenticated_response()
 
     challenge_id: str = request.path_params.get("challenge_id", "")
     if not challenge_id:
+        # The second place that writes no row. Also unreachable through the
+        # assembled app: this handler is only ever mounted on
+        # `/challenges/{challenge_id}/approve` and Starlette's router cannot
+        # match an empty path segment, so reaching here means something other
+        # than the route table dispatched the request. A row naming no
+        # challenge names nothing an investigator can act on, so this is
+        # logged instead -- which it was not before the audit trail landed,
+        # making it the one refusal in this file that left no trace anywhere.
+        logger.warning("challenge approve: dispatched with no challenge_id in the path")
         return _error(400, "invalid_request", "challenge_id is required in path")
 
     body = await request.json()
@@ -126,17 +202,146 @@ async def approve_challenge(request: Request) -> JSONResponse:
     unverified_signature: str = body.get("signature", "")
     verification_result: str | None = body.get("verification_result")
 
+    # Typed rather than left as the `Any` that `app.state` hands back, so
+    # `_approve` and `ApprovalAudit` below are both checked against the real
+    # sessionmaker rather than against anything at all.
+    db: Database = request.app.state.postern_database
+
+    # Built HERE: the first point at which a verified subject and a non-empty
+    # challenge id both exist, which is exactly the boundary
+    # `services/confirm/audit.py` defines for "this request gets a completion
+    # row". Everything below this line writes one.
+    #
+    # TWO POOLED CONNECTIONS PER APPROVAL, WHERE THERE USED TO BE ONE, and
+    # that doubling is a real cost rather than an implementation detail. Both
+    # audit rows open their own session from `db.sessionmaker()` while
+    # `_approve` below still holds the session that claimed the challenge, and
+    # they must: an audit row that shared the approval's transaction would be
+    # rolled back with it, which is the opposite of what an append-only,
+    # regulator-facing table is for, and the entry row specifically has to be
+    # durable BEFORE the backend request that the same transaction has not
+    # committed yet.
+    #
+    # `Database.__init__` sets no `pool_size` and no `max_overflow`
+    # (`postern_core.store.engine`), so this service silently inherits
+    # SQLAlchemy's 5 + 10 -- a number nobody in this repository chose. This
+    # change makes that unchosen ceiling bind at half the concurrency it used
+    # to. Sizing the pool is a separate decision with production consequences
+    # and is deliberately NOT made here; what belongs here is that the next
+    # person reading a `pool_timeout` in this service's logs finds the cause
+    # written down rather than inferring it.
+    audit = ApprovalAudit(
+        db=db,
+        call_id=str(uuid.uuid4()),
+        at=at,
+        started=started,
+        subject=subject,
+        claims=verified_claims(request),
+        challenge_id=challenge_id,
+        body=body,
+    )
+
+    try:
+        response, detail = await _approve(
+            request,
+            audit,
+            db=db,
+            subject=subject,
+            challenge_id=challenge_id,
+            body=body,
+            unverified_signature=unverified_signature,
+            verification_result=verification_result,
+        )
+    except Exception as exc:
+        # `raise exc from audit_exc`, never a bare `raise` from inside this
+        # handler: an audit-write failure must not REPLACE the exception that
+        # actually ended the request. Raising while already handling `exc`
+        # would chain implicitly through `__context__` and put the database's
+        # exception where the request's own belongs, so the operator reading
+        # the traceback would learn what the audit store did and not what the
+        # approval did. Same shape, same reasoning, as
+        # `services/api/middleware/audit.py`'s raised branch.
+        try:
+            await audit.raised(type(exc).__name__)
+        except Exception as audit_exc:
+            logger.error(
+                "audit write failed for challenge %r after the approval raised %s: %s",
+                challenge_id,
+                type(exc).__name__,
+                audit_exc,
+                exc_info=audit_exc,
+            )
+            raise exc from audit_exc
+        raise
+
+    try:
+        if detail is None:
+            await audit.returned()
+        else:
+            await audit.raised(detail)
+    except Exception as audit_exc:
+        logger.error(
+            "audit write failed for challenge %r after the approval finished with "
+            "status %d; failing the request because the audit row could not be written",
+            challenge_id,
+            response.status_code,
+            exc_info=audit_exc,
+        )
+        raise
+    return response
+
+
+async def _approve(
+    request: Request,
+    audit: ApprovalAudit,
+    *,
+    db: Database,
+    subject: str,
+    challenge_id: str,
+    body: dict[str, Any],
+    unverified_signature: str,
+    verification_result: str | None,
+) -> tuple[JSONResponse, str | None]:
+    """The approval itself, returning ``(response, detail)``.
+
+    ``detail`` is ``None`` when the work succeeded and one of
+    ``services/confirm/audit.py``'s ``DETAIL_*`` literals otherwise. Split out
+    from ``approve_challenge`` so that every one of the eight exits below
+    names its own outcome exactly once, at the point the decision is made,
+    and the completion row is written in exactly one place rather than at
+    eight returns that a future ninth could forget to join.
+
+    The status code and the detail are deliberately NOT derived from each
+    other. Two exits return 404 with the same body for different reasons (no
+    such challenge, and not yours), which is an intentional absence of an
+    existence oracle in the RESPONSE and would be a loss of the most valuable
+    signal on this path in the TABLE.
+    """
     if not unverified_signature:
-        return _error(400, "invalid_request", "signature is required")
+        return (
+            _error(400, "invalid_request", "signature is required"),
+            DETAIL_MISSING_SIGNATURE,
+        )
 
     # --- 1. Look up the challenge (from DB, not agent input) ---
-    db = request.app.state.postern_database
-
     async with db.sessionmaker() as session:
         challenge_record = await get_challenge(session, challenge_id)
 
         if challenge_record is None:
-            return _error(404, "not_found", f"challenge {challenge_id} not found")
+            # `tool_name` stays the unresolved literal on this row: no
+            # challenge was found, so there is no operation to name. That is
+            # what makes `WHERE tool_name = 'challenges.approve'` the
+            # id-enumeration query.
+            return (
+                _error(404, "not_found", f"challenge {challenge_id} not found"),
+                DETAIL_CHALLENGE_NOT_FOUND,
+            )
+
+        # The operation is known from here on, so every row below names it.
+        # Recorded even on the refusals -- an investigator asking "what did
+        # this caller try to approve" gets an answer whether or not they were
+        # allowed to.
+        audit.resolve(challenge_record.tool_name)
 
         # --- 2. The challenge must belong to the authenticated customer ---
         #
@@ -155,7 +360,16 @@ async def approve_challenge(request: Request) -> JSONResponse:
                 "challenge approve: %s requested by a subject that does not own it",
                 challenge_id,
             )
-            return _error(404, "not_found", f"challenge {challenge_id} not found")
+            # THE HIGHEST-VALUE ROW THIS MODULE WRITES. The response is
+            # byte-identical to "no such challenge" on purpose, so the caller
+            # learns nothing; the audit row is where the two are told apart.
+            # `customer_ref` names the CALLER, `tool_name` names what they
+            # tried to approve, so a cross-customer probe is one predicate on
+            # `detail` and the target is on the same row.
+            return (
+                _error(404, "not_found", f"challenge {challenge_id} not found"),
+                DETAIL_CHALLENGE_NOT_OWNED,
+            )
 
         # --- 3. Claim the challenge: pending -> approved, in one statement ---
         #
@@ -179,7 +393,14 @@ async def approve_challenge(request: Request) -> JSONResponse:
                 signature=unverified_signature,
             )
         except Exception as exc:
-            return _error(500, "internal_error", f"approval update failed: {exc}")
+            # `type(exc).__name__` and never `str(exc)` on the audit row, even
+            # though the RESPONSE interpolates the message: a store exception
+            # can embed the offending value, and this table is a long-lived
+            # one. The response's own disclosure predates this change.
+            return (
+                _error(500, "internal_error", f"approval update failed: {exc}"),
+                type(exc).__name__,
+            )
 
         if updated is None:
             return await _refused_transition_response(session, challenge_id)
@@ -201,6 +422,14 @@ async def approve_challenge(request: Request) -> JSONResponse:
             write_client = BackendWriteClient(
                 base_url=settings.backend_base_url,
                 minter=minter,
+                # THE ENTRY ROW. Invoked by `execute` immediately before the
+                # outbound request and AFTER the write JWT is minted, so the
+                # row it commits says a write token existed for this challenge
+                # and the socket was next. If it raises, the backend is never
+                # reached -- that is `BackendRequestHook`'s contract, and it is
+                # what makes an audit outage stop money movement rather than
+                # merely fail to describe it.
+                before_backend_request=audit.record,
             )
 
             try:
@@ -240,32 +469,65 @@ async def approve_challenge(request: Request) -> JSONResponse:
                 )
             await session.commit()
 
-            return _json(
-                200,
-                {
-                    "challenge_id": challenge_id,
-                    "status": "executed",
-                    "message": f"{updated.tool_name} executed successfully",
-                },
+            # THE ONLY EXIT THAT RECORDS `returned`. It is reached when, and
+            # only when, the backend accepted the write, so `outcome` on this
+            # row means the money moved -- not that the server answered.
+            return (
+                _json(
+                    200,
+                    {
+                        "challenge_id": challenge_id,
+                        "status": "executed",
+                        "message": f"{updated.tool_name} executed successfully",
+                    },
+                ),
+                None,
             )
 
         except BackendWriteError as exc:
             # Execution failed — challenge is approved but not executed.
             # The backend may have partially processed the request; audit trail
             # captures this state for investigation.
-            return _json(
-                207,
-                {
-                    "challenge_id": challenge_id,
-                    "status": "approved",  # Approved but not executed.
-                    "message": f"approval recorded, backend execution failed: {exc.detail}",
-                    "backend_status": exc.status,
-                },
+            #
+            # `raised`, not `returned`, and the 207 does not change that: the
+            # `outcome` vocabulary describes what the WORK did, not what HTTP
+            # said. This row is paired with an entry row, because the backend
+            # was reached -- which is exactly the state an investigator needs,
+            # since a challenge sitting in `approved` may or may not have been
+            # partially processed on the other side.
+            #
+            # `exc.detail` is already scrubbed by `_scrub_response`, but it is
+            # still a backend MESSAGE, so what reaches the table is the
+            # exception type alone. The status code lives in the response, and
+            # the `Idempotency-Key` in the backend's own access log is what
+            # joins this row to what actually happened there.
+            return (
+                _json(
+                    207,
+                    {
+                        "challenge_id": challenge_id,
+                        "status": "approved",  # Approved but not executed.
+                        "message": f"approval recorded, backend execution failed: {exc.detail}",
+                        "backend_status": exc.status,
+                    },
+                ),
+                type(exc).__name__,
             )
 
         except ValueError as exc:
             # Tool not registered or payload missing required fields.
-            return _error(500, "internal_error", f"execution setup failed: {exc}")
+            #
+            # A SINGLE ROW, no entry row, and that asymmetry is the point.
+            # `resolve_endpoint` raises before `BackendWriteClient` is
+            # constructed, so nothing was reached and the hook never ran -- but
+            # the challenge has ALREADY been claimed and committed as
+            # `approved` by step 3. This row is the only record that a
+            # challenge is stranded in `approved` with no execution behind it
+            # and no backend to reconcile against.
+            return (
+                _error(500, "internal_error", f"execution setup failed: {exc}"),
+                type(exc).__name__,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +535,9 @@ async def approve_challenge(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-async def _refused_transition_response(session: Any, challenge_id: str) -> JSONResponse:
+async def _refused_transition_response(
+    session: Any, challenge_id: str
+) -> tuple[JSONResponse, str | None]:
     """Name the reason a conditional ``pending`` -> ``approved`` matched no row.
 
     The statement that refused carried three predicates -- the id, ``status =
@@ -315,10 +579,25 @@ async def _refused_transition_response(session: Any, challenge_id: str) -> JSONR
             "challenge %s vanished between the ownership read and the update",
             challenge_id,
         )
-        return _error(404, "not_found", f"challenge {challenge_id} not found")
+        # The response is the ordinary 404; the audit row is not. This detail
+        # is the only place the anomaly is durable -- the log line above is
+        # whatever the deployment does with stderr, and the row is in the
+        # table a regulator reads.
+        return (
+            _error(404, "not_found", f"challenge {challenge_id} not found"),
+            DETAIL_CHALLENGE_VANISHED,
+        )
 
     if current.status != "pending":
-        return _error(409, "already_terminal", f"challenge is already {current.status}")
+        # A lost race and a replayed approval are the same row. Both are
+        # normal enough not to be an anomaly and interesting enough to count:
+        # MCP 2026-07-28 removed SSE resumability, so a client re-issuing a
+        # dropped request is specified behaviour, and a spike in these is how
+        # a replay attempt would look.
+        return (
+            _error(409, "already_terminal", f"challenge is already {current.status}"),
+            DETAIL_ALREADY_TERMINAL,
+        )
 
     # Still pending, so the deadline is what refused the claim. Record that,
     # conditionally and in SQL like every other transition: ``expiry="expired"``
@@ -333,7 +612,14 @@ async def _refused_transition_response(session: Any, challenge_id: str) -> JSONR
     )
     if expired is not None:
         await session.commit()
-        return _error(410, "expired", f"challenge {challenge_id} has expired")
+        # This path WRITES -- it retires the challenge -- and is the one
+        # refusal that changes state. The row records that the transition to
+        # `expired` was driven by this caller at this instant, which the
+        # `challenges` row itself does not say.
+        return (
+            _error(410, "expired", f"challenge {challenge_id} has expired"),
+            DETAIL_EXPIRED,
+        )
 
     # Pending, unexpired, and yet a statement whose only other predicate was
     # the primary key matched nothing. There is no state of the table that
@@ -344,7 +630,10 @@ async def _refused_transition_response(session: Any, challenge_id: str) -> JSONR
         "pending and unexpired",
         challenge_id,
     )
-    return _error(500, "internal_error", "approval update matched no row")
+    return (
+        _error(500, "internal_error", "approval update matched no row"),
+        DETAIL_UPDATE_MATCHED_NO_ROW,
+    )
 
 
 def _error(status: int, code: str, description: str) -> JSONResponse:

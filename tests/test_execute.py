@@ -170,6 +170,7 @@ async def test_execute_success_200() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     response = await client.execute(
         customer_ref="cust_7f3a",
@@ -192,6 +193,7 @@ async def test_execute_success_201() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     response = await client.execute(
         customer_ref="cust_7f3a",
@@ -214,6 +216,7 @@ async def test_execute_success_202() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     response = await client.execute(
         customer_ref="cust_7f3a",
@@ -241,6 +244,7 @@ async def test_execute_400_raises_backend_write_error() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     with pytest.raises(BackendWriteError) as excinfo:
         await client.execute(
@@ -264,6 +268,7 @@ async def test_execute_500_raises_backend_write_error() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     with pytest.raises(BackendWriteError) as excinfo:
         await client.execute(
@@ -294,6 +299,7 @@ async def test_execute_attaches_bearer_token() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     await client.execute(
         customer_ref="cust_7f3a",
@@ -326,6 +332,7 @@ async def test_execute_includes_challenge_id_in_token_mint() -> None:
         base_url="https://backend.test",
         minter=_CapturingMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     await client.execute(
         customer_ref="cust_7f3a",
@@ -368,6 +375,7 @@ async def test_execute_sends_the_challenge_id_as_the_idempotency_key() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     await client.execute(
         customer_ref="cust_7f3a",
@@ -397,6 +405,7 @@ async def test_two_executions_of_one_challenge_carry_the_same_idempotency_key() 
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     for _ in range(2):
         await client.execute(
@@ -422,6 +431,7 @@ async def test_distinct_challenges_carry_distinct_idempotency_keys() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     for challenge_id in ("chal_idem_003", "chal_idem_004"):
         await client.execute(
@@ -450,6 +460,7 @@ async def test_backend_write_error_scrubs_pan_from_json_detail() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     with pytest.raises(BackendWriteError) as excinfo:
         await client.execute(
@@ -473,6 +484,7 @@ async def test_backend_write_error_scrubs_iban_from_json_detail() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     with pytest.raises(BackendWriteError) as excinfo:
         await client.execute(
@@ -496,6 +508,7 @@ async def test_backend_write_error_scrubs_pan_from_json_body_no_detail_key() -> 
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     with pytest.raises(BackendWriteError) as excinfo:
         await client.execute(
@@ -523,6 +536,7 @@ async def test_backend_write_error_scrubs_iban_from_non_json_body() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     with pytest.raises(BackendWriteError) as excinfo:
         await client.execute(
@@ -547,6 +561,7 @@ async def test_backend_write_error_detail_is_capped_at_200_chars() -> None:
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
         transport=_transport(handler),
+        before_backend_request=None,
     )
     with pytest.raises(BackendWriteError) as excinfo:
         await client.execute(
@@ -630,6 +645,7 @@ async def test_aclose_closes_underlying_client() -> None:
     client = BackendWriteClient(
         base_url="https://backend.test",
         minter=_StubWriteMinter(),
+        before_backend_request=None,
     )
     await client.aclose()
     # After aclose, the internal client should be closed.

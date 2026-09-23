@@ -92,7 +92,7 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
-from postern_core.domain.masking import FreeText, redaction_budget
+from postern_core.domain.masking import redaction_budget, scrub_tree
 from postern_core.identity import CustomerRef
 from postern_core.risk.session import get_current_session
 from postern_core.store import audit
@@ -105,13 +105,36 @@ from postern_core.store.models import (
     OUTCOME_REACHING,
     OUTCOME_RETURNED,
 )
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
 from services.api import consent
 
 logger = logging.getLogger(__name__)
 
-_FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
+# `_scrub` IS NO LONGER DEFINED HERE. It was this module's own function until
+# 2026-09-23, when the write path needed the same masking and
+# `services/confirm/execute.py` was found to be carrying a second, weaker copy
+# of it -- one that validated through `FreeText` without the NUL strip, so a
+# NUL-split PAN in a backend error body was reassembled unmasked. Rather than
+# write a third copy, both branches were promoted to
+# `postern_core.domain.masking` as `scrub_text` and `scrub_tree`, which is
+# where `FreeText`, `redaction_budget` and the validator they call already
+# live. The reasoning that used to sit in this file's docstring for it --
+# above all WHY the NUL strip precedes the contiguous-digit match, which is
+# the one ordering this function must not have -- went with the code rather
+# than staying behind in the file that no longer has it.
+#
+# Re-bound to the old private name on purpose, as an assignment rather than
+# an `import ... as` so it stays an explicit export that
+# `tests/test_audit_middleware.py` can keep importing unchanged. Every comment
+# in this module that reasons about `_scrub`'s cost, its bare-masking of
+# over-length runs, and its never lengthening a value in characters still
+# describes exactly the function being called, so the rebinding keeps them
+# true without a rewrite. The behaviour is identical -- `scrub_tree` is the
+# same four branches in the same order, and `scrub_text` calls
+# `_redact_free_text` directly where this file went through
+# `TypeAdapter(FreeText)`, which for a `str` argument is the same operation.
+_scrub = scrub_tree
 
 # The marker a clamped value carries, so the VALUE announces its own
 # alteration -- the way a masked value already announces itself by containing
@@ -242,48 +265,6 @@ def _clamp(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - len(_TRUNCATED)] + _TRUNCATED
-
-
-def _scrub(value: Any) -> Any:
-    """Redact PAN- and IBAN-shaped substrings anywhere in the argument tree,
-    including dict keys, and strip NUL bytes.
-
-    Keys matter as much as values here: arguments are captured before
-    `call_next` validates them, so a key is just as agent-controlled as a
-    value (e.g. `{"4111111111114417": "x"}`), and an unmasked key would
-    persist a full PAN into a long-lived table exactly like an unmasked
-    value would. Two distinct keys can collide onto the same masked string
-    (`"41111111111111"` and `"241111111111111"` both end in `1111`); that
-    silently drops one during the dict comprehension. That is the right
-    trade for an audit log -- it must never hold the raw value either key
-    started as -- but a reader needs to know it was a deliberate choice, not
-    an oversight.
-
-    NUL bytes are stripped BEFORE redaction, not after, and the order is
-    load-bearing: `_PAN_IN_TEXT_RE` (`\\d{12,}`) matches a CONTIGUOUS run of
-    12 or more digits, with the 19-digit PAN length cap applied separately
-    when deciding what to emit, so a NUL planted inside a PAN splits it into
-    two shorter runs that individually fail to match, and validation finds
-    nothing to redact. Stripping the NUL afterwards then reassembles the
-    full, unmasked PAN in the value that gets written -- one byte of
-    attacker input surviving as a raw PAN in a long-lived store, and it
-    reaches a dict KEY the same way, bypassing the key-masking above too.
-    Stripping first removes the split before `FreeText` ever sees the
-    string, so the contiguous run is there to match. Measured directly
-    against every split position; do not swap this back to
-    validate-then-strip, even though that reads more natural (validate the
-    input, then clean it) -- it is the specific ordering this function must
-    not have. `FreeText` not handling other separators (spaces, hyphens) is
-    a separate, documented limitation (masking.py) with its own rationale;
-    NUL is different only because this line is what reassembles it.
-    """
-    if isinstance(value, str):
-        return _FREE_TEXT.validate_python(value.replace("\x00", ""))
-    if isinstance(value, dict):
-        return {_scrub(k): _scrub(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_scrub(v) for v in value]
-    return value
 
 
 class _Subject(NamedTuple):

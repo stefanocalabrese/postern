@@ -270,6 +270,30 @@ def verified_subject(request: Request) -> str | None:
     return assertion.subject
 
 
+def verified_claims(request: Request) -> dict[str, Any]:
+    """Every claim of the verified assertion, or ``{}`` if none was verified.
+
+    The companion to ``verified_subject`` above, split out rather than folded
+    into it because the two have different failure contracts.
+    ``verified_subject`` returns ``None`` so a handler can fail closed on it;
+    this one returns an EMPTY DICT, because no claim it carries is ever an
+    authorization input. Its one reader is
+    ``services/confirm/audit.py::_client_id``, which asks for ``client_id``
+    then ``azp`` to record WHICH client called, and a missing claim there is a
+    NULL column, not a refusal.
+
+    Returning ``{}`` rather than ``None`` therefore keeps that reader from
+    having to decide what an absent assertion means: on this service it cannot
+    happen except in the same handler-without-middleware case
+    ``verified_subject`` already fails closed on, and that branch returns 401
+    before anything asks for claims.
+    """
+    assertion = request.scope.get("state", {}).get(ASSERTION_STATE_KEY)
+    if not isinstance(assertion, AppAssertion):
+        return {}
+    return assertion.claims
+
+
 def unauthenticated_response() -> JSONResponse:
     """The 401 a handler returns when ``verified_subject`` gives ``None``.
 

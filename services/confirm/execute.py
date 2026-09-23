@@ -18,8 +18,14 @@ import re
 from typing import Any, Protocol
 
 import httpx2
-from postern_core.domain.masking import FreeText
-from pydantic import TypeAdapter
+from postern_core.domain.masking import scrub_text
+
+# The same Protocol `BackendClient` uses for the same job, imported rather
+# than redeclared so the read and write paths cannot drift into two
+# incompatible hook shapes. `.importlinter` permits it: the forbidden edges
+# are `postern_core.facade -> postern_core.store` and `services.api <->
+# services.confirm`, and this is neither.
+from postern_core.facade.client import BackendRequestHook
 
 from services.confirm.minter import WRITE_SCOPES, WriteTokenMinter
 
@@ -37,13 +43,16 @@ class _MinterProtocol(Protocol):
     ) -> str: ...
 
 
-# Built once at import time: validating a bare string against `FreeText`
-# doesn't need a wrapping `BaseModel`, just its `AfterValidator`.
-_FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
-
-
-def _scrub(text: str) -> str:
-    return _FREE_TEXT.validate_python(text)
+# A LIVE GAP CLOSED, not a tidy-up. This module used to carry its own
+# `_scrub`, `TypeAdapter(FreeText).validate_python(text)`, which is
+# `postern_core.domain.masking.scrub_text` MINUS the NUL strip. That omission
+# was exploitable on exactly one path and it is the money path: a NUL byte
+# planted inside a PAN in a backend error body splits the digits into two runs
+# that `_PAN_IN_TEXT_RE` (`\d{12,}`) individually fails to match, so
+# `_scrub_response` below found nothing to redact and the raw PAN reached
+# `BackendWriteError.detail` -- and from there the 207 response body this
+# service returns. `scrub_text` strips the NUL first, so the contiguous run is
+# there to match. Its docstring carries the full ordering argument.
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +137,27 @@ class BackendWriteClient:
         *,
         transport: httpx2.AsyncBaseTransport | None = None,
         timeout: float = 10.0,
+        # REQUIRED with no default, though `None` is a legitimate value, and
+        # for exactly the reason `postern_core.facade.client.BackendClient`
+        # gives for the identical parameter one package over: a hook left off
+        # reaches a backend WRITE endpoint with nothing recorded first, which
+        # is the hole it exists to close, and a default lets a future
+        # construction site inherit that silently instead of writing the
+        # decision down. The stake is higher here than on the read path --
+        # what sits at the end of this call is money movement, not a masked
+        # balance -- so if the two ever diverge this is the one that keeps the
+        # requirement.
+        #
+        # `None` stays legal because this package has callers with genuinely
+        # nothing to record: `tests/test_execute.py` exercises path
+        # resolution, minting and response scrubbing with no store behind
+        # them. What is NOT enforced anywhere is that
+        # `services/confirm/callback.py` passes a real one;
+        # `tests/test_write_audit.py` fails if it stops.
+        before_backend_request: BackendRequestHook | None,
     ) -> None:
         self._minter = minter
+        self._before_backend_request = before_backend_request
         self._client = httpx2.AsyncClient(
             base_url=base_url,
             transport=transport,
@@ -166,6 +194,29 @@ class BackendWriteClient:
             scope=WRITE_SCOPES.get(audience, "write:execute"),
             challenge_id=challenge_id,
         )
+
+        if self._before_backend_request is not None:
+            # LAST, with nothing between it and the request but the request
+            # itself, and AFTER the mint above. Both halves of that placement
+            # are load-bearing and they say different things.
+            #
+            # AFTER THE MINT: the audit row this hook commits therefore means
+            # "a write token was minted for this challenge and the socket was
+            # next", which is strictly stronger than "the server intended to
+            # call the backend". A mint that fails writes no row, correctly --
+            # nothing was reached and nothing could have been. That a write
+            # JWT existed at all was one of the facts an investigator had no
+            # way to establish before this hook.
+            #
+            # LAST: from this line on, the next thing that happens is a socket
+            # carrying this customer's identity and a payment instruction to
+            # the operator's backend.
+            #
+            # Not guarded by try/except on purpose. `BackendRequestHook`'s own
+            # contract is that a raise stops the request, which is the entire
+            # value of running first: a caller that cannot record the write
+            # can prevent it.
+            await self._before_backend_request()
 
         # `Idempotency-Key` is defence in depth behind the conditional
         # `pending -> approved` transition in
@@ -233,4 +284,4 @@ def _scrub_response(response: httpx2.Response) -> str:
         text = response.text
     else:
         text = str(body.get("detail", body)) if isinstance(body, dict) else str(body)
-    return _scrub(text)[:200]
+    return scrub_text(text)[:200]
