@@ -79,6 +79,7 @@ failed `CustomerRef` -- and never the subject that failed, for the reason
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -265,6 +266,284 @@ def _clamp(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - len(_TRUNCATED)] + _TRUNCATED
+
+
+# `arguments` is `JSONB` (models.py), and until this bound existed it was the
+# one column on this row with NO ceiling of any kind. The three bounds above
+# each exist because a `VARCHAR(n)` refuses an over-wide value; JSONB refuses
+# nothing, so the absence of a width to overflow read as the absence of a
+# reason to bound -- `services/confirm/audit.py`'s `_arguments` says exactly
+# that in its own docstring ("this is a ``JSONB`` column with no width to
+# overflow"). The reason to bound it is not the column, it is the disk.
+#
+# Measured against the real column, not argued. `settings.max_body_bytes`
+# (1 MiB by default) is the only thing standing between an authenticated
+# `tools/call` and this column. One call carrying 1,037,473 characters of
+# incompressible base64 in an argument wrote, per row, 968,430 bytes of JSON
+# text and 954,961 bytes on disk after TOAST -- and BOTH rows of the call
+# carry the same tree, so one request wrote 1,909,922 bytes, 1.82 MiB. A
+# thousand of them write 1.78 GiB. With this bound the same call writes 586
+# bytes per row and 1,172 per call, a factor of 1,630.
+#
+# Incompressible matters and cost a measurement to learn: `pg_column_size`
+# reports the width AFTER TOAST compression, so a repetitive 1 MiB payload
+# stores in about 24 KB and makes the defect look seventy times smaller than
+# it is. The numbers above are from random bytes, which is what an attacker
+# sends when the goal is bytes on disk rather than meaning.
+#
+# There is no retention job, no partitioning, and no `DELETE` anywhere in
+# production code (searched 2026-09-23; the only ones are test fixtures).
+# So the table only grows, and when the volume fills, the audit INSERT
+# fails -- at which point
+# `dev-docs/decisions/0006-audit-write-failure.md`'s fail-closed policy
+# turns a storage problem into a total outage: every tool call in the
+# service fails, for every customer, because the audit row cannot be
+# written. That is a denial of service costing an attacker a few thousand
+# requests, and the fail-closed policy is what converts the cost from
+# "wasted disk" into "the service is down".
+#
+# TWO BOUNDS, NOT ONE, because either alone leaves the other's attack open.
+#
+# `_MAX_ARGUMENT_VALUE` bounds one string. Without it the tree bound alone
+# would be all-or-nothing: one 1 MiB junk value beside a real `account_ref`
+# would push the tree over and take the `account_ref` with it, so the
+# cheapest attack would also be the one that erases the most forensic
+# value. With it, that call records `{"account_ref": "acc_...", "junk":
+# "<511 chars>…"}` -- the real argument intact, the junk marked as clipped.
+#
+# `_MAX_ARGUMENTS_BYTES` bounds the whole tree, which the per-value bound
+# cannot: ten thousand keys of 40 characters each are individually fine and
+# collectively 400 KB. It is also the only one of the two that catches a
+# value that is not a `str` at all -- `scrub_tree` returns an `int`
+# unchanged, and `{"n": 10**100000}` is a 100,001-digit integer no string
+# clamp will ever see.
+#
+# 512 CHARACTERS, the same width as `_MAX_CLIENT_ID`, the widest bound this
+# file already carries. Derived against what a legitimate argument can be
+# rather than picked round: the widest identifier this server mints is an
+# `_OPAQUE` ref at 65 characters (models.py), and the widest free-text
+# field in the payments domain it models is ISO 20022's unstructured
+# remittance information at 140. 512 is 7.9x the first and 3.7x the second.
+#
+# 8,192 BYTES for the tree. Measured against every argument tree this
+# repository's registered tools can actually produce: `start_session`,
+# `accounts.list` and `cards.list` take none at all (2 bytes, `{}`),
+# `accounts.get_balance` at a maximal ref is 84, `transactions.list` at a
+# maximal ref and `days=365` is 97, and a hypothetical `create_payment`
+# with a maximal ref, an amount and a 140-character reference is 290. The
+# bound is 28x the largest of those and 84x the largest any REGISTERED tool
+# produces today, so nothing legitimate is anywhere near it. It also holds
+# four values at their own 2,048-byte worst case (512 characters times
+# UTF-8's 4-byte maximum), so the per-value bound cannot on its own push a
+# tree over this one.
+#
+# BYTES for the tree and CHARACTERS for the value, deliberately, and the
+# mismatch is the point rather than an inconsistency. `_clamp` counts
+# characters because the columns it defends are `VARCHAR(n)` and Postgres
+# counts `n` in characters. Nothing counts characters here: what fills a
+# volume is bytes, and masking.py's own byte-width note is the reason not
+# to assume the two track each other -- `_MASK` is U+2022, 3 bytes per
+# character, so a scrubbed value can grow in bytes while shrinking in
+# characters.
+_MAX_ARGUMENT_VALUE = 512
+
+_MAX_ARGUMENTS_BYTES = 8_192
+
+# The marker key. Dotted and namespaced so a JSONB predicate reads
+# unambiguously -- `WHERE arguments @> '{"postern.arguments_truncated":
+# true}'` -- and so it does not collide with an argument name any tool in
+# this repository declares.
+#
+# It is NOT unforgeable, and that limit is the same one `_TRUNCATED`'s own
+# comment states for itself: an argument name is arbitrary client-chosen
+# text, so a caller can send `{"postern.arguments_truncated": true, ...}`
+# and make one row read as truncated when nothing was dropped. No in-value
+# marker can close that; a column could, and a column is a migration, which
+# is out of this change's scope exactly as it is out of `_MAX_TOOL_NAME`'s.
+# What the forgery buys is a row that overstates its own loss, never one
+# that understates it: a row that really was capped always carries this
+# key, because the capped tree is built here and contains nothing else.
+_ARGUMENTS_TRUNCATED_KEY = "postern.arguments_truncated"
+
+# Room held back from `_MAX_ARGUMENTS_BYTES` for the marker itself, so the
+# capped tree cannot come out wider than the bound that capped it -- the same
+# reservation `_clamp` makes for `_TRUNCATED` when it cuts to
+# `limit - len(_TRUNCATED)` rather than to `limit`. The marker is four fixed
+# keys holding three small integers and a null-or-integer, and its widest
+# serialisation is under 150 bytes; 256 is that with room to spare and is
+# 3.1% of the bound, which is not a meaningful bite out of what is kept.
+_ARGUMENTS_MARKER_RESERVE = 256
+
+
+def _serialized_bytes(tree: Any) -> int | None:
+    """`tree` as UTF-8 JSON, measured in bytes, or None when it cannot be
+    serialised at all.
+
+    `ensure_ascii=False` because that is what Postgres stores: `JSONB`
+    decodes `\\uXXXX` escapes on parse and holds the text, so an
+    escaped-ASCII byte count would overstate the width of exactly the
+    non-ASCII values this repository's masking produces.
+
+    NEVER RAISES, which is a requirement rather than a nicety: anything
+    raised here lands in `on_call_tool` before either row is written, and
+    under `dev-docs/decisions/0006-audit-write-failure.md` a failed audit
+    write takes the tool call with it. A bound whose whole purpose is
+    preventing an outage must not be able to cause one.
+
+    Two things can go wrong in `json.dumps` and `default=str` covers only
+    the first. `default` handles an unserialisable TYPE. It does NOT handle
+    a serialisable type that raises while being written, which Python 3.12
+    has one of: `int.__str__` refuses beyond `sys.get_int_max_str_digits()`
+    (4,300 by default) and raises `ValueError`. Found by this module's own
+    test rather than reasoned about -- `{"n": 10**100000}` raised straight
+    through the first version of this code, which would have been a
+    tool-call outage caused by the bound meant to prevent one. `json.loads`
+    refuses the same literal on the way in, so nothing reaches this through
+    an MCP body today, but "an earlier layer happens to reject it" is not a
+    property this function should rest on.
+
+    None therefore means "unmeasurable", and every caller treats that as
+    OVER the limit rather than under it: a value whose size cannot be
+    established cannot be stored safely either.
+    """
+    try:
+        return len(json.dumps(tree, ensure_ascii=False, default=str).encode())
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        return None
+
+
+def _clip_tree(value: Any) -> Any:
+    """`_clamp` at `_MAX_ARGUMENT_VALUE`, applied through the argument tree.
+
+    KEYS AS WELL AS VALUES, for the reason `masking.scrub_tree` gives for
+    masking both: arguments are captured before anything validates them, so
+    a key is exactly as caller-chosen as a value, and `{"<1 MiB of junk>":
+    1}` is as good a way to fill this column as `{"k": "<1 MiB of junk>"}`.
+    Two distinct keys can clip onto the same string and one then wins the
+    dict comprehension -- the same collision `scrub_tree` already documents
+    for masking, accepted here for the same reason and now reachable one
+    additional way.
+
+    AFTER `_scrub`, never before, which is the ordering `_client_id` and the
+    tool name both spell out at length: `_scrub` reaches
+    `masking._strip_invisible`, which deletes characters outright, so a
+    marker written before it would depend on a function in another package
+    to survive. Clipping afterwards puts `_TRUNCATED` where nothing can
+    touch it.
+
+    The cost of that ordering, stated rather than left to be discovered:
+    `_scrub` still walks the whole 1 MiB body before anything here shortens
+    it. That cost is already bounded and already measured -- `on_call_tool`
+    wraps the walk in one `redaction_budget`, and masking.py's own journal
+    puts a 1 MiB value at 170-200ms of synchronous event-loop stall -- so
+    this bound does not make it worse and does not make it better. Moving
+    the clip in front of the scrub would cut that stall, and is a separate
+    change with its own ordering argument to make; it is not smuggled in
+    here.
+
+    Non-`str`, non-`dict`, non-`list` values pass through untouched, exactly
+    as they do through `scrub_tree`: an `int`, a `float`, a `bool`, `None`.
+    An oversized one of those is the tree bound's job, not this one's.
+    """
+    if isinstance(value, str):
+        return _clamp(value, _MAX_ARGUMENT_VALUE)
+    if isinstance(value, dict):
+        return {_clip_tree(k): _clip_tree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clip_tree(v) for v in value]
+    return value
+
+
+def _cap_arguments(tree: dict[str, Any]) -> dict[str, Any]:
+    """`tree` unchanged when its serialised form fits `_MAX_ARGUMENTS_BYTES`,
+    otherwise a marker object recording that it did not and by how much.
+
+    MARKED, NOT SILENT, AND NEVER A LOST ROW. Dropping the row is what the
+    unbounded version already effectively does once the disk is full, and it
+    is the failure this bound exists to prevent, so it cannot be the remedy.
+    Shortening in silence is the other failure: a row that reads as a
+    complete record of a call and is not one, which is what this file's other
+    three bounds each refuse by carrying `_TRUNCATED`. So the tree is
+    shortened AND says so, in the same object, with the numbers a reader
+    needs to know what is missing.
+
+    A FIRST-FIT PREFIX, not all-or-nothing, and the difference is what an
+    investigator keeps. Replacing the whole tree was the first version of
+    this function, and it hands the attacker more than the disk: one junk
+    argument beside a real `account_ref` would take the `account_ref` with
+    it, so the cheapest attack would also erase the most forensically
+    valuable field. Top-level entries are kept while they fit, so the small
+    real arguments survive and the large junk one does not.
+
+    FIRST entry that does not fit, then stop, rather than continuing to look
+    for smaller ones that would. Best-fit keeps marginally more and costs an
+    unbounded number of serialisations on a tree of many large entries --
+    a `tools/call` body is capped at `settings.max_body_bytes` but that
+    still allows on the order of a hundred thousand small keys. Stopping at
+    the first miss bounds the work to the entries actually kept, plus one.
+
+    WHAT THE MARKER RECORDS. `original_bytes` is the whole tree's serialised
+    size before anything was dropped (`null` when it could not be measured,
+    see below), `dropped_keys` and `kept_keys` say how the split fell, and
+    `limit_bytes` is recorded rather than left implicit so a row stays
+    readable after the bound is ever retuned -- a reader comparing two rows
+    written under different limits can see which was which without going to
+    the git history. Between them they answer both halves of "how much was
+    dropped": how many bytes the call really carried, and how much of its
+    shape is missing from what is stored.
+
+    The marker key wins a collision with a kept argument of the same name,
+    which is the right direction: a row that was capped always says so.
+
+    Sizes come from `_serialized_bytes`, which measures what Postgres
+    actually stores and never raises; an unmeasurable tree is treated as OVER
+    the limit, and `original_bytes` is `null` on that path -- a third
+    distinguishable state in the row, valid JSON and queryable, rather than a
+    fabricated number.
+    """
+    original = _serialized_bytes(tree)
+    if original is not None and original <= _MAX_ARGUMENTS_BYTES:
+        return tree
+
+    room = _MAX_ARGUMENTS_BYTES - _ARGUMENTS_MARKER_RESERVE
+    kept: dict[str, Any] = {}
+    used = 0
+    dropped = 0
+    items = list(tree.items())
+    for index, (key, value) in enumerate(items):
+        size = _serialized_bytes({key: value})
+        if size is None or used + size > room:
+            dropped = len(items) - index
+            break
+        kept[key] = value
+        used += size
+    kept[_ARGUMENTS_TRUNCATED_KEY] = {
+        "original_bytes": original,
+        "limit_bytes": _MAX_ARGUMENTS_BYTES,
+        "dropped_keys": dropped,
+        "kept_keys": len(kept),
+    }
+    return kept
+
+
+def _arguments(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """What one `tools/call` carried, scrubbed and bounded, for both of its
+    rows.
+
+    MUST BE CALLED INSIDE `on_call_tool`'s `with redaction_budget()` BLOCK
+    and never inside a second one of its own, for the reason `_client_id`
+    states: the scrub below spends from whichever `_ScanBudget` is ambient,
+    and a private scope would buy this tree its own allowance on top of the
+    one the call already has.
+
+    ONE VALUE, BOTH ROWS. `on_call_tool` computes this once and hands the
+    same object to `_PendingEntry` (which writes the `reaching` row) and to
+    `_write` (which writes the `returned` or `raised` one), so the bound
+    cannot apply to one row and miss the other -- there is only one tree.
+    That is pinned by a test rather than left as a reading of the code, in
+    `tests/test_audit_arguments_cap.py`.
+    """
+    return _cap_arguments(_clip_tree(_scrub(dict(raw or {}))))
 
 
 class _Subject(NamedTuple):
@@ -942,7 +1221,11 @@ class AuditMiddleware(Middleware):
             # allowance, 2.22%. A realistic CIMD id spends zero. Both numbers
             # are derived in `_client_id`'s own docstring.
             client_id = _client_id(access_token)
-            arguments = _scrub(dict(context.message.arguments or {}))
+            # Scrubbed AND bounded, in that order, by `_arguments` -- which
+            # is where the two bounds and the reasoning behind both live.
+            # Until 2026-09-23 this line was a bare `_scrub(...)` and this
+            # column had no ceiling but `settings.max_body_bytes`.
+            arguments = _arguments(context.message.arguments)
         # One call, two fields, exactly one of them non-None: see `_Subject`
         # for why the pair is returned together rather than derived twice.
         subject = _customer_ref(access_token)

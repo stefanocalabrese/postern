@@ -864,11 +864,25 @@ async def test_on_call_tool_request_budget_bounds_a_junk_heavy_argument_list(
     exhaust the PRODUCTION default budget (100,000 checksums, ~559 per
     element, so at least 179) inside one tool call's argument list,
     followed by a genuine IBAN as the final element. The stored audit row
-    must never contain the real IBAN, and the trailing element must be
-    bare-masked rather than correctly identified -- proof that
-    `on_call_tool` actually wraps `_scrub` in `redaction_budget()` in
-    production, not just that the two primitives compose correctly in a
-    unit test."""
+    must never contain the real IBAN -- proof that `on_call_tool` actually
+    wraps `_scrub` in `redaction_budget()` in production, not just that the
+    two primitives compose correctly in a unit test.
+
+    WHERE THAT PROOF NOW LIVES, changed 2026-09-23 with
+    `_MAX_ARGUMENTS_BYTES`. This test used to read it off the arguments
+    themselves (`_MASK in stored`, the trailing element bare-masked rather
+    than correctly identified). It cannot any more, and the reason is a
+    genuine tension between the two bounds rather than a fixture that drifted:
+    exhausting a 100,000-checksum budget takes at least 179 junk elements of
+    128 characters, which is at least 23 KB of argument tree, and no payload
+    that large can also fit under an 8,192-byte cap. Every payload that
+    exhausts the budget is therefore a payload the cap truncates, so the
+    masking it triggered is no longer observable in the column.
+
+    `redaction_budget_exhausted` is the column that exists for exactly this
+    fact, and it is asserted here instead. The IBAN assertion is unchanged
+    and is now satisfied more strongly than before: the element carrying it
+    does not reach the row at all."""
     real_iban = "MT84MALT011000012345MTLCAST001S"
     payload = [_JUNK_128] * 200 + [f"{_JUNK_128} {real_iban}"]
     async with Client(transport=audit_server) as c:
@@ -876,8 +890,10 @@ async def test_on_call_tool_request_budget_bounds_a_junk_heavy_argument_list(
     entry = (await rows(session))[0]
     stored = str(entry.arguments)
     assert real_iban not in stored
-    assert _MASK in stored
     assert "MT••" not in stored
+    assert entry.redaction_budget_exhausted is True, (
+        "the budget was not spent, so this payload no longer exercises what it claims to"
+    )
 
 
 # -- `redaction_budget_exhausted`: `on_call_tool` reads `RedactionScope
