@@ -121,6 +121,7 @@ from typing import Any
 from postern_core.domain.masking import redaction_budget, scrub_text, scrub_tree
 from postern_core.identity import CustomerRef
 from postern_core.store import audit
+from postern_core.store.audit import TRUNCATED, bound_arguments, clamp
 from postern_core.store.engine import Database
 from postern_core.store.models import (
     ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
@@ -201,35 +202,29 @@ DETAIL_UPDATE_MATCHED_NO_ROW = "update_matched_no_row"
 # under the fail-closed policy costs the audit row and the approval.
 _MAX_CLIENT_ID = 512
 
-# U+2026 HORIZONTAL ELLIPSIS, the same marker
-# `services/api/middleware/audit.py` uses and for the reasons its own constant
-# gives at length: it survives `_strip_invisible` (category `Po`), it is
-# neither a digit nor a letter so it can neither extend a PAN run nor sit
-# inside an IBAN token, and it cannot be misread as `_MASK`.
+# NO LONGER A SECOND COPY, AS OF 2026-09-24. This constant and ``_clamp``
+# below were duplicated here from ``services/api/middleware/audit.py`` on
+# 2026-09-23, with a comment recording that as a known cost and naming
+# ``postern_core.store.audit`` as where a third copy should be promoted
+# instead. The third copy became due immediately: ``_arguments`` below needed
+# the argument bounds the read path had just grown, and ``.importlinter``
+# forbids ``services.confirm`` importing ``services.api`` in either
+# direction, so promotion was the only lawful way to share them. Both
+# services now re-bind the promoted names, and the reasoning for each went
+# with the code.
 #
-# A SECOND COPY, and that is a known cost rather than an oversight. Promoting
-# `_clamp` and this marker alongside `scrub_text`/`scrub_tree` was considered
-# and left out of that change: they are not masking, they are audit-column
-# width management, so `postern_core.domain.masking` is the wrong home and
-# `postern_core.store.audit` would be a second unrequested promotion. Recorded
-# here so the next person to need a third copy promotes it instead.
-_TRUNCATED = "…"
-
-
-def _clamp(value: str, limit: int) -> str:
-    """``value`` cut to fit ``limit`` characters, carrying ``_TRUNCATED`` when,
-    and only when, something was cut.
-
-    The cut is to ``limit - len(_TRUNCATED)``, not to ``limit``: appending the
-    marker to a value already cut to the column width would write
-    ``limit + 1`` characters, which is the truncation error the clamp exists
-    to avoid. A value already within ``limit`` comes back unchanged, character
-    for character -- a marker on a value nothing touched would be the row
-    lying about itself.
-    """
-    if len(value) <= limit:
-        return value
-    return value[: limit - len(_TRUNCATED)] + _TRUNCATED
+# U+2026 HORIZONTAL ELLIPSIS, for the reasons the promoted constant gives at
+# length: it survives ``_strip_invisible`` (category ``Po``), it is neither a
+# digit nor a letter so it can neither extend a PAN run nor sit inside an
+# IBAN token, and it cannot be misread as ``_MASK``.
+#
+# Re-bound to the old private names as assignments rather than
+# ``import ... as``, matching how ``services/api/middleware/audit.py`` rebinds
+# ``_scrub``: every comment in this file that reasons about ``_clamp``'s
+# reservation of the marker's own character still describes exactly the
+# function being called.
+_TRUNCATED = TRUNCATED
+_clamp = clamp
 
 
 def _client_id(claims: dict[str, Any]) -> str | None:
@@ -591,26 +586,93 @@ def _arguments(challenge_id: str, body: dict[str, Any]) -> dict[str, Any]:
     body, so all three are caller-influenced and all three are scrubbed.
     ``signature`` is reduced to a boolean before it reaches this table at all.
 
-    Not clamped, unlike ``tool_name`` and ``client_id``: this is a ``JSONB``
-    column with no width to overflow. The read path makes the same choice for
-    the same reason -- it clamps ``tool_name``, ``request_id`` and
-    ``client_id``, and leaves the argument tree unbounded.
+    BOUNDED SINCE 2026-09-24, and the paragraph this replaces said the
+    opposite: "not clamped ... this is a ``JSONB`` column with no width to
+    overflow. The read path makes the same choice for the same reason." Both
+    halves were wrong by the time they were read. The reason to bound this
+    column is the disk and not the column's width, the read path had already
+    stopped making that choice in ``1a97160``, and the same defect is strictly
+    worse here on two counts that were measured rather than argued
+    (2026-09-24, against this column):
+
+    1. NO BODY LIMIT AT ALL. ``services/api`` wires ``HeaderBodyValidation``
+       with ``max_body_bytes``, which is what capped the read path's version
+       of this attack at 1 MiB. ``services/confirm/main.py``'s
+       ``create_confirm_app`` passes only ``AppAssertionMiddleware``, so
+       nothing bounds an approval body: a 404 carrying 10,131,578 characters
+       in ``confirming_device`` wrote 7,742,315 bytes to this column in ONE
+       row.
+    2. A ROW ON EVERY REFUSED PATH. The module docstring's own rule is that
+       every attempt past a verified subject and a non-empty challenge id
+       gets a completion row, so a caller needs NO valid challenge to write
+       one. A 404 aimed at an id naming nothing, carrying 1 MiB, wrote 979,108
+       bytes on disk and 992,895 bytes of JSON text. That is the cheap attack:
+       no challenge to create, no race to win, no expiry to beat.
+
+    Fail closed (``dev-docs/decisions/0006-audit-write-failure.md``) is what
+    turns a full volume into an outage, and the two services SHARE the
+    database, so filling it from here takes down every tool call in
+    ``services/api`` as well as every approval here.
+
+    THE SAME BOUNDS AS THE READ PATH, from the one place both import, with
+    the reasoning for every constant in ``postern_core.store.audit``. The
+    same per-value clip, the same tree ceiling and the same
+    ``postern.arguments_truncated`` marker, so one query finds truncation
+    across both services -- which matters here more than anywhere, because
+    the module docstring above records that no column of ``audit_log`` names
+    the service that wrote the row.
+
+    THE KEY ORDER BELOW IS LOAD-BEARING and must not be tidied.
+    ``cap_arguments`` keeps a first-fit prefix of top-level entries, so the
+    three server-chosen keys are listed before the two caller-supplied ones:
+    an over-limit tree therefore keeps ``route``, ``challenge_id`` and
+    ``signature_present`` -- everything an investigator needs to identify the
+    request -- and drops exactly the two fields that carried the junk.
+    Measured: a 404 carrying 1 MiB now writes a row whose ``arguments`` names
+    the challenge it was aimed at, says two keys were dropped, and records
+    what the caller really sent in ``original_bytes``.
+
+    WHAT THIS DOES NOT CLOSE, stated here because bounding the column makes
+    it easy to believe otherwise: the body is still parsed in full before any
+    of this runs, so the MEMORY cost of a 10 MiB approval body is unchanged.
+    Only the bytes that reach the disk are bounded. Closing the other half is
+    an ASGI body-size middleware on this service, which is a separate change
+    with its own ordering question against ``AppAssertionMiddleware``.
     """
-    return {
-        "route": APPROVE_ROUTE,
-        "challenge_id": scrub_text(challenge_id),
-        # PRESENCE, NEVER THE VALUE. CLAUDE.md forbids a raw signature in this
-        # table. A digest was considered as a middle path -- it would let an
-        # investigator spot one signature replayed across challenges without
-        # storing it -- and rejected: the value is unverified and carries no
-        # defined meaning (`services/confirm/callback.py`'s docstring is
-        # explicit that presence is the entire check), so a digest of it would
-        # look like cryptographic evidence and be none.
-        "signature_present": bool(body.get("signature")),
-        # Recorded here because on every refused path they exist NOWHERE else:
-        # `update_challenge_status` writes them onto the challenge row only on
-        # the winning transition, so a 404, 409 or 410 would otherwise lose
-        # what the caller sent.
-        "confirming_device": scrub_tree(body.get("confirming_device")),
-        "verification_result": scrub_tree(body.get("verification_result")),
-    }
+    return bound_arguments(
+        {
+            "route": APPROVE_ROUTE,
+            # Clipped at `MAX_ARGUMENT_VALUE` like everything else, which
+            # costs this column nothing it was worth keeping:
+            # `challenges.challenge_id` is `String(36)` (models.py), so an id
+            # past 512 characters can name no challenge that exists and the
+            # join this value serves -- to `challenges`, and to the backend's
+            # access log through the `Idempotency-Key` header carrying the
+            # same string -- was never going to resolve for it. What is
+            # clipped is only ever an enumeration probe, and it still records
+            # its own first 511 characters and says it was cut.
+            "challenge_id": scrub_text(challenge_id),
+            # PRESENCE, NEVER THE VALUE. CLAUDE.md forbids a raw signature in
+            # this table. A digest was considered as a middle path -- it would
+            # let an investigator spot one signature replayed across
+            # challenges without storing it -- and rejected: the value is
+            # unverified and carries no defined meaning
+            # (`services/confirm/callback.py`'s docstring is explicit that
+            # presence is the entire check), so a digest of it would look like
+            # cryptographic evidence and be none.
+            #
+            # It is also the one caller-supplied field of the five that the
+            # bounds never had to reach, because a boolean has no width.
+            "signature_present": bool(body.get("signature")),
+            # Recorded here because on every refused path they exist NOWHERE
+            # else: `update_challenge_status` writes them onto the challenge
+            # row only on the winning transition, so a 404, 409 or 410 would
+            # otherwise lose what the caller sent.
+            #
+            # LAST, AND IN THIS ORDER, for the first-fit reason above: these
+            # two are the unbounded caller input, so they are the two a capped
+            # tree drops.
+            "confirming_device": scrub_tree(body.get("confirming_device")),
+            "verification_result": scrub_tree(body.get("verification_result")),
+        }
+    )
