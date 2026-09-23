@@ -31,6 +31,14 @@ from the verified ``sub``. ``POST /device_authorization`` and ``POST /token``
 are the BROWSER, which by the device grant's premise holds no credential at
 all, and they are named in that module's ``PUBLIC_PATHS`` with the reason.
 
+WHO CAN BE CUT, AND WHERE (ZT-7). Both endpoints that know a customer refuse a
+revoked one: ``POST /approve`` on the assertion's ``sub``, before the device
+code is touched, and ``POST /token`` on the ``customer_ref`` stored on the
+device code, before the read token is minted. Nothing is keyed on
+``DeviceCode.client_id`` -- the browser supplies it unauthenticated at
+``POST /device_authorization``, so a kill switch enforced on it would be
+theatre. ``services/confirm/revocation.py`` holds the full argument.
+
 WHAT THIS MODULE NO LONGER DOES. It used to take the customer identity from
 ``/approve``'s request body (``subject_value``) and it used to return a
 WRITE-signed token from ``/token``. Together those made three unauthenticated
@@ -74,6 +82,7 @@ from postern_core.auth.device_codes import (
     create_device_code_store,
 )
 from postern_core.auth.internal_jwt import InternalTokenMinter
+from postern_core.auth.revocation import RevocationStoreUnavailable
 from postern_core.identity import CustomerRef
 from pydantic import ValidationError
 from starlette.requests import Request
@@ -81,6 +90,12 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from services.confirm.auth import unauthenticated_response, verified_subject
+from services.confirm.revocation import (
+    customer_revoked,
+    log_refusal,
+    revoked_response,
+    store_unavailable_response,
+)
 from services.confirm.settings import ConfirmSettings
 
 logger = logging.getLogger(__name__)
@@ -198,8 +213,14 @@ async def token_endpoint(request: Request) -> JSONResponse:
     Error codes per RFC 8628 §3.4:
         authorization_pending — not yet approved, keep polling.
         slow_down — client is polling too fast (adds 5s to interval).
-        access_denied — user explicitly denied on mobile app.
+        access_denied — user explicitly denied on mobile app, OR the customer
+            who approved this code has been revoked (ZT-7). The two are
+            deliberately indistinguishable here; see the comment at the check.
         expired_token — device code has passed its TTL.
+
+    And one that is not RFC 8628's, answered with 503:
+        temporarily_unavailable — the revocation store could not be consulted,
+            so nothing was minted. Retryable on purpose.
     """
     form = await request.form()
     grant_type_raw = form.get("grant_type", "")
@@ -277,6 +298,37 @@ async def token_endpoint(request: Request) -> JSONResponse:
         logger.warning("device grant: stored customer reference is not well-formed")
         return _error(500, "invalid_state", "approval identity is not a customer reference")
 
+    # ZT-7: refuse the MINT, not only the use.
+    #
+    # `services/api` would refuse this token on every call anyway, so the
+    # practical exposure of minting it is narrow -- but ZT-7's acceptance bar
+    # is that a revoked identity stops obtaining access, and handing out a
+    # freshly signed token for a customer the operator has cut is obtaining
+    # it. Keyed on the customer STORED on the device code, written from a
+    # verified assertion at ``POST /approve`` and by nothing else; never on
+    # ``code.client_id``, which the browser supplies unauthenticated at
+    # ``/device_authorization`` and can set to anything.
+    #
+    # ``access_denied`` is RFC 8628 §3.5's code for an authorization that was
+    # refused, and this endpoint's own docstring already documents it as "user
+    # explicitly denied on mobile app". That collision is the point rather
+    # than an accident: the browser cannot tell a revocation from the customer
+    # declining on their phone, so a party holding only a ``device_code``
+    # learns nothing about anyone's revocation state. It holds a code this
+    # same customer already approved, so it is not a third party either.
+    #
+    # The store failing is NOT a denial. `store_unavailable_response` answers
+    # 503 so the browser retries rather than treating an outage as a refusal;
+    # either way no token is minted, which is the fail-closed half.
+    try:
+        revoked = await customer_revoked(request, customer.value)
+    except RevocationStoreUnavailable:
+        logger.warning("device grant: revocation store unavailable, refusing to mint")
+        return store_unavailable_response()
+    if revoked:
+        log_refusal("a device-grant token exchange")
+        return _error(400, "access_denied", "authorization was refused")
+
     read_minter: InternalTokenMinter = request.app.state.read_minter
     read_token = read_minter.mint(
         subject=customer,
@@ -345,7 +397,8 @@ async def approve_callback(request: Request) -> JSONResponse:
         wrong.
     Response (401): no verified assertion.
     Response (403): the assertion verified but its ``sub`` is not a customer
-        reference.
+        reference (``invalid_subject``), or that customer's access has been
+        revoked (``access_revoked``, ZT-7).
     """
     subject = verified_subject(request)
     if subject is None:
@@ -364,6 +417,21 @@ async def approve_callback(request: Request) -> JSONResponse:
         # see the matching note in `token_endpoint`.
         logger.warning("device approve: assertion subject is not a customer reference")
         return _error(403, "invalid_subject", "assertion subject is not a customer reference")
+
+    # ZT-7, and placed here rather than left to ``/token`` to catch it. This
+    # is the earliest point at which a verified customer exists, and refusing
+    # now means ``customer_ref`` is never written onto the device code at all
+    # -- strictly better than refusing the mint that would read it back,
+    # because the pairing leaves no half-authorized state behind.
+    #
+    # `RevocationStoreUnavailable` propagates: this endpoint is
+    # assertion-authenticated, like the challenge approval, so it takes that
+    # path's shape (a 500, nothing written) rather than ``/token``'s 503. The
+    # party here is the operator's own app, which retries on its own terms;
+    # the browser polling ``/token`` is the one that needed a retryable code.
+    if await customer_revoked(request, customer.value):
+        log_refusal("a device pairing approval")
+        return revoked_response("this customer's access has been revoked")
 
     try:
         body = await request.json()

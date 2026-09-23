@@ -37,6 +37,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
 import pytest
+from postern_core.auth.revocation import InMemoryRevocationStore
 from postern_core.domain.verification import VerificationTier
 from postern_core.store.models import ChallengeRecord
 from starlette.requests import Request
@@ -257,6 +258,19 @@ def _make_state(
     state.postern_database = db_mock
     state.write_minter = _StubMinter()
     state.settings = ConfirmSettings.for_testing()
+    # ZT-7. An EMPTY store, not a mock: `_approve`'s first statement asks it
+    # whether this customer is revoked, and the bare `MagicMock` attribute
+    # this line replaces returned a `MagicMock` from `is_customer_revoked`,
+    # which is not awaitable. Every test below therefore exercises the real
+    # check answering "not revoked" rather than skipping it.
+    #
+    # NOT a permissive stub either. Leaving the attribute off entirely also
+    # fails closed -- Starlette's `State` raises `AttributeError` for a name
+    # nothing set, and the handler turns that into a 500 with an audit row --
+    # which is why `services/confirm/revocation.py` needs no absent-store
+    # branch of its own. `tests/test_zt7_confirm_revocation.py` is where the
+    # refusing side of this check is measured.
+    state.postern_revocation_store = InMemoryRevocationStore()
 
     import services.confirm.callback as cb
 

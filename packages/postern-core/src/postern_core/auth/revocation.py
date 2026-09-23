@@ -44,14 +44,39 @@ already trusts with the risk session store. This paragraph would have been a
 decision record; `dev-docs/` is gitignored and `docs/decisions/` holds stale
 copies, so it lives here, in a tracked file, instead.
 
-WHAT REVOKING DOES NOT STOP, STATED PLAINLY. Only `services/api` consults
-this store. `services/confirm` has no revocation check at all: neither the
-RFC 8628 device-grant token exchange nor
-``POST /challenges/{challenge_id}/approve``. **Revoking a session does not
-stop a payment approval.** A customer whose session is revoked mid-flow can
-still approve a challenge that was already created, and the approval callback
-will still reach the backend write endpoint. Closing that is a follow-up, and
-it is the write path, so it is worth more than the read path this covers.
+WHICH SCOPE REACHES WHICH SERVICE, STATED PLAINLY. `services/api` checks all
+three, keyed on the customer access token it validates. `services/confirm`
+cannot, and the reason is structural rather than an omission: the only token
+it holds is a banking-app assertion minted by the operator's own app backend,
+so it carries no AI-session ``jti``, and its ``client_id``/``azp`` name that
+app rather than a vendor (`services/confirm/audit.py`'s `_client_id` records
+the same fact for the audit column it fills). The one identity that service
+holds is the customer. So the write path asks `is_customer_revoked` below,
+which matches ANY pair naming that customer, and the coverage is:
+
+- ``customer-client`` stops that customer's reads through that client AND
+  their challenge approvals and device-grant token mints, through EVERY
+  client. Deliberately wider on the write path than on the read path: it errs
+  toward refusing money movement for a customer the operator has just
+  declared compromised, and ``restore-customer-client`` undoes it.
+- ``session`` stops reads only. The ``jti`` an operator names belongs to the
+  AI client's access token, and no request on the write path carries it.
+- ``kill-switch`` stops reads only. ``challenges`` records no client id, so
+  enforcing a kill switch there would mean refusing every customer's
+  approvals rather than that client's.
+
+**TO STOP THE WRITE PATH, NAME THE CUSTOMER.** `postern_core.auth.revoke_cli`
+says the same where an operator will meet it, and
+`services/confirm/revocation.py` says it at the check site.
+
+THE EXACT KEYING IS THE RIGHT END STATE AND IS NOT BUILT. Recording the AI
+session's ``jti`` and ``client_id`` on the challenge row at creation would
+make all three scopes match precisely on both paths. It belongs to the
+payments tool rather than ahead of it: that tool's handler is the first code
+that will hold both values, and
+`packages/postern-core/src/postern_core/store/challenges.py`'s
+`create_challenge` has no production caller today, so the two columns would
+be a migration that nothing writes.
 
 WHAT IS ALSO NOT BUILT. The zero-trust plan §4's fourth ZT-7 bullet -- the
 customer cutting their own sessions from inside the bank app, and seeing
@@ -404,6 +429,40 @@ class RevocationStoreBase(ABC):
     async def entries(self) -> RevocationSnapshot:
         """Everything currently revoked."""
 
+    async def is_customer_revoked(self, customer_ref: str) -> bool:
+        """Whether ANY revocation names this customer, whatever the client.
+
+        THE WRITE PATH'S QUESTION, and a different one from `is_revoked`.
+        `services/confirm` holds no AI-session ``jti`` and no vendor
+        ``client_id`` (this module's docstring says why), so it cannot ask the
+        three-scope question at all. It can ask this one, and the answer is
+        the wider of the two: cutting a customer from ONE client refuses that
+        customer's challenge approvals through every client. That is the
+        trade recorded above -- it errs toward refusing money movement.
+
+        Reads only the customer-plus-client scope. A kill switch is NOT
+        consulted: it names a client, `challenges` records none, so honouring
+        one here would refuse every customer's approvals instead of that
+        client's.
+
+        DELIBERATELY CONCRETE AND NOT ABSTRACT, the same way `close` below is,
+        and for a sharper reason. Every backend that can enumerate itself can
+        answer this, so a default over `entries` is complete rather than a
+        stub -- and a store that cannot enumerate raises out of `entries`,
+        which makes the default FAIL CLOSED with no code of its own. An
+        abstract method would instead force every existing implementation to
+        grow one, including `tests/test_zt7_revocation_reachable.py`'s
+        `UnreachableRevocationStore`, whose whole value is that it answers
+        nothing; it inherits this and refuses, unchanged.
+
+        `RedisRevocationStore` overrides it for one round trip instead of
+        three. Nothing else needs to.
+
+        Raises `RevocationStoreUnavailable` when the store cannot answer.
+        """
+        snapshot = await self.entries()
+        return any(customer == customer_ref for customer, _client in snapshot.customer_clients)
+
     async def close(self) -> None:  # noqa: B027 - concrete and empty on purpose
         """Release any connection this store holds. A no-op by default.
 
@@ -620,6 +679,34 @@ class RedisRevocationStore(RevocationStoreBase):
             customer_clients=tuple(sorted(_pair_from_member(str(value)) for value in pairs)),
             clients=tuple(sorted(str(value) for value in clients)),
         )
+
+    async def is_customer_revoked(self, customer_ref: str) -> bool:
+        """One ``SMEMBERS`` on the pairs key, where the base default costs three.
+
+        The base implementation reads `entries`, which fetches all three sets
+        to answer a question that concerns one of them. This overrides it for
+        that saving alone; the semantics are identical and
+        `tests/test_zt7_confirm_revocation.py` pins the two backends against
+        the same matrix so they cannot drift.
+
+        O(n) IN THE NUMBER OF REVOKED PAIRS, and that is a real property
+        rather than an implementation note. A SET member cannot be matched on
+        its first JSON element server-side without ``SCAN`` or Lua, so every
+        pair crosses the wire. It is paid once per challenge approval and once
+        per device-grant exchange -- calls that already make two database
+        writes and an outbound HTTP request -- and never on a read, which is
+        the path with the volume. If the revoked-pair count ever reaches a
+        size where that matters, the fix is a maintained
+        ``revoked:customers`` index written beside the pair, which needs
+        reference counting to restore correctly and was not worth it today.
+        """
+        try:
+            members = await self._redis.smembers(self._pairs_key)
+        except Exception as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation list could not be read: {type(exc).__name__}"
+            ) from exc
+        return any(_pair_from_member(str(value))[0] == customer_ref for value in members)
 
     async def close(self) -> None:
         await self._redis.aclose()

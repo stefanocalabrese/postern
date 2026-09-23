@@ -19,6 +19,12 @@ Today this process does three things:
    from the banking app, mark challenges approved in Postgres, and execute
    backend write endpoints server-side.
 
+ZT-7 revocation cuts across all three: an operator who revokes a customer
+stops their challenge approvals and their device-grant token mints as well as
+their reads. Which scope reaches this service, and which two do not, is
+`services/confirm/revocation.py`'s subject -- the summary is that the write
+path can only be keyed on the customer, so **to stop it, name the customer**.
+
 Everything except ``/.well-known/jwks.json``, ``/device_authorization`` and
 ``/token`` requires a verified banking-app assertion. ``services/confirm/auth.py``
 holds that middleware, the reasoning for each public path, and the audience
@@ -44,6 +50,7 @@ from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.auth.device_codes import create_device_code_store
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource, warn_ephemeral_signing_key
+from postern_core.auth.revocation import create_revocation_store
 from postern_core.store.engine import Database
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -158,6 +165,20 @@ def create_confirm_app(
     # --- Device code store ---
     device_code_store = create_device_code_store()
 
+    # --- ZT-7 revocation (shared with every `services/api` replica) ---
+    #
+    # THE SAME FACTORY BOTH SERVICES CALL, deliberately, so one
+    # ``POSTERN_REDIS_URL`` points the read path, the write path and
+    # `postern_core.auth.revoke_cli` at one key space. Pointing them at
+    # different stores by construction is the failure this shape removes: an
+    # operator would revoke, watch the reads stop, and never learn that the
+    # approval path was reading an empty list.
+    #
+    # What this service asks of it is NOT what `services/api` asks --
+    # `services/confirm/revocation.py` holds the whole argument and the three
+    # call sites.
+    revocation_store = create_revocation_store()
+
     # --- Database (for challenges table, §6.3 approval callback) ---
     db = Database(
         settings.database_url,
@@ -190,6 +211,11 @@ def create_confirm_app(
     app.state.device_code_store = device_code_store
     # Expose database for the approval callback.
     app.state.postern_database = db
+    # ZT-7: read by `services/confirm/revocation.py`'s `revocation_store` on
+    # all three of this service's authenticated-or-minting paths. Same
+    # attribute name as `services/api/main.py` uses, so one grep over both
+    # services finds every place the control is wired.
+    app.state.postern_revocation_store = revocation_store
     app.state.settings = settings
 
     return app

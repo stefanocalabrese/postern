@@ -41,6 +41,17 @@ app assertion (``services/confirm/auth.py``), and the challenge's
 ``customer_ref`` must equal that assertion's ``sub``. Knowing an id is no
 longer enough; being the customer the challenge was raised for is.
 
+WHAT STOPS THIS MID-FLOW (ZT-7). Until 2026-09-23 nothing did. An operator who
+revoked a compromised session stopped every read on every replica and did not
+stop this handler: a challenge already created could still be approved, a
+write JWT was still minted, and the backend write endpoint was still reached.
+``_approve`` now refuses a revoked customer as its first act, before the
+challenge is read and therefore before any of the three writes below.
+``services/confirm/revocation.py`` holds which revocation scope reaches this
+service and which two cannot; the short form is that only a revocation naming
+the CUSTOMER stops a payment, because nothing on this path carries the AI
+client's ``jti`` or its ``client_id``.
+
 WHAT THE ``signature`` FIELD IS, AND WHAT IT IS NOT. It is checked for
 PRESENCE and stored. That is the whole check, today, and the local variable is
 named ``unverified_signature`` at every use site so no reader has to take this
@@ -100,11 +111,13 @@ from services.confirm.audit import (
     DETAIL_CHALLENGE_VANISHED,
     DETAIL_EXPIRED,
     DETAIL_MISSING_SIGNATURE,
+    DETAIL_REVOKED,
     DETAIL_UPDATE_MATCHED_NO_ROW,
     ApprovalAudit,
 )
 from services.confirm.auth import unauthenticated_response, verified_claims, verified_subject
 from services.confirm.execute import BackendWriteClient, BackendWriteError, resolve_endpoint
+from services.confirm.revocation import customer_revoked, log_refusal, revoked_response
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +135,8 @@ async def approve_challenge(request: Request) -> JSONResponse:
 
     Flow:
         0. Verify the app assertion; the customer is its ``sub``.
+        0b. Refuse if that customer's access is revoked (ZT-7), before
+           anything here is read or written.
         1. Look up the challenge by ID (from stored row, not agent input).
         2. Reject unless the challenge belongs to that customer.
         3. Claim it: one conditional ``UPDATE`` that carries "still pending"
@@ -317,6 +332,39 @@ async def _approve(
     existence oracle in the RESPONSE and would be a loss of the most valuable
     signal on this path in the TABLE.
     """
+    # --- 0. ZT-7: is this customer's access revoked? ---
+    #
+    # THE FIRST STATEMENT, and every part of that placement is load-bearing.
+    #
+    # Before the signature check and before `get_challenge`, so a revoked
+    # caller's answer depends on nothing but their own revocation state: they
+    # cannot use the difference between 400, 403 and 404 to learn whether a
+    # challenge id exists, and challenge ids leave this system through the
+    # model's channel into a third party's chat history.
+    #
+    # Necessarily before the conditional ``UPDATE`` below, so a revoked caller
+    # cannot burn a challenge into a terminal state -- ``pending ->
+    # approved`` and the ``pending -> expired`` retirement inside
+    # `_refused_transition_response` are both writes, and neither must be
+    # reachable by an identity the operator has cut.
+    #
+    # And before `BackendWriteClient` exists at all, so no write JWT is
+    # minted, which is the difference between refusing a payment and
+    # recording one.
+    #
+    # `RevocationStoreUnavailable` is deliberately NOT caught. It propagates
+    # to `approve_challenge`'s ``except Exception``, which writes a completion
+    # row carrying the exception type and re-raises: the caller gets a 500 and
+    # the challenge is untouched, still ``pending``. Reporting a store outage
+    # as "not revoked" would un-revoke every entry the operator holds, at the
+    # moment they most believe they have acted.
+    if await customer_revoked(request, subject):
+        log_refusal("a challenge approval")
+        return (
+            revoked_response("this customer's access has been revoked"),
+            DETAIL_REVOKED,
+        )
+
     if not unverified_signature:
         return (
             _error(400, "invalid_request", "signature is required"),

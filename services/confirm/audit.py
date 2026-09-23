@@ -41,7 +41,9 @@ So a refused transition is recorded: a lost race (409), an expired challenge
 (410) and an approval aimed at somebody else's challenge (404) are each a real
 event, and the last of them is the single highest-value security signal on
 this path. None of the three gets an entry row, because none of them reaches
-the backend.
+the backend. A ZT-7 revocation refusal (403) joins them for the same reason
+and is recorded even earlier -- it is decided before the challenge is read, so
+its row names no tool, which is the same shape a 404 for an unknown id takes.
 
 TWO BACKSTOPS BEFORE THAT POINT WRITE NOTHING, both unreachable through the
 assembled app and both logged instead. The handler's own 401 fires only when
@@ -142,6 +144,7 @@ __all__ = [
     "DETAIL_CHALLENGE_VANISHED",
     "DETAIL_EXPIRED",
     "DETAIL_MISSING_SIGNATURE",
+    "DETAIL_REVOKED",
     "DETAIL_UPDATE_MATCHED_NO_ROW",
 ]
 
@@ -173,6 +176,13 @@ APPROVE_ROUTE = "/challenges/{challenge_id}/approve"
 # reason to keep the names here in one place rather than inline at six call
 # sites: a misspelling is then a diff in this block rather than a value
 # nothing filters on.
+#: ZT-7. The one refusal here that is decided BEFORE the challenge is read, so
+#: the row it lands on carries ``UNRESOLVED_TOOL_NAME`` and no entry row --
+#: nothing was resolved and nothing was reached. ``WHERE detail = 'revoked'``
+#: is how an operator confirms their revocation took effect on the write path,
+#: and it is the only place that is durable: this service has no client id to
+#: put in a log line the way `services/api/middleware/revocation.py` does.
+DETAIL_REVOKED = "revoked"
 DETAIL_MISSING_SIGNATURE = "missing_signature"
 DETAIL_CHALLENGE_NOT_FOUND = "challenge_not_found"
 DETAIL_CHALLENGE_NOT_OWNED = "challenge_not_owned"

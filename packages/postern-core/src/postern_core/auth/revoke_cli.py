@@ -27,10 +27,26 @@ outcome.
 
 WHAT A REVOCATION STOPS. Every `services/api` tool call and every
 ``tools/list`` for that identity, refused before the operator's backend is
-touched. **It does not stop a payment approval**: `services/confirm` consults
-no revocation store, so a challenge already created can still be approved and
-executed. That is a follow-up, and it is stated here because this file is
-what an operator reads while acting on a compromise.
+touched. The WRITE path -- ``POST /challenges/{challenge_id}/approve`` and
+the RFC 8628 device-grant exchange -- is covered too, but by one scope only:
+
+**TO STOP THE WRITE PATH, NAME THE CUSTOMER.** ``customer-client`` is the
+command that stops a payment approval. It cuts that customer's approvals
+through EVERY client, not only the one named, because the write path cannot
+tell the clients apart.
+
+``session`` does NOT stop a payment approval. The ``jti`` you name is the AI
+client's access token, and the write path is called by the banking app
+holding an assertion from a different issuer, which carries no such value.
+
+``kill-switch`` does NOT stop a payment approval either. The ``challenges``
+row does not record which vendor created it, so enforcing a kill switch there
+would refuse every customer's approvals rather than that client's.
+
+So an operator cutting a compromised session runs ``session`` AND
+``customer-client``: the first stops the reads, the second stops the money.
+`postern_core.auth.revocation` carries the full argument and what would close
+the gap.
 
 WHICH ``jti``. The one in the CUSTOMER's access token, which is what
 `services/api/middleware/revocation.py`'s `RevocationMiddleware` reads.
