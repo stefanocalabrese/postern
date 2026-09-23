@@ -16,7 +16,6 @@ from fastmcp.server.auth import AuthContext, AuthProvider
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef, CustomerResolver
-from postern_core.risk.session import SessionStoreBase
 from postern_core.store.engine import Database
 from pydantic import ValidationError
 
@@ -82,7 +81,6 @@ def build_server(
     *,
     db: Database | None = None,
     auth_override: AuthProvider | None = None,
-    session_store: SessionStoreBase | None = None,
 ) -> FastMCP:
     has_jwks_uri = settings.customer_jwks_uri is not None
     has_issuer = settings.customer_token_issuer is not None
@@ -120,7 +118,7 @@ def build_server(
         cache_ttl=settings.cache_ttl_seconds,
     )
     if backend is not None:
-        bootstrap_tools.register(server, resolver, backend, session_store)
+        bootstrap_tools.register(server, resolver, backend)
         accounts_check = consent_for("accounts", db) if db is not None else _no_consent_required
         transactions_check = (
             consent_for("transactions", db) if db is not None else _no_consent_required

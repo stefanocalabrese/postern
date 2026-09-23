@@ -174,15 +174,18 @@ def test_json_round_trip_preserves_verification_tier() -> None:
 
 
 def test_serialization_default_tier_is_zero() -> None:
-    """from_dict with missing tier field defaults to SESSION_ONLY."""
+    """from_dict with missing tier field defaults to SESSION_ONLY.
+
+    The field names lost their leading underscores when the serialised shape
+    became a validated model (2026-09-22); `started_at` is the one field with
+    no default, because a stored context whose creation instant is unknown
+    cannot be aged and must be refused rather than restored as new.
+    """
+    import time
+
     data: dict[str, object] = {
-        "_records": 0,
-        "_accounts": [],
-        "_max_days": 0,
-        "_start_time": 1000.0,
-        "_ip_tracker": {"entries": []},
-        "_session_id": "no-tier",
-        "_risk_signals": [],
+        "session_id": "no-tier",
+        "started_at": time.time(),
     }
 
     ctx = RiskContext.from_dict(data)

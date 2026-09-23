@@ -1,66 +1,94 @@
-"""Risk session middleware — wires ``SessionStore`` into the FastMCP server.
+"""Risk session middleware — the thing that makes ZT-5 execute.
 
-For every tool call (except ``start_session`` itself), extracts the
-``session_handle`` from arguments, looks up the ``RiskContext``, and pushes
-it onto a contextvar so that:
-
-* tool handlers can record data touches (records, accounts, days)
-* the IP tracker records client IPs
-* post-call evaluation runs ``RiskEngine`` + ``IpAnomalyDetector``
+For every tool call it derives the caller's identity, loads (or creates) that
+identity's `RiskContext`, records the client IP, and evaluates the risk engine
+and the IP anomaly detector twice: once BEFORE the tool runs, as an admission
+check, and once after, to account for what the handlers recorded.
 
 Action model (per ZT-5 design):
 
-* ``LOW`` signals → logged, tool continues normally.
-* ``MEDIUM`` signals → session verification tier is escalated (tier 0 → 1,
-  or 1 → 2) so that subsequent calls require stronger verification.
-* ``HIGH`` signals → the current tool call is blocked with a
-  ``RiskActionError``, and the session is marked for termination.
+* ``LOW`` signals → logged, the tool continues normally.
+* ``MEDIUM`` signals → the verification tier is escalated (tier 0 → 1, or
+  1 → 2) so that subsequent calls require stronger verification.
+* ``HIGH`` signals → the call is refused with a ``RiskActionError``.
 
-Session lifecycle:
+WHY TWICE. Evaluating only after ``call_next`` -- what this module did until
+2026-09-22 -- means the FIRST call that exhausts a budget has already reached
+the operator's backend, and so has every call after it, because a refusal
+that happens after the request is not a refusal of the request. The
+pre-call pass is what makes "the record budget is exhausted" cost the backend
+nothing: `tests/test_risk_middleware_actions.py` counts backend touches
+rather than status codes, and asserts zero. The post-call pass still runs
+because only the handlers know how many records they returned.
 
-1. Client calls ``start_session`` → returns a new ``session_handle``
-2. Client includes ``session_handle`` in all subsequent calls
-3. Middleware looks up the context and pushes it onto the contextvar
-4. After each call, data is recorded (by handlers) and risk signals are
-   evaluated by this middleware
+WHAT A FAILURE DOES. Every exit below is closed. A caller whose identity
+cannot be derived is refused; a store that cannot answer refuses the call
+(`session.py`'s `SessionStoreUnavailable`); and the evaluation itself is no
+longer wrapped in a blanket ``except Exception``. The version that was
+wrapped caught the ``RiskActionError`` it had raised two lines earlier and
+logged it as "risk evaluation failed; continuing" -- the HIGH branch
+existed, had tests, and blocked nothing, which is why the tests in this
+module's test file now drive a real server instead of raising the exception
+they assert on.
 
-No session cleanup is performed here — sessions live until the store is
-replaced with a backed implementation (Redis/database) that supports TTL.
-
-Wiring: install via ``server.add_middleware(RiskMiddleware(store))`` in
-``services/api/main.py::create_app``, after ``AuditMiddleware``.
+Wiring: ``server.add_middleware(RiskMiddleware(store, resolver, ...))`` in
+`main.py`'s `create_app`, after `AuditMiddleware`.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
-from typing import Any
 
+from fastmcp.server.dependencies import get_access_token, get_http_request
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
+from postern_core.identity import CustomerResolver
 from postern_core.risk.context import RiskContext
 from postern_core.risk.engine import RiskConfig, RiskEngine
-from postern_core.risk.ip_anomaly import IpAnomalyDetector
-from postern_core.risk.session import SessionStoreBase, set_current_session
-from postern_core.risk.types import RiskActionError
+from postern_core.risk.ip_anomaly import IpAnomalyConfig, IpAnomalyDetector
+from postern_core.risk.session import SessionKey, SessionStoreBase, set_current_session
+from postern_core.risk.types import RiskActionError, RiskSignal, Severity
 
 logger = logging.getLogger(__name__)
 
+#: `SessionKey.client_id` for a call that carried no access token. A literal
+#: no OAuth client id can collide with, because `_client_id` below only ever
+#: stores a value fastmcp read off a validated token.
+NO_CLIENT = "-"
+
 
 class RiskMiddleware(Middleware):
-    """Pushes the current session's ``RiskContext`` onto a contextvar.
+    """Loads the caller's `RiskContext`, evaluates it, and refuses HIGH risk.
 
-    Reads ``session_handle`` from tool arguments, looks it up in the
-    store, and makes the context available via ``get_current_session()``.
+    ``store`` holds the contexts, ``resolver`` answers which customer is
+    calling, and the two configs carry the thresholds (injectable so a test
+    can drive a small budget rather than 500 records).
 
-    After each call, records client IP and evaluates risk signals.
-    Data recording (records returned, accounts touched) is done by the
-    tool handlers themselves via ``get_current_session()``.
+    ``trusted_proxy_hops`` is how many proxies in front of this process
+    append to ``X-Forwarded-For``; see `_client_ip` for what the number
+    selects and why the default trusts the header for nothing.
     """
 
-    def __init__(self, store: SessionStoreBase) -> None:
+    def __init__(
+        self,
+        store: SessionStoreBase,
+        resolver: CustomerResolver,
+        *,
+        config: RiskConfig | None = None,
+        ip_config: IpAnomalyConfig | None = None,
+        trusted_proxy_hops: int = 0,
+    ) -> None:
+        if trusted_proxy_hops < 0:
+            raise ValueError(
+                f"trusted_proxy_hops must be zero or positive, got {trusted_proxy_hops}"
+            )
         self.store = store
+        self.resolver = resolver
+        self.engine = RiskEngine(config or RiskConfig())
+        self.ip_detector = IpAnomalyDetector(ip_config or IpAnomalyConfig())
+        self.trusted_proxy_hops = trusted_proxy_hops
 
     async def on_call_tool(
         self,
@@ -69,166 +97,218 @@ class RiskMiddleware(Middleware):
     ) -> ToolResult:
         tool_name = context.message.name or "unknown"
 
-        # start_session creates a new session — no prior context to push.
-        if tool_name == "start_session":
-            return await call_next(context)
+        # FIRST, before anything can fail: clear the contextvar. It is left
+        # SET on the way out (see the bottom of this method), so a call
+        # refused before it has a context of its own must not be able to read
+        # the previous call's.
+        set_current_session(None)
 
-        # For all other tools, extract session_handle and push context.
-        session_handle = self._extract_session_handle(context.message.arguments)
+        key = self._session_key()
+        ctx = await self.store.context_for(key)
 
-        if session_handle is None:
-            # No session handle provided — run without risk tracking.
-            return await call_next(context)
-
-        ctx = await self.store.get_session(session_handle)
-        if ctx is None:
-            logger.warning(
-                "RiskMiddleware: session %r not found for tool %s; running without risk tracking",
-                session_handle,
-                tool_name,
-            )
-            return await call_next(context)
-
-        # Record client IP on the session's tracker.
-        ip = self._extract_client_ip(context)
+        ip = self._client_ip()
         if ip is not None:
             ctx.ip_tracker.record_ip(ip)
 
-        # Push the context onto the contextvar for this call.
         set_current_session(ctx)
+
+        # --- Admission: what this identity has already spent ---
+        admission = self._evaluate(ctx, key, tool_name)
+        blocking = [s for s in admission if s.severity is Severity.HIGH]
+        if blocking:
+            # Persisted before the raise: the IP just recorded, and the
+            # signals the audit row is about to read, are part of the record
+            # of the refusal.
+            await self.store.save(key, ctx)
+            self._log_block(key, tool_name, blocking, when="before")
+            raise RiskActionError(blocking)
+
         try:
             result = await call_next(context)
-            # Evaluate risk signals after the handler has recorded data.
-            self._evaluate_signals(ctx, session_handle)
-            # Persist mutations (records, accounts, IPs) back to the store.
-            await self.store.save_session(session_handle, ctx)
-            return result
-        except RiskActionError:
-            # HIGH signal blocked the call — persist context (signals are on it)
-            # and re-raise so the caller sees the block.
-            await self.store.save_session(session_handle, ctx)
-            raise
         except Exception:
-            # Even on failure, evaluate signals and persist (handler may have
-            # recorded partial data before the exception).
-            self._evaluate_signals(ctx, session_handle)
-            await self.store.save_session(session_handle, ctx)
+            # A failed call still touched whatever it touched before failing,
+            # so it is accounted for like any other.
+            self._settle(ctx, key, tool_name)
+            await self.store.save(key, ctx)
             raise
 
-    def _extract_session_handle(self, arguments: dict[str, Any] | None) -> str | None:
-        """Extract ``session_handle`` from tool arguments."""
-        if not arguments:
-            return None
-        return arguments.get("session_handle")
+        # --- Accounting: what this call itself spent ---
+        blocking = self._settle(ctx, key, tool_name)
+        await self.store.save(key, ctx)
+        if blocking:
+            # The backend was already reached, so this does not un-read the
+            # data -- it withholds it from the model and guarantees the next
+            # call is refused at admission, above, before any request.
+            self._log_block(key, tool_name, blocking, when="after")
+            raise RiskActionError(blocking)
 
-    def _extract_client_ip(self, context: MiddlewareContext[CallToolRequestParams]) -> str | None:
-        """Extract client IP from the request context.
+        # The contextvar is deliberately NOT reset here. `AuditMiddleware` is
+        # installed outside this one and reads `get_current_session()` after
+        # this method returns, to copy the signals onto the completion row;
+        # resetting would make `audit_log.risk_signals` NULL for every call.
+        # The `set_current_session(None)` at the top of this method is what
+        # keeps a stale context from outliving its call.
+        return result
 
-        Reads ``X-Forwarded-For`` header first, falls back to remote address.
-        Returns None if neither is available.
+    # --- Identity -----------------------------------------------------------
+
+    def _session_key(self) -> SessionKey:
+        """Which identity this call is budgeted against.
+
+        The customer comes from the injected `CustomerResolver`, which is the
+        one place in this service that answers "which customer is this?"
+        (`server.py`'s `token_customer_resolver` reads the validated token's
+        ``sub`` and refuses anything that is not a customer reference). Read
+        through the resolver rather than from the token a second time on
+        purpose: the tools resolve the customer the same way, so the context a
+        budget is charged to and the customer whose data was returned cannot
+        drift apart. In the documented no-auth path a test or the compose
+        stack injects a fixed customer, and in production a call with no token
+        raises ``PermissionError`` here and is refused.
         """
-        if context.fastmcp_context:
-            headers = getattr(context.fastmcp_context, "request", None)
-            if headers is not None:
-                headers = getattr(headers, "headers", None)
-            if headers:
-                xff = headers.get("x-forwarded-for")
-                if xff:
-                    return str(xff.split(",")[0].strip())
+        customer = self.resolver()
+        return SessionKey(customer_ref=customer.value, client_id=self._client_id())
 
-            if context.fastmcp_context:
-                try:
-                    req = getattr(context.fastmcp_context, "request", None)
-                    if req is not None:
-                        peer = getattr(req, "client", None)
-                        if peer and hasattr(peer, "host"):
-                            return str(peer.host)
-                except Exception:
-                    logger.debug("IP extraction failed", exc_info=True)
+    def _client_id(self) -> str:
+        """The OAuth client on the validated token, or `NO_CLIENT`.
 
-        return None
+        ``AccessToken.client_id`` is fastmcp's own
+        ``client_id`` / ``azp`` / ``sub`` fallback chain, so this is the
+        ``client_id``-or-``azp`` the design asks for without re-deriving it.
+        ``get_access_token()`` returns ``None`` for a call arriving over the
+        in-process ``Client(transport=server)`` transport, which carries no
+        token at all.
+        """
+        token = get_access_token()
+        if token is None or not token.client_id:
+            return NO_CLIENT
+        return str(token.client_id)
 
-    def _evaluate_signals(self, ctx: RiskContext, session_handle: str) -> None:
-        """Evaluate risk engine and IP anomaly detector signals.
+    # --- Client IP ----------------------------------------------------------
 
-        Runs after each tool call (success or failure). Data recording
-        is done by handlers via ``get_current_session()`` before this runs.
+    def _client_ip(self) -> str | None:
+        """The client address to record, or ``None`` to record nothing.
 
-        Action model:
-        - MEDIUM signals → escalate the session's verification tier so that
-          subsequent calls require stronger authentication.
-        - HIGH signals → raise ``RiskActionError`` to block the current call
-          and mark the session for termination.
+        TWO DEFECTS ARE FIXED HERE, and decision record 0010 is why they
+        matter: with DPoP absent from the MCP spec, IP anomaly detection is
+        the primary compensating control for a stolen token replayed from
+        other infrastructure (A4).
 
-        All signals (regardless of severity) are stored on the context for
-        audit logging and logged at WARNING level.
+        The first: this used to read ``context.fastmcp_context.request``,
+        which fastmcp 4.0.3's ``Context`` does not have, so the address was
+        unconditionally ``None`` and the detector always saw zero IPs.
+        `get_http_request` is what `consent.py`'s `_domains` already uses.
+
+        The second: it took the LEFTMOST ``X-Forwarded-For`` element, which
+        is the one the client writes. An attacker could pin their apparent
+        address to defeat the diversity and impossible-travel checks outright,
+        or rotate it to spend the budget at will. The rightmost entries are
+        the ones infrastructure appended, so with ``trusted_proxy_hops = n``
+        the address is the n-th from the right -- the value written by the
+        outermost proxy this deployment trusts. A header shorter than ``n``
+        entries is not the shape this deployment expects and is discarded
+        rather than read at whatever offset it happens to have.
+
+        The DEFAULT IS ZERO: trust the header for nothing and use the socket
+        peer. A deployment behind an ALB, an Istio gateway or any other proxy
+        MUST set ``POSTERN_TRUSTED_PROXY_HOPS`` to the number of hops that
+        append, or every call will be attributed to the proxy. The opposite
+        default would mean a deployment with no proxy in front of it trusting
+        a header the caller writes, which is the defect being fixed.
+
+        ``ipaddress.ip_address`` both validates and canonicalises, so
+        ``::FFFF:1.2.3.4`` and ``::ffff:1.2.3.4`` cannot count as two
+        addresses against the diversity budget. Anything it refuses is
+        dropped -- the call proceeds, with one fewer IP recorded, rather than
+        with a garbage one that would make every later comparison lie.
         """
         try:
-            # Evaluate general risk engine (record budgets, account diversity,
-            # session age, time window)
-            config = RiskConfig()
-            signals = RiskEngine(config).evaluate(ctx)
+            request = get_http_request()
+        except RuntimeError:
+            # No HTTP request: the in-process client transport. Nothing to
+            # record, and nothing about that is an error.
+            return None
 
-            # Evaluate IP anomaly detector (impossible travel, diversity)
-            ip_detector = IpAnomalyDetector()
-            ip_signals = ip_detector.evaluate(ctx.ip_tracker)
+        if self.trusted_proxy_hops > 0:
+            forwarded = request.headers.get("x-forwarded-for")
+            if not forwarded:
+                return None
+            parts = [part.strip() for part in forwarded.split(",") if part.strip()]
+            if len(parts) < self.trusted_proxy_hops:
+                logger.warning(
+                    "X-Forwarded-For carries %d entries, fewer than the %d trusted hops "
+                    "configured; recording no client IP for this call",
+                    len(parts),
+                    self.trusted_proxy_hops,
+                )
+                return None
+            candidate = parts[-self.trusted_proxy_hops]
+        else:
+            peer = request.client
+            if peer is None:
+                return None
+            candidate = peer.host
 
-            # Store all signals on the context for audit logging.
-            # Clear first so only this call's signals survive (the list is
-            # per-call, not cumulative across the session).
-            ctx._risk_signals = [*signals, *ip_signals]
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            logger.warning("discarding unparseable client address for this call")
+            return None
 
+    # --- Evaluation ---------------------------------------------------------
+
+    def _evaluate(self, ctx: RiskContext, key: SessionKey, tool_name: str) -> list[RiskSignal]:
+        """Run both detectors, record the signals on the context, log them.
+
+        NOT wrapped in ``try``. Everything here is arithmetic over state this
+        process already holds, so an exception is a defect in the risk layer
+        itself, and a risk layer that cannot evaluate must not be the reason a
+        call to a bank's data succeeds. The blanket handler this replaces is
+        what swallowed the block.
+        """
+        signals = [*self.engine.evaluate(ctx), *self.ip_detector.evaluate(ctx.ip_tracker)]
+        ctx.record_signals(signals)
+        if signals:
             snap = ctx.snapshot()
             for signal in signals:
                 logger.warning(
-                    "RiskSignal[%s] session=%s records=%d accounts=%d severity=%s: %s",
-                    session_handle[:8],
+                    "RiskSignal[%s] session=%s tool=%s records=%s accounts=%s ips=%s "
+                    "severity=%s: %s",
                     signal.code,
-                    snap.get("records", 0),
-                    snap.get("distinct_accounts", 0),
+                    key.log_ref,
+                    tool_name,
+                    snap.get("records"),
+                    snap.get("distinct_accounts"),
+                    snap.get("distinct_ips"),
                     signal.severity.name,
                     signal.description,
                 )
+        return signals
 
-            for signal in ip_signals:
-                logger.warning(
-                    "IpAnomalySignal[%s] session=%s distinct_ips=%d severity=%s: %s",
-                    signal.code,
-                    session_handle[:8],
-                    snap.get("distinct_ips", 0),
-                    signal.severity.name,
-                    signal.description,
-                )
+    def _settle(self, ctx: RiskContext, key: SessionKey, tool_name: str) -> list[RiskSignal]:
+        """Post-call evaluation: escalate on MEDIUM, report what blocks.
 
-            # --- Take action on MEDIUM and HIGH signals ---
-
-            # Escalate tier for any MEDIUM signal.
-            medium_signals = [s for s in signals if s.severity.name == "MEDIUM"] + [
-                s for s in ip_signals if s.severity.name == "MEDIUM"
-            ]
-            if medium_signals:
-                ctx.escalate_tier()
-                logger.info(
-                    "RiskMiddleware: escalated tier to %s for session=%s",
-                    ctx.verification_tier,
-                    session_handle[:8],
-                )
-
-            # Block on any HIGH signal.
-            high_signals = [s for s in signals if s.severity.name == "HIGH"] + [
-                s for s in ip_signals if s.severity.name == "HIGH"
-            ]
-            if high_signals:
-                logger.warning(
-                    "RiskMiddleware: blocking session=%s due to HIGH signals: %s",
-                    session_handle[:8],
-                    ", ".join(s.code for s in high_signals),
-                )
-                raise RiskActionError(high_signals)
-
-        except Exception:
-            # Risk evaluation must never break the tool call — unless it's a
-            # RiskActionError, which is intentionally raised to block the call.
-            logger.exception(
-                "RiskMiddleware: risk evaluation failed; continuing without signal processing"
+        Tier escalation happens here and not in the admission pass, so one
+        call escalates at most one level however many times the same standing
+        condition is re-detected.
+        """
+        signals = self._evaluate(ctx, key, tool_name)
+        if any(s.severity is Severity.MEDIUM for s in signals):
+            ctx.escalate_tier()
+            logger.info(
+                "RiskMiddleware: escalated session=%s to tier %s",
+                key.log_ref,
+                ctx.verification_tier,
             )
+        return [s for s in signals if s.severity is Severity.HIGH]
+
+    def _log_block(
+        self, key: SessionKey, tool_name: str, signals: list[RiskSignal], *, when: str
+    ) -> None:
+        logger.warning(
+            "RiskMiddleware: refused %s for session=%s %s the call, on: %s",
+            tool_name,
+            key.log_ref,
+            when,
+            ", ".join(s.code for s in signals),
+        )

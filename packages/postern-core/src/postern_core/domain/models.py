@@ -75,5 +75,7 @@ class SessionInfo(_Strict):
     write_enabled: list[str]
     confirmation_note: FreeText
     session_handle: str
-    """Opaque handle identifying this session. Pass it to all subsequent
-    tool calls so the server can track per-session risk budgets."""
+    """Opaque identifier for this session, for support and log correlation
+    only. No tool accepts it: the server recognises the session from the
+    access token on every call, never from an argument. Empty when the
+    server carries no risk middleware."""

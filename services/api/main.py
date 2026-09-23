@@ -338,9 +338,16 @@ def create_app(
                 "of this setting."
             )
 
+    # ONE resolver object, handed to both `build_server` and `RiskMiddleware`
+    # below. The middleware charges a call's record and account budgets to
+    # whichever customer this answers, and the tools read whichever customer
+    # this answers; two separate reads of the identity could disagree, and a
+    # budget charged to a different customer than the one whose data was
+    # returned is not a budget.
+    customer_resolver = resolver or token_customer_resolver
     server = build_server(
         settings,
-        resolver or token_customer_resolver,
+        customer_resolver,
         backend,
         db=consent_db,
         auth_override=auth_override,
@@ -353,9 +360,19 @@ def create_app(
     # middleware is what makes that hook resolvable at all, so the two go
     # together and neither is conditional.
     server.add_middleware(AuditMiddleware(db))
-    # ZT-5: risk session middleware — pushes per-session RiskContext onto a
-    # contextvar so tool handlers can record data touches and evaluate risk.
-    server.add_middleware(RiskMiddleware(session_store))
+    # ZT-5: the risk layer. INSIDE `AuditMiddleware` (added second, so it
+    # runs nested within it), which is what lets the audit row carry this
+    # call's risk signals: `AuditMiddleware` reads `get_current_session()`
+    # after this middleware returns or raises, so the contextvar must still
+    # be set by then. A refusal from here therefore still writes a completion
+    # row, with `outcome='raised'` and the signals that caused it.
+    server.add_middleware(
+        RiskMiddleware(
+            session_store,
+            customer_resolver,
+            trusted_proxy_hops=settings.trusted_proxy_hops,
+        )
+    )
     app = server.http_app(
         path="/mcp",
         stateless_http=True,
@@ -393,6 +410,11 @@ def create_app(
     app.state.backend_client = backend
     app.state.postern_server = server
     app.state.postern_database = db
+    # ZT-5, same reason as the three above: a test that wants to prove a
+    # budget is enforced has to be able to seed one, and the alternative --
+    # driving 500 records' worth of real calls to reach the threshold -- would
+    # measure the fixtures rather than the control.
+    app.state.postern_session_store = session_store
     # The public half of the key the minter above signs with. Task 3's JWKS
     # route serves it, and it is the only handle on that key outside the
     # `BackendClient` the minter is buried in.

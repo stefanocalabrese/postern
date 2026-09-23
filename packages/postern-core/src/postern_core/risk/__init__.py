@@ -9,9 +9,11 @@ ZT-5 follow-up: IP/ASN anomaly detection via ``IpAnomalyDetector`` and
 ``IpTracker`` — detects impossible travel, excessive IP diversity, and
 suspicious ASN connections (compensating control for ZT-6).
 
-Session management: pluggable ``SessionStore`` (in-memory or Redis) and
-contextvar so tool handlers can reach the current session's ``RiskContext``
-without threading it through every function.
+Session management: a pluggable store (in-memory or Redis) keyed on the
+caller's verified identity -- ``SessionKey``, the customer plus the OAuth
+client -- and a contextvar so tool handlers can reach the current call's
+``RiskContext`` without threading it through every function. A store that
+cannot answer raises ``SessionStoreUnavailable``, which refuses the call.
 
 Production deployments set ``POSTERN_REDIS_URL`` to enable the Redis
 backend (compatible with AWS ElastiCache, Google Memorystore, Azure Cache
@@ -24,8 +26,10 @@ from postern_core.risk.ip_anomaly import IpAnomalyConfig, IpAnomalyDetector
 from postern_core.risk.session import (
     InMemorySessionStore,
     RedisSessionStore,
-    SessionHandle,
+    SessionKey,
     SessionStore,
+    SessionStoreBase,
+    SessionStoreUnavailable,
     create_session_store,
     get_current_session,
 )
@@ -43,8 +47,10 @@ __all__ = [
     "RiskEngine",
     "RiskSignal",
     "Severity",
-    "SessionHandle",
+    "SessionKey",
     "SessionStore",
+    "SessionStoreBase",
+    "SessionStoreUnavailable",
     "create_session_store",
     "get_current_session",
 ]

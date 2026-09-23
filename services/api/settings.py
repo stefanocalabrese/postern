@@ -27,6 +27,24 @@ class Settings:
     audience: str = "postern"
     strict_headers: bool = False
     cache_ttl_seconds: int = 60
+    # ZT-5: how many proxies in front of this process append to
+    # `X-Forwarded-For`. `services/api/middleware/risk.py`'s `_client_ip`
+    # reads the n-th entry from the RIGHT, which is the address the outermost
+    # proxy this deployment trusts wrote; the leftmost entry is the one the
+    # caller writes, and reading it let an attacker pin or rotate their
+    # apparent address at will against the IP-anomaly control that decision
+    # record 0010 makes the primary compensating control for a replayed token.
+    #
+    # ZERO, deliberately, and it is the value that trusts the header for
+    # NOTHING: the socket peer is used instead. A deployment behind an ALB or
+    # the Istio gateway MUST raise this to the number of hops that actually
+    # append, or every call is attributed to the proxy and the diversity and
+    # impossible-travel checks see one unchanging address. The opposite
+    # default would have a deployment with no proxy trusting a header its
+    # caller controls, which is the defect, so the number that is wrong in
+    # the safe direction is the default and the deployment states its own
+    # topology.
+    trusted_proxy_hops: int = 0
     # Task 12: the façade's `BackendClient(timeout=...)` applies a bare float
     # independently to each of connect/read/write/pool (Task 6 measured this
     # against httpx2 2.12.0), so a single "10 seconds" was really a worst
@@ -176,6 +194,7 @@ class Settings:
             audience=os.environ.get("POSTERN_AUDIENCE", "postern"),
             strict_headers=os.environ.get("POSTERN_STRICT_HEADERS") == "1",
             cache_ttl_seconds=int(os.environ.get("POSTERN_CACHE_TTL_SECONDS", "60")),
+            trusted_proxy_hops=int(os.environ.get("POSTERN_TRUSTED_PROXY_HOPS", "0")),
             backend_connect_timeout_seconds=float(
                 os.environ.get("POSTERN_BACKEND_CONNECT_TIMEOUT_SECONDS", "2.0")
             ),

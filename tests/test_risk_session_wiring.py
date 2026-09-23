@@ -1,73 +1,90 @@
-"""Integration tests for risk session wiring (ZT-5).
+"""Risk session storage and serialisation (ZT-5).
 
-Tests the full flow: start_session creates a session, subsequent calls
-record data on the RiskContext, and risk signals fire correctly.
+The store half of the ZT-5 wiring: a context is addressed by the caller's
+verified identity (`SessionKey`), created on first use, aged out on read, and
+round-tripped through JSON without losing the one thing the engine measures
+time against.
 
-Covers:
-- SessionStore creates and retrieves sessions
-- start_session returns a session_handle
-- Tool handlers record data via get_current_session()
-- Risk middleware evaluates signals after each call
-- IP tracking through the middleware
+The identity-keyed shape replaced an opaque handle passed as a tool argument
+on 2026-09-22. `tests/test_risk_middleware_actions.py` covers what the
+middleware does with a context; this file covers the store that holds it.
 """
 
 import dataclasses
+import time
 from unittest.mock import patch
 
 import pytest
-from postern_core.risk.context import RiskContext
+from postern_core.risk.context import IpTracker, RiskContext
 from postern_core.risk.engine import RiskConfig, RiskEngine
 from postern_core.risk.ip_anomaly import IpAnomalyDetector
 from postern_core.risk.session import (
-    SessionHandle,
+    RedisSessionStore,
+    SessionKey,
     SessionStore,
     get_current_session,
     set_current_session,
 )
 from postern_core.risk.types import Severity
 
-# --- SessionStore tests ---
+KEY = SessionKey(customer_ref="cust_7f3a", client_id="vendor-a")
+OTHER_KEY = SessionKey(customer_ref="cust_9b21", client_id="vendor-a")
 
 
-async def test_session_store_creates_unique_handles() -> None:
-    """Each create_session call returns a distinct handle."""
+def _age(ctx: RiskContext, seconds: float) -> None:
+    """Make a context `seconds` older, the way the passage of time would.
+
+    `RiskContext.started_at` is derived from the monotonic start reading, so
+    moving that reading back is what a context created `seconds` ago looks
+    like on both clocks at once. Patching `time.time` instead moves the
+    store's reading and the context's together and changes nothing.
+    """
+    ctx._start_time -= seconds
+
+
+# --- Store tests ---
+
+
+async def test_the_key_is_a_digest_of_the_identity_and_nothing_else() -> None:
+    """Stable for one identity, different for another, and reversible into
+    neither: the key is what lands in a Redis key name."""
+    assert KEY.value == SessionKey(customer_ref="cust_7f3a", client_id="vendor-a").value
+    assert KEY.value != OTHER_KEY.value
+    assert KEY.value != SessionKey(customer_ref="cust_7f3a", client_id="vendor-b").value
+    assert "cust_7f3a" not in KEY.value
+    assert len(KEY.value) == 64
+
+
+async def test_context_for_creates_on_first_use_and_returns_the_same_one_after() -> None:
+    """No `create_session`: the first call of a session creates the context,
+    and there is no separate operation an agent could reach for twice."""
     store = SessionStore()
-    h1 = await store.create_session()
-    h2 = await store.create_session()
-    assert h1.value != h2.value
-    assert isinstance(h1, SessionHandle)
+    first = await store.context_for(KEY)
+    first.record_records(7)
+    second = await store.context_for(KEY)
+    assert second is first
+    assert second.record_count.total == 7
 
 
-async def test_session_store_retrieves_by_handle() -> None:
-    """Created sessions are retrievable by their handle."""
+async def test_load_returns_none_for_an_identity_with_no_context() -> None:
+    """A miss, which the caller turns into a new context -- distinct from an
+    outage, which raises."""
     store = SessionStore()
-    h = await store.create_session()
-    ctx = await store.get_session(h.value)
-    assert ctx is not None
-    assert ctx.session_id == h.value
+    assert await store.load(KEY) is None
 
 
-async def test_session_store_returns_none_for_unknown_handle() -> None:
-    """Unknown handles return None."""
+async def test_remove_forgets_the_context() -> None:
     store = SessionStore()
-    assert await store.get_session("nonexistent") is None
+    await store.context_for(KEY)
+    await store.remove(KEY)
+    assert await store.load(KEY) is None
 
 
-async def test_session_store_removes_sessions() -> None:
-    """remove_session deletes the context."""
+async def test_the_created_context_carries_the_key_as_its_id() -> None:
+    """So a log line, an audit row and a store key all name the same thing."""
     store = SessionStore()
-    h = await store.create_session()
-    await store.remove_session(h.value)
-    assert await store.get_session(h.value) is None
-
-
-async def test_session_context_has_id() -> None:
-    """Created contexts carry their session_id."""
-    store = SessionStore()
-    h = await store.create_session()
-    ctx = await store.get_session(h.value)
-    assert ctx is not None
-    assert ctx.session_id == h.value
+    ctx = await store.context_for(KEY)
+    assert ctx.session_id == KEY.value
 
 
 # --- ContextVar tests ---
@@ -260,25 +277,18 @@ def test_risk_signals_from_engine_are_immutable() -> None:
 
 
 async def test_full_session_lifecycle() -> None:
-    """Create → retrieve → record → evaluate → snapshot."""
+    """Create on first use → record → evaluate → snapshot → forget."""
     store = SessionStore()
 
-    # 1. Create session
-    handle = await store.create_session()
-    assert handle.value is not None
+    ctx = await store.context_for(KEY)
+    assert ctx.session_id == KEY.value
 
-    # 2. Retrieve context
-    ctx = await store.get_session(handle.value)
-    assert ctx is not None
-    assert ctx.session_id == handle.value
-
-    # 3. Record data (simulating tool handler behavior)
+    # Record data (simulating tool handler behavior)
     ctx.record_records(50)
     for i in range(3):
         ctx.record_account(f"acc_{i}")
     ctx.record_days(30)
 
-    # 4. Evaluate risk (within bounds)
     config = RiskConfig(
         max_records_per_session=100,
         max_distinct_accounts=5,
@@ -287,35 +297,29 @@ async def test_full_session_lifecycle() -> None:
     signals = RiskEngine(config).evaluate(ctx)
     assert signals == []
 
-    # 5. Snapshot captures state
     snap = ctx.snapshot()
     assert snap["records"] == 50
     assert snap["distinct_accounts"] == 3
     assert snap["max_days_requested"] == 30
-    assert snap["session_id"] == handle.value
+    assert snap["session_id"] == KEY.value
 
-    # 6. Exhaust budget and re-evaluate
+    # Exhaust budget and re-evaluate
     ctx.record_records(60)  # total now 110, over limit of 100
+    await store.save(KEY, ctx)
     signals = RiskEngine(config).evaluate(ctx)
     assert len(signals) > 0
 
-    # 7. Remove session
-    await store.remove_session(handle.value)
-    assert await store.get_session(handle.value) is None
+    await store.remove(KEY)
+    assert await store.load(KEY) is None
 
 
-async def test_multiple_sessions_are_isolated() -> None:
-    """Each session has independent state."""
+async def test_two_identities_are_isolated() -> None:
+    """Each identity has independent state."""
     store = SessionStore()
 
-    h1 = await store.create_session()
-    h2 = await store.create_session()
+    ctx1 = await store.context_for(KEY)
+    ctx2 = await store.context_for(OTHER_KEY)
 
-    ctx1 = await store.get_session(h1.value)
-    ctx2 = await store.get_session(h2.value)
-
-    assert ctx1 is not None
-    assert ctx2 is not None
     assert ctx1 is not ctx2
     assert ctx1.session_id != ctx2.session_id
 
@@ -325,13 +329,36 @@ async def test_multiple_sessions_are_isolated() -> None:
     assert ctx1.record_count.total == 50
     assert ctx2.record_count.total == 10
 
-    # Different sessions, different contexts
     config = RiskConfig(max_records_per_session=30)
-    signals1 = RiskEngine(config).evaluate(ctx1)
-    signals2 = RiskEngine(config).evaluate(ctx2)
+    assert len(RiskEngine(config).evaluate(ctx1)) > 0  # 50 > 30
+    assert RiskEngine(config).evaluate(ctx2) == []  # 10 <= 30
 
-    assert len(signals1) > 0  # 50 > 30
-    assert signals2 == []  # 10 <= 30
+
+async def test_the_in_memory_store_ages_a_context_out() -> None:
+    """Nothing here ever expired before 2026-09-22.
+
+    With the context keyed on identity rather than on a handle, a context
+    that reached a HIGH signal would otherwise block that customer for the
+    life of the process, and the engine's own eight-hour session-age
+    threshold would make that the normal end state of a long session. The
+    lifetime runs from CREATION, so a caller cannot hold one budget window
+    open by staying busy.
+    """
+    store = SessionStore(ttl_seconds=60)
+    ctx = await store.context_for(KEY)
+    ctx.record_records(400)
+    assert await store.load(KEY) is ctx
+
+    # Age the context by moving its own start instant back, rather than by
+    # patching a clock: `time.time` is one module attribute shared by this
+    # store and `RiskContext.started_at`, so patching it moves both readings
+    # together and the elapsed time between them never changes.
+    _age(ctx, 61)
+    assert await store.load(KEY) is None
+
+    fresh = await store.context_for(KEY)
+    assert fresh is not ctx
+    assert fresh.record_count.total == 0
 
 
 # --- Serialization tests (Redis persistence) ---
@@ -439,10 +466,9 @@ async def test_in_memory_session_store_factory() -> None:
         assert isinstance(store, InMemorySessionStore)
 
         # Verify it works
-        handle = await store.create_session()
-        ctx = await store.get_session(handle.value)
-        assert ctx is not None
-        assert ctx.session_id == handle.value
+        ctx = await store.context_for(KEY)
+        assert ctx.session_id == KEY.value
+        assert await store.load(KEY) is ctx
     finally:
         if redis_url is not None:
             os.environ["POSTERN_REDIS_URL"] = redis_url
@@ -451,119 +477,253 @@ async def test_in_memory_session_store_factory() -> None:
 # --- Redis session store tests (using fakeredis) ---
 
 
-async def test_redis_session_store_creates_and_retrieves() -> None:
-    """RedisSessionStore creates and retrieves sessions via fakeredis."""
+def _fake_store(ttl: int = 300) -> RedisSessionStore:
     import fakeredis.aioredis
-    from postern_core.risk.session import RedisSessionStore
-
-    # Create a fake async Redis client
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
     store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis
+    store._redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     store._prefix = "test:"
-    store._ttl = 300
-
-    handle = await store.create_session()
-    assert handle.value is not None
-
-    ctx = await store.get_session(handle.value)
-    assert ctx is not None
-    assert ctx.session_id == handle.value
+    store._ttl = ttl
+    return store
 
 
-async def test_redis_session_store_removes() -> None:
-    """RedisSessionStore removes sessions."""
-    import fakeredis.aioredis
-    from postern_core.risk.session import RedisSessionStore
+async def test_redis_store_creates_and_retrieves() -> None:
+    store = _fake_store()
+    created = await store.context_for(KEY)
+    assert created.session_id == KEY.value
 
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-
-    store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis
-    store._prefix = "test:"
-    store._ttl = 300
-
-    handle = await store.create_session()
-    await store.remove_session(handle.value)
-
-    assert await store.get_session(handle.value) is None
+    loaded = await store.load(KEY)
+    assert loaded is not None
+    assert loaded.session_id == KEY.value
 
 
-async def test_redis_session_store_serialization_round_trip() -> None:
-    """RedisSessionStore round-trips a full context with data and signals."""
-    import fakeredis.aioredis
-    from postern_core.risk.engine import RiskConfig, RiskEngine
-    from postern_core.risk.session import RedisSessionStore
+async def test_redis_store_removes() -> None:
+    store = _fake_store()
+    await store.context_for(KEY)
+    await store.remove(KEY)
+    assert await store.load(KEY) is None
 
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
-    store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis
-    store._prefix = "test:"
-    store._ttl = 300
+async def test_redis_store_round_trips_a_full_context() -> None:
+    """What crosses the process boundary: counters, accounts, days, signals."""
+    store = _fake_store()
+    ctx = await store.context_for(KEY)
 
-    handle = await store.create_session()
-    ctx = await store.get_session(handle.value)
-    assert ctx is not None
-
-    # Record data (simulating tool handler behavior)
     ctx.record_records(50)
     for i in range(3):
         ctx.record_account(f"acc_{i}")
     ctx.record_days(30)
-
-    # Evaluate risk (generates signals)
     config = RiskConfig(max_records_per_session=100, max_distinct_accounts=5)
-    signals = RiskEngine(config).evaluate(ctx)
-    ctx._risk_signals = list(signals)
+    ctx.record_signals(RiskEngine(config).evaluate(ctx))
 
-    # Persist mutations back to Redis (what RiskMiddleware does after each call).
-    await store.save_session(handle.value, ctx)
+    await store.save(KEY, ctx)
 
-    # Now retrieve from store (simulates cross-process load).
-    loaded = await store.get_session(handle.value)
+    loaded = await store.load(KEY)
     assert loaded is not None
-    assert loaded.session_id == handle.value
+    assert loaded is not ctx, "a Redis load must rebuild the object, not hand back the same one"
+    assert loaded.session_id == KEY.value
     assert loaded.record_count.total == 50
     assert loaded.distinct_accounts == 3
     assert loaded.max_days_requested == 30
 
 
-async def test_redis_session_store_key_prefix() -> None:
-    """RedisSessionStore uses the configured key prefix."""
-    import fakeredis.aioredis
-    from postern_core.risk.session import RedisSessionStore
-
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-
-    store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis
-    store._prefix = "tenant123:"
-    store._ttl = 300
-
-    handle = await store.create_session()
-
-    # Verify the key was stored with the prefix
-    expected_key = f"tenant123:session:{handle.value}"
-    assert await fake_redis.exists(expected_key) == 1
+async def test_redis_store_uses_the_configured_key_prefix() -> None:
+    store = _fake_store()
+    await store.context_for(KEY)
+    assert await store._redis.exists(f"test:risk:{KEY.value}") == 1
 
 
-async def test_redis_session_store_ttl() -> None:
-    """RedisSessionStore sets TTL on created sessions."""
-    import fakeredis.aioredis
-    from postern_core.risk.session import RedisSessionStore
+async def test_redis_store_sets_a_ttl_on_a_new_context() -> None:
+    store = _fake_store(ttl=600)
+    await store.context_for(KEY)
+    ttl = await store._redis.ttl(f"test:risk:{KEY.value}")
+    assert 599 <= ttl <= 600, "a fresh context gets its full lifetime, not one second less"
 
-    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
-    store = RedisSessionStore.__new__(RedisSessionStore)
-    store._redis = fake_redis
-    store._prefix = "test:"
-    store._ttl = 600
+async def test_a_context_older_than_the_ttl_is_dropped_and_not_returned() -> None:
+    """The TTL that could never fire.
 
-    handle = await store.create_session()
-    key = f"test:session:{handle.value}"
+    ``to_dict`` used to write ``time.time()`` -- the instant of the write --
+    into the field this arithmetic measures elapsed time against, so every
+    save reset the clock and ``elapsed`` was always about zero however old
+    the context really was.
+    """
+    store = _fake_store(ttl=60)
+    ctx = await store.context_for(KEY)
+    ctx.record_records(400)
+    _age(ctx, 61)
+    await store.save(KEY, ctx)
 
-    # TTL should be set (fakeredis counts down, so allow 599–600).
-    ttl = await fake_redis.ttl(key)
-    assert 599 <= ttl <= 600
+    assert await store.load(KEY) is None
+
+
+async def test_saving_repeatedly_does_not_extend_the_lifetime() -> None:
+    """An absolute lifetime, not an idle one: a caller that keeps calling
+    must not be able to hold one budget window open indefinitely."""
+    store = _fake_store(ttl=60)
+    ctx = await store.context_for(KEY)
+    first = await store._redis.ttl(f"test:risk:{KEY.value}")
+
+    _age(ctx, 30)
+    await store.save(KEY, ctx)
+    second = await store._redis.ttl(f"test:risk:{KEY.value}")
+
+    assert second < first
+    assert second <= 31
+
+
+# --- The two clocks (audit finding, 2026-09-22) ---
+
+
+def test_a_restored_context_reports_its_real_age_not_a_negative_one() -> None:
+    """The defect in one assertion.
+
+    ``from_dict`` assigned a POSIX timestamp into the field
+    ``session_age_seconds`` subtracts from ``time.monotonic()``, so a
+    restored context's age was about -1.7e9 seconds and the engine's
+    session-age check could never fire for it.
+    """
+    ctx = RiskContext(session_id="aged")
+    data = ctx.to_dict()
+    data["started_at"] = time.time() - 7200  # created two hours ago
+
+    restored = RiskContext.from_dict(data)
+
+    assert restored.session_age_seconds == pytest.approx(7200, abs=5)
+    assert restored.session_age_seconds > 0
+
+
+def test_a_restored_context_is_old_enough_for_the_engine_to_end_it() -> None:
+    """Three inert things, one cause: this is the one the engine owns."""
+    ctx = RiskContext(session_id="ancient")
+    data = ctx.to_dict()
+    data["started_at"] = time.time() - (9 * 3600)  # older than the 8h default
+
+    restored = RiskContext.from_dict(data)
+    codes = {s.code for s in RiskEngine(RiskConfig()).evaluate(restored)}
+
+    assert "SESSION_AGE_EXCEEDED" in codes
+
+
+def test_serialising_twice_does_not_move_the_start_time() -> None:
+    """``to_dict`` records when the context was CREATED, not when it was
+    written, which is what makes any TTL built on it able to fire."""
+    ctx = RiskContext(session_id="stable")
+    first = ctx.to_dict()["started_at"]
+    # Five minutes later, on BOTH clocks -- the offset between them is what
+    # the conversion reads, so moving one alone would simulate a clock jump
+    # rather than the passage of time.
+    later = time.time() + 300
+    later_monotonic = time.monotonic() + 300
+    with (
+        patch("postern_core.risk.context.time.time", return_value=later),
+        patch("postern_core.risk.context.time.monotonic", return_value=later_monotonic),
+    ):
+        second = ctx.to_dict()["started_at"]
+
+    assert isinstance(first, float) and isinstance(second, float)
+    assert second == pytest.approx(first, abs=1)
+
+
+#: Two unrelated monotonic epochs. A monotonic clock's zero is arbitrary --
+#: on Linux, boot -- so two processes' readings are not comparable, and
+#: `IpTracker` stored raw readings while its docstring claimed it converted
+#: them. Within one process that is invisible: every reading shares one epoch
+#: and the interval between two of them is right by accident. These constants
+#: are what makes the defect visible, and they are the shape MCP 2026-07-28
+#: makes routine rather than exotic, since any request can land on any
+#: instance.
+PROCESS_A_EPOCH = 1_000_000.0
+PROCESS_B_EPOCH = 5_000_000.0
+
+
+def test_an_ip_change_30_seconds_after_a_restore_is_still_30_seconds() -> None:
+    """The interval the impossible-travel check reads, across a restore.
+
+    Measured against the old serialisation, this came back as 4000030.0
+    seconds -- the distance between the two epochs -- so a genuine IP change
+    30 seconds apart sailed past a 300-second window.
+    """
+    with patch("postern_core.risk.context.time.monotonic", return_value=PROCESS_A_EPOCH):
+        tracker = IpTracker()
+        tracker.record_ip("198.51.100.1")
+        data = tracker.to_dict()
+
+    with patch("postern_core.risk.context.time.monotonic", return_value=PROCESS_B_EPOCH):
+        restored = IpTracker.from_dict(data)
+    with patch("postern_core.risk.context.time.monotonic", return_value=PROCESS_B_EPOCH + 30):
+        restored.record_ip("203.0.113.9")
+
+    assert restored.time_since_last_change() == pytest.approx(30, abs=2)
+
+
+def test_a_restored_tracker_still_fires_impossible_travel() -> None:
+    """What the interval is FOR: the A4 compensating control of record 0010."""
+    with patch("postern_core.risk.context.time.monotonic", return_value=PROCESS_A_EPOCH):
+        tracker = IpTracker()
+        tracker.record_ip("198.51.100.1")
+        data = tracker.to_dict()
+
+    with patch("postern_core.risk.context.time.monotonic", return_value=PROCESS_B_EPOCH):
+        restored = IpTracker.from_dict(data)
+    with patch("postern_core.risk.context.time.monotonic", return_value=PROCESS_B_EPOCH + 5):
+        restored.record_ip("203.0.113.9")
+
+    codes = {s.code for s in IpAnomalyDetector().evaluate(restored)}
+
+    assert "IMPOSSIBLE_TRAVEL" in codes
+
+
+def test_a_restored_entry_is_never_timestamped_in_this_process_s_future() -> None:
+    """A reading from another epoch could otherwise sit ahead of `now`, and
+    every interval measured against it would be negative."""
+    tracker = IpTracker()
+    tracker.record_ip("198.51.100.1")
+
+    restored = IpTracker.from_dict(tracker.to_dict())
+
+    assert restored.entries[-1].recorded_at <= time.monotonic()
+
+
+def test_a_restored_tracker_is_still_bounded() -> None:
+    """A stored blob longer than this process's cap cannot re-inflate the
+    list that cap exists to bound."""
+    tracker = IpTracker(max_entries=200)
+    for i in range(150):
+        tracker.record_ip(f"198.51.100.{i % 256}")
+
+    restored = IpTracker.from_dict(tracker.to_dict(), max_entries=100)
+
+    assert len(restored.entries) == 100
+
+
+def test_a_stored_context_without_a_creation_instant_is_refused() -> None:
+    """It cannot be aged, so it must not be restored as new."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        RiskContext.from_dict({"session_id": "no-start"})
+
+
+def test_a_stored_context_with_an_unknown_tier_is_refused() -> None:
+    """Validation, not coercion: the seven `type: ignore` comments this
+    replaced each marked a value reaching a constructor unchecked."""
+    import pydantic
+
+    data = RiskContext(session_id="tiers").to_dict()
+    data["verification_tier"] = 9
+
+    with pytest.raises(pydantic.ValidationError):
+        RiskContext.from_dict(data)
+
+
+def test_an_unknown_field_in_a_stored_context_is_ignored() -> None:
+    """A rolling deploy has an older replica reading a newer replica's rows;
+    refusing them would turn a deploy into an outage, since a context that
+    cannot be read now denies the call."""
+    data = RiskContext(session_id="forward").to_dict()
+    data["some_future_field"] = {"added": "later"}
+
+    restored = RiskContext.from_dict(data)
+
+    assert restored.session_id == "forward"

@@ -38,7 +38,6 @@ from fastmcp.server.http import StarletteWithLifespan
 from postern_core.store.engine import Database
 from postern_core.store.models import (
     REFUSAL_DOMAIN_NOT_CONSENTED,
-    REFUSAL_NO_CUSTOMER_REF,
     AuditEntry,
     ConsentRecord,
 )
@@ -286,16 +285,33 @@ async def test_a_subject_that_is_not_a_customer_reference_records_its_own_reason
     consent_session: AsyncSession,
     session: AsyncSession,
 ) -> None:
-    """The second refusal, and the one that proves this column is not a
-    boolean. The token is valid and signed; its `sub` is an IBAN, which
-    `CustomerRef` refuses, so the check never gets as far as asking what
-    this caller consented to. `no_customer_ref` says exactly that and
-    nothing about the token itself.
+    """The second refusal. The token is valid and signed; its `sub` is an
+    IBAN, which `CustomerRef` refuses, so no layer can name this caller.
 
-    `customer_ref` on the same row is NULL, because the middleware validates
-    the subject the same way. That column answers a different question from
-    this one and cannot replace it: it is NULL on plenty of rows nobody
-    refused.
+    WHICH LAYER REFUSES CHANGED ON 2026-09-22, and this test records the new
+    measurement rather than the old one. ZT-5's `RiskMiddleware` derives the
+    identity a risk budget is charged to through the same
+    `services/api/server.py`'s `token_customer_resolver` the tools use, and
+    it runs BEFORE the tool dispatch that evaluates `auth=`. So the
+    resolver's own `PermissionError` now ends the call, and
+    `services/api/consent.py` never runs -- which is why `refusal_reason` is
+    NULL here where it used to read `no_customer_ref`
+    (`REFUSAL_NO_CUSTOMER_REF`, still written by any server assembled
+    without the risk middleware).
+
+    THE ROW STILL SAYS WHY, in the column that exists for exactly this:
+    `customer_ref_absence_reason` reads `subject_not_a_customer_ref`, from
+    the same token, written by `AuditMiddleware` regardless of which layer
+    refused. `detail` reads `PermissionError` rather than `NotFoundError`
+    for the same reason: the exception now escapes the tool dispatch instead
+    of being raised inside it.
+
+    WHAT DID NOT CHANGE is the only disclosure property this test ever
+    guarded: the raw subject does not appear in the response. The resolver
+    raises an unchained `PermissionError` precisely so the value stays out
+    of both the wire and the log, and the message it does carry is the same
+    for every tool name, existing or not, so a caller in this state can
+    still not enumerate the tool surface.
     """
     token = token_for(key_pair, NOT_A_CUSTOMER_REF)
     response = await call(pg_url, key_pair, token, "accounts.list")
@@ -303,10 +319,10 @@ async def test_a_subject_that_is_not_a_customer_reference_records_its_own_reason
     entry = (await rows(session))[0]
     assert entry.tool_name == "accounts.list"
     assert entry.outcome == "raised"
-    assert entry.detail == "NotFoundError"
-    assert entry.refusal_reason == REFUSAL_NO_CUSTOMER_REF
+    assert entry.detail == "PermissionError"
+    assert entry.refusal_reason is None
     assert entry.customer_ref is None
-    assert "Unknown tool: 'accounts.list'" in response.text
+    assert entry.customer_ref_absence_reason == "subject_not_a_customer_ref"
     assert NOT_A_CUSTOMER_REF not in response.text
 
 
