@@ -57,15 +57,18 @@ test:
 		uv run pytest -q -rs; \
 	fi
 
-# NOT a `ci` prerequisite: `alembic check` is a second, independent reason to
-# need a reachable Postgres beyond the `test` gate above, and keeping it a
-# standalone target means the drift check runs against a database an
-# operator points it at explicitly, rather than the disposable container
-# `test` starts and tears down itself. Run this by hand before committing
-# any change to packages/postern-core/src/postern_core/store/models.py,
-# against `docker compose up -d db` or any other reachable database, to
-# catch a model change that has no matching migration before it surfaces at
-# deploy time. The same check runs in `.github/workflows/ci.yml` against a
+# No longer the only thing running `alembic check` -- `tests/test_schema_drift.py`
+# now runs the same check inside `test` above (via the session-scoped `pg_url`
+# fixture's testcontainers Postgres) and blocks `ci` on it, which is what
+# this comment used to say `migrations` alone could not do offline. This
+# target stays as the faster manual loop for the one case that test cannot
+# serve: checking drift against a database an operator points it at
+# explicitly -- `docker compose up -d db`, a staging replica, anything that
+# is not the disposable per-session container `test` starts and tears down
+# itself -- without running the rest of the suite first. Run this by hand
+# before committing any change to
+# packages/postern-core/src/postern_core/store/models.py against such a
+# database. The same check also runs in `.github/workflows/ci.yml` against a
 # free Postgres service container, dispatched manually.
 migrations:
 	POSTERN_DATABASE_URL=$${POSTERN_DATABASE_URL:-postgresql+asyncpg://postern:postern@localhost:5432/postern} uv run alembic check
