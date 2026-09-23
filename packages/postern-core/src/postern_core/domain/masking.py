@@ -1814,14 +1814,32 @@ _LATIN_SCRIPT_EXEMPTIONS: frozenset[str] = frozenset("ªºµ²³¹¼½¾ʼ") | f
 def _is_script_intrusion(ch: str) -> bool:
     """True if `ch` is an alphanumeric character whose Unicode name does not
     contain "LATIN", or a non-alphanumeric codepoint in the Me (enclosing
-    mark), Mc (spacing combining mark) or Sk (modifier symbol) categories.
+    mark), Mc (spacing combining mark), Sk (modifier symbol), Co (private
+    use) or Cn (unassigned) categories.
 
     These are the two classes of characters that split a token without being
     a visible break the way a space is. The first class (alphanumeric, non-
-    Latin) is the original intrusion; the second (Me/Mc/Sk) was added to
-    close residual 3 on `_mask_bridged_runs`. Bridging across them (rather
-    than stripping, which would mangle Indic scripts) replaces the split
-    with a bare `_MASK`.
+    Latin) is the original intrusion; the second was added to close
+    residual 3 on `_mask_bridged_runs` (Me/Mc/Sk) and then residual 9
+    (Co/Cn). Bridging across them (rather than stripping, which would
+    mangle Indic scripts) replaces the split with a bare `_MASK`.
+
+    Co and Cn are the categories the "renders as nothing is stripped,
+    renders as a visible break is left alone" rule could not answer, which
+    is exactly why they were neither stripped nor bridged and leaked. A
+    private-use codepoint renders as whatever a private agreement says,
+    which is nothing at all outside that agreement; an unassigned one
+    renders as a `.notdef` box or as nothing, at the renderer's discretion.
+    Neither is a break the ISSUER of the text can rely on a reader seeing,
+    and the consumer here is a model reading a codepoint stream, which
+    reads straight through a tofu box as if it were not there. Bridged
+    rather than stripped for the reason `_STRIPPED_CATEGORIES` gives for
+    refusing to strip all of `Cn`: stripping would silently delete every
+    codepoint Unicode has not assigned a meaning to yet, an unbounded set
+    that grows with every future Unicode version without this file
+    changing. Bridging costs nothing on text that has none of them, which
+    is all legitimate text -- see `_mask_bridged_runs`'s residual 9 for
+    the measured false-positive evidence.
 
     Read that as written, not as "from a non-Latin script". The two are not
     the same set, and the gap between them is `_LATIN_SCRIPT_EXEMPTIONS`
@@ -1837,11 +1855,32 @@ def _is_script_intrusion(ch: str) -> bool:
     is a separator a reader can see, which is this module's own documented
     grouped-IBAN limitation rather than an evasion.
 
-    Alphanumeric (part 1) or Me/Mc/Sk category (part 2), because the non-
-    ASCII characters that are not letters, digits, or these mark categories
-    are overwhelmingly visible breaks -- an em dash, a Chinese full stop, a
-    Catalan punt volat -- and bridging across those would mask
-    `FACTURA2026·REFERENCIA4455`. That is the reason for both tests.
+    Alphanumeric (part 1) or Me/Mc/Sk/Co/Cn category (part 2), because the
+    non-ASCII characters that are not letters, digits, or one of these five
+    categories are overwhelmingly visible breaks -- an em dash, a Chinese
+    full stop, a Catalan punt volat -- and bridging across those would mask
+    `FACTURA2026·REFERENCIA4455`. That is the reason for both tests. The
+    categories deliberately NOT in part 2 after the Co/Cn addition, so the
+    next reader does not have to re-derive the boundary: the visible-break
+    categories `Pc`/`Pd`/`Ps`/`Pe`/`Pi`/`Pf`/`Po`, `Sm`/`Sc`/`So` and
+    `Zs`/`Zl`/`Zp`, all left alone on the same recorded decision that
+    leaves a space or an em dash alone. `Cc`, `Cf` and `Mn` are not here
+    either, because they are STRIPPED before this predicate ever runs
+    (`_STRIPPED_CATEGORIES`), which is a strictly stronger treatment.
+
+    `Cs` (surrogate) is the one category the Co/Cn addition leaves in the
+    same shape Co and Cn were in, and it is NOT covered here -- stated
+    rather than left for the next reader to rediscover, as residual 10 on
+    `_mask_bridged_runs`. It is reachable: `json.loads('"\\ud800"')`
+    returns a lone surrogate, it is neither alphanumeric nor in part 2's
+    set, and it leaks MT92MALT01100ABCDEFGH1234IJKL56 verbatim at offset
+    15 exactly as U+E000 did. It is out of scope for the change that added
+    Co and Cn because closing it is a different decision, not a wider
+    version of this one: a lone surrogate cannot be UTF-8 encoded at all,
+    so every consumer downstream of here -- the `audit_log` INSERT
+    included -- raises rather than storing it, which makes the live
+    question "where should this value be rejected" rather than "what
+    should this predicate return".
 
     Not named "LATIN" (part 1 only), because that is where the accented
     letters live that ordinary Spanish, Catalan, Turkish, Polish and Nordic
@@ -1895,13 +1934,15 @@ def _is_script_intrusion(ch: str) -> bool:
     ):
         return True
     # Part 2: non-alphanumeric codepoints in the Me (enclosing mark), Mc
-    # (spacing combining mark) and Sk (modifier symbol) categories. These
-    # are not visible breaks the way a space is, so a reader still sees one
-    # continuous token even though the scan splits on them. Bridging across
-    # them (rather than stripping, which would mangle Indic scripts) is the
-    # only safe closure path.
+    # (spacing combining mark), Sk (modifier symbol), Co (private use) and
+    # Cn (unassigned) categories. None of these is a visible break the way a
+    # space is, so a reader still sees one continuous token even though the
+    # scan splits on them. Bridging across them (rather than stripping,
+    # which would mangle Indic scripts for Me/Mc and would hand Cn an
+    # unbounded, version-drifting strip list -- see `_STRIPPED_CATEGORIES`)
+    # is the only safe closure path.
     cat = unicodedata.category(ch)
-    if not ch.isascii() and cat in {"Me", "Mc", "Sk"}:
+    if not ch.isascii() and cat in {"Me", "Mc", "Sk", "Co", "Cn"}:
         return True
     return False
 
@@ -2040,20 +2081,25 @@ def _mask_bridged_runs(value: str, skeleton: str) -> str:
     unchanged and identity-comparable, when nothing qualifies -- which is
     what lets `_redact_free_text` skip rebuilding its skeleton.
 
-    THE RESIDUAL. SEVEN open shapes (one closed: the 590 spacing marks,
-    resolved by widening `_is_script_intrusion`). The count has been wrong
-    twice before: this docstring first said "two", which read as exhaustive
-    when it was a list of the two that had been thought about, and then
-    said "five" while a seventh-of-a-card case sat untested next door, and
-    then said "five" again while `_LATIN_SCRIPT_EXEMPTIONS` sat below it as
-    an 18-codepoint universal bypass that appeared nowhere on the list at
-    all -- the list read as exhaustive while the sharpest shape in the
-    module was missing from it. Each of the seven open shapes now has a
-    test, in tests/test_masking_confusables.py or (for 7 and 8, added with
-    audit finding C-07) tests/test_masking_exemption_bypass.py, so none can
-    be lost by a later edit to this comment, and a number stated here is a
-    number some test will defend. Counts are against Unicode 15.0.0, the
-    version `unicodedata.unidata_version` reports here.
+    THE RESIDUAL. EIGHT open shapes (two closed: the 590 spacing marks and
+    the 962,813 private-use and unassigned codepoints, both resolved by
+    widening `_is_script_intrusion`). The count has been wrong three times
+    before: this docstring first said "two", which read as exhaustive when
+    it was a list of the two that had been thought about, and then said
+    "five" while a seventh-of-a-card case sat untested next door, and then
+    said "five" again while `_LATIN_SCRIPT_EXEMPTIONS` sat below it as an
+    18-codepoint universal bypass that appeared nowhere on the list at all
+    -- the list read as exhaustive while the sharpest shape in the module
+    was missing from it -- and then said "seven" while Co and Cn, a set two
+    orders of magnitude larger than any entry on it, were neither stripped
+    nor bridged and leaked a complete IBAN. The pattern in all four is the
+    same: the list enumerated the shapes someone had thought about and read
+    as enumerating the shapes that exist. Each of the eight open shapes now
+    has a test, in tests/test_masking_confusables.py or (for 7 and 8, added
+    with audit finding C-07) tests/test_masking_exemption_bypass.py, so
+    none can be lost by a later edit to this comment, and a number stated
+    here is a number some test will defend. Counts are against Unicode
+    15.0.0, the version `unicodedata.unidata_version` reports here.
 
     NOT ON THIS LIST ANY MORE, because it is closed rather than accepted:
     an exempt codepoint INSERTED into a PAN or an IBAN. That was the
@@ -2145,7 +2191,64 @@ def _mask_bridged_runs(value: str, skeleton: str) -> str:
        the tests are what differ, and they differ for the reason
        `_redact_exemption_bridged_span` opens with.
 
-    None of these is closable by this module's own means. See ADR-0008 for
+    9. CLOSED: the 137,468 Co (private use) and 825,345 Cn (unassigned)
+       codepoints, 962,813 between them and 959,044 once the 3,769
+       Default_Ignorable unassigned ones `_strip_invisible` already removes
+       are taken out. This was the largest hole this module has had, and it
+       was open because the rule stated above `_STRIPPED_CATEGORIES` --
+       "renders as NOTHING is stripped, renders as a VISIBLE BREAK is not"
+       -- is a question neither category answers. A private-use codepoint
+       renders as whatever a private agreement says; an unassigned one
+       renders as a `.notdef` box or as nothing, at the renderer's
+       discretion. Neither is a break the writer of the text can rely on a
+       reader seeing, and the consumer here is not a reader at all: it is a
+       model reading a codepoint stream, which reads straight through a
+       tofu box as though it were absent. Measured before the fix, splitter
+       INSERTED at offset 15 of MT92MALT01100ABCDEFGH1234IJKL56, through
+       `_redact_free_text`: U+E000 (Co), U+F8FF (Co) and U+0378 (Cn, an
+       unassigned codepoint that is NOT Default_Ignorable) each returned
+       the complete IBAN verbatim. Closed by adding Co and Cn to
+       `_is_script_intrusion`'s part-2 category set -- BRIDGED, not
+       stripped, for the reason `_STRIPPED_CATEGORIES` gives for refusing
+       to strip all of `Cn`: a strip list covering every codepoint Unicode
+       has not yet assigned grows with every future Unicode version without
+       this file changing, where bridging does not delete anything. Swept
+       INSERTED over 4,172 sampled Co and Cn codepoints (2,052 of Co's
+       137,468 and 2,120 of Cn's 825,345, evenly spaced across each,
+       endpoints forced, plus both noncharacter ranges and one member of
+       each `_DEFAULT_IGNORABLE_UNASSIGNED_RANGES` entry) at every interior
+       offset of a Luhn-valid 16-digit PAN and of the 15-, 18-, 24- and
+       31-character IBAN formats -- 413,028 planted values: ZERO
+       survivors. The same sweep SUBSTITUTED survives at exactly one
+       offset, the last one, on NL and MT, and that is residual 2 rather
+       than anything Co/Cn-specific: verified directly, Cyrillic Ж and CJK
+       北 survive at that same single offset and nowhere else. False
+       positives: zero across all 217 corpus entries in this repo, which
+       between them contain zero Co and zero Cn characters -- and cannot
+       contain one, since Co has no meaning outside a private agreement and
+       no encoder emits Cn from standard text. See
+       `tests/test_masking_private_use_and_unassigned.py`'s
+       `test_every_private_use_and_unassigned_codepoint_is_covered`, which
+       makes the per-codepoint half of that claim exhaustively rather than
+       by sample, and pins every count in this paragraph.
+
+    10. `Cs` (surrogate), 2,048 codepoints, in exactly the shape Co and Cn
+       were in before 9 closed them: not alphanumeric, not stripped, not
+       bridged, and `json.loads('"\\ud800"')` hands one straight to this
+       module. Leaks MT92MALT01100ABCDEFGH1234IJKL56 verbatim at offset 15,
+       verified directly rather than inferred from the category. Left open
+       deliberately and not folded into 9, because the fix is a different
+       decision rather than a wider version of the same one: a lone
+       surrogate cannot be UTF-8 encoded, so the `audit_log` INSERT and
+       every other consumer downstream of here raises on it, which makes
+       the real question where such a value should be REJECTED rather than
+       what this predicate should return for it. Adding `Cs` to part 2
+       would mask the leak and leave the encoding failure exactly where it
+       is. Demonstrated, not asserted from the category table, by
+       `tests/test_masking_private_use_and_unassigned.py`'s
+       `test_new_residual_ten_a_lone_surrogate_still_leaks`.
+
+    None of the OPEN shapes above is closable by this module's own means. See ADR-0008 for
     the full analysis, acceptance, and upstream closure path. The earlier
     version of this docstring said "handoff §10.17 will close them" — that
     was wrong. §10.17 asks whether the domain teams will expose agent-facing
