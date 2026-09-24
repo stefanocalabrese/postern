@@ -1,0 +1,32 @@
+{
+  "_readme": [
+    "Enrolled device public keys for the local docker-compose stack ONLY.",
+    "",
+    "This document is the input to the approval signature check in",
+    "services/confirm/device_signature.py. Its format belongs to",
+    "postern_core.auth.device_keys; top-level keys other than 'customers' are",
+    "ignored, which is what lets this note live here.",
+    "",
+    "IT ENROLS NOBODY, ON PURPOSE. The confirm service refuses to start without",
+    "a device key store, and this is the one line of configuration that says",
+    "'no phone can approve yet' -- there is no line of configuration anywhere",
+    "that says 'approve without checking'. Starting against it warns loudly",
+    "(postern_core.auth.device_keys's warn_no_enrolled_devices) and every",
+    "approval is refused with 'device_not_enrolled'. The compose stack has no",
+    "database wired into confirm, so it could not approve anything regardless.",
+    "",
+    "NO PRIVATE KEY IS COMMITTED HERE, and a 'd' parameter in any entry below",
+    "is refused at startup rather than ignored: a device signing key that has",
+    "reached a file on a host is compromised. To exercise an approval locally,",
+    "generate a key pair, paste the PUBLIC half in, and sign the canonical",
+    "message with the private half you keep:",
+    "",
+    "  uv run python -c \"from joserfc.jwk import OKPKey; import json; \\",
+    "    k = OKPKey.generate_key('Ed25519'); \\",
+    "    print(json.dumps(k.as_dict(private=True)))\"",
+    "",
+    "The bytes to sign are postern_core.auth.approval_signature's",
+    "canonical_approval_message, built from the stored challenge row."
+  ],
+  "customers": {}
+}

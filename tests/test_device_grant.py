@@ -52,6 +52,7 @@ from postern_core.auth.device_codes import (
     _generate_device_code,
     _generate_user_code,
 )
+from postern_core.auth.device_keys import no_enrolled_devices
 from starlette.applications import Starlette
 from starlette.requests import Request
 
@@ -101,7 +102,15 @@ def app(key_pair: RSAKeyPair) -> Starlette:
     instead of the wiring itself.
     """
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
-    return create_confirm_app(ConfirmSettings.for_testing(), assertion_verifier=verifier)
+    return create_confirm_app(
+        ConfirmSettings.for_testing(),
+        assertion_verifier=verifier,
+        # Nothing in this module approves a challenge; the device GRANT is a
+        # different flow from the device SIGNATURE (`postern_core.auth.
+        # device_keys` says why they are not the same store), and
+        # `create_confirm_app` now refuses to build without one.
+        device_key_store=no_enrolled_devices(),
+    )
 
 
 def bearer(

@@ -7,12 +7,19 @@ nothing else, while ``services/api`` wrote two rows for every tool call. The
 asymmetry ran exactly backwards: reading a balance was fully recorded, and
 approving a payment -- the highest-consequence action in the system -- left
 behind only the ``challenges`` row it mutated, whose ``confirming_device`` and
-``signature`` are both caller-supplied and whose ``signature`` is still
-unverified (``services/confirm/callback.py``'s module docstring says why). An
+``signature`` were both caller-supplied and neither of which was verified. An
 investigator after an incident had no approval instant distinct from the row's
 own, no record that a write JWT had been minted, and no correlation key tying
 any of it to anything. Under GDPR that is a 72-hour notification problem, not
 only an operations one.
+
+``signature`` STOPPED BEING CALLER-SUPPLIED-AND-UNCHECKED ON 2026-09-24.
+``services/confirm/device_signature.py`` verifies it against a key the
+operator enrolled for that customer, over bytes built from the stored row, and
+three of the ``DETAIL_*`` literals below exist to tell its refusals apart. The
+value on the ``challenges`` row is now evidence rather than an echo; what this
+table records about it is unchanged, and the reasoning for that is at
+``_arguments`` below.
 
 THE SHAPE IS THE READ PATH'S, and deliberately so, because a regulator reads
 one table and must not have to learn two schemas to do it:
@@ -107,8 +114,8 @@ nowhere else on a refused path: ``update_challenge_status`` writes
 on the winning transition, so on every 404, 409 and 410 those values would
 otherwise vanish with the request. ``signature`` is recorded as a BOOLEAN
 PRESENCE and never as a value: CLAUDE.md forbids a raw signature in this
-table, and a digest of an unverified string with no defined meaning would be
-ceremony rather than evidence.
+table, and the verified one is already on the ``challenges`` row that
+``arguments['challenge_id']`` joins to.
 
 ``refusal_reason`` IS NULL ON EVERY ROW THIS MODULE WRITES, which is a gap and
 not a decision anybody is happy with. ``REFUSAL_REASONS``
@@ -156,10 +163,13 @@ __all__ = [
     "DETAIL_CHALLENGE_NOT_FOUND",
     "DETAIL_CHALLENGE_NOT_OWNED",
     "DETAIL_CHALLENGE_VANISHED",
+    "DETAIL_DEVICE_NOT_ENROLLED",
     "DETAIL_EXPIRED",
     "DETAIL_MALFORMED_BODY",
     "DETAIL_MISSING_SIGNATURE",
     "DETAIL_REVOKED",
+    "DETAIL_SIGNATURE_INVALID",
+    "DETAIL_SIGNATURE_MALFORMED",
     "DETAIL_UPDATE_MATCHED_NO_ROW",
 ]
 
@@ -210,6 +220,27 @@ DETAIL_REVOKED = "revoked"
 #: STAGE an approval stopped at, and all four stopped at the same one.
 DETAIL_MALFORMED_BODY = "malformed_body"
 DETAIL_MISSING_SIGNATURE = "missing_signature"
+#: THE THREE THE SIGNATURE CHECK OWNS, and the reason they are three rather
+#: than one literal spanning "the signature did not get us through". All three
+#: answer 403 and none of them moves a challenge, so the caller cannot tell
+#: two of them apart and the table must.
+#:
+#: ``device_not_enrolled`` is the store answering that this customer has no
+#: phone enrolled -- a support event, and in bulk the shape of an enrolment
+#: pipeline that stopped publishing. It is DISTINCT FROM AN OUTAGE, which
+#: raises `postern_core.auth.device_keys.DeviceKeyStoreUnavailable` and lands
+#: on a row whose ``detail`` is that exception's type: an operator must never
+#: read "the store is down" as "every customer un-enrolled at once".
+#:
+#: ``signature_malformed`` is a value that is not a spelling of an Ed25519
+#: signature at all, which is a client defect rather than an attack.
+#:
+#: ``signature_invalid`` is the one to alert on: a well-formed signature that
+#: verifies against none of this customer's enrolled devices, which is what
+#: something holding a stolen app assertion produces.
+DETAIL_DEVICE_NOT_ENROLLED = "device_not_enrolled"
+DETAIL_SIGNATURE_MALFORMED = "signature_malformed"
+DETAIL_SIGNATURE_INVALID = "signature_invalid"
 DETAIL_CHALLENGE_NOT_FOUND = "challenge_not_found"
 DETAIL_CHALLENGE_NOT_OWNED = "challenge_not_owned"
 DETAIL_ALREADY_TERMINAL = "already_terminal"
@@ -678,13 +709,17 @@ def _arguments(challenge_id: str, body: dict[str, Any]) -> dict[str, Any]:
             # its own first 511 characters and says it was cut.
             "challenge_id": scrub_text(challenge_id),
             # PRESENCE, NEVER THE VALUE. CLAUDE.md forbids a raw signature in
-            # this table. A digest was considered as a middle path -- it would
-            # let an investigator spot one signature replayed across
-            # challenges without storing it -- and rejected: the value is
-            # unverified and carries no defined meaning
-            # (`services/confirm/callback.py`'s docstring is explicit that
-            # presence is the entire check), so a digest of it would look like
-            # cryptographic evidence and be none.
+            # this table, and the reason to keep it that way survived the
+            # value becoming meaningful on 2026-09-24. A digest was considered
+            # as a middle path -- it would let an investigator spot one
+            # signature replayed across challenges without storing it -- and
+            # rejected twice over: while the value was unverified a digest of
+            # it would have looked like cryptographic evidence and been none,
+            # and now that `services/confirm/device_signature.py` verifies it,
+            # the signature that actually approved a payment is on the
+            # `challenges` row this column's `challenge_id` joins to. One fact,
+            # one table. What no row here records is a signature that was
+            # presented and REFUSED, which `detail` names by class instead.
             #
             # It is also the one caller-supplied field of the five that the
             # bounds never had to reach, because a boolean has no width.

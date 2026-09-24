@@ -110,7 +110,30 @@ services:
     # this stack that publishes a key set. There is still no `depends_on`: the
     # fetch is lazy, inside `load_access_token`, so a `confirm` that starts
     # before the stub is up simply refuses tokens until it is.
+    #
+    # `POSTERN_DEVICE_KEYS_PATH` is required for the same reason and by the
+    # same kind of guard (`services/confirm/main.py`'s `_device_key_store`):
+    # since 2026-09-24 an approval must carry an Ed25519 signature from a
+    # device the operator enrolled for that customer, and a service with no
+    # way to check one is the finding, not a convenience. Without this line
+    # the container crash-loops.
+    #
+    # The file it points at enrols NOBODY, so this stack starts, warns loudly,
+    # and refuses every approval with `device_not_enrolled`. That is the whole
+    # local-development path: explicit, greppable, and not a mode that
+    # verifies less. This service has no database wired here anyway, so it
+    # could not approve a challenge if it wanted to.
+    #
+    # BIND-MOUNTED RATHER THAN BAKED IN, and that is not a preference:
+    # `.dockerignore` excludes `stub/` from the build context of both images,
+    # so a path inside the image would not exist and this container would
+    # crash-loop on a missing file instead of on a missing variable. Mounting
+    # it read-only also matches what a deployment does -- an enrolment export
+    # arrives as a mounted secret, not as a layer.
+    volumes:
+      - ./stub/device-keys.json:/etc/postern/device-keys.json:ro
     environment:
       POSTERN_APP_ASSERTION_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
       POSTERN_APP_ASSERTION_ISSUER: "https://postern-local-dev.invalid"
       POSTERN_APP_ASSERTION_AUDIENCE: "postern-confirm"
+      POSTERN_DEVICE_KEYS_PATH: /etc/postern/device-keys.json

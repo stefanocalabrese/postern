@@ -62,6 +62,7 @@ from services.confirm.audit import DETAIL_REVOKED, UNRESOLVED_TOOL_NAME
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.fixtures.device_keys import approval_body, device_key, enrolled_store
 
 ISSUER = "https://app.test.invalid"
 AUDIENCE = "postern-confirm"
@@ -79,6 +80,13 @@ TOOL = "payments.create_payment"
 #: Every challenge this module inserts carries it, so teardown can delete by
 #: prefix without touching another module's rows.
 PREFIX = "chal_zt7w_"
+
+#: One enrolled phone, shared by both customers in this file. Nothing here is
+#: about the signature check -- every approval below either passes it or is
+#: refused by ZT-7 before it runs -- so the key exists only so that an
+#: approval which SHOULD succeed still can. ``approve`` signs the stored row
+#: with it automatically; see its docstring.
+DEVICE_PRIVATE, DEVICE_PUBLIC = device_key("zt7w-phone")
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +113,11 @@ def build_app(settings: ConfirmSettings, key_pair: RSAKeyPair) -> Starlette:
     would pass with the wiring deleted.
     """
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
-    return create_confirm_app(settings, assertion_verifier=verifier)
+    return create_confirm_app(
+        settings,
+        assertion_verifier=verifier,
+        device_key_store=enrolled_store(OWNER, DEVICE_PUBLIC, **{OTHER: (DEVICE_PUBLIC,)}),
+    )
 
 
 @pytest.fixture()
@@ -240,16 +252,38 @@ async def approve(
     ``raise_app_exceptions=False`` the transport does what uvicorn does and
     turns an unhandled exception into a real 500, so a fail-closed assertion
     reads "the caller was told no" rather than "something blew up in the test".
+
+    THE BODY IS SIGNED FOR REAL, by reading the stored row through the app's
+    OWN database and signing it with this module's enrolled key. Every call
+    site is unchanged by that: a test asserting 403 gets a valid signature
+    that ZT-7 refuses before it is looked at, which is the stronger statement
+    of the two -- the revocation check stops an approval that would otherwise
+    have been accepted in full. Where no row exists (the ``nosuchid`` probes),
+    the body carries a placeholder, because there is nothing to sign and the
+    404 does not depend on it.
     """
+    body = await _approval_body(app, challenge_id)
     async with httpx2.AsyncClient(
         transport=httpx2.ASGITransport(app=app, raise_app_exceptions=not as_a_server_would),
         base_url="http://t",
     ) as c:
         return await c.post(
             f"/challenges/{challenge_id}/approve",
-            json={"signature": "sig_x"},
+            json=body,
             headers=headers,
         )
+
+
+async def _approval_body(app: Starlette, challenge_id: str) -> dict[str, Any]:
+    """A signed approval body, or a placeholder when the challenge is absent."""
+    database: Database = app.state.postern_database
+    async with database.sessionmaker() as session:
+        exists = await session.execute(
+            select(ChallengeRecord.id).where(ChallengeRecord.challenge_id == challenge_id)
+        )
+        if exists.scalar_one_or_none() is None:
+            return {"signature": "no-such-challenge-to-sign"}
+    return await approval_body(database, challenge_id, DEVICE_PRIVATE)
 
 
 async def post_form(app: Starlette, path: str, data: dict[str, str]) -> httpx2.Response:

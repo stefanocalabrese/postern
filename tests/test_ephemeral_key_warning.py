@@ -44,6 +44,7 @@ from pathlib import Path
 
 import pytest
 from joserfc.jwk import RSAKey
+from postern_core.auth.device_keys import no_enrolled_devices
 
 from services.api.main import create_app
 from services.api.settings import Settings
@@ -125,7 +126,7 @@ def test_the_confirm_composition_root_warns_when_no_write_pem_path_is_set() -> N
     three key fields, so nothing else in that service could ever hint at a
     misconfiguration."""
     with pytest.warns(RuntimeWarning, match="WRITE signing key generated in process"):
-        create_confirm_app(ConfirmSettings.for_testing())
+        create_confirm_app(ConfirmSettings.for_testing(), device_key_store=no_enrolled_devices())
 
 
 # --- 3. A configured PEM is silent ----------------------------------------
@@ -154,7 +155,11 @@ def test_the_confirm_composition_root_is_silent_when_a_real_pem_is_configured(
         app_assertion_audience="postern-confirm",
     )
     assert [
-        m for m in _ephemeral_warnings(lambda: create_confirm_app(settings)) if MARKER in m
+        m
+        for m in _ephemeral_warnings(
+            lambda: create_confirm_app(settings, device_key_store=no_enrolled_devices())
+        )
+        if MARKER in m
     ] == []
 
 
@@ -170,7 +175,9 @@ def test_the_confirm_composition_root_is_silent_when_a_real_pem_is_configured(
             id="api",
         ),
         pytest.param(
-            lambda: create_confirm_app(ConfirmSettings.for_testing()),
+            lambda: create_confirm_app(
+                ConfirmSettings.for_testing(), device_key_store=no_enrolled_devices()
+            ),
             2,  # write + read (device grant exception)
             id="confirm",
         ),

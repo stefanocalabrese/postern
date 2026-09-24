@@ -63,12 +63,19 @@ from services.confirm.audit import (
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.fixtures.device_keys import approval_body, device_key, enrolled_store
 
 ISSUER = "https://app.test.invalid"
 AUDIENCE = "postern-confirm"
 OWNER = "cust_7f3a"
 STRANGER = "cust_9e21"
 TOOL = "payments.create_payment"
+
+#: The owner's one enrolled phone. STRANGER enrols nothing, deliberately: the
+#: cross-customer tests below must be refused by the OWNERSHIP check, which
+#: runs first, and giving them an enrolled key would leave it ambiguous which
+#: of the two refusals produced the 404.
+DEVICE_PRIVATE, DEVICE_PUBLIC = device_key("write-audit-phone")
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +157,11 @@ def key_pair() -> RSAKeyPair:
 @pytest.fixture()
 def app(settings: ConfirmSettings, key_pair: RSAKeyPair) -> Starlette:
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
-    return create_confirm_app(settings, assertion_verifier=verifier)
+    return create_confirm_app(
+        settings,
+        assertion_verifier=verifier,
+        device_key_store=enrolled_store(OWNER, DEVICE_PUBLIC),
+    )
 
 
 class Backend:
@@ -238,6 +249,24 @@ async def post(
         return await c.post(f"/challenges/{challenge_id}/approve", json=body, headers=headers)
 
 
+async def signed(app: Starlette, challenge_id: str, **extra: Any) -> dict[str, Any]:
+    """An approval body carrying a real signature over the STORED row.
+
+    Reads the row through the app's own database and signs it with
+    ``DEVICE_PRIVATE``, which is what the customer's phone would present. Used
+    by every test below whose request is meant to get past the signature check
+    -- including the 409 and 410 cases, because that check runs before the
+    conditional ``UPDATE`` that refuses them, so an unsigned approval would
+    never reach either refusal.
+
+    The tests that are refused EARLIER (no such challenge, not yours, no
+    signature at all) keep their placeholder bodies: a signature is not what
+    stops them, and giving them a valid one would hide which check did.
+    """
+    database: Database = app.state.postern_database
+    return await approval_body(database, challenge_id, DEVICE_PRIVATE, **extra)
+
+
 async def seed(
     db: Database,
     challenge_id: str,
@@ -298,7 +327,9 @@ async def test_a_successful_approval_writes_a_correlated_pair(
     """Verification step 1: the two rows, and every relationship between them."""
     await seed(clean, "chal_pair_001")
 
-    resp = await post(app, "chal_pair_001", {"signature": "sig_x"}, bearer(key_pair, OWNER))
+    resp = await post(
+        app, "chal_pair_001", await signed(app, "chal_pair_001"), bearer(key_pair, OWNER)
+    )
     assert resp.status_code == 200, resp.text
 
     await dump(clean, "step 1: successful approval")
@@ -356,7 +387,9 @@ async def test_the_arguments_column_points_at_the_challenge_without_copying_it(
     await post(
         app,
         "chal_args_001",
-        {"signature": "sig_x", "confirming_device": "pixel-9", "verification_result": "match_ok"},
+        await signed(
+            app, "chal_args_001", confirming_device="pixel-9", verification_result="match_ok"
+        ),
         bearer(key_pair, OWNER),
     )
 
@@ -391,11 +424,12 @@ async def test_a_caller_supplied_pan_is_masked_before_it_reaches_the_table(
     await post(
         app,
         "chal_pan_001",
-        {
-            "signature": "s",
-            "confirming_device": "dev 4111111111114417",
-            "verification_result": "4111\x00111111114417",
-        },
+        await signed(
+            app,
+            "chal_pan_001",
+            confirming_device="dev 4111111111114417",
+            verification_result="4111\x00111111114417",
+        ),
         bearer(key_pair, OWNER),
     )
 
@@ -433,7 +467,7 @@ async def test_a_failed_entry_write_stops_the_backend_write(
         resp = await post(
             app,
             "chal_closed_001",
-            {"signature": "sig_x"},
+            await signed(app, "chal_closed_001"),
             bearer(key_pair, OWNER),
             as_a_server_would=True,
         )
@@ -474,7 +508,7 @@ async def test_a_total_audit_outage_stops_the_backend_write_and_leaves_no_rows(
         resp = await post(
             app,
             "chal_closed_002",
-            {"signature": "sig_x"},
+            await signed(app, "chal_closed_002"),
             bearer(key_pair, OWNER),
             as_a_server_would=True,
         )
@@ -511,7 +545,7 @@ async def test_an_audit_failure_after_a_successful_backend_write_fails_the_reque
         resp = await post(
             app,
             "chal_closed_003",
-            {"signature": "sig_x"},
+            await signed(app, "chal_closed_003"),
             bearer(key_pair, OWNER),
             as_a_server_would=True,
         )
@@ -550,9 +584,10 @@ async def test_a_crash_between_the_two_rows_leaves_the_entry_row(
         raise asyncio.CancelledError("simulated process death after the entry row")
 
     backend.responder = die
+    body = await signed(app, "chal_crash_001")
 
     with pytest.raises(asyncio.CancelledError):
-        await post(app, "chal_crash_001", {"signature": "sig_x"}, bearer(key_pair, OWNER))
+        await post(app, "chal_crash_001", body, bearer(key_pair, OWNER))
 
     await dump(clean, "step 3: crash between the rows")
     surviving = await rows(clean)
@@ -578,7 +613,9 @@ async def test_a_lost_race_records_one_row_and_no_touch(
     """409: already terminal. One row, no entry row, the backend untouched."""
     await seed(clean, "chal_409_001", status="approved")
 
-    resp = await post(app, "chal_409_001", {"signature": "sig_x"}, bearer(key_pair, OWNER))
+    resp = await post(
+        app, "chal_409_001", await signed(app, "chal_409_001"), bearer(key_pair, OWNER)
+    )
     assert resp.status_code == 409
 
     await dump(clean, "step 4: 409 already terminal")
@@ -597,7 +634,9 @@ async def test_an_expired_challenge_records_one_row_and_no_touch(
     """410: expired. The one refusal that also WRITES, retiring the challenge."""
     await seed(clean, "chal_410_001", expired=True)
 
-    resp = await post(app, "chal_410_001", {"signature": "sig_x"}, bearer(key_pair, OWNER))
+    resp = await post(
+        app, "chal_410_001", await signed(app, "chal_410_001"), bearer(key_pair, OWNER)
+    )
     assert resp.status_code == 410
 
     await dump(clean, "step 4: 410 expired")
@@ -720,7 +759,9 @@ async def test_a_backend_error_records_a_pair_whose_completion_raised(
     await seed(clean, "chal_207_001")
     backend.responder = lambda _: httpx2.Response(503, json={"detail": "backend down"})
 
-    resp = await post(app, "chal_207_001", {"signature": "sig_x"}, bearer(key_pair, OWNER))
+    resp = await post(
+        app, "chal_207_001", await signed(app, "chal_207_001"), bearer(key_pair, OWNER)
+    )
     assert resp.status_code == 207
 
     await dump(clean, "step 4: 207 backend refused")
@@ -773,7 +814,7 @@ async def test_the_client_id_comes_from_the_assertion_claims(
     await post(
         app,
         "chal_cid_001",
-        {"signature": "s"},
+        await signed(app, "chal_cid_001"),
         bearer(key_pair, OWNER, client_id="bank-app-ios"),
     )
     entry, completion = await rows(clean)
@@ -781,12 +822,17 @@ async def test_the_client_id_comes_from_the_assertion_claims(
 
     await _wipe(clean)
     await seed(clean, "chal_cid_002")
-    await post(app, "chal_cid_002", {"signature": "s"}, bearer(key_pair, OWNER, azp="bank-app-and"))
+    await post(
+        app,
+        "chal_cid_002",
+        await signed(app, "chal_cid_002"),
+        bearer(key_pair, OWNER, azp="bank-app-and"),
+    )
     assert (await rows(clean))[0].client_id == "bank-app-and"
 
     await _wipe(clean)
     await seed(clean, "chal_cid_003")
-    await post(app, "chal_cid_003", {"signature": "s"}, bearer(key_pair, OWNER))
+    await post(app, "chal_cid_003", await signed(app, "chal_cid_003"), bearer(key_pair, OWNER))
     row = (await rows(clean))[0]
     assert row.client_id is None
     assert row.customer_ref == OWNER  # the combination the read path never produces
@@ -808,6 +854,7 @@ async def test_the_callback_passes_a_real_entry_hook_to_the_write_client(
     that.
     """
     await seed(clean, "chal_wire_001")
+    body = await signed(app, "chal_wire_001")
     seen: list[Any] = []
     original = BackendWriteClient.__init__
 
@@ -822,7 +869,7 @@ async def test_the_callback_passes_a_real_entry_hook_to_the_write_client(
         )
 
     with patch.object(BackendWriteClient, "__init__", capture):
-        await post(app, "chal_wire_001", {"signature": "s"}, bearer(key_pair, OWNER))
+        await post(app, "chal_wire_001", body, bearer(key_pair, OWNER))
 
     assert len(seen) == 1
     assert seen[0] is not None, "callback.py built a write client with no audit hook"

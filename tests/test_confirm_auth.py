@@ -23,6 +23,7 @@ from typing import Any
 import httpx2
 import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
+from postern_core.auth.device_keys import no_enrolled_devices
 from starlette.applications import Starlette
 
 from services.confirm.auth import (
@@ -54,7 +55,11 @@ def key_pair() -> RSAKeyPair:
 @pytest.fixture
 def app(key_pair: RSAKeyPair) -> Starlette:
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
-    return create_confirm_app(ConfirmSettings.for_testing(), assertion_verifier=verifier)
+    return create_confirm_app(
+        ConfirmSettings.for_testing(),
+        assertion_verifier=verifier,
+        device_key_store=no_enrolled_devices(),
+    )
 
 
 def client(app: Starlette) -> httpx2.AsyncClient:
@@ -117,7 +122,7 @@ def test_an_incomplete_assertion_config_refuses_to_build(omitted: str) -> None:
 
 def test_a_complete_assertion_config_builds() -> None:
     """The negative above is only worth something if the positive holds."""
-    assert create_confirm_app(_settings()) is not None
+    assert create_confirm_app(_settings(), device_key_store=no_enrolled_devices()) is not None
 
 
 def test_for_testing_builds_an_app_that_authenticates_nobody() -> None:
@@ -129,12 +134,19 @@ def test_for_testing_builds_an_app_that_authenticates_nobody() -> None:
     while the default fixture is one that can authenticate NOBODY. For a
     service whose finding was that it authenticated everybody, that is the
     direction the default belongs in.
+
+    It supplies no device key store at all, which is why this call passes
+    ``no_enrolled_devices()`` explicitly: since 2026-09-24 an app that cannot
+    verify an approval signature does not build, and the fixture that enrols
+    nobody is named at the call site rather than defaulted into existence.
+    Both halves say the same thing -- this app authenticates nobody and can
+    approve nothing.
     """
     settings = ConfirmSettings.for_testing()
     assert settings.app_assertion_jwks_uri is not None
     assert settings.app_assertion_issuer is not None
     assert settings.app_assertion_audience is not None
-    assert create_confirm_app(settings) is not None
+    assert create_confirm_app(settings, device_key_store=no_enrolled_devices()) is not None
 
 
 def test_the_test_audience_is_not_the_api_services_audience() -> None:
@@ -334,7 +346,11 @@ async def test_a_verifier_that_raises_is_a_401_and_not_a_500(app: Starlette) -> 
         async def verify_token(self, token: str) -> Any:
             raise RuntimeError("JWKS endpoint unreachable")
 
-    exploding = create_confirm_app(ConfirmSettings.for_testing(), assertion_verifier=_Exploding())
+    exploding = create_confirm_app(
+        ConfirmSettings.for_testing(),
+        assertion_verifier=_Exploding(),
+        device_key_store=no_enrolled_devices(),
+    )
     async with client(exploding) as c:
         response = await c.post(
             PROTECTED, json={"signature": "x"}, headers={"Authorization": "Bearer anything"}

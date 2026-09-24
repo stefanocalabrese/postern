@@ -57,6 +57,7 @@ import services.confirm.callback as cb
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.fixtures.device_keys import device_key, enrolled_store, sign_row
 
 ISSUER = "https://app.test.invalid"
 AUDIENCE = "postern-confirm"
@@ -106,11 +107,26 @@ def key_pair() -> RSAKeyPair:
     return RSAKeyPair.generate()
 
 
+#: SIX ENROLLED PHONES FOR ONE CUSTOMER, which is what lets this module keep
+#: asserting that each concurrent request carries a DISTINCT signature. Ed25519
+#: is deterministic, so one key signing one challenge produces one string
+#: however many times it signs: six concurrent approvals from one device would
+#: be six identical bodies, and "the row records the winner's signature" would
+#: become unfalsifiable. Six devices is also the realistic shape of the race
+#: this file exists for -- a customer with a phone and a tablet, or one phone
+#: retrying through a dropped stream.
+DEVICES = [device_key(f"race-phone-{i}") for i in range(CONCURRENT_APPROVALS)]
+
+
 @pytest.fixture()
 def app(settings: ConfirmSettings, key_pair: RSAKeyPair) -> Starlette:
     """The real confirm app, with a real database and a real route table."""
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
-    return create_confirm_app(settings, assertion_verifier=verifier)
+    return create_confirm_app(
+        settings,
+        assertion_verifier=verifier,
+        device_key_store=enrolled_store("cust_7f3a", *(public for _private, public in DEVICES)),
+    )
 
 
 @pytest.fixture()
@@ -151,6 +167,20 @@ async def challenge(db: Database) -> AsyncGenerator[str, None]:
                 text("DELETE FROM challenges WHERE challenge_id LIKE 'chal_race_%'")
             )
             await cleanup.commit()
+
+
+@pytest.fixture()
+async def signatures(db: Database, challenge: str) -> list[str]:
+    """One valid signature per enrolled device, over the stored challenge row.
+
+    All six are signatures over the SAME bytes by six different keys, so they
+    are six distinct strings that all verify -- which is exactly what this
+    module needs to tell the winner from the losers on the row afterwards.
+    """
+    async with db.sessionmaker() as session:
+        record = await store.get_challenge(session, challenge)
+        assert record is not None
+        return [sign_row(private, record) for private, _public in DEVICES]
 
 
 @pytest.fixture()
@@ -240,6 +270,7 @@ async def test_concurrent_approvals_execute_at_most_one_payment(
     app: Starlette,
     db: Database,
     challenge: str,
+    signatures: list[str],
     key_pair: RSAKeyPair,
     backend_calls: list[httpx2.Request],
     read_barrier: None,
@@ -253,7 +284,7 @@ async def test_concurrent_approvals_execute_at_most_one_payment(
     headers = bearer(key_pair, "cust_7f3a")
 
     responses = await asyncio.gather(
-        *(approve(app, challenge, headers, f"sig_{i}") for i in range(CONCURRENT_APPROVALS))
+        *(approve(app, challenge, headers, signatures[i]) for i in range(CONCURRENT_APPROVALS))
     )
 
     codes = sorted(r.status_code for r in responses)
@@ -286,6 +317,7 @@ async def test_concurrent_approvals_leave_exactly_one_writer_on_the_row(
     app: Starlette,
     db: Database,
     challenge: str,
+    signatures: list[str],
     key_pair: RSAKeyPair,
     backend_calls: list[httpx2.Request],
     read_barrier: None,
@@ -300,7 +332,7 @@ async def test_concurrent_approvals_leave_exactly_one_writer_on_the_row(
     headers = bearer(key_pair, "cust_7f3a")
 
     responses = await asyncio.gather(
-        *(approve(app, challenge, headers, f"sig_{i}") for i in range(CONCURRENT_APPROVALS))
+        *(approve(app, challenge, headers, signatures[i]) for i in range(CONCURRENT_APPROVALS))
     )
 
     successes = [r for r in responses if r.status_code == 200]
@@ -313,13 +345,17 @@ async def test_concurrent_approvals_leave_exactly_one_writer_on_the_row(
     # backend call carried, since only the winner reaches the backend at all.
     assert len(backend_calls) == 1
     assert signature is not None
-    assert signature.startswith("sig_")
+    # Exactly one of the six, and a real one: every string here verifies
+    # against a different enrolled device, so the row names WHICH phone
+    # approved rather than merely that something did.
+    assert signature in signatures
 
 
 async def test_second_approval_after_the_first_completes_is_409(
     app: Starlette,
     db: Database,
     challenge: str,
+    signatures: list[str],
     key_pair: RSAKeyPair,
     backend_calls: list[httpx2.Request],
 ) -> None:
@@ -332,8 +368,8 @@ async def test_second_approval_after_the_first_completes_is_409(
     """
     headers = bearer(key_pair, "cust_7f3a")
 
-    first = await approve(app, challenge, headers, "sig_first")
-    second = await approve(app, challenge, headers, "sig_second")
+    first = await approve(app, challenge, headers, signatures[0])
+    second = await approve(app, challenge, headers, signatures[1])
 
     assert first.status_code == 200
     assert second.status_code == 409
@@ -342,7 +378,7 @@ async def test_second_approval_after_the_first_completes_is_409(
 
     status, signature = await _status_of(db, challenge)
     assert status == "executed"
-    assert signature == "sig_first"
+    assert signature == signatures[0]
 
 
 def test_module_is_running_against_a_real_database(pg_url: str) -> None:

@@ -36,6 +36,7 @@ from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.fixtures.device_keys import approval_body, device_key, enrolled_store
 
 # ---------------------------------------------------------------------------
 # App-assertion fixture constants (audit findings C-01, C-02).
@@ -43,6 +44,12 @@ from services.confirm.settings import ConfirmSettings
 
 ISSUER = "https://app.test.invalid"
 AUDIENCE = "postern-confirm"
+
+#: The enrolled phone every approval in this module signs with. Only
+#: ``cust_7f3a`` has one: the cross-customer tests are refused by the
+#: ownership check before any key is looked up, which is the order
+#: ``services/confirm/device_signature.py`` argues for at length.
+DEVICE_PRIVATE, DEVICE_PUBLIC = device_key("integration-phone")
 
 # ---------------------------------------------------------------------------
 # Fixtures.
@@ -176,7 +183,11 @@ def app(settings: ConfirmSettings, key_pair: RSAKeyPair) -> Starlette:
     prescribes for tests.
     """
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
-    return create_confirm_app(settings, assertion_verifier=verifier)
+    return create_confirm_app(
+        settings,
+        assertion_verifier=verifier,
+        device_key_store=enrolled_store("cust_7f3a", DEVICE_PUBLIC),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -231,6 +242,16 @@ def bearer(key_pair: RSAKeyPair, subject: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def signed(db: Database, challenge_id: str, **extra: Any) -> dict[str, Any]:
+    """An approval body signed over the row as the database currently holds it.
+
+    Read rather than reconstructed, because two tests below rewrite
+    ``expires_at`` with raw SQL after creating the challenge and the deadline
+    is part of what is signed (`postern_core.auth.approval_signature`).
+    """
+    return await approval_body(db, challenge_id, DEVICE_PRIVATE, **extra)
+
+
 async def post(
     app: Starlette,
     path: str,
@@ -276,6 +297,7 @@ async def _insert_pending_challenge(
 
 async def test_successful_approval_and_execution(
     app: Starlette,
+    db: Database,
     session: Any,
     key_pair: RSAKeyPair,
 ) -> None:
@@ -288,9 +310,7 @@ async def test_successful_approval_and_execution(
     resp = await post(
         app,
         "/challenges/chal_int_001/approve",
-        {
-            "signature": "sig_mobile_app_xyz",
-        },
+        await signed(db, "chal_int_001"),
         headers=bearer(key_pair, "cust_7f3a"),
     )
 
@@ -308,6 +328,7 @@ async def test_successful_approval_and_execution(
 
 async def test_approval_of_already_approved_challenge_returns_409(
     app: Starlette,
+    db: Database,
     session: Any,
     key_pair: RSAKeyPair,
 ) -> None:
@@ -316,25 +337,17 @@ async def test_approval_of_already_approved_challenge_returns_409(
     auth = bearer(key_pair, "cust_7f3a")
 
     # First approval succeeds (returns 207 due to no backend).
-    resp1 = await post(
-        app,
-        "/challenges/chal_int_002/approve",
-        {
-            "signature": "sig_first",
-        },
-        headers=auth,
-    )
+    body = await signed(db, "chal_int_002")
+    resp1 = await post(app, "/challenges/chal_int_002/approve", body, headers=auth)
     assert resp1.status_code == 207
 
-    # Second approval on same challenge → 409.
-    resp2 = await post(
-        app,
-        "/challenges/chal_int_002/approve",
-        {
-            "signature": "sig_second",
-        },
-        headers=auth,
-    )
+    # The SAME signature again, which is the realistic replay: Ed25519 is
+    # deterministic, so one phone signing one challenge produces one string
+    # however many times it is asked. What refuses the second presentation is
+    # the conditional UPDATE, not the signature -- see
+    # `postern_core.auth.approval_signature`'s docstring on where single use
+    # actually lives.
+    resp2 = await post(app, "/challenges/chal_int_002/approve", body, headers=auth)
     assert resp2.status_code == 409
     data = json.loads(resp2.content.decode())
     assert data["error"] == "already_terminal"
@@ -342,6 +355,7 @@ async def test_approval_of_already_approved_challenge_returns_409(
 
 async def test_expired_challenge_returns_410(
     app: Starlette,
+    db: Database,
     session: Any,
     key_pair: RSAKeyPair,
 ) -> None:
@@ -371,9 +385,9 @@ async def test_expired_challenge_returns_410(
     resp = await post(
         app,
         "/challenges/chal_int_expired/approve",
-        {
-            "signature": "sig_xyz",
-        },
+        # Signed over the row AFTER the deadline was rewritten, so the
+        # signature is valid and the 410 comes from the conditional UPDATE.
+        await signed(db, "chal_int_expired"),
         headers=bearer(key_pair, "cust_7f3a"),
     )
 
@@ -470,6 +484,7 @@ async def test_challenge_not_found_returns_404(
 
 async def test_verification_result_passed_through(
     app: Starlette,
+    db: Database,
     session: Any,
     key_pair: RSAKeyPair,
 ) -> None:
@@ -479,10 +494,7 @@ async def test_verification_result_passed_through(
     resp = await post(
         app,
         "/challenges/chal_int_vr/approve",
-        {
-            "signature": "sig_xyz",
-            "verification_result": "vr_selfie_match_001",
-        },
+        await signed(db, "chal_int_vr", verification_result="vr_selfie_match_001"),
         headers=bearer(key_pair, "cust_7f3a"),
     )
 
@@ -498,6 +510,7 @@ async def test_verification_result_passed_through(
 
 async def test_confirming_device_passed_through(
     app: Starlette,
+    db: Database,
     session: Any,
     key_pair: RSAKeyPair,
 ) -> None:
@@ -507,10 +520,7 @@ async def test_confirming_device_passed_through(
     resp = await post(
         app,
         "/challenges/chal_int_dev/approve",
-        {
-            "signature": "sig_xyz",
-            "confirming_device": "device_abc123",
-        },
+        await signed(db, "chal_int_dev", confirming_device="device_abc123"),
         headers=bearer(key_pair, "cust_7f3a"),
     )
 
@@ -521,6 +531,7 @@ async def test_confirming_device_passed_through(
 
 async def test_backend_write_error_returns_207(
     app: Starlette,
+    db: Database,
     session: Any,
     key_pair: RSAKeyPair,
 ) -> None:
@@ -530,9 +541,7 @@ async def test_backend_write_error_returns_207(
     resp = await post(
         app,
         "/challenges/chal_int_be/approve",
-        {
-            "signature": "sig_xyz",
-        },
+        await signed(db, "chal_int_be"),
         headers=bearer(key_pair, "cust_7f3a"),
     )
 
@@ -545,6 +554,7 @@ async def test_backend_write_error_returns_207(
 
 async def test_standing_orders_cancel_path(
     app: Starlette,
+    db: Database,
     session: Any,
     key_pair: RSAKeyPair,
 ) -> None:
@@ -559,9 +569,7 @@ async def test_standing_orders_cancel_path(
     resp = await post(
         app,
         "/challenges/chal_int_so/approve",
-        {
-            "signature": "sig_xyz",
-        },
+        await signed(db, "chal_int_so"),
         headers=bearer(key_pair, "cust_7f3a"),
     )
 

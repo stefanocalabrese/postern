@@ -17,7 +17,7 @@ Request format (POST /challenges/{challenge_id}/approve)::
     Authorization: Bearer <assertion minted by the operator's app backend>
 
     {
-        "signature": "<recorded, NOT verified — see below>",
+        "signature": "<86 base64url chars: Ed25519 over the stored row>",
         "verification_result": "<tier-2 selfie match reference, if applicable>"
     }
 
@@ -52,32 +52,35 @@ service and which two cannot; the short form is that only a revocation naming
 the CUSTOMER stops a payment, because nothing on this path carries the AI
 client's ``jti`` or its ``client_id``.
 
-WHAT THE ``signature`` FIELD IS, AND WHAT IT IS NOT. It is checked for
-PRESENCE and stored. That is the whole check, today, and the local variable is
-named ``unverified_signature`` at every use site so no reader has to take this
-paragraph's word for it.
+WHAT THE ``signature`` FIELD IS. Until 2026-09-24 it was checked for PRESENCE
+and stored, and the local variable was named ``unverified_signature`` at every
+use site so no reader had to take a docstring's word for it. This paragraph
+used to say what would close that: "a per-customer device public key,
+registered at enrolment, with this handler verifying a signature over the
+stored challenge row's own fields rather than over anything the caller
+supplies". That is now what happens. ``services/confirm/device_signature.py``
+is the check, `postern_core.auth.approval_signature` is the message, and every
+byte of that message comes from the row this handler read -- the same property
+CLAUDE.md requires of the confirmation payload, applied to the signature,
+because a signature over something the caller chose proves only that the
+caller can sign what it chose.
 
-Verifying it for real means answering "which public key belongs to this
-customer's enrolled device", and this repository has no device public-key
-registry, no enrolment flow and no key-rotation story for one — that is the
-operator's app platform's to build (handoff §10.10 is the nearest open
-question). Inventing one here would produce a control that looks like
-cryptographic proof of user presence and is not.
-
-The residual risk, stated plainly: the assertion proves the CALLER is the
-operator's app acting for this customer. Nothing proves the human held the
-device and consented. Anything able to mint or steal an app assertion for a
-customer can approve that customer's pending challenges without touching
-their phone. What closes it is a per-customer device public key, registered
-at enrolment, with this handler verifying a signature over the stored
-challenge row's own fields (id, amount, payee, nonce) rather than over
-anything the caller supplies.
+WHAT IT STILL IS NOT. A verified signature says the private half of an
+enrolled key signed exactly these bytes. It does not say a human read the
+amount, and it does not say the phone was not compromised: both of those live
+behind the device's secure element and the unlock the operator's app requires
+before it signs, and nothing in this repository can attest either. The
+assertion and the signature answer different questions and the pair is the
+control -- the assertion says the operator's APP is calling for this customer,
+the signature says that customer's own enrolled DEVICE produced this approval.
+Enrolment itself is the operator's, in the same sense Vault is
+(`postern_core.auth.device_keys`).
 
 WHAT IS RECORDED. Until 2026-09-23 this handler wrote nothing to
 ``audit_log``. The only trace an approval left was the ``challenges`` row it
-mutated -- whose ``confirming_device`` and ``signature`` are both
-caller-supplied, whose ``signature`` is unverified, and which carries no
-instant for the approval distinct from its own. Meanwhile ``services/api``
+mutated -- whose ``confirming_device`` and ``signature`` were both
+caller-supplied, neither of them verified, and which carries no instant for
+the approval distinct from its own. Meanwhile ``services/api``
 recorded two rows for reading a balance. The asymmetry ran backwards: the
 highest-consequence action in the system was the least recorded one.
 
@@ -129,6 +132,7 @@ from services.confirm.audit import (
     ApprovalAudit,
 )
 from services.confirm.auth import unauthenticated_response, verified_claims, verified_subject
+from services.confirm.device_signature import signature_refusal
 from services.confirm.execute import BackendWriteClient, BackendWriteError, resolve_endpoint
 from services.confirm.revocation import customer_revoked, log_refusal, revoked_response
 
@@ -152,8 +156,12 @@ async def approve_challenge(request: Request) -> JSONResponse:
            anything here is read or written.
         1. Look up the challenge by ID (from stored row, not agent input).
         2. Reject unless the challenge belongs to that customer.
+        2b. Verify the approval signature against a device key the operator
+           enrolled for that customer, over bytes built from the row read in
+           step 1. Before step 3 because step 3 WRITES, and a caller who
+           cannot sign must not be able to move anybody's challenge.
         3. Claim it: one conditional ``UPDATE`` that carries "still pending"
-           and "not yet expired" in its ``WHERE`` and records the unverified
+           and "not yet expired" in its ``WHERE`` and records the verified
            signature + verification_result. Winning it is what authorizes
            step 4; zero rows goes to ``_refused_transition_response``.
         4. Execute the backend write endpoint server-side via execute.py,
@@ -309,10 +317,11 @@ async def approve_challenge(request: Request) -> JSONResponse:
             DETAIL_MALFORMED_BODY,
         )
     else:
-        # Named for what it is at every use site. Presence is the entire
-        # check; the module docstring records why there is no real one and
-        # what would close it.
-        unverified_signature: str = body.get("signature", "")
+        # Named for what it is at every use site, and the name changed with
+        # the control: this is what the caller PRESENTED. `_approve` verifies
+        # it against an enrolled device key before anything is written, and
+        # only a verified value ever reaches the `challenges` row.
+        presented_signature: str = body.get("signature", "")
         verification_result: str | None = body.get("verification_result")
         try:
             response, detail = await _approve(
@@ -322,7 +331,7 @@ async def approve_challenge(request: Request) -> JSONResponse:
                 subject=subject,
                 challenge_id=challenge_id,
                 body=body,
-                unverified_signature=unverified_signature,
+                presented_signature=presented_signature,
                 verification_result=verification_result,
             )
         except Exception as exc:
@@ -372,17 +381,20 @@ async def _approve(
     subject: str,
     challenge_id: str,
     body: dict[str, Any],
-    unverified_signature: str,
+    presented_signature: str,
     verification_result: str | None,
 ) -> tuple[JSONResponse, str | None]:
     """The approval itself, returning ``(response, detail)``.
 
     ``detail`` is ``None`` when the work succeeded and one of
     ``services/confirm/audit.py``'s ``DETAIL_*`` literals otherwise. Split out
-    from ``approve_challenge`` so that every one of the eight exits below
-    names its own outcome exactly once, at the point the decision is made,
-    and the completion row is written in exactly one place rather than at
-    eight returns that a future ninth could forget to join.
+    from ``approve_challenge`` so that every exit below names its own outcome
+    exactly once, at the point the decision is made, and the completion row is
+    written in exactly one place rather than at each return, where a new one
+    could forget to join. The signature check is the one exit that names its
+    detail somewhere else -- ``services/confirm/device_signature.py`` returns
+    the same ``(response, detail)`` pair, because it owns three of them and
+    the difference between them is its subject, not this function's.
 
     The status code and the detail are deliberately NOT derived from each
     other. Two exits return 404 with the same body for different reasons (no
@@ -423,7 +435,13 @@ async def _approve(
             DETAIL_REVOKED,
         )
 
-    if not unverified_signature:
+    # STILL HERE, AHEAD OF THE ROW, and still a 400 rather than one of the
+    # 403s the verification below returns. An empty field is a malformed
+    # REQUEST, answerable without reading anything: keeping it here means a
+    # caller who sends no signature at all learns nothing about which
+    # challenge ids exist, which is the same reason the revocation check
+    # above sits where it does.
+    if not presented_signature:
         return (
             _error(400, "invalid_request", "signature is required"),
             DETAIL_MISSING_SIGNATURE,
@@ -477,6 +495,34 @@ async def _approve(
                 DETAIL_CHALLENGE_NOT_OWNED,
             )
 
+        # --- 2b. Did the customer's own enrolled device sign THIS row? ---
+        #
+        # AFTER the ownership check and BEFORE the ``UPDATE``, and both edges
+        # are load-bearing: after, so a 403 from here cannot answer "does this
+        # challenge id exist" for a caller who does not own it, which the
+        # byte-identical 404 above exists to refuse; before, so a signature
+        # that does not verify leaves the row exactly ``pending`` and the
+        # customer's real phone can still approve it.
+        #
+        # It cannot run any earlier than ``get_challenge``, because the bytes
+        # being verified ARE the row: challenge id, customer, tool, payload
+        # and deadline, canonically encoded by
+        # `postern_core.auth.approval_signature`. Nothing from ``body``
+        # reaches that message; the caller contributes the signature alone.
+        #
+        # `DeviceKeyStoreUnavailable` and `UncanonicalChallengeError` are both
+        # deliberately NOT caught, for the reason the revocation check states:
+        # they propagate to `approve_challenge`'s ``except Exception``, which
+        # writes a completion row carrying the exception type and re-raises,
+        # so the caller gets a 500 and the challenge is untouched. An
+        # enrolment store that cannot answer must not read as a customer who
+        # has not enrolled.
+        refusal = await signature_refusal(
+            request, record=challenge_record, presented_signature=presented_signature
+        )
+        if refusal is not None:
+            return refusal
+
         # --- 3. Claim the challenge: pending -> approved, in one statement ---
         #
         # There is no ``if status != "pending"`` and no ``if now >=
@@ -496,7 +542,10 @@ async def _approve(
                 expiry="unexpired",
                 confirming_device=body.get("confirming_device"),
                 verification_result=verification_result,
-                signature=unverified_signature,
+                # Verified by step 2b before this line could be reached, so
+                # what lands on the row is evidence: an Ed25519 signature by
+                # an enrolled device over this row's own contents.
+                signature=presented_signature,
             )
         except Exception as exc:
             # `type(exc).__name__` and never `str(exc)` on the audit row, even

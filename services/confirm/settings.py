@@ -31,6 +31,15 @@ balances to a process that cannot mint a write token, and this one holds the
 write key and approves money movement. Making the unauthenticated
 configuration unrepresentable is cheaper than remembering not to deploy it.
 
+The approval signature check (2026-09-24) adds a fourth required field,
+``device_keys_path``, for the same reason and with the same consequence:
+``create_confirm_app`` refuses to build without it, because a confirm service
+that cannot verify an approval signature is the finding
+``services/confirm/device_signature.py`` exists to close, and a default would
+make reaching that state a typo rather than a decision. It names a JSON
+document of enrolled device public keys whose format
+``postern_core.auth.device_keys`` owns.
+
 ``app_assertion_audience`` has no default on purpose. A default would be a
 value an operator never typed, and the value that matters here is the one
 that must NOT collide with ``services/api/settings.py``'s ``audience``
@@ -71,6 +80,22 @@ class ConfirmSettings:
     app_assertion_jwks_uri: str | None = None
     app_assertion_issuer: str | None = None
     app_assertion_audience: str | None = None
+    # Enrolled device public keys, the input to the approval signature check
+    # (`services/confirm/device_signature.py`). A path rather than a
+    # connection string, and a field here rather than an environment variable
+    # read inside a factory the way `create_revocation_store` and
+    # `create_device_code_store` read `POSTERN_REDIS_URL`: this is key
+    # material the operator renders, so it follows `read_key_pem_path` and
+    # `write_key_pem_path` above, and `postern_core.auth.device_keys` records
+    # at length why enrolment data must not share the cache's variable.
+    #
+    # REQUIRED, with no default, exactly like the three assertion fields:
+    # `create_confirm_app` refuses to build without it. A default would be a
+    # path the operator never typed, and the failure mode of getting it wrong
+    # is a service that cannot approve anything -- which is fail-closed, and
+    # is still an outage an operator must meet at startup rather than at the
+    # first payment.
+    device_keys_path: str | None = None
     # RFC 8628 §5.2: bound `user_code` guessing. Three tolerates a user
     # mistyping the pairing code on the app's screen; the fourth failure
     # revokes the device code outright, which forces a fresh QR and so
@@ -93,10 +118,10 @@ class ConfirmSettings:
     #   whole approval tree measures under 300 bytes; `/token` carries
     #   `grant_type` plus a 43-character device code; `/approve` carries two
     #   short codes. 64 KiB is ~220x the largest of those and 8x the floor,
-    #   which leaves room for the per-customer device signature
-    #   `services/confirm/callback.py`'s docstring says this path still owes
-    #   (an RSA-4096 signature is 684 base64 characters) without leaving room
-    #   for a megabyte.
+    #   which left room for the per-customer device signature this path owed
+    #   when the bound was chosen. That signature landed on 2026-09-24 and
+    #   costs 86 characters (`postern_core.auth.approval_signature`'s
+    #   `SIGNATURE_BYTES`, base64url-encoded), so the room was never needed.
     #
     # A DELIBERATELY DIFFERENT ENVIRONMENT VARIABLE FROM `services/api`'s
     # `POSTERN_MAX_BODY_BYTES`, which is 1 MiB. Sharing the name would mean an
@@ -148,6 +173,7 @@ class ConfirmSettings:
             app_assertion_jwks_uri=os.environ.get("POSTERN_APP_ASSERTION_JWKS_URI") or None,
             app_assertion_issuer=os.environ.get("POSTERN_APP_ASSERTION_ISSUER") or None,
             app_assertion_audience=os.environ.get("POSTERN_APP_ASSERTION_AUDIENCE") or None,
+            device_keys_path=os.environ.get("POSTERN_DEVICE_KEYS_PATH") or None,
             user_code_max_attempts=int(os.environ.get("POSTERN_USER_CODE_MAX_ATTEMPTS", "3")),
             max_body_bytes=int(
                 os.environ.get("POSTERN_CONFIRM_MAX_BODY_BYTES", str(65_536)),
@@ -157,6 +183,15 @@ class ConfirmSettings:
     @classmethod
     def for_testing(cls) -> "ConfirmSettings":
         """Settings that build an app which authenticates NOBODY successfully.
+
+        ``device_keys_path`` is deliberately left ``None`` here, which means
+        these settings alone do not build an app at all: a test that wants one
+        passes ``device_key_store=no_enrolled_devices()`` to
+        ``create_confirm_app``, the same way it passes ``assertion_verifier=``.
+        Both halves of "this fixture can approve nothing" are then written at
+        the call site rather than hidden in a default, which is the whole
+        reason `postern_core.auth.device_keys`'s ``no_enrolled_devices`` has a
+        name.
 
         The three ``app_assertion_*`` values point at
         ``app.postern-local-dev.invalid``. RFC 2606 reserves ``.invalid``, so

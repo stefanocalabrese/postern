@@ -32,6 +32,14 @@ requirement an operator owns. Until 2026-09-22 this app was built as
 ``Starlette(routes=routes)`` with no ``middleware=`` argument at all and
 authenticated nobody on any route.
 
+A challenge approval needs one thing more, since 2026-09-24: an Ed25519
+signature from a device the operator enrolled for that customer, over bytes
+built from the stored challenge row. The assertion says the operator's APP is
+calling for this customer; the signature says the customer's own PHONE did.
+``services/confirm/device_signature.py`` holds the check and
+`postern_core.auth.device_keys` holds where the keys come from -- and, like
+the three assertion settings, this service refuses to start without them.
+
 In front of that sits ``services/confirm/body_limit.py``, which bounds what
 any route -- authenticated or public -- will read into memory. Until
 2026-09-24 nothing did: ``POST /device_authorization`` read 9,999,989 bytes
@@ -51,8 +59,11 @@ See ``services.confirm.device_auth`` for device auth endpoint implementations
 and ``services.confirm.callback`` for the challenge approval handler.
 """
 
+from pathlib import Path
+
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.auth.device_codes import create_device_code_store
+from postern_core.auth.device_keys import DeviceKeyStoreBase, FileDeviceKeyStore
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource, warn_ephemeral_signing_key
 from postern_core.auth.revocation import create_revocation_store
@@ -113,10 +124,50 @@ def _assertion_verifier(settings: ConfirmSettings) -> AssertionVerifier:
     )
 
 
+def _device_key_store(settings: ConfirmSettings) -> DeviceKeyStoreBase:
+    """The enrolled-device keys this service verifies approvals against, or
+    refuse to start.
+
+    THE SAME GUARD AS ``_assertion_verifier`` ABOVE, and the same argument.
+    Until 2026-09-24 the ``signature`` field on an approval was checked for
+    presence and stored; ``services/confirm/device_signature.py`` records what
+    that left open. A service that starts without a way to verify it is back
+    in that state, so there is no such mode: no default path, no
+    warn-and-continue, and no environment variable that turns the check off.
+
+    WHY THIS RAISES WHERE ``warn_ephemeral_signing_key`` WARNS, since both
+    guard key material and this repository has precedent both ways. That
+    warning covers a process that generated a key IT WILL USE: the service
+    still works, tokens still verify against its own JWKS, and the cost is
+    confined to multi-replica deployments. This guards the absence of the only
+    input that makes an approval more than a claim, and its failure mode is
+    money moving on an unverified assertion. A control gating money fails at
+    startup.
+
+    The consequence is deliberate and worth naming: an operator who has not
+    built enrolment yet gets a crash loop here, and closes it with an empty
+    enrolment document, which starts and refuses every approval loudly
+    (`postern_core.auth.device_keys`'s ``warn_no_enrolled_devices``). That is
+    one line of configuration to say "no phone can approve yet", and no line
+    of configuration anywhere says "approve without checking".
+    """
+    if not settings.device_keys_path:
+        raise ValueError(
+            "the confirm service cannot start without enrolled device keys: "
+            "device_keys_path must be set (POSTERN_DEVICE_KEYS_PATH) to a JSON "
+            "document of the public keys the operator enrolled for each customer. "
+            "There is no unverified-signature mode on this service; see "
+            "services/confirm/device_signature.py. An empty document "
+            '({"customers": {}}) starts the service and refuses every approval.'
+        )
+    return FileDeviceKeyStore(Path(settings.device_keys_path))
+
+
 def create_confirm_app(
     settings: ConfirmSettings | None = None,
     *,
     assertion_verifier: AssertionVerifier | None = None,
+    device_key_store: DeviceKeyStoreBase | None = None,
 ) -> Starlette:
     """Assemble the write-path ASGI app with device authorization and callback endpoints.
 
@@ -137,15 +188,30 @@ def create_confirm_app(
             and needs no JWKS server. It is a keyword argument with no
             environment variable behind it, so no deployment can reach it by
             configuration.
+        device_key_store: Overrides the store built from
+            ``settings.device_keys_path``. The same kind of seam, for the same
+            reason: a test that must approve something generates an Ed25519
+            key pair and enrols the public half in an
+            ``InMemoryDeviceKeyStore``, and one that must not passes
+            ``no_enrolled_devices()``. Also keyword-only with no environment
+            variable behind it, so it cannot become a deployment's answer to
+            the guard below.
 
     Raises:
         ValueError: if no verifier is given and the ``app_assertion_*``
-            settings are incomplete. Refusing to build is the point: it makes
-            an unauthenticated confirm service unreachable by construction
-            rather than by remembering to configure one.
+            settings are incomplete, if no device key store is given and
+            ``device_keys_path`` is unset, or if the document it names cannot
+            be parsed. Refusing to build is the point in all three cases: it
+            makes a confirm service that authenticates nobody, or that cannot
+            verify an approval signature, unreachable by construction rather
+            than by remembering to configure one.
     """
     settings = settings or ConfirmSettings.from_env()
     verifier = assertion_verifier or _assertion_verifier(settings)
+    # AFTER the assertion guard, so an operator missing both is told about
+    # authentication first -- it is the outer control, and a service that
+    # authenticates nobody has nothing to verify a signature for.
+    keys = device_key_store or _device_key_store(settings)
 
     # --- Write key / minter (existing path) ---
     _write_minter, write_key_source = build_write_minter(settings)
@@ -247,6 +313,11 @@ def create_confirm_app(
     # attribute name as `services/api/main.py` uses, so one grep over both
     # services finds every place the control is wired.
     app.state.postern_revocation_store = revocation_store
+    # Read by `services/confirm/device_signature.py`'s `device_key_store`, on
+    # the one path that approves money movement. The ``postern_`` prefix
+    # matches every other store this state dict carries, so a route table that
+    # forgets one fails the same way the others do.
+    app.state.postern_device_key_store = keys
     app.state.settings = settings
 
     return app

@@ -3,6 +3,7 @@ import pytest
 from joserfc import jwt
 from joserfc.errors import InvalidKeyIdError
 from joserfc.jwk import KeySet
+from postern_core.auth.device_keys import no_enrolled_devices
 from starlette.applications import Starlette
 
 from services.confirm.main import create_confirm_app
@@ -42,20 +43,33 @@ def test_every_write_scope_is_a_write_scope() -> None:
 
 
 async def test_the_write_jwks_is_served(settings: ConfirmSettings) -> None:
-    r = await get(create_confirm_app(settings), "/.well-known/jwks.json")
+    r = await get(
+        create_confirm_app(settings, device_key_store=no_enrolled_devices()),
+        "/.well-known/jwks.json",
+    )
     assert r.status_code == 200
     assert {e["kid"] for e in r.json()["keys"]} == {"write-1"}
 
 
 async def test_the_write_jwks_carries_no_private_material(settings: ConfirmSettings) -> None:
-    for entry in (await get(create_confirm_app(settings), "/.well-known/jwks.json")).json()["keys"]:
+    for entry in (
+        await get(
+            create_confirm_app(settings, device_key_store=no_enrolled_devices()),
+            "/.well-known/jwks.json",
+        )
+    ).json()["keys"]:
         assert set(entry) & _PRIVATE_PARAMS == set(), entry
 
 
 async def test_the_write_jwks_never_contains_a_read_key(settings: ConfirmSettings) -> None:
     kids = {
         e["kid"]
-        for e in (await get(create_confirm_app(settings), "/.well-known/jwks.json")).json()["keys"]
+        for e in (
+            await get(
+                create_confirm_app(settings, device_key_store=no_enrolled_devices()),
+                "/.well-known/jwks.json",
+            )
+        ).json()["keys"]
     }
     assert not any(k.startswith("read") for k in kids)
 

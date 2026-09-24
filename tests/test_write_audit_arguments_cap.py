@@ -60,8 +60,10 @@ from services.confirm.audit import APPROVE_ROUTE
 from services.confirm.audit import _arguments as write_path_arguments
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.fixtures.device_keys import enrolled_store
 from tests.test_write_audit import (
     AUDIENCE,
+    DEVICE_PUBLIC,
     ISSUER,
     OWNER,
     Backend,
@@ -70,6 +72,7 @@ from tests.test_write_audit import (
     post,
     rows,
     seed,
+    signed,
 )
 
 # 1 MiB of incompressible, MIME-wrapped base64, the fixture shape
@@ -201,7 +204,11 @@ def key_pair() -> RSAKeyPair:
 @pytest.fixture()
 def app(settings: ConfirmSettings, key_pair: RSAKeyPair) -> Starlette:
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
-    return create_confirm_app(settings, assertion_verifier=verifier)
+    return create_confirm_app(
+        settings,
+        assertion_verifier=verifier,
+        device_key_store=enrolled_store(OWNER, DEVICE_PUBLIC),
+    )
 
 
 def _bounded(tree: dict[str, Any]) -> dict[str, Any]:
@@ -509,7 +516,7 @@ async def test_a_refused_409_is_bounded(
     resp = await post(
         app,
         "chal_409_cap",
-        {"signature": "sig_x", "verification_result": ONE_MIB},
+        await signed(app, "chal_409_cap", verification_result=ONE_MIB),
         bearer(key_pair, OWNER),
     )
     assert resp.status_code == 409
@@ -546,7 +553,9 @@ async def test_both_rows_of_a_successful_approval_carry_the_bound(
     resp = await post(
         app,
         "chal_pair_cap",
-        {"signature": "sig_x", "confirming_device": "pixel-9", "verification_result": ONE_MIB},
+        await signed(
+            app, "chal_pair_cap", confirming_device="pixel-9", verification_result=ONE_MIB
+        ),
         bearer(key_pair, OWNER),
     )
     assert resp.status_code == 200
@@ -578,7 +587,9 @@ async def test_an_ordinary_approval_stores_exactly_what_it_sent(
     resp = await post(
         app,
         "chal_plain_cap",
-        {"signature": "sig_x", "confirming_device": "pixel-9", "verification_result": "match_ok"},
+        await signed(
+            app, "chal_plain_cap", confirming_device="pixel-9", verification_result="match_ok"
+        ),
         bearer(key_pair, OWNER),
     )
     assert resp.status_code == 200

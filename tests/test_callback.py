@@ -13,14 +13,18 @@ Covers:
   assertion, byte-identical to the "no such challenge" body (no ownership
   oracle for ids that leak into the model's channel), including the ordering
   guarantee that ownership is checked before the expiry branch that writes.
-- 400 when challenge_id is missing from path / signature from body.
+- 400 when challenge_id is missing from path / signature from body, and 403
+  when a signature is present and does not verify against an enrolled device
+  key — with no state transition attempted, so a caller who cannot sign
+  cannot burn somebody's challenge.
 - 404 when challenge not found in DB.
 - 409 when challenge is already terminal (approved/executed/declined/expired).
 - 410 when challenge is expired (marks it as expired in DB via update_challenge_status).
 - 200 on successful approval + backend execution.
 - 207 on successful approval + backend execution failure (BackendWriteError).
-- The ``signature`` field is checked for PRESENCE only, never verified —
-  pinned explicitly so a real per-device check landing later breaks this test.
+- The ``signature`` field is verified against an enrolled Ed25519 device key
+  over the STORED row, and the value that reaches ``update_challenge_status``
+  is the one that verified.
 - Verification result and confirming device passthrough.
 - JWT injection, PAN scrubbing, standing-orders path interpolation.
 - BackendWriteClient always closed (success and error paths).
@@ -37,6 +41,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
 import pytest
+from postern_core.auth.device_keys import no_enrolled_devices
 from postern_core.auth.revocation import InMemoryRevocationStore
 from postern_core.domain.verification import VerificationTier
 from postern_core.store.models import ChallengeRecord
@@ -46,6 +51,13 @@ from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
 from services.confirm.callback import approve_challenge
 from services.confirm.execute import BackendWriteClient
 from services.confirm.settings import ConfirmSettings
+from tests.fixtures.device_keys import device_key, enrolled_store, sign_row
+
+#: The one enrolled phone this module signs with. `_make_state` enrols its
+#: public half for whichever customer the challenge record names, so a test
+#: that hands in a record gets a store that can verify an approval for it, and
+#: `_make_request(record=...)` produces the signature that phone would send.
+DEVICE_PRIVATE, DEVICE_PUBLIC = device_key("callback-phone")
 
 
 class _Patcher(Protocol):
@@ -96,6 +108,7 @@ def _make_request(
     challenge_id: str = "chal_abc123",
     body: dict[str, Any] | None = None,
     subject: str | None = "cust_7f3a",
+    record: ChallengeRecord | None = None,
 ) -> Request:
     """Build a Starlette ``Request`` with mock scope and receive.
 
@@ -112,7 +125,15 @@ def _make_request(
     exercising a caller who owns the challenge, same as before this
     parameter existed.
     """
-    raw_body = json.dumps(body if body is not None else {"signature": "sig_xyz"}).encode()
+    if body is None:
+        # `record` is the stored row this approval is for. Given one, the
+        # default body carries the signature the enrolled phone would produce
+        # over it -- which is what every test that means to get PAST the
+        # signature check needs. Without one the placeholder stays, and those
+        # are exactly the tests refused before the check runs (no assertion,
+        # not the owner, no such challenge, no signature at all).
+        body = {"signature": sign_row(DEVICE_PRIVATE, record)} if record else {"signature": "sig"}
+    raw_body = json.dumps(body).encode()
 
     scope: dict[str, Any] = {
         "type": "http",
@@ -271,6 +292,18 @@ def _make_state(
     # branch of its own. `tests/test_zt7_confirm_revocation.py` is where the
     # refusing side of this check is measured.
     state.postern_revocation_store = InMemoryRevocationStore()
+    # The device signature check (2026-09-24), wired the same way and for the
+    # same reason: a bare `MagicMock` attribute returns a `MagicMock` from
+    # `keys_for`, which is not awaitable, so every test below exercises the
+    # real check rather than skipping it. The record's own customer is what is
+    # enrolled -- a cross-customer test therefore reaches a store that holds a
+    # key for the OWNER and never for the caller, which is the shape
+    # production has.
+    state.postern_device_key_store = (
+        enrolled_store(challenge_record.customer_ref, DEVICE_PUBLIC)
+        if challenge_record is not None
+        else no_enrolled_devices()
+    )
 
     import services.confirm.callback as cb
 
@@ -471,7 +504,7 @@ async def test_terminal_challenge_returns_409(status: str) -> None:
 
     state, patches = _make_state(challenge_record=rec)
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -495,7 +528,7 @@ async def test_expired_challenge_returns_410_and_marks_expired() -> None:
 
     state, patches = _make_state(challenge_record=rec)
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -521,7 +554,7 @@ async def test_successful_approval_and_execution() -> None:
         backend_response=httpx2.Response(201, json={"id": "pay_99"}),
     )
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -549,7 +582,7 @@ async def test_approval_recorded_but_backend_execution_fails() -> None:
         backend_response=httpx2.Response(500, json={"detail": "internal server error"}),
     )
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -577,7 +610,7 @@ async def test_approval_update_failure_returns_500() -> None:
 
     patches.append(patch.object(cb, "update_challenge_status", mock_update_raises))
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -615,7 +648,7 @@ async def test_update_returns_none_returns_500() -> None:
 
     patches.append(patch.object(cb, "update_challenge_status", mock_update_none))
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -636,7 +669,7 @@ async def test_unknown_tool_returns_500() -> None:
 
     state, patches = _make_state(challenge_record=rec)
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -662,7 +695,9 @@ async def test_verification_result_passed_to_update() -> None:
         backend_response=httpx2.Response(200, json={}),
     )
 
-    req = _make_request(body={"signature": "sig", "verification_result": "vr_match_001"})
+    req = _make_request(
+        body={"signature": sign_row(DEVICE_PRIVATE, rec), "verification_result": "vr_match_001"}
+    )
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -688,7 +723,9 @@ async def test_confirming_device_passed_to_update() -> None:
         backend_response=httpx2.Response(200, json={}),
     )
 
-    req = _make_request(body={"signature": "sig", "confirming_device": "dev_ios_abc"})
+    req = _make_request(
+        body={"signature": sign_row(DEVICE_PRIVATE, rec), "confirming_device": "dev_ios_abc"}
+    )
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -737,7 +774,7 @@ async def test_backend_write_receives_correct_jwt_claims() -> None:
 
     patches.append(patch.object(BackendWriteClient, "__init__", patched_init))
 
-    req = _make_request(subject="cust_special")
+    req = _make_request(subject="cust_special", record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -760,7 +797,7 @@ async def test_response_includes_challenge_id() -> None:
         challenge_record=rec, backend_response=httpx2.Response(200, json={})
     )
 
-    req = _make_request(challenge_id="chal_unique_99")
+    req = _make_request(challenge_id="chal_unique_99", record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -784,7 +821,7 @@ async def test_207_response_includes_backend_status() -> None:
         backend_response=httpx2.Response(502, json={"detail": "bad gateway"}),
     )
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -809,7 +846,7 @@ async def test_backend_error_detail_scrubs_pan() -> None:
         backend_response=httpx2.Response(400, json={"detail": f"card {TEST_PAN} declined"}),
     )
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -856,7 +893,7 @@ async def test_standing_orders_cancel_execution() -> None:
 
     patches.append(patch.object(BackendWriteClient, "__init__", patched_init))
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -879,7 +916,7 @@ async def test_missing_path_param_returns_500() -> None:
 
     state, patches = _make_state(challenge_record=rec)
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -914,7 +951,7 @@ async def test_backend_write_client_closed_on_success() -> None:
 
     patches.append(patch.object(BackendWriteClient, "aclose", patched_aclose))
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -943,7 +980,7 @@ async def test_backend_write_client_closed_on_error() -> None:
 
     patches.append(patch.object(BackendWriteClient, "aclose", patched_aclose))
 
-    req = _make_request()
+    req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
@@ -957,8 +994,9 @@ async def test_backend_write_client_closed_on_error() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_signature_passed_to_update() -> None:
-    """The signature from the request body is forwarded to update_challenge_status."""
+async def test_the_verified_signature_is_what_reaches_the_row() -> None:
+    """The signature forwarded to ``update_challenge_status`` is the one that
+    verified, so the value on the row is evidence rather than an echo."""
     rec = _pending_record()
     update_status_calls: list[dict[str, Any]] = []
 
@@ -968,25 +1006,31 @@ async def test_signature_passed_to_update() -> None:
         backend_response=httpx2.Response(200, json={}),
     )
 
-    req = _make_request(body={"signature": "sig_device_42"})
+    signature = sign_row(DEVICE_PRIVATE, rec)
+    req = _make_request(body={"signature": signature})
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
 
     assert resp.status_code == 200
-    # The first update call should include the signature.
-    assert any(c.get("signature") == "sig_device_42" for c in update_status_calls)
+    assert update_status_calls[0]["signature"] == signature
 
 
-async def test_unverified_signature_junk_value_is_accepted_and_stored() -> None:
-    """Presence, not validity, is the whole check today: a junk string with no
-    relationship to any device key is accepted and stored verbatim.
+async def test_a_junk_signature_is_refused_and_nothing_is_written() -> None:
+    """What this file used to pin, inverted.
 
-    ``services/confirm/callback``'s module docstring records why there is no
-    real check — no device public-key registry, no enrolment flow, no
-    key-rotation story, and none of those are this repository's to invent.
-    When a real per-device signature check lands, this test must fail and
-    force an update here, not silently keep passing.
+    Until 2026-09-24 the test here was
+    ``test_unverified_signature_junk_value_is_accepted_and_stored``: a string
+    with no relationship to any device key was accepted, stored verbatim, and
+    a payment was executed behind it. Its own docstring said "when a real
+    per-device signature check lands, this test must fail and force an update
+    here, not silently keep passing". It landed, and this is that update.
+
+    The three assertions are the whole of the control at this level: the
+    caller is refused, NO transition is attempted -- so the challenge is not
+    burned and the customer's real phone can still approve it -- and the
+    refusal is a 403 naming the signature rather than the 404 that would tell
+    a stranger whether the id exists.
     """
     rec = _pending_record()
     update_status_calls: list[dict[str, Any]] = []
@@ -1002,5 +1046,6 @@ async def test_unverified_signature_junk_value_is_accepted_and_stored() -> None:
         req.scope["app"] = type("FakeApp", (), {"state": state})()
         resp = await approve_challenge(req)
 
-    assert resp.status_code == 200
-    assert update_status_calls[0]["signature"] == "not-a-real-signature"
+    assert resp.status_code == 403
+    assert update_status_calls == []
+    assert json.loads(_resp_body(resp).decode())["error"] == "invalid_signature"
