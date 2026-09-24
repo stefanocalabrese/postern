@@ -54,6 +54,19 @@ at all -- a row would have to invent a class of absence that
 request, since Starlette cannot match an empty path segment, and a row naming
 no challenge names nothing an investigator can act on.
 
+A THIRD WRITES NOTHING AND IS REACHABLE, as of 2026-09-24: an oversized body
+is refused with 413 by ``services/confirm/body_limit.py``, which runs in front
+of ``AppAssertionMiddleware`` and so has no verified subject to record and no
+database handle to record it with. Giving it one would let an unauthenticated
+caller drive an INSERT per request, which is a cheaper denial of service than
+the one that middleware closes. So an oversized body IS a way to make a
+request this table does not see. What that costs is bounded by what such a
+request does, which is nothing: no challenge is read, none moves, and no write
+JWT is minted. The refusal is logged and that is its only trace. A MALFORMED
+body is the opposite case and gets a row (``DETAIL_MALFORMED_BODY``), because
+by the time it is found the subject and the challenge id both exist and this
+module's rule above already owed one.
+
 WHAT ``tool_name`` HOLDS, AND THE LIMITATION THAT COMES WITH IT. The
 challenge's own ``tool_name`` (``payments.create_payment``), verbatim, so that
 one filter returns both halves of a payment -- the read-path rows for the tool
@@ -144,6 +157,7 @@ __all__ = [
     "DETAIL_CHALLENGE_NOT_OWNED",
     "DETAIL_CHALLENGE_VANISHED",
     "DETAIL_EXPIRED",
+    "DETAIL_MALFORMED_BODY",
     "DETAIL_MISSING_SIGNATURE",
     "DETAIL_REVOKED",
     "DETAIL_UPDATE_MATCHED_NO_ROW",
@@ -184,6 +198,17 @@ APPROVE_ROUTE = "/challenges/{challenge_id}/approve"
 #: and it is the only place that is durable: this service has no client id to
 #: put in a log line the way `services/api/middleware/revocation.py` does.
 DETAIL_REVOKED = "revoked"
+#: The body could not be read as an approval -- not JSON, not decodable as
+#: UTF-8, nested past the interpreter's recursion limit, or well-formed JSON
+#: that is not an object. Until 2026-09-24 every one of those was an unhandled
+#: exception from a bare ``await request.json()``, so the request 500ed and
+#: wrote NO row -- a silent refusal path beyond the two
+#: ``services/confirm/callback.py``'s docstring enumerates, and one this
+#: module's own rule already said should be recorded, since it is reached well
+#: past the point where a verified subject and a non-empty challenge id both
+#: exist. One literal covers all four shapes because ``detail`` records the
+#: STAGE an approval stopped at, and all four stopped at the same one.
+DETAIL_MALFORMED_BODY = "malformed_body"
 DETAIL_MISSING_SIGNATURE = "missing_signature"
 DETAIL_CHALLENGE_NOT_FOUND = "challenge_not_found"
 DETAIL_CHALLENGE_NOT_OWNED = "challenge_not_owned"

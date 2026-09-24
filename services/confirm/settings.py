@@ -76,6 +76,39 @@ class ConfirmSettings:
     # revokes the device code outright, which forces a fresh QR and so
     # re-anchors the human code comparison that is the actual A2 control.
     user_code_max_attempts: int = 3
+    # The ceiling `services/confirm/body_limit.py` enforces on every request
+    # body this service will read into memory. Measured before it existed:
+    # `POST /device_authorization` read 9,999,989 bytes and answered 200 with
+    # no credential presented at all.
+    #
+    # 64 KiB, and the interval it sits in is derived even though the point in
+    # it is not:
+    #
+    # - THE FLOOR IS 8,192, `postern_core.store.audit`'s `MAX_ARGUMENTS_BYTES`
+    #   -- the most of a body that can ever reach `audit_log.arguments` from
+    #   this service. A limit below it would make the bound `579dfd7` put on
+    #   that column unreachable from any request, which is not a tighter
+    #   control but a dead one.
+    # - THE CEILING THAT MATTERS is what a legitimate body actually is. The
+    #   whole approval tree measures under 300 bytes; `/token` carries
+    #   `grant_type` plus a 43-character device code; `/approve` carries two
+    #   short codes. 64 KiB is ~220x the largest of those and 8x the floor,
+    #   which leaves room for the per-customer device signature
+    #   `services/confirm/callback.py`'s docstring says this path still owes
+    #   (an RSA-4096 signature is 684 base64 characters) without leaving room
+    #   for a megabyte.
+    #
+    # A DELIBERATELY DIFFERENT ENVIRONMENT VARIABLE FROM `services/api`'s
+    # `POSTERN_MAX_BODY_BYTES`, which is 1 MiB. Sharing the name would mean an
+    # operator raising the READ path's ceiling -- which that service's own
+    # comment invites, "a deployment that later adds a tool with a genuinely
+    # larger request body (a bulk import, say) must raise this deliberately"
+    # -- silently raising the WRITE path's by the same factor, in a repository
+    # whose `docker-compose.yml` runs both services from one file. The two
+    # bound different things: a JSON-RPC tool-call envelope there, an approval
+    # body here. An operator who needs this one wider must say so separately,
+    # with `POSTERN_CONFIRM_MAX_BODY_BYTES`.
+    max_body_bytes: int = 65_536
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -116,6 +149,9 @@ class ConfirmSettings:
             app_assertion_issuer=os.environ.get("POSTERN_APP_ASSERTION_ISSUER") or None,
             app_assertion_audience=os.environ.get("POSTERN_APP_ASSERTION_AUDIENCE") or None,
             user_code_max_attempts=int(os.environ.get("POSTERN_USER_CODE_MAX_ATTEMPTS", "3")),
+            max_body_bytes=int(
+                os.environ.get("POSTERN_CONFIRM_MAX_BODY_BYTES", str(65_536)),
+            ),
         )
 
     @classmethod

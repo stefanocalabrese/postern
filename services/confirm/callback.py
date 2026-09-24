@@ -89,6 +89,18 @@ where to read about them; what matters here is that the writes FAIL CLOSED
 (``dev-docs/decisions/0006-audit-write-failure.md``), so an audit store that
 is down or merely slow stops money from moving rather than letting it move
 unrecorded.
+
+"EVERY PATH BELOW" WAS NOT TRUE UNTIL 2026-09-24. A body that was not a JSON
+object raised out of a bare ``await request.json()``, three lines above where
+the audit object is built, so the request 500ed and recorded nothing --
+measured on four shapes, all 500s, row count unchanged. ``_read_body`` below
+holds them and the handler now refuses each with a 400 and one row.
+
+WHAT BOUNDS THE BODY THIS READS. ``services/confirm/body_limit.py``, wired in
+front of ``AppAssertionMiddleware`` by ``services/confirm/main.py``. Before it
+existed this handler parsed whatever arrived -- measured at 9,999,984 bytes
+for one 404 -- and a request it refuses with 413 is the one class of request
+that reaches neither this handler nor the table.
 """
 
 from __future__ import annotations
@@ -110,6 +122,7 @@ from services.confirm.audit import (
     DETAIL_CHALLENGE_NOT_OWNED,
     DETAIL_CHALLENGE_VANISHED,
     DETAIL_EXPIRED,
+    DETAIL_MALFORMED_BODY,
     DETAIL_MISSING_SIGNATURE,
     DETAIL_REVOKED,
     DETAIL_UPDATE_MATCHED_NO_ROW,
@@ -210,12 +223,17 @@ async def approve_challenge(request: Request) -> JSONResponse:
         logger.warning("challenge approve: dispatched with no challenge_id in the path")
         return _error(400, "invalid_request", "challenge_id is required in path")
 
-    body = await request.json()
-    # Named for what it is at every use site. Presence is the entire check;
-    # the module docstring records why there is no real one and what would
-    # close it.
-    unverified_signature: str = body.get("signature", "")
-    verification_result: str | None = body.get("verification_result")
+    # NOT a bare `await request.json()` any more. Until 2026-09-24 it was one,
+    # outside any `try`, three lines above where `ApprovalAudit` is built --
+    # so a body that was not a JSON object raised before the audit existed and
+    # the request failed with NO ROW AT ALL. Measured, all four 500s with an
+    # unchanged row count: `{not json` (`JSONDecodeError`), `[1,2,3]`
+    # (`AttributeError` from `.get` on a list), 200,000 nested arrays
+    # (`RecursionError`) and an empty body (`JSONDecodeError`). That was a
+    # silent refusal path beyond the two enumerated above, and
+    # `services/confirm/audit.py`'s own rule already owed a row here: the
+    # verified subject and the non-empty challenge id both exist by this line.
+    body = await _read_body(request)
 
     # Typed rather than left as the `Any` that `app.state` hands back, so
     # `_approve` and `ApprovalAudit` below are both checked against the real
@@ -253,41 +271,81 @@ async def approve_challenge(request: Request) -> JSONResponse:
         subject=subject,
         claims=verified_claims(request),
         challenge_id=challenge_id,
-        body=body,
+        # `{}` when the body was unreadable, which records the truth: this
+        # caller supplied no `confirming_device`, no `verification_result` and
+        # no signature that reached the handler. `detail` below is what says
+        # a body arrived and could not be read, as against none arriving.
+        body=body if body is not None else {},
     )
 
-    try:
-        response, detail = await _approve(
-            request,
-            audit,
-            db=db,
-            subject=subject,
-            challenge_id=challenge_id,
-            body=body,
-            unverified_signature=unverified_signature,
-            verification_result=verification_result,
+    # Declared before the branch rather than inferred from whichever arm mypy
+    # meets first: the malformed arm below always names a `DETAIL_*` literal,
+    # so an inferred `str` would make `_approve`'s `str | None` an error on
+    # the other arm, and widening at the assignment instead would put the
+    # annotation where the reader is not looking.
+    response: JSONResponse
+    detail: str | None
+
+    if body is None:
+        # THE REFUSAL DEFECT 2 EXISTS FOR, and it deliberately does not call
+        # `_approve`. That means the ZT-7 revocation check, which is
+        # `_approve`'s first statement, does not run: a revoked customer who
+        # sends a malformed body is recorded as `malformed_body` rather than
+        # `revoked`, so `WHERE detail = 'revoked'` undercounts them by
+        # whatever they send that cannot be parsed. They are still refused,
+        # still move no challenge and still mint no write JWT, which is every
+        # property `services/confirm/revocation.py` claims for that placement;
+        # what is lost is only a row's label. Checking revocation first would
+        # mean building `ApprovalAudit` before the body is known, and its
+        # constructor computes `arguments` from the body inside the one
+        # `redaction_budget()` scope a request gets -- so the order here is
+        # forced by that contract rather than chosen.
+        logger.warning(
+            "challenge approve: %s refused, the body is not a JSON object",
+            challenge_id,
         )
-    except Exception as exc:
-        # `raise exc from audit_exc`, never a bare `raise` from inside this
-        # handler: an audit-write failure must not REPLACE the exception that
-        # actually ended the request. Raising while already handling `exc`
-        # would chain implicitly through `__context__` and put the database's
-        # exception where the request's own belongs, so the operator reading
-        # the traceback would learn what the audit store did and not what the
-        # approval did. Same shape, same reasoning, as
-        # `services/api/middleware/audit.py`'s raised branch.
+        response, detail = (
+            _error(400, "invalid_request", "body must be a JSON object"),
+            DETAIL_MALFORMED_BODY,
+        )
+    else:
+        # Named for what it is at every use site. Presence is the entire
+        # check; the module docstring records why there is no real one and
+        # what would close it.
+        unverified_signature: str = body.get("signature", "")
+        verification_result: str | None = body.get("verification_result")
         try:
-            await audit.raised(type(exc).__name__)
-        except Exception as audit_exc:
-            logger.error(
-                "audit write failed for challenge %r after the approval raised %s: %s",
-                challenge_id,
-                type(exc).__name__,
-                audit_exc,
-                exc_info=audit_exc,
+            response, detail = await _approve(
+                request,
+                audit,
+                db=db,
+                subject=subject,
+                challenge_id=challenge_id,
+                body=body,
+                unverified_signature=unverified_signature,
+                verification_result=verification_result,
             )
-            raise exc from audit_exc
-        raise
+        except Exception as exc:
+            # `raise exc from audit_exc`, never a bare `raise` from inside
+            # this handler: an audit-write failure must not REPLACE the
+            # exception that actually ended the request. Raising while already
+            # handling `exc` would chain implicitly through `__context__` and
+            # put the database's exception where the request's own belongs, so
+            # the operator reading the traceback would learn what the audit
+            # store did and not what the approval did. Same shape, same
+            # reasoning, as `services/api/middleware/audit.py`'s raised branch.
+            try:
+                await audit.raised(type(exc).__name__)
+            except Exception as audit_exc:
+                logger.error(
+                    "audit write failed for challenge %r after the approval raised %s: %s",
+                    challenge_id,
+                    type(exc).__name__,
+                    audit_exc,
+                    exc_info=audit_exc,
+                )
+                raise exc from audit_exc
+            raise
 
     try:
         if detail is None:
@@ -581,6 +639,40 @@ async def _approve(
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
+
+
+async def _read_body(request: Request) -> dict[str, Any] | None:
+    """The approval body as a dict, or ``None`` if it is not one.
+
+    FOUR SHAPES COLLAPSE TO ``None``, and each was a 500 with no audit row
+    until 2026-09-24:
+
+    - bytes that are not JSON (``json.JSONDecodeError``, a ``ValueError``);
+    - bytes that are not decodable as UTF-8 (``UnicodeDecodeError``, which is
+      a ``ValueError`` too but is named anyway, because the pairing is the one
+      ``services/api/asgi/header_validation.py::_parse`` writes and a reader
+      comparing them should not have to work out that one implies the other);
+    - JSON nested past the interpreter's recursion limit. ``json.loads``
+      raises ``RecursionError`` there, which is a ``RuntimeError`` subclass
+      and therefore NOT caught by ``except (ValueError, UnicodeDecodeError)``
+      -- the same gap the read path's ``_parse`` carries. Measured: 200,000
+      nested arrays, well inside ``ConfirmSettings.max_body_bytes``, raised it;
+    - well-formed JSON that is not an object. ``[1,2,3]`` parsed fine and then
+      raised ``AttributeError`` on the first ``body.get``, which is why the
+      ``isinstance`` below is part of this function and not a separate check:
+      the caller's contract is "a dict or ``None``", so nothing downstream has
+      to ask a second time.
+
+    ``request.json()`` is left to buffer the body because
+    ``services/confirm/body_limit.py`` has already bounded what it can buffer.
+    Without that middleware this function would be reading an unbounded body
+    into memory in order to refuse it.
+    """
+    try:
+        parsed = await request.json()
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 async def _refused_transition_response(

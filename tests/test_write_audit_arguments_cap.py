@@ -143,7 +143,33 @@ def pg_url() -> Generator[str]:
 
 @pytest.fixture()
 def settings(pg_url: str) -> ConfirmSettings:
-    return ConfirmSettings(backend_base_url="https://backend.test", database_url=pg_url)
+    """THE ONE LINE THIS FILE CHANGED WHEN THE BODY LIMIT LANDED, and it is
+    the fixture rather than any assertion.
+
+    ``services/confirm/body_limit.py`` arrived on 2026-09-24 with a 65,536-byte
+    default, and ``ONE_MIB`` below is 1,075,622 bytes on the wire. Four cases
+    here -- the 404, the 409, the successful pair and the thousand refusals --
+    would otherwise get a 413 from a middleware instead of reaching the column
+    this file is about, and the file's subject is ``audit_log.arguments``, not
+    the body limit in front of it. So the limit is configured out of the way
+    and every assertion is untouched.
+
+    THIS IS NOT THE BOUND BEING WEAKENED. The two controls are independent and
+    both still fire in production: 65,536 is eight times
+    ``MAX_ARGUMENTS_BYTES``, so a body at the real limit still overflows this
+    column and still gets clipped and marked -- which
+    ``tests/test_confirm_body_limit.py::test_the_limit_leaves_the_audit_column_bound_reachable``
+    asserts rather than assumes. What the 1 MiB fixture buys is headroom: it
+    proves the column holds against a payload an order of magnitude past
+    anything the front door now admits, so raising
+    ``POSTERN_CONFIRM_MAX_BODY_BYTES`` cannot quietly outrun the column's own
+    bound.
+    """
+    return ConfirmSettings(
+        backend_base_url="https://backend.test",
+        database_url=pg_url,
+        max_body_bytes=2 * len(ONE_MIB),
+    )
 
 
 @pytest.fixture()

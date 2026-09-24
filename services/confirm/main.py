@@ -32,6 +32,11 @@ requirement an operator owns. Until 2026-09-22 this app was built as
 ``Starlette(routes=routes)`` with no ``middleware=`` argument at all and
 authenticated nobody on any route.
 
+In front of that sits ``services/confirm/body_limit.py``, which bounds what
+any route -- authenticated or public -- will read into memory. Until
+2026-09-24 nothing did: ``POST /device_authorization`` read 9,999,989 bytes
+and answered 200 with no credential presented at all.
+
 The device authorization endpoints are:
 - ``POST /device_authorization`` — Generate device code + QR pairing data.
 - ``POST /token`` with ``grant_type=device_code`` — Exchange device code for
@@ -57,6 +62,7 @@ from starlette.middleware import Middleware
 from starlette.routing import Route
 
 from services.confirm.auth import AppAssertionMiddleware, AssertionVerifier
+from services.confirm.body_limit import BodySizeLimit
 from services.confirm.callback import callback_routes
 from services.confirm.device_auth import device_auth_routes
 from services.confirm.jwks import jwks_route
@@ -200,7 +206,32 @@ def create_confirm_app(
 
     app = Starlette(
         routes=routes,
-        middleware=[Middleware(AppAssertionMiddleware, verifier=verifier)],
+        middleware=[
+            # FIRST, AND THAT MEANS OUTERMOST. Starlette builds the stack in
+            # reverse (`starlette/applications.py::build_middleware_stack`),
+            # so entry zero is the last one applied and therefore the first
+            # one a request reaches -- the same reason
+            # `services/api/main.py` lists `RequestDeadline` before
+            # `HeaderBodyValidation`.
+            #
+            # In front of the assertion check on purpose: behind it, the body
+            # would already be buffered by the time the signature was
+            # verified, which is the cost this bound exists to avoid. In front
+            # of it, an oversized body is refused before a JWKS fetch and
+            # before a signature verification.
+            #
+            # This does NOT move the authentication boundary.
+            # `AppAssertionMiddleware`'s docstring claims its placement means
+            # "an unauthenticated request never reaches a handler, never opens
+            # a database session and never touches the device code store", and
+            # all three still hold: `BodySizeLimit` holds an int and a
+            # `Receive`, reaches no store, no database and no handler, and can
+            # only answer 413 or pass the request through to the middleware
+            # below. `services/confirm/body_limit.py` carries the rest,
+            # including why a request it refuses writes no `audit_log` row.
+            Middleware(BodySizeLimit, max_body_bytes=settings.max_body_bytes),
+            Middleware(AppAssertionMiddleware, verifier=verifier),
+        ],
     )
     # Expose key sources on ``app.state`` for external consumers.
     app.state.postern_write_key_source = write_key_source
