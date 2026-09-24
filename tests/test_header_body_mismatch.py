@@ -589,3 +589,386 @@ async def test_duplicate_header_detected_regardless_of_name_casing() -> None:
     assert _status(sent) == 400
     assert _json(sent)["error"]["code"] == -32020
     assert seen == []
+
+
+# --- The drain, and the two defects the write path fixed first ------------
+#
+# `0743101` closed both of these on `services/confirm/body_limit.py`. This
+# section is the read path's half. The two middlewares are not the same
+# control -- this one owes an HTTP 400 with JSON-RPC -32020 on a header/body
+# mismatch and that one owes nothing of the sort -- so what is ported is the
+# accumulator shape and the exception tuple, not the module.
+
+
+class _Counted:
+    """A `receive` handing `body` over `chunk` bytes at a time, counting what
+    the application actually pulled.
+
+    That count is what every claim below is about and it is the one number a
+    client cannot observe: an HTTP client hands the whole body to a transport
+    and the transport decides what to deliver. So these drive raw ASGI.
+    """
+
+    def __init__(self, body: bytes, chunk: int = 1 << 16) -> None:
+        self.body = body
+        self.chunk = chunk
+        self.taken = 0
+        self.calls = 0
+        self._pos = 0
+        self._done = False
+
+    async def __call__(self) -> Message:
+        self.calls += 1
+        if self._done:
+            return {"type": "http.disconnect"}
+        end = min(self._pos + self.chunk, len(self.body))
+        piece = self.body[self._pos : end]
+        self._pos = end
+        self.taken += len(piece)
+        more = self._pos < len(self.body)
+        if not more:
+            self._done = True
+        return {"type": "http.request", "body": piece, "more_body": more}
+
+
+async def _drive(
+    app: ASGIApp, headers: dict[str, str], receive: _Counted
+) -> tuple[list[Message], _Counted]:
+    scope: Scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "server": ("test", 80),
+        "client": ("test", 1234),
+        "state": {},
+    }
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return sent, receive
+
+
+def test_the_drain_accumulates_into_a_list_and_never_with_bytes_concatenation() -> None:
+    """Defect 1, pinned structurally.
+
+    `_drain` accumulated with `body += chunk`, which reallocates and copies
+    the whole accumulated body once per chunk: O(n^2) in the chunk count, and
+    one `http.request` message per byte is a shape the caller picks. Measured
+    head to head on 2026-09-24, both unbounded so the accumulator was the only
+    difference -- 262,144 B: 0.494s vs 0.037s; 524,288 B: 1.736s vs 0.076s;
+    1,048,576 B: 7.421s vs 0.152s; 2,097,152 B: 29.086s vs 0.308s. Through the
+    real assembled app at the 1,048,576-byte default cap, one byte per
+    message: 7.581s before, 0.237s after.
+
+    A timing assertion would police the machine rather than the code, so what
+    is checked is the shape, exactly as
+    `tests/test_confirm_body_limit.py::test_the_drain_accumulates_into_a_list_and_never_with_bytes_concatenation`
+    checks it for the write path: the only augmented assignment in `_drain` is
+    the integer counter, and the bytes are joined exactly once.
+    """
+    import ast
+    import inspect
+
+    from services.api.asgi.header_validation import _drain
+
+    tree = ast.parse(inspect.getsource(_drain))
+
+    augmented = {
+        node.target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name)
+    }
+    assert augmented == {"total"}, f"only the integer counter may use +=, found {augmented}"
+
+    appends = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+    ]
+    joins = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+    ]
+    assert len(appends) == 1, "the chunks go into a list, one append per chunk"
+    assert len(joins) == 1, "and are joined exactly once, at the end"
+
+
+async def test_the_drain_is_linear_in_the_number_of_chunks() -> None:
+    """The behavioural half of the assertion above, and it catches shapes the
+    AST guard cannot -- `chunks.append(b"".join(chunks) + chunk)` uses a list,
+    one append and one join, and is still quadratic.
+
+    The sizes and the bound are chosen so this can actually fail, which cost a
+    measurement. A quadratic accumulator costs 4x per doubling and a linear
+    one 2x, so 8x the bytes at one byte per message separates them by 8x in
+    theory. Measured both shapes head to head on 2026-09-24 at 32,768 then
+    262,144 bytes: quadratic 0.0105s then 0.5394s, a growth of 51.3x; linear
+    0.0051s then 0.0416s, a growth of 8.2x. The bound asserted is 25x, which
+    leaves 3x of headroom over the linear measurement and stays 2x under the
+    quadratic one.
+
+    The obvious 4x-the-bytes version of this test does NOT discriminate:
+    quadratic grows 17.2x there, under the 40x bound
+    `tests/test_confirm_body_limit.py::test_the_drain_is_linear_in_the_number_of_chunks`
+    asserts, so that test passes against a reintroduced `body += chunk`. Only
+    the AST guard catches it on the write path.
+    """
+    import resource
+
+    from services.api.asgi.header_validation import _drain
+
+    def cpu() -> float:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return usage.ru_utime + usage.ru_stime
+
+    timings: list[float] = []
+    for size in (32_768, 262_144):
+        started = cpu()
+        await _drain(_Counted(b"x" * size, 1), size + 1)
+        timings.append(cpu() - started)
+
+    growth = timings[1] / max(timings[0], 1e-6)
+    assert growth < 25.0, f"8x the chunks cost {growth:.1f}x the time"
+
+
+async def test_the_drain_stops_at_the_cap_instead_of_reading_the_whole_body() -> None:
+    """The anti-amplification half of `max_body_bytes`, measured in bytes
+    pulled rather than in the status code.
+
+    `test_body_exceeding_configured_cap_is_rejected_with_413_and_stops_buffering`
+    above delivers its body in one message, so the `stops_buffering` in its
+    name is not actually observable there. Here the body arrives one byte at a
+    time, so what the drain refused to read is countable: it costs the cap
+    plus the one byte that crossed it, not the 8 KiB offered.
+    """
+    seen: list[bytes] = []
+    app = HeaderBodyValidation(_downstream(seen), max_body_bytes=1024)
+    sent, receive = await _drive(app, {}, _Counted(b"x" * 8192, 1))
+    assert _status(sent) == 413
+    assert seen == []
+    assert receive.taken == 1025, f"pulled {receive.taken:,} bytes for a cap of 1,024"
+
+
+async def test_the_cap_boundary_is_exact() -> None:
+    """A body of exactly `max_body_bytes` is allowed; one byte more is not."""
+    for size, expected in ((63, 200), (64, 200), (65, 413)):
+        seen: list[bytes] = []
+        app = HeaderBodyValidation(_downstream(seen), max_body_bytes=64)
+        sent, _ = await _drive(app, {}, _Counted(b"x" * size, 1))
+        assert _status(sent) == expected, f"{size} bytes against a cap of 64"
+        assert seen == ([b"x" * size] if expected == 200 else [])
+
+
+DEEP = b"[" * 200_000
+
+
+async def test_a_deeply_nested_body_does_not_escape_the_middleware() -> None:
+    """Defect 2.
+
+    `json.loads` raises `RecursionError` on a deeply nested body, and that is
+    a `RuntimeError` subclass, so `except (ValueError, UnicodeDecodeError)`
+    missed it and it left this middleware as an exception. Measured against
+    the real assembled app on 2026-09-24: 200,000 bytes -- under the
+    1,048,576-byte cap, and one `b"["` per level -- produced
+    `500 Internal Server Error` and a logged traceback out of Starlette's
+    `ServerErrorMiddleware`, which wraps `user_middleware` and is therefore
+    outside this control. `services/confirm/callback.py` had the same escape
+    and `0743101` closed it.
+
+    What it produces instead is what `_parse`'s docstring argues for at
+    length: nothing. It is a body this middleware cannot cross-check, so it
+    goes downstream exactly as `b"not json"` and a top-level array already do
+    (finding 7 of dev-docs/decisions/0002-header-validation.md), and the test
+    below pins the part that makes that safe.
+    """
+    seen: list[bytes] = []
+    app = HeaderBodyValidation(_downstream(seen))
+    sent = await _call(app, {"Mcp-Method": "tools/call", "Mcp-Name": "accounts.list"}, DEEP)
+    assert _status(sent) == 200
+    assert seen == [DEEP]
+
+
+async def test_a_deeply_nested_body_behaves_identically_under_strict_headers() -> None:
+    """`strict` does not reach this body, in either direction.
+
+    `_check` returns at `payload is None` before either `if self.strict`
+    branch, so an unparseable body is passed through whether or not strict
+    mode is on -- which is true of `b"not json"` today and stays true of a
+    deeply nested one. Recorded because the two fixes in this commit had to be
+    checked against the flag, not because the flag should change: it defaults
+    to `False` in `services/api/settings.py` and `docker-compose.yml` ships
+    `"0"`, so a fix that only held under `strict=True` would not hold in the
+    configuration that actually ships.
+    """
+    seen: list[bytes] = []
+    app = HeaderBodyValidation(_downstream(seen), strict=True)
+    sent = await _call(app, {}, DEEP)
+    assert _status(sent) == 200
+    assert seen == [DEEP]
+
+
+async def test_a_deeply_nested_body_is_refused_by_the_mcp_layer_with_32700() -> None:
+    """The fact that makes passing it through safe, pinned rather than
+    trusted.
+
+    `_parse` returns `None` on the measured fact that the layer below gives up
+    at the same depth it does, so nothing it declines can go on to execute.
+    That is a fact about a parser in another package, so it is checked here
+    against the real stack rather than assumed -- and at the BOUNDARY, since
+    the boundary is the only place a divergence could appear. The depth is
+    searched for rather than written down: on CPython 3.12.13 the `_json` C
+    scanner stops at 9,997 nested arrays, but that is an interpreter constant
+    this test has no business hardcoding.
+
+    If a future parser downstream ever accepts what this one rejects, the body
+    runs with the header/body cross-check silently skipped, and this fails.
+
+    `raise_app_exceptions` is left at its default `True`, so a `RecursionError`
+    escaping the middleware again propagates here and fails the test loudly
+    rather than arriving as a quiet 500.
+    """
+    import httpx2
+    from starlette.middleware import Middleware
+
+    from services.api.asgi.header_validation import _parse
+    from services.api.server import build_server
+    from services.api.settings import Settings
+    from tests.conftest import TEST_CUSTOMER
+
+    def body_at(depth: int) -> bytes:
+        nested = "[" * depth + "]" * depth
+        return (
+            '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+            '{"name":"accounts.list","arguments":{"x":' + nested + "},"
+            '"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",'
+            '"io.modelcontextprotocol/clientCapabilities":{}}}}'
+        ).encode()
+
+    # The shallowest body `_parse` declines: binary search over a range wide
+    # enough that hitting its top would mean the ceiling moved, which the
+    # assertion below reports rather than silently passing.
+    low, high = 1, 100_000
+    assert _parse(body_at(low)) is not None, "the search must start from a body that parses"
+    assert _parse(body_at(high)) is None, f"_parse still reads {high:,} levels; widen the search"
+    while low < high - 1:
+        middle = (low + high) // 2
+        if _parse(body_at(middle)) is None:
+            high = middle
+        else:
+            low = middle
+    boundary = body_at(high)
+
+    settings = Settings.for_testing()
+    assert len(boundary) < settings.max_body_bytes, "this must be about defect 2, not the cap"
+    assert len(DEEP) < settings.max_body_bytes, "and so must the gross case above"
+
+    server = build_server(settings, resolver=lambda: TEST_CUSTOMER, backend=None)
+    app = server.http_app(
+        path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        middleware=[
+            Middleware(
+                HeaderBodyValidation,
+                strict=settings.strict_headers,
+                max_body_bytes=settings.max_body_bytes,
+            )
+        ],
+    )
+
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with app.router.lifespan_context(app):
+            answers = []
+            for content in (boundary, DEEP):
+                response = await client.post(
+                    "/mcp",
+                    headers={
+                        "Mcp-Method": "tools/call",
+                        "Mcp-Name": "accounts.list",
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json",
+                        "MCP-Protocol-Version": "2026-07-28",
+                    },
+                    content=content,
+                )
+                answers.append((response.status_code, response.json()))
+
+    for status, payload in answers:
+        assert status == 400, payload
+        assert payload["error"]["code"] == -32700, payload
+
+
+async def test_a_chunked_matching_request_is_replayed_in_a_shape_the_dispatcher_reads() -> None:
+    """The replay is the read path's obligation that the write path's limiter
+    shares, and the only way to know the shape is right is to make the real
+    dispatcher read it.
+
+    The body arrives one byte per `http.request` message -- 60 messages for a
+    60-byte `tools/list` -- and `_replay` hands it downstream as ONE message.
+    FastMCP's dispatcher parses the reassembled bytes and answers about their
+    CONTENTS, echoing the id it found in them, which is what proves the
+    reassembly and not merely that a 200 came back.
+    """
+    from starlette.middleware import Middleware
+
+    from services.api.server import build_server
+    from services.api.settings import Settings
+    from tests.conftest import TEST_CUSTOMER
+
+    settings = Settings.for_testing()
+    server = build_server(settings, resolver=lambda: TEST_CUSTOMER, backend=None)
+    app = server.http_app(
+        path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        middleware=[
+            Middleware(
+                HeaderBodyValidation,
+                strict=settings.strict_headers,
+                max_body_bytes=settings.max_body_bytes,
+            )
+        ],
+    )
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }
+            },
+        }
+    ).encode()
+    headers = {
+        "Mcp-Method": "tools/list",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "MCP-Protocol-Version": "2026-07-28",
+    }
+    receive = _Counted(body, 1)
+    async with app.router.lifespan_context(app):
+        sent, _ = await _drive(app, headers, receive)
+
+    assert receive.calls >= len(body), "the body must actually arrive one byte at a time"
+    assert _status(sent) == 200
+    answer = _json(sent)
+    assert answer["id"] == 41, answer
+    assert "result" in answer, answer
