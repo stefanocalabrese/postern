@@ -79,6 +79,7 @@ from datetime import UTC, datetime
 from postern_core.auth.device_codes import (
     DeviceCode,
     DeviceCodeStoreBase,
+    DeviceCodeStoreFull,
     create_device_code_store,
 )
 from postern_core.auth.internal_jwt import InternalTokenMinter
@@ -116,6 +117,43 @@ def _error(status: int, code: str, description: str) -> JSONResponse:
     )
 
 
+def _store_full_response(retry_after: int) -> JSONResponse:
+    """The 503 ``POST /device_authorization`` answers when the store is full.
+
+    THE SAME SHAPE AND THE SAME ARGUMENT AS
+    `services/confirm/revocation.py`'s ``store_unavailable_response``, which
+    already chose ``temporarily_unavailable`` with a 503 for the one other
+    condition on this path that is neither the caller's fault nor terminal.
+    RFC 6749 §4.1.2.1 vocabulary rather than a §5.2 token-endpoint code,
+    stated rather than glossed: no §5.2 code means "come back", and inventing
+    a private one would be worse. The browser here holds no credential, has
+    done nothing wrong, and the honest signal for it is one it can retry.
+
+    ``Retry-After`` carries the device code lifetime, because that is the
+    interval after which capacity is guaranteed to have been released: the
+    oldest code in a full store expires within one TTL, and
+    ``create_device_code`` sweeps before it refuses.
+
+    NOT ``access_denied`` and NOT a 429. ``access_denied`` is terminal and
+    would end every pairing attempt during a capacity event, dressing an
+    availability failure as a security decision. A 429 would say the CALLER
+    sent too many, which is false for the customer who arrives during someone
+    else's flood -- and it is `services/confirm/rate_limit.py`'s code, kept
+    distinct so an operator reading logs can tell "this caller is being
+    limited" from "the service is full".
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "temporarily_unavailable",
+            "error_description": (
+                "the service cannot start a new device pairing right now; retry shortly"
+            ),
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Device authorization endpoint — POST /device_authorization.
 # ---------------------------------------------------------------------------
@@ -138,31 +176,91 @@ async def device_authorization(request: Request) -> JSONResponse:
 
     RFC 8628 §3.1 — the device_code is 40+ chars, user_code is 6+ chars
     of uppercase alphanumeric (no ambiguous characters).
+
+    Response (503): the device code store is at its cap. See
+    ``_store_full_response``.
+
+    WHAT THIS HANDLER STORES FROM AN UNAUTHENTICATED BODY, and why both
+    fields are now checked. ``client_id`` and ``scopes`` are copied verbatim
+    onto a row kept for the code's whole life, and until 2026-09-24 neither
+    was bounded or even type-checked. That made the per-row cost a caller's
+    choice: 1,633 bytes for a realistic code, 65,560 for one padded to the
+    body limit. `services/confirm/settings.py` carries the measurement and
+    the ceilings.
+
+    The type check is not decoration. ``await request.json()`` hands back
+    whatever JSON contains, so ``{"scopes": [0, 0, ...]}`` put a Python list
+    on a field annotated ``str`` -- and 24,000 bytes of that JSON parse to
+    67,252 bytes of objects, so the byte-counting body limit in front of this
+    service was never a bound on what the store holds. The same ``isinstance``
+    guard, for the same reason, is already in ``approve_callback`` below.
     """
+    settings: ConfirmSettings = request.app.state.settings
+
     # Parse form or JSON body.
+    #
+    # WRAPPED, unlike every version of this handler before 2026-09-24. This
+    # is a public endpoint and ``await request.json()`` sat bare: ``{not
+    # json`` raised ``JSONDecodeError`` and a JSON array raised
+    # ``AttributeError`` from ``.get`` on a list, both 500s from an endpoint
+    # that owes a 400. The identical defect was fixed one file over in
+    # `services/confirm/callback.py`; leaving this one because it is
+    # technically a different function is how the write path ended up with
+    # three copies of ``_scrub``.
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _error(400, "invalid_request", "body must be JSON")
+        if not isinstance(body, dict):
+            return _error(400, "invalid_request", "body must be a JSON object")
     else:
         form = await request.form()
         body = dict(form)
 
-    client_id: str = body.get("client_id", "")
+    client_id = body.get("client_id", "")
+    scopes = body.get("scopes", "accounts:read transactions:read cards:read")
+
+    if not isinstance(client_id, str) or not isinstance(scopes, str):
+        return _error(400, "invalid_request", "client_id and scopes must be strings")
+
     if not client_id:
         return _error(400, "invalid_request", "client_id is required")
 
-    scopes: str = body.get("scopes", "accounts:read transactions:read cards:read")
+    # REJECTED, never truncated. Truncating would silently store a different
+    # ``client_id`` than the caller sent and a different scope set than the
+    # caller asked for, and both are values a later control could key on.
+    # ``invalid_scope`` is RFC 6749 §5.2 vocabulary for the scope half.
+    if len(client_id) > settings.max_client_id_length:
+        return _error(
+            400,
+            "invalid_request",
+            f"client_id exceeds {settings.max_client_id_length} characters",
+        )
+    if len(scopes) > settings.max_scopes_length:
+        return _error(
+            400,
+            "invalid_scope",
+            f"scopes exceeds {settings.max_scopes_length} characters",
+        )
 
     store: DeviceCodeStoreBase = request.app.state.device_code_store
-    settings: ConfirmSettings = request.app.state.settings
 
-    code: DeviceCode = await store.create_device_code(
-        client_id=client_id,
-        scopes=scopes,
-        verification_uri=settings.device_verification_uri,
-        expires_in=settings.device_code_ttl_seconds,
-        interval=settings.device_poll_interval_seconds,
-    )
+    try:
+        code: DeviceCode = await store.create_device_code(
+            client_id=client_id,
+            scopes=scopes,
+            verification_uri=settings.device_verification_uri,
+            expires_in=settings.device_code_ttl_seconds,
+            interval=settings.device_poll_interval_seconds,
+        )
+    except DeviceCodeStoreFull as exc:
+        logger.warning(
+            "device authorization refused: the device code store holds %d codes, its cap",
+            exc.held,
+        )
+        return _store_full_response(settings.device_code_ttl_seconds)
 
     return JSONResponse(
         status_code=200,

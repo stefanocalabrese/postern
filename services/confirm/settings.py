@@ -134,6 +134,44 @@ class ConfirmSettings:
     # body here. An operator who needs this one wider must say so separately,
     # with `POSTERN_CONFIRM_MAX_BODY_BYTES`.
     max_body_bytes: int = 65_536
+    # How many proxies in front of this service append to ``X-Forwarded-For``.
+    # `services/confirm/rate_limit.py` keys its counters on the address this
+    # selects, and `postern_core.net`'s `client_ip` holds what the number
+    # means and why the default of zero trusts the header for nothing.
+    #
+    # A DELIBERATELY SEPARATE VARIABLE FROM `services/api`'s
+    # ``POSTERN_TRUSTED_PROXY_HOPS``, for the reason
+    # ``POSTERN_CONFIRM_MAX_BODY_BYTES`` above is separate: these are two
+    # deployables that this repository's ``docker-compose.yml`` happens to
+    # run from one file, and nothing guarantees they sit behind the same
+    # number of proxies. `.importlinter` forbids this module from reading the
+    # other service's settings to find out, so an operator sets each.
+    trusted_proxy_hops: int = 0
+    # The ceiling on how many device codes the store will hold, enforced by
+    # `postern_core.auth.device_codes`. Its ``DEFAULT_MAX_DEVICE_CODES``
+    # carries the measurement and the derivation of the number.
+    max_device_codes: int = 10_000
+    # Ceilings on the two fields ``POST /device_authorization`` copies out of
+    # an unauthenticated request body and stores for the code's whole life.
+    #
+    # THESE ARE WHAT MAKE THE STORE CAP MEAN A NUMBER OF BYTES. A cap counts
+    # entries, so without a bound on what one entry can cost it bounds
+    # nothing: measured on 2026-09-24, a device code holding a realistic
+    # ``scopes`` string costs 1,633 bytes and one padded to the 64 KiB body
+    # limit costs 65,560, so 40x of the standing cost was one caller-supplied
+    # string. `services/confirm/body_limit.py` does not bound it either --
+    # it counts wire bytes, and 24,000 bytes of JSON list parse to 67,252
+    # bytes of Python objects, so the body limit is not a bound on what the
+    # store holds at all.
+    #
+    # 512 and 256 characters. The default scope string this service issues is
+    # 41 characters ("accounts:read transactions:read cards:read"), and the
+    # four domains the architecture names could not plausibly exceed 200;
+    # OAuth client identifiers are UUIDs or short labels. Both are ~12x the
+    # largest legitimate value, which is the same shape of margin
+    # ``max_body_bytes`` was chosen with.
+    max_scopes_length: int = 512
+    max_client_id_length: int = 256
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -178,6 +216,10 @@ class ConfirmSettings:
             max_body_bytes=int(
                 os.environ.get("POSTERN_CONFIRM_MAX_BODY_BYTES", str(65_536)),
             ),
+            trusted_proxy_hops=int(os.environ.get("POSTERN_CONFIRM_TRUSTED_PROXY_HOPS", "0")),
+            max_device_codes=int(os.environ.get("POSTERN_MAX_DEVICE_CODES", str(10_000))),
+            max_scopes_length=int(os.environ.get("POSTERN_MAX_SCOPES_LENGTH", str(512))),
+            max_client_id_length=int(os.environ.get("POSTERN_MAX_CLIENT_ID_LENGTH", str(256))),
         )
 
     @classmethod

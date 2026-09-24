@@ -78,6 +78,7 @@ from services.confirm.callback import callback_routes
 from services.confirm.device_auth import device_auth_routes
 from services.confirm.jwks import jwks_route
 from services.confirm.minter import build_write_minter
+from services.confirm.rate_limit import RateLimit
 from services.confirm.settings import ConfirmSettings
 
 
@@ -235,7 +236,14 @@ def create_confirm_app(
     read_minter = InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
 
     # --- Device code store ---
-    device_code_store = create_device_code_store()
+    #
+    # The cap is passed in rather than read from the environment inside the
+    # factory, so this service's settings stay the one place its
+    # configuration is read. `postern_core.auth.device_codes`'s
+    # ``DEFAULT_MAX_DEVICE_CODES`` holds the measurement behind the number
+    # and ``DeviceCodeStoreFull`` holds why a full store refuses rather than
+    # evicting.
+    device_code_store = create_device_code_store(max_codes=settings.max_device_codes)
 
     # --- ZT-7 revocation (shared with every `services/api` replica) ---
     #
@@ -273,12 +281,31 @@ def create_confirm_app(
     app = Starlette(
         routes=routes,
         middleware=[
-            # FIRST, AND THAT MEANS OUTERMOST. Starlette builds the stack in
-            # reverse (`starlette/applications.py::build_middleware_stack`),
+            # AHEAD OF THE BODY LIMIT, AND THEREFORE AHEAD OF EVERYTHING.
+            # A request this refuses must not first be drained: behind
+            # `BodySizeLimit` every refusal would still cost a 64 KiB buffer,
+            # which is the resource a flood is trying to spend. It answers
+            # without ever calling ``receive``.
+            #
+            # It bounds the ARRIVAL RATE. The cap on what the device code
+            # store will hold bounds the STANDING COST, and is passed to the
+            # store above. `services/confirm/rate_limit.py` opens by saying
+            # why neither substitutes for the other, and says plainly what
+            # the pair does not achieve: they turn unbounded memory growth
+            # into a bounded-memory denial of service, and stopping a
+            # distributed flood before it arrives needs infrastructure that
+            # is not in this repository.
+            Middleware(
+                RateLimit,
+                trusted_proxy_hops=settings.trusted_proxy_hops,
+            ),
+            # SECOND, AND STILL AHEAD OF AUTHENTICATION. Starlette builds the
+            # stack in reverse (`starlette/applications.py::build_middleware_stack`),
             # so entry zero is the last one applied and therefore the first
             # one a request reaches -- the same reason
             # `services/api/main.py` lists `RequestDeadline` before
-            # `HeaderBodyValidation`.
+            # `HeaderBodyValidation`. This was entry zero until the rate
+            # limit landed above it on 2026-09-24.
             #
             # In front of the assertion check on purpose: behind it, the body
             # would already be buffered by the time the signature was

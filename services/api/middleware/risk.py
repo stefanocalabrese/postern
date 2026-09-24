@@ -37,7 +37,6 @@ Wiring: ``server.add_middleware(RiskMiddleware(store, resolver, ...))`` in
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 
 from fastmcp.server.dependencies import get_access_token, get_http_request
@@ -45,6 +44,7 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
 from postern_core.identity import CustomerResolver
+from postern_core.net import client_ip
 from postern_core.risk.context import RiskContext
 from postern_core.risk.engine import RiskConfig, RiskEngine
 from postern_core.risk.ip_anomaly import IpAnomalyConfig, IpAnomalyDetector
@@ -202,25 +202,25 @@ class RiskMiddleware(Middleware):
         The second: it took the LEFTMOST ``X-Forwarded-For`` element, which
         is the one the client writes. An attacker could pin their apparent
         address to defeat the diversity and impossible-travel checks outright,
-        or rotate it to spend the budget at will. The rightmost entries are
-        the ones infrastructure appended, so with ``trusted_proxy_hops = n``
-        the address is the n-th from the right -- the value written by the
-        outermost proxy this deployment trusts. A header shorter than ``n``
-        entries is not the shape this deployment expects and is discarded
-        rather than read at whatever offset it happens to have.
+        or rotate it to spend the budget at will.
 
-        The DEFAULT IS ZERO: trust the header for nothing and use the socket
-        peer. A deployment behind an ALB, an Istio gateway or any other proxy
-        MUST set ``POSTERN_TRUSTED_PROXY_HOPS`` to the number of hops that
-        append, or every call will be attributed to the proxy. The opposite
-        default would mean a deployment with no proxy in front of it trusting
-        a header the caller writes, which is the defect being fixed.
+        THAT SECOND FIX NO LONGER LIVES HERE. `postern_core.net`'s
+        `client_ip` holds it, and this method is the adapter that hands it
+        what a fastmcp request carries: the header value and the socket peer.
+        The move is not a tidy-up. `services/confirm/rate_limit.py` needs the
+        same derivation on a public endpoint, `.importlinter` forbids it from
+        importing this module, and the alternative was a second copy of a
+        hop-counted address derivation -- which is the shape
+        `services/api/middleware/audit.py` records going wrong once already,
+        when three copies of ``_scrub`` existed and the weakest of them sat on
+        the money path. The reasoning for every branch, including why the
+        default of zero hops trusts the header for nothing and why
+        ``POSTERN_TRUSTED_PROXY_HOPS`` must be set behind any proxy, moved
+        with the code.
 
-        ``ipaddress.ip_address`` both validates and canonicalises, so
-        ``::FFFF:1.2.3.4`` and ``::ffff:1.2.3.4`` cannot count as two
-        addresses against the diversity budget. Anything it refuses is
-        dropped -- the call proceeds, with one fewer IP recorded, rather than
-        with a garbage one that would make every later comparison lie.
+        What stays here is the one thing that is this service's and not the
+        shared function's: a call arriving over the in-process client
+        transport has no HTTP request at all.
         """
         try:
             request = get_http_request()
@@ -229,31 +229,12 @@ class RiskMiddleware(Middleware):
             # record, and nothing about that is an error.
             return None
 
-        if self.trusted_proxy_hops > 0:
-            forwarded = request.headers.get("x-forwarded-for")
-            if not forwarded:
-                return None
-            parts = [part.strip() for part in forwarded.split(",") if part.strip()]
-            if len(parts) < self.trusted_proxy_hops:
-                logger.warning(
-                    "X-Forwarded-For carries %d entries, fewer than the %d trusted hops "
-                    "configured; recording no client IP for this call",
-                    len(parts),
-                    self.trusted_proxy_hops,
-                )
-                return None
-            candidate = parts[-self.trusted_proxy_hops]
-        else:
-            peer = request.client
-            if peer is None:
-                return None
-            candidate = peer.host
-
-        try:
-            return str(ipaddress.ip_address(candidate))
-        except ValueError:
-            logger.warning("discarding unparseable client address for this call")
-            return None
+        peer = request.client
+        return client_ip(
+            forwarded=request.headers.get("x-forwarded-for"),
+            peer_host=None if peer is None else peer.host,
+            trusted_proxy_hops=self.trusted_proxy_hops,
+        )
 
     # --- Evaluation ---------------------------------------------------------
 

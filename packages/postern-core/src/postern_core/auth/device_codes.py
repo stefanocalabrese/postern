@@ -57,6 +57,7 @@ backend; without it, the in-memory store is used.
 from __future__ import annotations
 
 import dataclasses
+import heapq
 import json as _json
 import os
 import secrets
@@ -67,6 +68,58 @@ from datetime import UTC as _UTC
 from typing import Any
 
 logger = __import__("logging").getLogger(__name__)
+
+#: How many device codes a store will hold before it refuses to create more.
+#:
+#: WHY A CAP EXISTS AT ALL. ``POST /device_authorization`` is public by RFC
+#: 8628's own premise -- the browser starting a pairing holds no credential --
+#: and every call stores a row. Measured against ``create_confirm_app`` over
+#: raw ASGI on 2026-09-24, before this cap: 2,000 unauthenticated calls, each
+#: with a body under the 64 KiB limit `services/confirm/body_limit.py`
+#: enforces, left 2,000 device codes costing 128,990,755 bytes, an RSS delta
+#: of 131,252,224 bytes, and 64,495 bytes per code. Extrapolated to a million
+#: calls that is 64.5 GB. A rate limit bounds the ARRIVAL RATE and does not
+#: bound that; this bounds the STANDING COST. Neither substitutes for the
+#: other, and `services/confirm/rate_limit.py` holds the other half.
+#:
+#: WHY 10,000. The number is derived from what a code costs once
+#: `services/confirm/device_auth.py` bounds the two caller-supplied fields:
+#: a realistic code measures 1,633 bytes and one with both fields at their
+#: new ceilings measures 2,336, so 10,000 codes is 16 to 23 MB. Against
+#: legitimate demand it is generous: a code lives 900 seconds, so 10,000
+#: concurrent codes is a deployment starting a device pairing every 90
+#: milliseconds, sustained, across every replica sharing one Redis.
+DEFAULT_MAX_DEVICE_CODES = 10_000
+
+
+class DeviceCodeStoreFull(RuntimeError):
+    """Raised by ``create_device_code`` when the store is at its cap.
+
+    REFUSING IS THE DECISION, and the alternative was evicting the oldest
+    code. `services/confirm/device_auth.py::approve_callback` already faced
+    the same trade and recorded the answer: it accepted leaking "this code is
+    approved" rather than let a caller "burn the attempt budget ... and
+    REVOKE it, denying the legitimate user the token they are already waiting
+    on", because "only one of them destroys a session in flight".
+
+    Eviction is that same destruction, aimed by age. It preferentially kills
+    the OLDEST pending pairing, which is the customer who has already
+    completed identity verification on their phone and is waiting for the
+    browser's next poll. They would see the browser hang and fail with no
+    explanation, and would have to repeat the verification. Refusal instead
+    falls on whoever tries to START a pairing while the store is full, is
+    loud, is symmetric between attacker and customer, leaves every in-flight
+    pairing untouched, and heals by itself as codes age out.
+
+    So the cost of this choice, stated plainly: a caller who can fill the
+    store can stop new pairings. That is a denial of service, and it is the
+    bounded-memory one that this cap trades the unbounded-memory one for.
+    """
+
+    def __init__(self, held: int, cap: int) -> None:
+        super().__init__(f"device code store holds {held} codes, at its cap of {cap}")
+        self.held = held
+        self.cap = cap
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +239,15 @@ class DeviceCodeStoreBase(ABC):
         expires_in: int = 900,
         interval: int = 5,
     ) -> DeviceCode:
-        """Create a new device code session and return it."""
+        """Create a new device code session and return it.
+
+        Every backend must first drop what has expired and then refuse with
+        `DeviceCodeStoreFull` if it still holds ``max_codes``. Sweeping first
+        is not an optimisation: an expired code is one no caller can use, so
+        refusing a pairing while holding a store full of them would be a
+        denial of service performed on this service's behalf by its own
+        bookkeeping.
+        """
 
     @abstractmethod
     async def get_device_code(self, device_code: str) -> DeviceCode | None:
@@ -236,10 +297,56 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
 
     Methods are ``async def`` so callers can uniformly ``await store.xxx()``
     regardless of which backend the factory returned.
+
+    UNTIL 2026-09-24 THIS STORE NEVER DROPPED ANYTHING. It has no TTL of its
+    own -- the 900-second lifetime described everywhere else in this module is
+    ``SETEX`` on the Redis backend, and was never a property of this one. The
+    only removals were `revoke_device_code`, reached when a ``POST /token``
+    poll happens to find a code expired, or after three wrong pairing codes at
+    ``POST /approve``. So a caller who created codes and never polled leaked
+    them for the life of the process, not for fifteen minutes. Measured: a
+    code created with ``expires_in=1`` still sat in ``_codes`` after it
+    reported ``is_expired`` true.
+
+    ``_expiry`` is the reaper that closes it: a heap of
+    ``(expiry timestamp, device_code)`` swept on create. Lazy deletion, so a
+    code that was revoked or re-indexed leaves a stale heap entry that is
+    discarded when it surfaces -- which is why `_drop_expired` re-reads the
+    dict rather than trusting the heap. The heap is therefore bounded by the
+    codes created in one TTL window rather than by the codes alive now, and
+    that bound is what the rate limit and the cap together make finite.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_codes: int = DEFAULT_MAX_DEVICE_CODES) -> None:
         self._codes: dict[str, DeviceCode] = {}
+        #: Min-heap of ``(expiry timestamp, device_code)``. See `_drop_expired`.
+        self._expiry: list[tuple[float, str]] = []
+        self._max_codes = max_codes
+
+    def _drop_expired(self) -> int:
+        """Remove every code whose expiry has passed, and say how many.
+
+        Pops the heap while its head is due. Three cases per entry, and the
+        dict is the authority in all three: the code is gone already (a stale
+        entry from a revocation, discarded), the code carries a LATER expiry
+        than this entry claims (a stale entry from a re-index, discarded), or
+        it is genuinely due (deleted). Stopping at the first entry that is not
+        yet due is what keeps the common case O(1) instead of O(n) per
+        creation -- an O(n) sweep on a public endpoint would be its own
+        amplification, ~10,000 comparisons per request at the cap.
+        """
+        now = datetime.now(UTC).timestamp()
+        dropped = 0
+        while self._expiry and self._expiry[0][0] <= now:
+            expires_ts, device_code = heapq.heappop(self._expiry)
+            existing = self._codes.get(device_code)
+            if existing is None or existing.expires_at.timestamp() > expires_ts:
+                continue
+            del self._codes[device_code]
+            dropped += 1
+        if dropped:
+            logger.info("device code store: swept %d expired codes", dropped)
+        return dropped
 
     async def create_device_code(
         self,
@@ -250,7 +357,15 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         expires_in: int = 900,
         interval: int = 5,
     ) -> DeviceCode:
-        """Create a new device code session and return it."""
+        """Create a new device code session and return it.
+
+        Raises:
+            DeviceCodeStoreFull: if the store still holds ``max_codes`` after
+                expired codes have been swept.
+        """
+        self._drop_expired()
+        if len(self._codes) >= self._max_codes:
+            raise DeviceCodeStoreFull(len(self._codes), self._max_codes)
         device_code = _generate_device_code()
         user_code = _generate_user_code()
         expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
@@ -264,10 +379,20 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
             scopes=scopes,
         )
         self._codes[device_code] = code
+        heapq.heappush(self._expiry, (expires_at.timestamp(), device_code))
         return code
 
     async def get_device_code(self, device_code: str) -> DeviceCode | None:
-        """Look up a device code by its opaque value, or ``None``."""
+        """Look up a device code by its opaque value, or ``None``.
+
+        Deliberately NOT expiry-filtered, because the callers depend on
+        getting an expired code back: `services/confirm/device_auth.py`'s
+        ``token_endpoint`` reads ``is_expired`` to answer RFC 8628 §3.5's
+        ``expired_token``, and returning ``None`` here would turn that into
+        ``invalid_grant``, which tells a legitimate browser its code was never
+        real rather than that it timed out. The reaper is a bound on memory,
+        not a second authority on what is valid.
+        """
         return self._codes.get(device_code)
 
     async def approve_device_code(self, device_code: str) -> bool:
@@ -340,6 +465,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         url: str | None = None,
         default_ttl: int | None = None,
         key_prefix: str | None = None,
+        max_codes: int = DEFAULT_MAX_DEVICE_CODES,
     ) -> None:
         import redis.asyncio as redis
 
@@ -348,6 +474,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             os.environ.get("POSTERN_REDIS_DEVICE_CODE_TTL", "900")
         )
         self._prefix = key_prefix or os.environ.get("POSTERN_REDIS_KEY_PREFIX", "postern:")
+        self._max_codes = max_codes
         self._redis: Any = redis.from_url(  # type: ignore[no-untyped-call]
             self._url,
             decode_responses=True,
@@ -356,6 +483,28 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
     def _key(self, device_code: str) -> str:
         """Build the Redis key for a device code."""
         return f"{self._prefix}device:{device_code}"
+
+    def _index_key(self) -> str:
+        """The sorted set indexing live device codes by expiry.
+
+        WHY AN INDEX AND NOT A COUNTER. A counter cannot cap a keyspace whose
+        members expire on their own: ``SETEX`` removes the value without
+        decrementing anything, so the counter would drift up and eventually
+        refuse every pairing with an empty store behind it. A sorted set
+        scored by expiry is the standard shape and answers both questions
+        this cap needs -- ``ZREMRANGEBYSCORE`` drops what is due and
+        ``ZCARD`` counts what is left -- which is also why this backend gets
+        a reaper for free rather than leaving expired members to
+        ``maxmemory`` eviction choosing victims at random.
+
+        WHY NOT ``DBSIZE`` OR ``SCAN``. Both count a whole database this
+        service may share with `postern_core.risk.session` and
+        `postern_core.auth.revocation`, which use the same
+        ``POSTERN_REDIS_URL`` by design, so either would cap device codes
+        against other subsystems' keys. ``SCAN`` is also O(keyspace) on a
+        public endpoint.
+        """
+        return f"{self._prefix}device:index"
 
     async def create_device_code(
         self,
@@ -366,7 +515,31 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         expires_in: int | None = None,
         interval: int = 5,
     ) -> DeviceCode:
-        """Create a new device code session and return it."""
+        """Create a new device code session and return it.
+
+        Raises:
+            DeviceCodeStoreFull: if the index still holds ``max_codes`` after
+                due members have been dropped.
+
+        THE CHECK IS NOT ATOMIC WITH THE WRITE, and that is accepted rather
+        than overlooked. Two replicas can both read a count under the cap and
+        both add, so the store can exceed it by roughly the number of
+        concurrent creations. A cap is a bound on standing memory, not an
+        invariant on a ledger, and paying for exactness here would mean a Lua
+        script or a ``WATCH`` retry loop on the one endpoint in this service
+        that an unauthenticated caller can reach at will. Over-admitting a
+        handful of 2 KB rows is cheaper than either.
+        """
+        now = datetime.now(UTC).timestamp()
+        pipe = self._redis.pipeline()
+        pipe.zremrangebyscore(self._index_key(), "-inf", now)
+        pipe.zcard(self._index_key())
+        dropped, held = await pipe.execute()
+        if dropped:
+            logger.info("device code store: swept %d expired codes", dropped)
+        if held >= self._max_codes:
+            raise DeviceCodeStoreFull(int(held), self._max_codes)
+
         device_code = _generate_device_code()
         user_code = _generate_user_code()
         expires_in = expires_in or self._default_ttl
@@ -406,22 +579,35 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         return True
 
     async def revoke_device_code(self, device_code: str) -> None:
-        """Remove a device code."""
-        await self._redis.delete(self._key(device_code))
+        """Remove a device code, and its index member with it.
+
+        Both, or the cap counts codes that no longer exist and a service that
+        revokes normally would refuse pairings it has room for.
+        """
+        pipe = self._redis.pipeline()
+        pipe.delete(self._key(device_code))
+        pipe.zrem(self._index_key(), device_code)
+        await pipe.execute()
 
     async def update_device_code(self, device_code: str, code: DeviceCode) -> None:
         """Replace a device code with an updated version."""
         await self._set_code(device_code, code)
 
     async def _set_code(self, device_code: str, code: DeviceCode) -> None:
-        """Store a device code with TTL."""
+        """Store a device code with TTL, and index it by the same expiry.
+
+        ``ZADD`` on every write and not only on creation, so an update
+        re-scores rather than leaving the index holding an older expiry than
+        the value it points at. Both are skipped when the TTL has already
+        passed, which is the existing behaviour for the value and keeps the
+        index from gaining a member that is due the moment it lands.
+        """
         ttl_seconds = max(0, int((code.expires_at - datetime.now(UTC)).total_seconds()))
         if ttl_seconds > 0:
-            await self._redis.setex(
-                self._key(device_code),
-                ttl_seconds,
-                code.to_json(),
-            )
+            pipe = self._redis.pipeline()
+            pipe.setex(self._key(device_code), ttl_seconds, code.to_json())
+            pipe.zadd(self._index_key(), {device_code: code.expires_at.timestamp()})
+            await pipe.execute()
 
     async def close(self) -> None:
         """Close the Redis connection pool."""
@@ -481,11 +667,19 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
 # ---------------------------------------------------------------------------
 
 
-def create_device_code_store() -> DeviceCodeStoreBase:
+def create_device_code_store(
+    max_codes: int = DEFAULT_MAX_DEVICE_CODES,
+) -> DeviceCodeStoreBase:
     """Create a device code store backed by the configured backend.
 
     Reads ``POSTERN_REDIS_URL``: if set, returns a
     ``RedisDeviceCodeStore``; otherwise returns an ``InMemoryDeviceCodeStore``.
+
+    ``max_codes`` is passed to whichever backend is chosen, so the cap holds
+    in both. It is an argument rather than another environment variable read
+    in here because `services/confirm/settings.py` owns this service's
+    configuration and a caller reading the same value from two places is how
+    the two drift.
 
     This is the recommended entry point for production code:
 
@@ -496,9 +690,9 @@ def create_device_code_store() -> DeviceCodeStoreBase:
     redis_url = os.environ.get("POSTERN_REDIS_URL")
     if redis_url:
         logger.info("Using Redis device code store (url=%s)", redis_url)
-        return RedisDeviceCodeStore(url=redis_url)
+        return RedisDeviceCodeStore(url=redis_url, max_codes=max_codes)
     logger.info("Using in-memory device code store (set POSTERN_REDIS_URL for Redis)")
-    return InMemoryDeviceCodeStore()
+    return InMemoryDeviceCodeStore(max_codes=max_codes)
 
 
 # ---------------------------------------------------------------------------
