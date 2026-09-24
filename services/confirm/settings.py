@@ -55,6 +55,49 @@ import os
 from dataclasses import dataclass
 
 
+def _positive_int(name: str, default: int) -> int:
+    """Read a positive integer from the environment, or refuse to start.
+
+    WHY THIS RAISES RATHER THAN FALLING BACK TO THE DEFAULT. A rate limit an
+    operator meant to raise and typoed is worse than one they never touched:
+    silently keeping the default means the variable they set to fix an
+    outage did nothing, and they find out from the same alert they were
+    already looking at. The failure has to land at boot.
+
+    ``0`` and negatives are refused rather than treated as "unlimited" or
+    "refuse everything". Both readings are defensible, which is exactly why
+    neither should be guessed from a bare number: an operator who wants no
+    limit on a path says so by raising it, and there is deliberately no value
+    that turns the control off.
+
+    This is the same posture as ``RiskMiddleware.__init__`` refusing a
+    negative ``trusted_proxy_hops`` and ``create_confirm_app`` refusing
+    incomplete assertion settings: a misconfiguration that would quietly
+    change a control's meaning fails when the app is assembled.
+
+    The offending value is echoed because it is an operator's own
+    environment, not caller input -- the opposite of the rule
+    `services/confirm/device_auth.py` follows for a malformed customer
+    reference, which is attacker-reachable and never logged.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be a positive integer, got {raw!r}. "
+            "It is a per-minute request count; there is no value that disables the limit."
+        ) from None
+    if value < 1:
+        raise ValueError(
+            f"{name} must be a positive integer, got {value}. "
+            "It is a per-minute request count; there is no value that disables the limit."
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class ConfirmSettings:
     write_key_pem_path: str | None = None
@@ -172,6 +215,45 @@ class ConfirmSettings:
     # ``max_body_bytes`` was chosen with.
     max_scopes_length: int = 512
     max_client_id_length: int = 256
+    # How many requests one client address bucket may make to each path per
+    # minute. `services/confirm/rate_limit.py`'s ``DEFAULT_LIMITS`` carries
+    # the working behind each default and these five values reproduce it
+    # exactly; what they add is a way to change one without a code change.
+    #
+    # WHICH WAY TO SET THESE, which is worth more than the knob itself. The
+    # limit is keyed on a client ADDRESS BUCKET, so the question is always
+    # "how many customers sit behind one address in this deployment?", and
+    # there are two cases where the answer is "a great many":
+    #
+    # - CARRIER-GRADE NAT, on the two public paths. A mobile carrier can put
+    #   thousands of subscribers behind one IPv4 address, so a browser-facing
+    #   limit low enough to bite an attacker holding a handful of addresses is
+    #   low enough to hurt a real NAT pool. The defaults are set on the side
+    #   that does not break customers, and the store cap rather than this is
+    #   what bounds memory.
+    # - THE APP BACKEND, on the two assertion-authenticated paths, and this is
+    #   the one that will hurt if it is wrong. ``rate_limit_approve`` and
+    #   ``rate_limit_challenge_approve`` default to 60/min per bucket, which
+    #   is right if the operator's banking app calls this service FROM THE
+    #   CUSTOMER'S PHONE, because then the addresses are as diverse as the
+    #   customers. If instead the app's BACKEND calls on the phone's behalf,
+    #   every approval in the bank arrives from a handful of egress addresses
+    #   and 60/min becomes a bank-wide ceiling on payment approvals. An
+    #   operator in that shape must raise these two, and the fact that it is
+    #   an environment variable rather than a release is the whole point:
+    #   discovering it at 3am costs a restart, not a deploy.
+    #
+    # The honest limit of all five: a per-address bound is the wrong UNIT for
+    # an authenticated path, where the meaningful one is per customer. Keying
+    # the assertion-authenticated paths on the verified ``sub`` needs a second
+    # limiter running AFTER ``AppAssertionMiddleware``, which is a different
+    # shape from the outermost one these configure; see
+    # `services/confirm/rate_limit.py`'s module docstring.
+    rate_limit_device_authorization: int = 60
+    rate_limit_token: int = 300
+    rate_limit_approve: int = 60
+    rate_limit_challenge_approve: int = 60
+    rate_limit_default: int = 60
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -220,6 +302,15 @@ class ConfirmSettings:
             max_device_codes=int(os.environ.get("POSTERN_MAX_DEVICE_CODES", str(10_000))),
             max_scopes_length=int(os.environ.get("POSTERN_MAX_SCOPES_LENGTH", str(512))),
             max_client_id_length=int(os.environ.get("POSTERN_MAX_CLIENT_ID_LENGTH", str(256))),
+            rate_limit_device_authorization=_positive_int(
+                "POSTERN_CONFIRM_RATE_LIMIT_DEVICE_AUTHORIZATION", 60
+            ),
+            rate_limit_token=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_TOKEN", 300),
+            rate_limit_approve=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_APPROVE", 60),
+            rate_limit_challenge_approve=_positive_int(
+                "POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE", 60
+            ),
+            rate_limit_default=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_DEFAULT", 60),
         )
 
     @classmethod

@@ -78,7 +78,12 @@ from services.confirm.callback import callback_routes
 from services.confirm.device_auth import device_auth_routes
 from services.confirm.jwks import jwks_route
 from services.confirm.minter import build_write_minter
-from services.confirm.rate_limit import RateLimit
+from services.confirm.rate_limit import (
+    RATE_LIMIT_WINDOW_SECONDS,
+    Limit,
+    RateLimit,
+    limits_from_settings,
+)
 from services.confirm.settings import ConfirmSettings
 
 
@@ -298,6 +303,13 @@ def create_confirm_app(
             Middleware(
                 RateLimit,
                 trusted_proxy_hops=settings.trusted_proxy_hops,
+                limits=limits_from_settings(
+                    device_authorization=settings.rate_limit_device_authorization,
+                    token=settings.rate_limit_token,
+                    approve=settings.rate_limit_approve,
+                    challenge_approve=settings.rate_limit_challenge_approve,
+                ),
+                fallback_limit=Limit(settings.rate_limit_default, RATE_LIMIT_WINDOW_SECONDS),
             ),
             # SECOND, AND STILL AHEAD OF AUTHENTICATION. Starlette builds the
             # stack in reverse (`starlette/applications.py::build_middleware_stack`),

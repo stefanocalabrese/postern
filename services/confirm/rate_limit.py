@@ -146,6 +146,14 @@ class Limit:
 #: Any limit low enough to bite an attacker holding a handful of addresses is
 #: low enough to hurt a real NAT pool, and there is no number that escapes
 #: that trade. These are set on the side that does not break customers.
+#:
+#: EVERY ONE OF THESE IS OVERRIDABLE, per `services/confirm/settings.py`'s
+#: five ``rate_limit_*`` fields, and that setting carries the sentence that
+#: says which way to set them. The knob exists for one case in particular: if
+#: the operator's banking app backend calls the two authenticated paths on the
+#: phone's behalf, every approval in the bank arrives from a handful of egress
+#: addresses and 60/min is a bank-wide ceiling on payment approvals. Finding
+#: that out should cost a restart, not a release.
 DEFAULT_LIMITS: dict[str, Limit] = {
     "/device_authorization": Limit(requests=60, window_seconds=60),
     "/token": Limit(requests=300, window_seconds=60),
@@ -155,6 +163,38 @@ DEFAULT_LIMITS: dict[str, Limit] = {
 
 #: What an unlisted path gets. See "WHY DEFAULT-DENY ON PATHS" above.
 FALLBACK_LIMIT = Limit(requests=60, window_seconds=60)
+
+#: The window every configurable limit is counted over.
+#:
+#: A CONSTANT AND NOT A SETTING, deliberately. What an operator needs to
+#: change is how many requests they will admit, and exposing the window too
+#: would make "60 per 60s" and "600 per 600s" two ways to write settings that
+#: behave very differently under a burst, for no benefit either can name. One
+#: unit, requests per minute, is the whole configuration surface.
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+
+def limits_from_settings(
+    *,
+    device_authorization: int,
+    token: int,
+    approve: int,
+    challenge_approve: int,
+) -> dict[str, Limit]:
+    """Build the per-path limit map from four per-minute request counts.
+
+    Here rather than in `services/confirm/main.py` so the composition root
+    stays assembly, and here rather than in `services/confirm/settings.py` so
+    that module keeps importing nothing but ``os`` and ``dataclasses``. The
+    path strings are `route_key`'s, which is the one place they are canonical.
+    """
+    return {
+        "/device_authorization": Limit(device_authorization, RATE_LIMIT_WINDOW_SECONDS),
+        "/token": Limit(token, RATE_LIMIT_WINDOW_SECONDS),
+        "/approve": Limit(approve, RATE_LIMIT_WINDOW_SECONDS),
+        "/challenges/approve": Limit(challenge_approve, RATE_LIMIT_WINDOW_SECONDS),
+    }
+
 
 #: How many device codes one bucket may create per device-code lifetime.
 #:
@@ -280,9 +320,28 @@ class RateLimit:
             raise ValueError(
                 f"trusted_proxy_hops must be zero or positive, got {trusted_proxy_hops}"
             )
+        # THE SECOND HALF OF THE STARTUP GUARD.
+        # `services/confirm/settings.py`'s `_positive_int` refuses a bad value
+        # as it is read from the environment, which is where an operator's
+        # typo enters. This refuses one however it arrives -- a caller
+        # constructing this middleware directly, or a future settings path
+        # that forgets to validate. A limit of zero would refuse every request
+        # on that path, which is an outage wearing a control's clothes, and a
+        # negative one is not a quantity at all.
+        resolved = DEFAULT_LIMITS if limits is None else limits
+        for name, limit in [
+            *resolved.items(),
+            ("the fallback", fallback_limit),
+            ("the pairing cap", pairing_limit),
+        ]:
+            if limit.requests < 1:
+                raise ValueError(
+                    f"rate limit for {name} must admit at least one request per window, "
+                    f"got {limit.requests}"
+                )
         self.app = app
         self.trusted_proxy_hops = trusted_proxy_hops
-        self.limits = DEFAULT_LIMITS if limits is None else limits
+        self.limits = resolved
         self.fallback_limit = fallback_limit
         self.pairing_limit = pairing_limit
         self._buckets = _Buckets(max_buckets)

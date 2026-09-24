@@ -76,9 +76,11 @@ from services.confirm.main import create_confirm_app
 from services.confirm.rate_limit import (
     DEFAULT_LIMITS,
     FALLBACK_LIMIT,
+    RATE_LIMIT_WINDOW_SECONDS,
     UNATTRIBUTED,
     Limit,
     RateLimit,
+    limits_from_settings,
     route_key,
 )
 from services.confirm.settings import ConfirmSettings
@@ -1010,6 +1012,136 @@ class TestTheConfiguredLimits:
 
     def test_the_fallback_is_not_more_generous_than_the_named_paths(self) -> None:
         assert FALLBACK_LIMIT.requests <= max(limit.requests for limit in DEFAULT_LIMITS.values())
+
+
+class TestTheLimitsAreSettableWithoutACodeChange:
+    """The safety valve.
+
+    The four defaults are keyed on a client ADDRESS BUCKET, and there is one
+    deployment shape where that is badly wrong: if the operator's banking app
+    BACKEND calls the two assertion-authenticated paths on the phone's behalf,
+    every approval in the bank arrives from a handful of egress addresses and
+    60/min becomes a bank-wide ceiling on payment approvals. Per-address is
+    also the wrong unit for an authenticated path -- per customer is -- but
+    fixing that needs a second limiter after ``AppAssertionMiddleware`` and is
+    a different change. What these tests pin is that discovering the problem
+    costs a restart rather than a release.
+    """
+
+    #: Every variable, and the field each one sets.
+    NAMES = [
+        ("POSTERN_CONFIRM_RATE_LIMIT_DEVICE_AUTHORIZATION", "rate_limit_device_authorization"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_TOKEN", "rate_limit_token"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_APPROVE", "rate_limit_approve"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE", "rate_limit_challenge_approve"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_DEFAULT", "rate_limit_default"),
+    ]
+
+    @pytest.mark.parametrize(("name", "field"), NAMES)
+    def test_a_value_is_read_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, field: str
+    ) -> None:
+        monkeypatch.setenv(name, "1234")
+        assert getattr(ConfirmSettings.from_env(), field) == 1234
+
+    @pytest.mark.parametrize(("name", "field"), NAMES)
+    @pytest.mark.parametrize("bad", ["0", "-1", "abc", "6 0", "1.5", "  "])
+    def test_a_bad_value_refuses_at_startup(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, field: str, bad: str
+    ) -> None:
+        """Naming the variable, because the operator has to find it.
+
+        Falling back to the default would be worse than never having the
+        knob: the variable they set to end an outage would do nothing, and
+        they would learn that from the same alert they were already reading.
+        """
+        monkeypatch.setenv(name, bad)
+        with pytest.raises(ValueError, match=name):
+            ConfirmSettings.from_env()
+
+    @pytest.mark.parametrize(("name", "field"), NAMES)
+    def test_an_unset_or_empty_variable_keeps_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, field: str
+    ) -> None:
+        monkeypatch.delenv(name, raising=False)
+        unset = getattr(ConfirmSettings.from_env(), field)
+        monkeypatch.setenv(name, "")
+        assert getattr(ConfirmSettings.from_env(), field) == unset
+
+    def test_the_defaults_reproduce_the_module_constants_exactly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The override must not quietly become the source of truth.
+
+        If these drift, an operator reading `DEFAULT_LIMITS`'s working would
+        be reading about numbers the service does not run.
+        """
+        for name, _ in self.NAMES:
+            monkeypatch.delenv(name, raising=False)
+        settings = ConfirmSettings.from_env()
+
+        assert (
+            limits_from_settings(
+                device_authorization=settings.rate_limit_device_authorization,
+                token=settings.rate_limit_token,
+                approve=settings.rate_limit_approve,
+                challenge_approve=settings.rate_limit_challenge_approve,
+            )
+            == DEFAULT_LIMITS
+        )
+        assert Limit(settings.rate_limit_default, RATE_LIMIT_WINDOW_SECONDS) == FALLBACK_LIMIT
+
+    async def test_a_raised_limit_reaches_the_assembled_app(self, key_pair: RSAKeyPair) -> None:
+        """End to end: the setting an operator would reach for at 3am.
+
+        `/challenges/{id}/approve` raised well above its default, driven
+        through the real composition root.
+        """
+        raised = 90
+        app = _app(key_pair, rate_limit_challenge_approve=raised)
+        statuses = []
+        async with _client(app) as client:
+            for _ in range(raised + 2):
+                resp = await client.post("/challenges/chal_x/approve", json={})
+                statuses.append(resp.status_code)
+
+        assert statuses[raised - 1] == 401, "still inside the raised budget"
+        assert statuses[raised] == 429, "and refused one past it"
+        assert raised > DEFAULT_LIMITS["/challenges/approve"].requests
+
+    async def test_a_lowered_limit_reaches_the_assembled_app(self, key_pair: RSAKeyPair) -> None:
+        app = _app(key_pair, rate_limit_device_authorization=3)
+        statuses = []
+        async with _client(app) as client:
+            for _ in range(5):
+                resp = await client.post("/device_authorization", json={"client_id": "b"})
+                statuses.append(resp.status_code)
+
+        assert statuses == [200, 200, 200, 429, 429]
+
+    async def test_the_fallback_is_settable_too(self, key_pair: RSAKeyPair) -> None:
+        app = _app(key_pair, rate_limit_default=2)
+        statuses = []
+        async with _client(app) as client:
+            for _ in range(4):
+                resp = await client.get("/.well-known/jwks.json")
+                statuses.append(resp.status_code)
+
+        assert statuses == [200, 200, 429, 429]
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_a_non_positive_limit_is_refused_at_construction(self, bad: int) -> None:
+        """The second half of the guard, for a caller that bypasses settings.
+
+        A limit of zero refuses every request on its path, which is an outage
+        wearing a control's clothes.
+        """
+        with pytest.raises(ValueError, match="at least one request"):
+            RateLimit(_Downstream(), limits={"/approve": Limit(bad, 60)})
+        with pytest.raises(ValueError, match="at least one request"):
+            RateLimit(_Downstream(), fallback_limit=Limit(bad, 60))
+        with pytest.raises(ValueError, match="at least one request"):
+            RateLimit(_Downstream(), pairing_limit=Limit(bad, 900))
 
 
 class TestTheLimiterMemoryIsSmall:
