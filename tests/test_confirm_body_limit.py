@@ -478,25 +478,31 @@ def test_the_drain_accumulates_into_a_list_and_never_with_bytes_concatenation() 
 
 
 async def test_the_drain_is_linear_in_the_number_of_chunks() -> None:
-    """The behavioural half of the assertion above, kept loose enough not to
-    be a speed test.
+    """The behavioural half of the assertion above, and it catches shapes the
+    AST guard cannot -- ``chunks.append(b"".join(chunks) + chunk)`` uses a
+    list, one append and one join, and is still quadratic.
 
-    A quadratic accumulator costs 4x per doubling of the body; a linear one
-    costs 2x. Sixteen bytes per message over four doublings would take the
-    quadratic version ~256x the smallest measurement. The bound asserted is
-    40x, which no linear implementation on any machine approaches and no
-    quadratic one survives.
+    4x the bytes does NOT discriminate: a reintroduced ``body += chunk``
+    grows only ~17.2x there, under a 40x bound, so that shape of this test
+    passed against the regression it exists to catch. Matched here to
+    ``tests/test_header_body_mismatch.py``'s version of the same assertion on
+    the read path's ``_drain``, which does discriminate: 8x the bytes at one
+    byte per message. Measured both shapes head to head on 2026-09-24 at
+    32,768 then 262,144 bytes, three runs on this machine: quadratic 40.1x,
+    43.5x, 44.6x; linear 8.1x, 8.2x, 8.4x. The bound asserted is 25x, the same
+    the read path uses, which leaves about 3x of headroom over the linear
+    measurement and stays clear under every quadratic one observed.
     """
     timings: list[float] = []
-    for size in (32_768, 131_072):
+    for size in (32_768, 262_144):
         payload = b"x" * size
         started = cpu()
         await _drain(Chunks(payload, 1), size + 1)
         timings.append(cpu() - started)
 
-    # 4x the bytes. Linear predicts ~4x the time, quadratic ~16x.
+    # 8x the bytes. Linear predicts ~8x the time, quadratic ~64x.
     growth = timings[1] / max(timings[0], 1e-6)
-    assert growth < 40.0, f"4x the chunks cost {growth:.1f}x the time"
+    assert growth < 25.0, f"8x the chunks cost {growth:.1f}x the time"
 
 
 # ---------------------------------------------------------------------------
