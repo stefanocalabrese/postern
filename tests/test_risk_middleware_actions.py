@@ -59,6 +59,9 @@ from services.api.main import create_app
 from services.api.middleware.risk import NO_CLIENT, RiskMiddleware
 from services.api.settings import Settings
 from tests.fixtures import backend_responses as fx
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
 
 CUSTOMER = CustomerRef(value="cust_7f3a")
 OTHER_CUSTOMER = CustomerRef(value="cust_9b21")
@@ -372,7 +375,7 @@ async def test_a_refused_call_writes_its_signals_to_the_audit_row(
     `risk_signals` NULL -- a blocked call that the table cannot explain.
     """
     async with database.sessionmaker() as session:
-        await session.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(session)
         await session.commit()
 
     backend = RecordingBackend()
@@ -391,7 +394,7 @@ async def test_a_refused_call_writes_its_signals_to_the_audit_row(
         signals = rows[0].risk_signals
         assert signals is not None
         assert "RECORD_BUDGET_EXHAUSTED" in {s["code"] for s in signals}
-        await session.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(session)
         await session.commit()
 
 

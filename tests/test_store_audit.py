@@ -14,8 +14,12 @@ import pytest_asyncio
 from postern_core.store import audit
 from postern_core.store.engine import Database
 from postern_core.store.models import ABSENCE_NO_ACCESS_TOKEN, AuditEntry
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
 
 # `audit.append` requires a correlation key and accepts no None: every row it
 # writes has to be joinable to the other row of its own tool call. These probe
@@ -41,7 +45,7 @@ PROBE_CALL_ID = "probe-call-id"
 async def clean_audit_log(database: Database) -> AsyncIterator[None]:
     async def _clear() -> None:
         async with database.sessionmaker() as s:
-            await s.execute(delete(AuditEntry))
+            await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
             await s.commit()
 
     await _clear()

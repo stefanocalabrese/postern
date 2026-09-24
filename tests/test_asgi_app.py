@@ -48,6 +48,9 @@ from services.api.asgi.header_validation import HeaderBodyValidation
 from services.api.main import create_app
 from services.api.settings import Settings
 from tests.fixtures import backend_responses as fx
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
 
 TEST_CUSTOMER = CustomerRef(value="cust_7f3a")
 
@@ -514,7 +517,9 @@ async def test_end_to_end_audit_rows_are_written_for_a_real_call(
             await session.execute(
                 delete(ConsentRecord).where(ConsentRecord.customer_ref == customer)
             )
-            await session.execute(delete(AuditEntry).where(AuditEntry.customer_ref == customer))
+            await delete_audit_rows_by_bypassing_the_append_only_triggers(
+                session, AuditEntry.customer_ref == customer
+            )
             await session.commit()
 
 

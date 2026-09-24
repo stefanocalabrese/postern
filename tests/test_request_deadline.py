@@ -77,6 +77,9 @@ from services.api.main import create_app
 from services.api.middleware.audit import AuditMiddleware, record_data_touch
 from services.api.server import build_server, token_customer_resolver
 from services.api.settings import Settings
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
 
 # The harness these tests are built on, imported rather than re-declared:
 # `SilentServer` is the TCP interposer that reproduces a path silent in both
@@ -148,11 +151,11 @@ async def consent_session(database: Database) -> AsyncIterator[AsyncSession]:
     able to read a neighbour's, in either direction.
     """
     async with database.sessionmaker() as s:
-        await s.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
         await s.commit()
         yield s
         await s.execute(delete(ConsentRecord))
-        await s.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
         await s.commit()
 
 

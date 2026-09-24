@@ -24,6 +24,10 @@ from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry, ConsentRecord
 from sqlalchemy import delete, select
 
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
+
 # The same 65 characters `test_customer_ref_width.py` derives from
 # `_OPAQUE` by parsing it; written as a literal here because this file's
 # job is only to prove a value of that length actually round-trips, not to
@@ -41,7 +45,9 @@ async def clean_max_length_rows(database: Database) -> AsyncIterator[None]:
 
     async def _clear() -> None:
         async with database.sessionmaker() as s:
-            await s.execute(delete(AuditEntry).where(AuditEntry.customer_ref == MAX_REF))
+            await delete_audit_rows_by_bypassing_the_append_only_triggers(
+                s, AuditEntry.customer_ref == MAX_REF
+            )
             await s.execute(delete(ConsentRecord).where(ConsentRecord.customer_ref == MAX_REF))
             await s.commit()
 

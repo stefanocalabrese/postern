@@ -73,6 +73,20 @@ Before production, run these six scenarios against your deployment:
 - **Art. 9 basis and DPIA** — DPO approval for identity verification processing (handoff §10.9)
 - **Third-party disclosure analysis** — DPO review of what data lands in AI vendor chat histories (§10.19)
 
+### 11. A database role that owns nothing (the `audit_log` append-only control)
+Migration `f1860c110112` makes `UPDATE`, `DELETE` and `TRUNCATE` on `audit_log` raise for every role. **Against the role this repo ships with, that is two statements from being off.** The table owner runs `ALTER TABLE audit_log DISABLE TRIGGER`, a superuser runs `SET session_replication_role = replica`, and either then erases the rows recording the calls an attacker made. Both are measured in `tests/test_audit_append_only.py`, which performs them.
+
+Closing that is yours, not this repo's, because `POSTERN_DATABASE_URL` is the only role this repo has and it is simultaneously the table owner, the role migrations run as, and a superuser in every environment here (`docker-compose.yml`, the test container). You must split it in two:
+
+- **A migration/owner role** that owns the schema and runs `alembic upgrade`. Not the application's role.
+- **An application login role** that owns nothing and is not a superuser, holding exactly `SELECT, INSERT` on `audit_log` and `USAGE` on its sequence. Both services connect as this one, via `POSTERN_DATABASE_URL`.
+
+**What you get for it, measured** (`tests/test_audit_append_only.py`, against postgres:17): that role appends and reads normally, is refused `UPDATE`, `DELETE` and `TRUNCATE` at the ACL check before the trigger is even consulted, and cannot reach either bypass: it cannot disable the triggers, cannot drop them, cannot drop the table and cannot set `session_replication_role`. That is the only configuration in which this control actually holds.
+
+**If you skip this**, `audit_log` is protected against an attacker who can run one statement and not against one who can run two. The write path's rows, the only record that a payment approval happened at all, are in that second category.
+
+Two things it does not give you, in any configuration. **No detection:** a `DELETE` that matches no row succeeds silently, and a refused one records nothing, so nothing here tells you an attempt was made. **No defence against a superuser:** nothing in a database binds one. Keep superuser off the application path and audit its use elsewhere.
+
 ---
 
 ## Source documents, in reading order

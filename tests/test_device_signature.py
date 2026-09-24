@@ -59,6 +59,9 @@ from services.confirm.audit import (
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
 from tests.fixtures.device_keys import device_key, enrolled_store, sign_fields, sign_row
 
 ISSUER = "https://app.test.invalid"
@@ -128,8 +131,8 @@ async def clean(database: Database) -> AsyncGenerator[Database, None]:
 
 async def _wipe(db: Database) -> None:
     async with db.sessionmaker() as session:
-        await session.execute(
-            delete(AuditEntry).where(AuditEntry.customer_ref.in_((OWNER, STRANGER)))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(
+            session, AuditEntry.customer_ref.in_((OWNER, STRANGER))
         )
         await session.execute(
             delete(ChallengeRecord).where(ChallengeRecord.customer_ref.in_((OWNER, STRANGER)))

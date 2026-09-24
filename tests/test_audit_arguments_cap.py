@@ -42,7 +42,7 @@ from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry
-from sqlalchemy import delete, select, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.middleware.audit import (
@@ -55,6 +55,9 @@ from services.api.middleware.audit import (
     _cap_arguments,
     _clip_tree,
     record_data_touch,
+)
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
 )
 
 CUSTOMER = CustomerRef(value="cust_capcheck")
@@ -299,7 +302,7 @@ async def capped_server(database: Database) -> AsyncIterator[FastMCP]:
     `reaching` row as well as the completion row. Both carry `arguments`, and
     the bound has to be on both."""
     async with database.sessionmaker() as s:
-        await s.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
         await s.commit()
 
     backend = _backend(database)
@@ -314,7 +317,7 @@ async def capped_server(database: Database) -> AsyncIterator[FastMCP]:
     yield mcp
 
     async with database.sessionmaker() as s:
-        await s.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
         await s.commit()
 
 

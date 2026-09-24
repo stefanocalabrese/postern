@@ -51,7 +51,7 @@ from postern_core.store.audit import (
     TRUNCATED,
 )
 from postern_core.store.engine import Database
-from postern_core.store.models import AuditEntry, ChallengeRecord
+from postern_core.store.models import ChallengeRecord
 from sqlalchemy import delete, text
 from starlette.applications import Starlette
 
@@ -60,6 +60,9 @@ from services.confirm.audit import APPROVE_ROUTE
 from services.confirm.audit import _arguments as write_path_arguments
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
 from tests.fixtures.device_keys import enrolled_store
 from tests.test_write_audit import (
     AUDIENCE,
@@ -191,7 +194,7 @@ async def clean(db: Database) -> AsyncGenerator[Database, None]:
 
 async def _wipe(db: Database) -> None:
     async with db.sessionmaker() as s:
-        await s.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
         await s.execute(delete(ChallengeRecord))
         await s.commit()
 

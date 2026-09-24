@@ -54,13 +54,16 @@ from postern_core.store.models import (
     REFUSAL_DOMAIN_NOT_CONSENTED,
     AuditEntry,
 )
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from services.api.main import create_app
 from services.api.middleware import audit as audit_middleware
 from services.api.middleware.audit import AuditMiddleware, record_data_touch
 from services.api.settings import Settings
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
 
 # The junk payload that exhausts the middleware's own redaction allowance,
 # imported rather than re-derived: `tests/test_audit_middleware.py` owns the
@@ -170,7 +173,7 @@ async def clean_audit_log(database: Database) -> None:
     to the next test in this file. Same reasoning as
     `tests/conftest.py::audit_server`."""
     async with database.sessionmaker() as s:
-        await s.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
         await s.commit()
 
 

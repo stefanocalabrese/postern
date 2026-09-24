@@ -10,12 +10,13 @@ from docker.errors import DockerException
 from fastmcp import FastMCP
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
-from postern_core.store.models import AuditEntry
-from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from testcontainers.community.postgres import PostgresContainer
 
 from services.api.middleware.audit import AuditMiddleware
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
 
 TEST_CUSTOMER = CustomerRef(value="cust_7f3a")
 
@@ -71,8 +72,13 @@ async def session(database: Database) -> AsyncIterator[AsyncSession]:
 
 
 async def _clear_audit_log(database: Database) -> None:
+    """Migration f1860c110112 makes a plain DELETE here raise, so this goes
+    through the one deliberate bypass the suite is allowed --
+    `tests/fixtures/append_only_bypass.py` says why that is a bypass and not
+    a utility, and `tests/test_audit_append_only.py` measures what it is a
+    bypass OF."""
     async with database.sessionmaker() as s:
-        await s.execute(delete(AuditEntry))
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
         await s.commit()
 
 
