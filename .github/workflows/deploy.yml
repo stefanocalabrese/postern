@@ -154,19 +154,32 @@ jobs:
           format: spdx-json
 
       # ── Vulnerability scanning (Trivy) ──────────────────────────
-      # The two steps below are the only unpinned `uses:` in either workflow,
-      # and deliberately so: `aquasecurity/trivy-action@v0` resolves to
-      # nothing, so there is no SHA to pin it to. Checked 25 September 2026
-      # against the GitHub API: that repository publishes full patch tags only
-      # (`v0.36.0`, `v0.35.0`, ... down to `v0.23.0`) and has no `v0` tag and
-      # no `v0` branch, so `repos/aquasecurity/trivy-action/commits/v0` answers
-      # 422 and `git/ref/tags/v0` answers 404. A run reaching this step fails
-      # to resolve the action. Pinning it means choosing a version, which is a
-      # behaviour change and a separate decision; guessing a SHA would be worse
-      # than the floating tag, because it would fail opaquely instead of
-      # loudly.
+      # These two steps carried `aquasecurity/trivy-action@v0` until now, and
+      # that ref resolves to nothing. Re-checked 25 September 2026 against the
+      # GitHub API: the repository publishes full patch tags only (`v0.36.0`,
+      # `v0.35.0`, ... down to `v0.23.0`) and has neither a `v0` tag nor a `v0`
+      # branch, so `git/ref/tags/v0` answers 404 and `commits/v0` answers 422.
+      # Every dispatch that reached here failed to resolve the action, which
+      # means the vulnerability-scanning half of gate 7b has never once run,
+      # while `tests/test_zt3_deploy_pipeline.py` and CLAUDE.md both recorded
+      # it as built and blocking.
+      #
+      # Pinned to v0.36.0, the current stable release (published 2026-04-22,
+      # not a prerelease, and the highest tag the repository carries). Its
+      # annotated tag object `a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8`
+      # dereferences to the commit below; that release ships Trivy v0.70.0.
+      #
+      # Every input these steps pass was checked against v0.36.0's
+      # `action.yaml` rather than assumed, because a step written against a
+      # version that never ran can be wrong in silence. All four survive and
+      # all four are still consumed: `image-ref` (documented there as "for
+      # backward compatibility", and still the value `entrypoint.sh` assigns
+      # to `scanRef`), plus `format`, `severity` and `exit-code`, which the
+      # composite action exports as `TRIVY_FORMAT`, `TRIVY_SEVERITY` and
+      # `TRIVY_EXIT_CODE`. `scan-type` is left at its `image` default. No
+      # rename, no removal, so neither step changes shape.
       - name: Run Trivy scan — api
-        uses: aquasecurity/trivy-action@v0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/postern-api:${{ github.sha }}
           format: table
@@ -174,7 +187,7 @@ jobs:
           exit-code: "1"
 
       - name: Run Trivy scan — confirm
-        uses: aquasecurity/trivy-action@v0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/postern-confirm:${{ github.sha }}
           format: table
