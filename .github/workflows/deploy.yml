@@ -228,7 +228,7 @@ jobs:
     name: deploy (${{ github.event.inputs.environment }})
     needs: build
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}  # manual approval gate
+    environment: ${{ github.event.inputs.environment }}  # branch policy only -- not a human gate, see below
     # Same two scopes, for one fewer reason. `id-token: write` is here for
     # `aws-actions/configure-aws-credentials` only: `cosign verify` checks a
     # Fulcio certificate against the Rekor log and mints no OIDC token, so
