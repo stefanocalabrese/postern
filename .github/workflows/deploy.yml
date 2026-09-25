@@ -252,6 +252,67 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       # ── Cosign verification (ZT-3 hard gate) ────────────────────
+      # Both verify steps below passed `--certificate-identity-regexp=".*"`
+      # until now. That matches every identity, so the gate proved only that
+      # the digest carried a signature from somebody holding a GitHub Actions
+      # OIDC certificate -- not from this repository, this workflow, or this
+      # owner. Anyone who can run a workflow in any public repository could
+      # mint a certificate it accepted. Gate 7 in CLAUDE.md says "signing
+      # without verification is ceremony"; verification that accepts every
+      # signer is the same ceremony one step later.
+      #
+      # What the certificate actually carries, read out of Fulcio's source
+      # rather than recalled: the `Embed` method in
+      # pkg/identity/github/principal.go sets `cert.URIs` to the GitHub server
+      # URL joined with the `job_workflow_ref` claim. So the SAN for a run of
+      # this file is exactly
+      #
+      #   https://github.com/stefanocalabrese/postern/.github/workflows/deploy.yml@refs/heads/<branch>
+      #
+      # The pattern is anchored at both ends and its dots are escaped, and
+      # neither is decoration. cosign's matcher is a SUBSTRING match:
+      # `MatchesSAN` in sigstore-go's pkg/verify/certificate_identity.go calls
+      # Go's `regexp.MatchString`, which does not anchor. Without `^` and `$`
+      # a padded identity such as
+      # `https://evil.example/x?u=https://github.com/...` passes; without the
+      # escapes the dots are wildcards and `githubXcom` passes. Both were run
+      # against Go's own RE2 before this landed, along with the other-repo,
+      # other-workflow, typosquat, tag-ref and pull-ref cases.
+      #
+      # The ref stays any `refs/heads/` branch rather than the literal
+      # `refs/heads/main`, and that is a decision, not an oversight. The
+      # deploy job verifies a signature the build job of the SAME dispatch
+      # produced, so the signer's ref is always this run's `github.ref`.
+      # Pinning `main` would fail every dispatch from any other branch at the
+      # last step, after two multi-platform builds, two ECR pushes, two SBOMs,
+      # two Trivy scans and two signings had already run -- the most expensive
+      # place available to fail. This pipeline has never completed a dispatch,
+      # so the first ones come from a branch. "Only main reaches production"
+      # is a real requirement, and it belongs in the `production` environment's
+      # deployment-branch rule (operator checklist item 4), which rejects the
+      # run before any of that work starts. A regex in the final step is the
+      # wrong layer and the wrong moment for a branch policy.
+      #
+      # So this forbids, and is tested to forbid: any other repository,
+      # including owner-prefix and repo-suffix typosquats; any other workflow
+      # file in this repository, `ci.yml` included; any ref outside
+      # `refs/heads/`, which means a dispatch from a tag or a pull-request ref
+      # is refused; and any issuer but GitHub's. It does not forbid a build
+      # signed from a branch of this repository -- see the environment rule
+      # above.
+      #
+      # `${{ github.ref }}` is deliberately not interpolated into the pattern.
+      # Git branch names may contain `$`, backticks, `;`, `&` and quotes, so
+      # interpolating one into a `run:` block is the standard Actions
+      # script-injection shape. The identity is written out literally and
+      # single-quoted, so the shell expands nothing inside it.
+      #
+      # `--certificate-oidc-issuer` replaces `--certificate-oidc-issuer-regexp`
+      # for the same reason the identity gained anchors: the regexp form was
+      # also unanchored with unescaped dots, so it accepted
+      # `https://token.actions.githubusercontent.com.evil.example`. There is
+      # exactly one correct issuer here, and the exact flag is string equality
+      # in sigstore-go's `IssuerMatcher`, so it is both stricter and simpler.
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3.9.1
 
@@ -266,22 +327,22 @@ jobs:
           COSIGN_EXPERIMENTAL: "1"
         run: |
           cosign verify \
-            --certificate-identity-regexp=".*" \
-            --certificate-oidc-issuer-regexp="https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp='^https://github\.com/stefanocalabrese/postern/\.github/workflows/deploy\.yml@refs/heads/[A-Za-z0-9._/-]+$' \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             --rekor-url=https://rekor.sigstore.dev \
             "${{ env.REGISTRY }}/postern-api@${{ needs.build.outputs.api_digest }}" \
-            || (echo "::error::Cosign verification failed for api image — unsigned or tampered" && exit 1)
+            || (echo "::error::Cosign verification failed for api image — unsigned, tampered, or not signed by this repository's deploy workflow on a branch ref" && exit 1)
 
       - name: Verify cosign signature — confirm
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: |
           cosign verify \
-            --certificate-identity-regexp=".*" \
-            --certificate-oidc-issuer-regexp="https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp='^https://github\.com/stefanocalabrese/postern/\.github/workflows/deploy\.yml@refs/heads/[A-Za-z0-9._/-]+$' \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             --rekor-url=https://rekor.sigstore.dev \
             "${{ env.REGISTRY }}/postern-confirm@${{ needs.build.outputs.confirm_digest }}" \
-            || (echo "::error::Cosign verification failed for confirm image — unsigned or tampered" && exit 1)
+            || (echo "::error::Cosign verification failed for confirm image — unsigned, tampered, or not signed by this repository's deploy workflow on a branch ref" && exit 1)
 
       # ── SBOM presence check ─────────────────────────────────────
       - name: Download SBOM artifacts
