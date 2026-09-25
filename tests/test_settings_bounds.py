@@ -8,6 +8,16 @@ naming neither the variable nor the service, and each silently accepting zero
 or a negative. `postern_core/config.py` carries what the two readers do; this
 file carries the inventory and the bound each variable got.
 
+A SECOND SEAM, added one commit later. Two more numbers were read with a
+bare ``int()`` and were not in either ``from_env``:
+``POSTERN_REDIS_SESSION_TTL`` and ``POSTERN_REDIS_DEVICE_CODE_TTL``, which
+`postern_core.risk.session`'s `RedisSessionStore` and
+`postern_core.auth.device_codes`'s `RedisDeviceCodeStore` read in their own
+constructors. `STORE_BOUNDED` is their inventory, and
+`TestNoBareNumericEnvironmentReadRemains` is the sweep that would have found
+them: it parses every module under ``packages`` and ``services`` rather than
+the two methods a reader already knows to look at.
+
 WHAT THE INVENTORY BELOW IS FOR. `BOUNDED` is the whole set, one record per
 variable, and every test here is parametrized over it. A new numeric setting
 that is added to a ``from_env`` and not to this tuple fails
@@ -31,7 +41,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from postern_core.config import float_from_env, int_from_env
+from postern_core.auth.device_codes import (
+    MIN_DEVICE_CODE_TTL_SECONDS as CORE_MIN_DEVICE_CODE_TTL_SECONDS,
+)
+from postern_core.config import (
+    MIN_REPRESENTABLE_TTL_SECONDS,
+    float_from_env,
+    int_from_env,
+)
+from postern_core.risk.session import DEFAULT_SESSION_TTL_SECONDS, MIN_SESSION_TTL_SECONDS
 from postern_core.store.audit import MAX_ARGUMENTS_BYTES
 
 from services.api.settings import Settings
@@ -624,3 +642,275 @@ class TestTheReadersThemselves:
         with pytest.raises(ValueError, match="greater than zero"):
             float_from_env("POSTERN_PROBE", 1.0, minimum=0, exclusive=True, because="x.")
         assert float_from_env("POSTERN_PROBE", 1.0, minimum=0, because="x.") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# The two numbers postern_core's Redis stores read for themselves.
+# ---------------------------------------------------------------------------
+
+#: Port 1 is reserved and nothing in this suite listens there. Never dialled:
+#: ``redis.asyncio.from_url`` opens no connection, so every assertion below is
+#: about what ``__init__`` parsed, which happens before any socket would. The
+#: stores that DO need a server are in tests/test_redis_backed_stores.py.
+UNREACHABLE_REDIS_URL = "redis://127.0.0.1:1/0"
+
+
+@dataclasses.dataclass(frozen=True)
+class StoreBounded:
+    """One environment variable a store constructor reads, and its bound.
+
+    Separate from `Bounded` above because there is no settings dataclass and
+    no ``from_env`` behind these two: `postern_core.risk.session`'s
+    `RedisSessionStore` and `postern_core.auth.device_codes`'s
+    `RedisDeviceCodeStore` read their own variable in ``__init__``, which is
+    exactly why they were missed when the nineteen above were bounded.
+    """
+
+    name: str
+    parameter: str
+    attribute: str
+    default: int
+    minimum: int
+    refuses: tuple[str, ...]
+    accepts: tuple[str, ...]
+
+    def build(self, **kwargs: Any) -> Any:
+        """Construct the store this variable belongs to."""
+        from postern_core.auth.device_codes import RedisDeviceCodeStore
+        from postern_core.risk.session import RedisSessionStore
+
+        cls = RedisSessionStore if self.parameter == "ttl" else RedisDeviceCodeStore
+        return cls(url=UNREACHABLE_REDIS_URL, key_prefix="bounds:", **kwargs)
+
+
+STORE_BOUNDED: tuple[StoreBounded, ...] = (
+    StoreBounded(
+        name="POSTERN_REDIS_DEVICE_CODE_TTL",
+        parameter="default_ttl",
+        attribute="_default_ttl",
+        default=900,
+        minimum=MIN_DEVICE_CODE_TTL_SECONDS,
+        # 1 and 2 are refused although the store can represent 2: this
+        # variable shares its floor with POSTERN_DEVICE_CODE_TTL_SECONDS,
+        # because both set the lifetime of the same device code.
+        refuses=("0", "-1", "1", "2", "5", "29", "-900"),
+        accepts=("30", "900", "3600"),
+    ),
+    StoreBounded(
+        name="POSTERN_REDIS_SESSION_TTL",
+        parameter="ttl",
+        attribute="_ttl",
+        default=DEFAULT_SESSION_TTL_SECONDS,
+        minimum=MIN_SESSION_TTL_SECONDS,
+        refuses=("0", "-1", "-1800"),
+        accepts=("1", "60", "1800", "7200"),
+    ),
+)
+
+STORE_IDS = [b.name for b in STORE_BOUNDED]
+
+
+@pytest.fixture(autouse=True)
+def _clean_store_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for bound in STORE_BOUNDED:
+        monkeypatch.delenv(bound.name, raising=False)
+
+
+class TestTheStoreVariablesAreBoundedToo:
+    """The same three properties the nineteen above got, at a different seam."""
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_an_unset_or_empty_variable_gives_the_documented_default(
+        self, bound: StoreBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert getattr(bound.build(), bound.attribute) == bound.default
+        monkeypatch.setenv(bound.name, "")
+        assert getattr(bound.build(), bound.attribute) == bound.default
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_the_default_clears_its_own_floor(self, bound: StoreBounded) -> None:
+        assert bound.default >= bound.minimum
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_each_refused_value_names_the_variable_and_echoes_the_value(
+        self, bound: StoreBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for raw in bound.refuses:
+            monkeypatch.setenv(bound.name, raw)
+            with pytest.raises(ValueError, match=bound.name) as caught:
+                bound.build()
+            assert raw in str(caught.value), f"{bound.name}={raw!r} refused without echoing it"
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_each_accepted_value_parses_to_itself(
+        self, bound: StoreBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for raw in bound.accepts:
+            monkeypatch.setenv(bound.name, raw)
+            assert getattr(bound.build(), bound.attribute) == int(raw)
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_a_non_numeric_value_refuses_naming_the_variable(
+        self, bound: StoreBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for raw in ("abc", "30s", "1.5", "  "):
+            monkeypatch.setenv(bound.name, raw)
+            with pytest.raises(ValueError, match=bound.name):
+                bound.build()
+
+
+class TestTheFalsyZeroPassthrough:
+    """``ttl or int(os.environ.get(...))`` discarded the number the caller passed.
+
+    Zero is falsy, so `RedisSessionStore` built with ``ttl=0`` and
+    `RedisDeviceCodeStore` built with ``default_ttl=0`` silently used the
+    environment's value instead, or the default when the variable was unset.
+    Measured before the fix with the two variables set to 888 and 777:
+    ``_ttl`` came back 888 and ``_default_ttl`` 777. That is the same "a
+    value you set does nothing" failure the bounds above exist to prevent,
+    one argument in from the environment.
+
+    IT IS REFUSED RATHER THAN HONOURED, and `postern_core/config.py`'s
+    `int_arg_or_env` carries the reasoning: at ``_ttl = 0`` a risk context is
+    deleted by the very next ``load``, so no ZT-5 budget ever accumulates,
+    and at ``_default_ttl = 0`` every device code is written nowhere.
+    """
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_zero_no_longer_reaches_the_environment(
+        self, bound: StoreBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(bound.name, "1800")
+        with pytest.raises(ValueError, match=bound.parameter) as caught:
+            bound.build(**{bound.parameter: 0})
+        assert "1800" not in str(caught.value), "the environment's value was never consulted"
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_a_negative_argument_is_refused_the_same_way(self, bound: StoreBounded) -> None:
+        with pytest.raises(ValueError, match=bound.parameter):
+            bound.build(**{bound.parameter: -5})
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_the_refusal_says_how_to_ask_for_the_environment(self, bound: StoreBounded) -> None:
+        """``None`` is the spelling, and a caller who wrote ``0`` meant zero."""
+        with pytest.raises(ValueError, match="Pass None") as caught:
+            bound.build(**{bound.parameter: 0})
+        assert bound.name in str(caught.value)
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_a_positive_argument_still_wins_over_the_environment(
+        self, bound: StoreBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unchanged, including the laziness: a set variable is not even parsed.
+
+        A store built with its own number never read the variable under
+        ``or``, because ``or`` short-circuits. It still does not, which is
+        what keeps tests/test_redis_backed_stores.py's harness -- and any
+        caller passing its own number -- working in an environment that holds
+        a value this store would otherwise refuse.
+        """
+        monkeypatch.setenv(bound.name, "not-a-number")
+        assert getattr(bound.build(**{bound.parameter: 600}), bound.attribute) == 600
+
+    @pytest.mark.parametrize("bound", STORE_BOUNDED, ids=STORE_IDS)
+    def test_the_argument_floor_is_representability_and_not_the_operator_floor(
+        self, bound: StoreBounded
+    ) -> None:
+        """One second in code, whatever the variable refuses.
+
+        For the session store the two coincide. For the device code store
+        they do not, on purpose: ``create_device_code``'s ``expires_in``
+        takes 2 (tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL) and
+        ``default_ttl`` is only the value it falls back to, so a fallback
+        floored at 30 would refuse in code what the same store accepts one
+        argument later.
+        """
+        assert getattr(bound.build(**{bound.parameter: 1}), bound.attribute) == 1
+
+
+class TestTheDeviceCodeFloorIsOneNumberAndNotTwo:
+    """Two variables set the lifetime of the same device code.
+
+    ``POSTERN_DEVICE_CODE_TTL_SECONDS`` reaches it as ``create_device_code``'s
+    ``expires_in``; ``POSTERN_REDIS_DEVICE_CODE_TTL`` reaches the same
+    argument through ``_default_ttl`` when no ``expires_in`` is passed. The
+    first was floored at 30 seconds on 2026-09-25 and the second was left a
+    bare ``int()`` the same day, so an operator could set one safely and the
+    other not. A second literal would let that reopen in silence.
+    """
+
+    def test_the_service_carries_no_second_literal(self) -> None:
+        """Parsed, not compared.
+
+        ``assert a is b`` would pass against two independent ``30``s, because
+        CPython caches small integers -- the first draft of this test did
+        exactly that and survived the mutation that split the constant in
+        two. What has to be false is that
+        `services/confirm/settings.py` assigns a NUMBER to this name at all.
+        """
+        source = Path(inspect.getfile(ConfirmSettings)).read_text(encoding="utf-8")
+        assigned = [
+            node.value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "MIN_DEVICE_CODE_TTL_SECONDS"
+                for t in node.targets
+            )
+        ]
+        assert len(assigned) == 1, "the name is assigned once, as a re-export"
+        assert isinstance(assigned[0], ast.Name), (
+            f"services/confirm/settings.py assigns {ast.dump(assigned[0])} to "
+            "MIN_DEVICE_CODE_TTL_SECONDS. A second literal is free to drift away from "
+            "postern_core.auth.device_codes', and then one of the two variables that set "
+            "a device code's lifetime is floored and the other is not."
+        )
+
+    def test_the_two_names_hold_the_same_number(self) -> None:
+        assert MIN_DEVICE_CODE_TTL_SECONDS == CORE_MIN_DEVICE_CODE_TTL_SECONDS == 30
+
+    def test_the_session_floor_claims_only_representability(self) -> None:
+        """No derivation is claimed for it, and the constant says so."""
+        assert MIN_SESSION_TTL_SECONDS == MIN_REPRESENTABLE_TTL_SECONDS == 1
+
+
+def _reads_the_environment(node: ast.AST) -> bool:
+    """``os.environ``, ``os.environ.get``, ``os.getenv``, and bare re-exports."""
+    if isinstance(node, ast.Attribute):
+        return node.attr in {"environ", "getenv"}
+    return isinstance(node, ast.Name) and node.id in {"environ", "getenv"}
+
+
+class TestNoBareNumericEnvironmentReadRemains:
+    """The question this line of work exists to close, asked mechanically.
+
+    `TestEveryNumericSettingIsInTheInventory` above parses the two
+    ``from_env`` methods, which is where nineteen of these lived -- and is
+    precisely why the two in this file's second half were missed, since they
+    are read in a constructor in another package. This walks every module
+    that ships instead, so the next one cannot hide by being somewhere new.
+
+    SCOPED TO WHAT SHIPS. ``packages`` and ``services`` are the two
+    ``root_packages`` in ``.importlinter`` and the only code that runs in a
+    container. ``tools`` and ``tests`` are developer code, where an operator
+    sets nothing.
+    """
+
+    def test_no_int_or_float_call_wraps_an_environment_read(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        offenders: list[str] = []
+        for root in ("packages", "services"):
+            for path in sorted((repo / root).rglob("*.py")):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    if not (isinstance(node.func, ast.Name) and node.func.id in {"int", "float"}):
+                        continue
+                    if any(_reads_the_environment(inner) for inner in ast.walk(node)):
+                        offenders.append(f"{path.relative_to(repo)}:{node.lineno}")
+        assert offenders == [], (
+            f"{offenders} wrap an environment read in a bare int()/float(). That accepts "
+            "an empty string as a crash naming neither the variable nor the module, and "
+            "zero and negatives in silence. Read it through postern_core.config instead."
+        )

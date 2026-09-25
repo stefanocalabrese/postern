@@ -67,6 +67,8 @@ from datetime import UTC, datetime, timedelta
 from datetime import UTC as _UTC
 from typing import Any
 
+from postern_core.config import int_arg_or_env
+
 logger = __import__("logging").getLogger(__name__)
 
 #: How many device codes a store will hold before it refuses to create more.
@@ -90,6 +92,79 @@ logger = __import__("logging").getLogger(__name__)
 #: concurrent codes is a deployment starting a device pairing every 90
 #: milliseconds, sustained, across every replica sharing one Redis.
 DEFAULT_MAX_DEVICE_CODES = 10_000
+
+#: The shortest device-code lifetime either configuration path accepts.
+#:
+#: Read by ``POSTERN_REDIS_DEVICE_CODE_TTL`` below and by
+#: `services/confirm/settings.py`'s ``POSTERN_DEVICE_CODE_TTL_SECONDS``,
+#: which imports this name rather than carrying a second 30.
+#:
+#: WHY A FLOOR EXISTS AT ALL (bug B1). `RedisDeviceCodeStore` below writes
+#: its key with
+#: ``max(0, int((expires_at - now).total_seconds()))``, and ``int``
+#: TRUNCATES. A code asked for one second has roughly 0.9999 of one left by
+#: the time that line runs, so it floors to zero and the ``if ttl_seconds >
+#: 0`` guard skips BOTH the ``SETEX`` and the ``ZADD``. Measured on
+#: 2026-09-25 against redis:7-alpine::
+#:
+#:     expires_in=   1  raw=0.999982  int()=0  stored=NO -- nothing written
+#:     expires_in=   2  raw=1.999990  int()=1  stored=YES
+#:     expires_in= 900  raw=899.999992  int()=899  stored=YES
+#:
+#: ``create_device_code`` returns a code in all three rows, so the first one
+#: hands a browser a device code the store never wrote; its next ``/token``
+#: poll is answered ``invalid_grant``, which tells a legitimate customer
+#: their code was never real. `InMemoryDeviceCodeStore` stores that same
+#: code, so dev and production disagree on the same call.
+#:
+#: THERE WERE TWO OPERATOR PATHS TO IT, NOT ONE, and this comment said
+#: otherwise until 2026-09-25. ``POSTERN_DEVICE_CODE_TTL_SECONDS`` was
+#: floored first; ``POSTERN_REDIS_DEVICE_CODE_TTL``, which feeds
+#: ``_default_ttl`` and from there ``create_device_code``'s ``expires_in``,
+#: was still a bare ``int()``. Measured at ``POSTERN_REDIS_DEVICE_CODE_TTL=1``
+#: against redis:7-alpine, through ``create_device_code_store()`` and a
+#: ``create_device_code`` call that passes no ``expires_in``::
+#:
+#:     expires_at - now = 0.999991  int() = 0
+#:     get_device_code  -> None
+#:     redis EXISTS key -> 0   redis ZSCORE index -> None
+#:
+#: Both variables now refuse below this number, which is the point of there
+#: being one number.
+#:
+#: WHY 30, DERIVED. Three bounds sit under it, and
+#: tests/test_device_grant.py::TestTheFloorIsDerivedAndNotPicked re-derives
+#: each one so that this working fails rather than rots:
+#:
+#: - 2 IS WHERE THE ARITHMETIC BITES. Below it the Redis backend stores
+#:   nothing at all; tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL
+#:   is that number and carries the same measurement. 30 is 15x it, which is
+#:   far enough that no rounding anywhere can reach the cliff.
+#: - 5 IS THE BROWSER'S FIRST POLL, `services/confirm/settings.py`'s
+#:   ``device_poll_interval_seconds``.
+#:   `services/confirm/device_auth.py`'s ``token_endpoint`` answers
+#:   ``slow_down`` to anything sooner, so a TTL at or under the interval
+#:   expires before the browser is permitted to ask even once. 30 is 6x it,
+#:   so a code at the floor survives several polls rather than exactly one.
+#: - 15 IS THE LONGEST MEASURED SERVER-SIDE LEG of the approval: CLAUDE.md
+#:   prices identity verification, which step 4 of the flow in this
+#:   module's docstring reaches, at 5 to 15 seconds. 30 is 2x its worst
+#:   case.
+#:
+#: WHAT THIS DELIBERATELY DOES NOT CLAIM, because a floor that reads as a
+#: recommendation is worse than none:
+#:
+#: - NOT that 30 is usable. It is not. 900 is the default and the only
+#:   lifetime in this tree derived for real use, and an operator who sets 30
+#:   will strand customers who take longer than half a minute to pick up a
+#:   phone. This bounds what is REPRESENTABLE, not what is SUFFICIENT.
+#: - NOT that a human can scan a QR, compare a pairing code and approve
+#:   within 30 seconds. Nothing here measures a human, and the number is
+#:   built only out of legs this repository has measured.
+#: - NOT that the truncation is fixed. It is not; ``_set_code`` below
+#:   records what still reaches it. This closes the CONFIGURATION paths
+#:   and no other.
+MIN_DEVICE_CODE_TTL_SECONDS = 30
 
 
 class DeviceCodeStoreFull(RuntimeError):
@@ -447,6 +522,11 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
 
     ``POSTERN_REDIS_DEVICE_CODE_TTL``
         Default TTL in seconds for new device codes (default 900 = 15 min).
+        Read only when the ``default_ttl`` argument is ``None``, and refused
+        below `MIN_DEVICE_CODE_TTL_SECONDS` -- the same floor
+        `services/confirm/settings.py` puts under
+        ``POSTERN_DEVICE_CODE_TTL_SECONDS``, because the two variables set
+        the lifetime of the same object.
 
     ``POSTERN_REDIS_KEY_PREFIX``
         Key prefix for multi-tenant deployments (default ``"postern:"``).
@@ -470,8 +550,30 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         import redis.asyncio as redis
 
         self._url = url or os.environ.get("POSTERN_REDIS_URL", "redis://localhost:6379/0")
-        self._default_ttl = default_ttl or int(
-            os.environ.get("POSTERN_REDIS_DEVICE_CODE_TTL", "900")
+        # ``default_ttl or int(os.environ.get(...))`` until 2026-09-25. It
+        # crashed on ``POSTERN_REDIS_DEVICE_CODE_TTL=`` with a message naming
+        # neither the variable nor this class, took zero and negatives without
+        # comment -- and at 1 walked straight into B1, because this value
+        # becomes ``create_device_code``'s ``expires_in`` and ``_set_code``
+        # truncates it to nothing. `MIN_DEVICE_CODE_TTL_SECONDS` above carries
+        # the measurement. It also discarded an explicitly passed ``0`` in
+        # favour of the environment; `postern_core.config`'s `int_arg_or_env`
+        # refuses it instead and says why.
+        self._default_ttl = int_arg_or_env(
+            default_ttl,
+            parameter="default_ttl",
+            name="POSTERN_REDIS_DEVICE_CODE_TTL",
+            # 900, unchanged: the same literal the bare `int()` defaulted to
+            # and the same lifetime `InMemoryDeviceCodeStore.create_device_code`
+            # carries in its signature.
+            default=900,
+            minimum=MIN_DEVICE_CODE_TTL_SECONDS,
+            because=(
+                "It is the lifetime a device code gets when create_device_code is called "
+                "without an expires_in, and a shorter one cannot outlive the browser's "
+                "poll interval or the user's approval on their phone; at 1 second the "
+                "store's truncation discards the code without storing it at all."
+            ),
         )
         self._prefix = key_prefix or os.environ.get("POSTERN_REDIS_KEY_PREFIX", "postern:")
         self._max_codes = max_codes
@@ -613,14 +715,20 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         nothing, ``expires_in=2`` stores a TTL of 1, ``expires_in=900``
         stores 899.
 
-        WHAT WAS FIXED IS THE CONFIGURATION PATH ONLY.
+        WHAT WAS FIXED IS THE CONFIGURATION PATHS ONLY, and there were two
+        of them rather than the one this paragraph claimed until 2026-09-25.
+        `MIN_DEVICE_CODE_TTL_SECONDS` above refuses both, and
         `services/confirm/settings.py`'s `MIN_DEVICE_CODE_TTL_SECONDS`
-        refuses a ``POSTERN_DEVICE_CODE_TTL_SECONDS`` below 30 at startup,
-        which is the only route an OPERATOR had to this. What still reaches
-        it is any direct caller of ``create_device_code`` passing a small
-        enough ``expires_in``, which in this tree means this repository's own
-        tests -- tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL
-        exists precisely because of it.
+        imports it rather than carrying a second 30. The two paths are a
+        ``POSTERN_DEVICE_CODE_TTL_SECONDS`` below 30, which arrives here as
+        the ``expires_in`` `services/confirm/device_auth.py` passes, and a
+        ``POSTERN_REDIS_DEVICE_CODE_TTL`` below 30, which arrives at the same
+        argument through ``_default_ttl`` whenever a caller passes none.
+        What still reaches the truncation is any direct caller of
+        ``create_device_code`` passing a small enough ``expires_in``, which
+        in this tree means this repository's own tests --
+        tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL exists
+        precisely because of it.
 
         NO GUARD IS RAISED HERE, deliberately. This method has three callers
         and a zero TTL means a different thing in each: from

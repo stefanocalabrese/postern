@@ -72,16 +72,20 @@ import pytest
 import pytest_asyncio
 import redis.exceptions
 from postern_core.auth.device_codes import (
+    MIN_DEVICE_CODE_TTL_SECONDS,
     DeviceCode,
     DeviceCodeStoreFull,
     RedisDeviceCodeStore,
+    create_device_code_store,
 )
 from postern_core.auth.revocation import RedisRevocationStore, RevocationStoreUnavailable
 from postern_core.risk.context import RiskContext
 from postern_core.risk.session import (
+    MIN_SESSION_TTL_SECONDS,
     RedisSessionStore,
     SessionKey,
     SessionStoreUnavailable,
+    create_session_store,
 )
 
 KEY = SessionKey(customer_ref="cust_7f3a", client_id="vendor-a")
@@ -948,3 +952,131 @@ async def test_a_device_code_store_that_cannot_reach_redis_raises_rather_than_ad
     finally:
         with contextlib.suppress(redis.exceptions.RedisError):
             await store.close()
+
+
+# ---------------------------------------------------------------------------
+# The two TTLs an operator configures, against the server that enforces them.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_device_code_ttl_variable_cannot_reach_the_truncation(
+    redis_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug B1's second operator path, closed at the composition root.
+
+    ``POSTERN_DEVICE_CODE_TTL_SECONDS`` was floored at
+    `MIN_DEVICE_CODE_TTL_SECONDS` first, and that floor covers the
+    ``expires_in`` `services/confirm/device_auth.py` passes.
+    ``POSTERN_REDIS_DEVICE_CODE_TTL`` reaches the SAME argument by the other
+    route -- ``_default_ttl``, used whenever ``create_device_code`` is called
+    with no ``expires_in``, which is the call this module's own docstring
+    shows -- and it was a bare ``int()`` until 2026-09-25. Measured then at
+    ``POSTERN_REDIS_DEVICE_CODE_TTL=1`` against the same container this test
+    uses, through ``create_device_code_store()``::
+
+        _default_ttl = 1
+        expires_at - now = 0.999991   int() = 0
+        get_device_code  -> None
+        redis EXISTS key -> 0     redis ZSCORE index -> None
+
+    ``create_device_code`` returned a `DeviceCode` on that run and had
+    written nothing. The refusal below is what the operator gets instead.
+    """
+    monkeypatch.setenv("POSTERN_REDIS_URL", redis_url)
+    monkeypatch.setenv("POSTERN_REDIS_DEVICE_CODE_TTL", "1")
+
+    with pytest.raises(ValueError, match="POSTERN_REDIS_DEVICE_CODE_TTL") as caught:
+        create_device_code_store()
+
+    assert str(MIN_DEVICE_CODE_TTL_SECONDS) in str(caught.value)
+
+
+async def test_a_code_created_at_the_floor_is_on_the_server(
+    redis_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: a floor is only worth having if the values above it work.
+
+    No ``expires_in``, so this is the ``_default_ttl`` path the test above
+    refuses one second of, driven at the lowest value it accepts. The key,
+    the index member and the TTL the SERVER reports are all asserted,
+    because the failure being closed here was one where
+    ``create_device_code`` still returned a code.
+    """
+    monkeypatch.setenv("POSTERN_REDIS_URL", redis_url)
+    monkeypatch.setenv("POSTERN_REDIS_DEVICE_CODE_TTL", str(MIN_DEVICE_CODE_TTL_SECONDS))
+    monkeypatch.setenv("POSTERN_REDIS_KEY_PREFIX", f"floor{uuid4().hex[:12]}:")
+    store = create_device_code_store()
+    assert isinstance(store, RedisDeviceCodeStore)
+
+    try:
+        code = await store.create_device_code(
+            client_id="vendor-a", scopes="accounts:read", verification_uri=VERIFY_URI
+        )
+
+        assert await store.get_device_code(code.device_code) is not None
+        assert await store._redis.exists(store._key(code.device_code)) == 1
+        assert await store._redis.zscore(store._index_key(), code.device_code) is not None
+        key_ttl = await store._redis.ttl(store._key(code.device_code))
+        assert MIN_DEVICE_CODE_TTL_SECONDS - 2 <= key_ttl <= MIN_DEVICE_CODE_TTL_SECONDS - 1, (
+            "int() still truncates a second off, which is why the floor is 30 and not 2"
+        )
+    finally:
+        await store.close()
+
+
+async def test_the_session_ttl_variable_round_trips_a_context_at_its_floor(
+    redis_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One second is the floor because one second still works, and zero does not.
+
+    `MIN_SESSION_TTL_SECONDS` claims nothing more than "positive", so the
+    thing worth pinning is the boundary itself: a context saved and loaded
+    at ``ttl=1`` comes back, which is what makes the refusal of ``0`` a
+    bound on the control rather than an arbitrary one.
+    """
+    monkeypatch.setenv("POSTERN_REDIS_URL", redis_url)
+    monkeypatch.setenv("POSTERN_REDIS_SESSION_TTL", str(MIN_SESSION_TTL_SECONDS))
+    monkeypatch.setenv("POSTERN_REDIS_KEY_PREFIX", f"sfloor{uuid4().hex[:12]}:")
+    store = create_session_store()
+    assert isinstance(store, RedisSessionStore)
+
+    try:
+        assert store._ttl == MIN_SESSION_TTL_SECONDS
+        ctx = RiskContext()
+        await store.save(KEY, ctx)
+        assert await store.load(KEY) is not None
+        assert 0 < await store._redis.ttl(store._key(KEY)) <= MIN_SESSION_TTL_SECONDS, (
+            "the server holds the lifetime the variable asked for, and no more"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_session_store_at_ttl_zero_forgets_every_context_immediately(
+    stores: RedisStores,
+) -> None:
+    """What honouring a passed ``0`` would have meant, measured not argued.
+
+    `postern_core/config.py`'s `int_arg_or_env` refuses ``ttl=0`` rather
+    than honouring it, and this is the evidence behind that sentence. The
+    store is built past its own constructor, the way
+    tests/test_risk_session_wiring.py builds one, because the constructor is
+    now exactly what makes this state unreachable.
+
+    ``save`` does write: ``_remaining_ttl`` floors at one second. ``load``
+    then computes ``ceil(0 - elapsed) <= 0``, deletes the key and answers
+    ``None`` -- so every call would start from an empty ZT-5 budget and bulk
+    extraction (A6) would accumulate against nothing.
+    """
+    healthy = stores.sessions(ttl=1800)
+    zero = RedisSessionStore.__new__(RedisSessionStore)
+    zero._ttl = 0
+    zero._prefix = healthy._prefix
+    zero._url = healthy._url
+    zero._redis = healthy._redis
+
+    await zero.save(KEY, RiskContext())
+
+    assert await healthy._redis.ttl(zero._key(KEY)) == 1, "_remaining_ttl floored it"
+    assert await zero.load(KEY) is None, "the first read expires it"
+    assert await healthy._redis.exists(zero._key(KEY)) == 0, "and deletes it"

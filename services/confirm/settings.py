@@ -56,6 +56,9 @@ forbids reading its settings — so the requirement is stated in
 import os
 from dataclasses import dataclass
 
+from postern_core.auth.device_codes import (
+    MIN_DEVICE_CODE_TTL_SECONDS as _MIN_DEVICE_CODE_TTL_SECONDS,
+)
 from postern_core.config import float_from_env, int_from_env
 
 #: The scope string ``POST /device_authorization`` substitutes when the caller
@@ -126,60 +129,15 @@ def _positive_int(name: str, default: int) -> int:
     )
 
 
-#: The shortest device-code lifetime ``POSTERN_DEVICE_CODE_TTL_SECONDS`` accepts.
-#:
-#: WHY A FLOOR EXISTS AT ALL (bug B1). `postern_core.auth.device_codes`'s
-#: `RedisDeviceCodeStore` writes its key with
-#: ``max(0, int((expires_at - now).total_seconds()))``, and ``int``
-#: TRUNCATES. A code asked for one second has roughly 0.9999 of one left by
-#: the time that line runs, so it floors to zero and the ``if ttl_seconds >
-#: 0`` guard skips BOTH the ``SETEX`` and the ``ZADD``. Measured on
-#: 2026-09-25 against redis:7-alpine::
-#:
-#:     expires_in=   1  raw=0.999982  int()=0  stored=NO -- nothing written
-#:     expires_in=   2  raw=1.999990  int()=1  stored=YES
-#:     expires_in= 900  raw=899.999992  int()=899  stored=YES
-#:
-#: ``create_device_code`` returns a code in all three rows, so the first one
-#: hands a browser a device code the store never wrote; its next ``/token``
-#: poll is answered ``invalid_grant``, which tells a legitimate customer
-#: their code was never real. `InMemoryDeviceCodeStore` stores that same
-#: code, so dev and production disagree on the same call. This variable was
-#: the only path an operator could reach that from: before this floor it was
-#: read with a bare ``int()`` and validated nowhere.
-#:
-#: WHY 30, DERIVED. Three bounds sit under it, and
-#: tests/test_device_grant.py::TestTheFloorIsDerivedAndNotPicked re-derives
-#: each one so that this working fails rather than rots:
-#:
-#: - 2 IS WHERE THE ARITHMETIC BITES. Below it the Redis backend stores
-#:   nothing at all; tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL
-#:   is that number and carries the same measurement. 30 is 15x it, which is
-#:   far enough that no rounding anywhere can reach the cliff.
-#: - 5 IS THE BROWSER'S FIRST POLL, ``device_poll_interval_seconds`` below.
-#:   `services/confirm/device_auth.py`'s ``token_endpoint`` answers
-#:   ``slow_down`` to anything sooner, so a TTL at or under the interval
-#:   expires before the browser is permitted to ask even once. 30 is 6x it,
-#:   so a code at the floor survives several polls rather than exactly one.
-#: - 15 IS THE LONGEST MEASURED SERVER-SIDE LEG of the approval: CLAUDE.md
-#:   prices identity verification, which step 4 of the flow in
-#:   `postern_core.auth.device_codes` reaches, at 5 to 15 seconds. 30 is 2x
-#:   its worst case.
-#:
-#: WHAT THIS DELIBERATELY DOES NOT CLAIM, because a floor that reads as a
-#: recommendation is worse than none:
-#:
-#: - NOT that 30 is usable. It is not. 900 is the default and the only
-#:   lifetime in this tree derived for real use, and an operator who sets 30
-#:   will strand customers who take longer than half a minute to pick up a
-#:   phone. This bounds what is REPRESENTABLE, not what is SUFFICIENT.
-#: - NOT that a human can scan a QR, compare a pairing code and approve
-#:   within 30 seconds. Nothing here measures a human, and the number is
-#:   built only out of legs this repository has measured.
-#: - NOT that the truncation is fixed. It is not; see
-#:   `postern_core.auth.device_codes`'s ``_set_code``, which records what
-#:   still reaches it. This closes the CONFIGURATION path and no other.
-MIN_DEVICE_CODE_TTL_SECONDS = 30
+#: Re-exported from `postern_core.auth.device_codes`, which is where the
+#: floor's derivation now lives, because the arithmetic that creates it lives
+#: there too (``_set_code``) and because a SECOND variable reaches that same
+#: arithmetic. ``POSTERN_REDIS_DEVICE_CODE_TTL``, read by
+#: `RedisDeviceCodeStore`'s constructor, sets the lifetime of the same object
+#: ``POSTERN_DEVICE_CODE_TTL_SECONDS`` does. Two literals would let an
+#: operator set one safely and the other not, so there is one number and both
+#: read it.
+MIN_DEVICE_CODE_TTL_SECONDS = _MIN_DEVICE_CODE_TTL_SECONDS
 
 
 def _device_code_ttl(name: str, default: int) -> int:

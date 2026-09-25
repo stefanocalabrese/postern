@@ -72,6 +72,7 @@ The table below lists every variable, grouped by service.
 | `POSTERN_REQUIRE_PEM_KEY` | No | - | Set to `"1"` to refuse startup with an ephemeral read key |
 | `POSTERN_REQUIRE_REDIS` | No | - | Set to `"1"` to refuse startup without `POSTERN_REDIS_URL` |
 | `POSTERN_REDIS_URL` | No | - | Redis connection string (for sessions, device codes, revocation lists) |
+| `POSTERN_REDIS_SESSION_TTL` | No | `1800` (30 min) | How long a risk context accumulates its ZT-5 budget, on the Redis session store. **At least 1**; at zero every load answers `None`, so every call starts from an empty budget |
 
 ### Confirm Service (`services/confirm/settings.py`)
 
@@ -96,6 +97,7 @@ The table below lists every variable, grouped by service.
 | `POSTERN_CONFIRM_RATE_LIMIT_DEFAULT` | No | `60` | As above, for every other path |
 | `POSTERN_DEVICE_VERIFICATION_URI` | No | `https://auth.postern.internal/verify` | Base URI for the user verification page (QR code target) |
 | `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code. Refused at startup below 30 seconds — the Redis store cannot represent a shorter one |
+| `POSTERN_REDIS_DEVICE_CODE_TTL` | No | `900` (15 min) | Lifetime a device code gets when the caller passes no `expires_in`, on the Redis store. Refused below the same 30 seconds, and for the same reason: it sets the lifetime of the same object |
 | `POSTERN_DEVICE_POLL_INTERVAL_SECONDS` | No | `5` | Minimum seconds between token polls. **At least 1**; must also stay below `POSTERN_DEVICE_CODE_TTL_SECONDS`, which is not checked: an interval at or above the lifetime expires the code before the browser may poll once |
 | `POSTERN_READ_KEY_PEM_PATH` | No | - | Read key PEM path (needed for device grant token exchange) |
 | `POSTERN_READ_KEY_KID` | No | `read-1` | Read key ID (must match API service) |

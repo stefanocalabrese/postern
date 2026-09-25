@@ -51,6 +51,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from postern_core.config import MIN_REPRESENTABLE_TTL_SECONDS, int_arg_or_env
 from postern_core.risk.context import RiskContext
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,28 @@ logger = logging.getLogger(__name__)
 #: shorter means a bulk-extraction attempt costs the attacker less waiting,
 #: longer means a false positive costs a real customer more.
 DEFAULT_SESSION_TTL_SECONDS = 1800
+
+#: The shortest ``POSTERN_REDIS_SESSION_TTL`` this store accepts.
+#:
+#: THERE IS NO DERIVATION HERE BEYOND "IT MUST BE POSITIVE", and saying so is
+#: the honest answer rather than inventing a number that reads as advice.
+#: `services/confirm/settings.py`'s `MIN_DEVICE_CODE_TTL_SECONDS` could be
+#: derived at 30 because three independent legs of the device grant have
+#: measured durations to sit above. A risk context has no equivalent: nothing
+#: in this repository measures how long a session that deserves a budget
+#: lasts, so any figure above one second would be a preference wearing a
+#: bound's clothes.
+#:
+#: WHAT ONE SECOND IS, THEN. It is the boundary between "short" and "off",
+#: and it is measured. At ``_ttl = 0``, against redis:7-alpine on 2026-09-25,
+#: ``save`` writes the key with a TTL of 1 -- ``_remaining_ttl`` floors there
+#: -- and the very next ``load`` computes ``ceil(0 - elapsed) <= 0``, deletes
+#: the key and answers ``None``. So every call gets a fresh context with a
+#: zeroed budget, the per-session budgets and tier escalation of ZT-5 never
+#: accumulate, and bulk extraction (A6) is counted against nothing. Negatives
+#: do the same, harder. That is not a short session, it is the control turned
+#: off through a variable whose name does not say so.
+MIN_SESSION_TTL_SECONDS = MIN_REPRESENTABLE_TTL_SECONDS
 
 
 class SessionStoreUnavailable(RuntimeError):
@@ -225,7 +248,9 @@ class RedisSessionStore(SessionStoreBase):
         ``rediss://user:pass@host:port/0`` (TLS).
 
     ``POSTERN_REDIS_SESSION_TTL``
-        Context TTL in seconds (default 1800 = 30 min).
+        Context TTL in seconds (default 1800 = 30 min). Read only when the
+        ``ttl`` argument is ``None``, and refused below one second --
+        `int_arg_or_env` carries both halves of that rule.
 
     ``POSTERN_REDIS_KEY_PREFIX``
         Key prefix for multi-tenant deployments (default ``"postern:"``).
@@ -240,8 +265,24 @@ class RedisSessionStore(SessionStoreBase):
         import redis.asyncio as redis
 
         self._url = url or os.environ.get("POSTERN_REDIS_URL", "redis://localhost:6379/0")
-        self._ttl = ttl or int(
-            os.environ.get("POSTERN_REDIS_SESSION_TTL", str(DEFAULT_SESSION_TTL_SECONDS))
+        # ``ttl or int(os.environ.get(...))`` until 2026-09-25, which crashed
+        # on ``POSTERN_REDIS_SESSION_TTL=`` with a message naming neither the
+        # variable nor this class, took zero and negatives without comment,
+        # and discarded an explicitly passed ``0`` in favour of the
+        # environment. `postern_core.config`'s `int_arg_or_env` closes all
+        # three and is the same reader `services/api/settings.py` and
+        # `services/confirm/settings.py` read their numbers through.
+        self._ttl = int_arg_or_env(
+            ttl,
+            parameter="ttl",
+            name="POSTERN_REDIS_SESSION_TTL",
+            default=DEFAULT_SESSION_TTL_SECONDS,
+            minimum=MIN_SESSION_TTL_SECONDS,
+            because=(
+                "It is how long a risk context accumulates its ZT-5 budget before the "
+                "store forgets it; at zero every load answers None, so every call starts "
+                "from an empty budget and bulk extraction accumulates against nothing."
+            ),
         )
         self._prefix = key_prefix or os.environ.get("POSTERN_REDIS_KEY_PREFIX", "postern:")
         self._redis: Any = redis.from_url(  # type: ignore[no-untyped-call]

@@ -34,6 +34,17 @@ identically, imported by each service's own middleware. Nothing here reads
 the environment on its own behalf or holds state, so it adds no coupling
 beyond the function call.
 
+WHAT ARRIVED ON THE SAME DAY, ONE COMMIT LATER. Two numbers were left out
+of the sweep above because neither is read in a ``from_env``: the Redis
+stores in `postern_core.risk.session` and `postern_core.auth.device_codes`
+read ``POSTERN_REDIS_SESSION_TTL`` and ``POSTERN_REDIS_DEVICE_CODE_TTL``
+inside their own constructors, as ``ttl or int(os.environ.get(...))``. That
+spelling carries a third defect the services' bare ``int()`` calls did not:
+an explicitly passed ``0`` is FALSY, so a caller asking for zero silently
+got the environment's value instead of being told no. `int_arg_or_env`
+below is the one shape for "an optional argument, else the environment",
+and it is the reason there is no third validation style in the tree.
+
 WHY AT PARSE TIME RATHER THAN AT FIRST USE. Three of these values already
 had a bound somewhere further in -- ``RequestDeadline.__init__`` refuses a
 non-positive deadline, ``RiskMiddleware.__init__`` and ``client_ip`` refuse
@@ -52,7 +63,24 @@ from __future__ import annotations
 import math
 import os
 
-__all__ = ["float_from_env", "int_from_env"]
+__all__ = [
+    "MIN_REPRESENTABLE_TTL_SECONDS",
+    "float_from_env",
+    "int_arg_or_env",
+    "int_from_env",
+]
+
+#: The smallest TTL any Redis-backed store in this repository can represent.
+#:
+#: ``SETEX key 0`` is a ``ResponseError`` on redis:7-alpine, not a write, and
+#: both stores already round up to keep off it:
+#: `postern_core.risk.session`'s ``_remaining_ttl`` returns ``max(1,
+#: ceil(...))`` and its ``load`` uses ``math.ceil`` for the same reason. So
+#: one second is the floor of the REPRESENTABLE range, and it is the only
+#: bound `int_arg_or_env` puts on a value a caller passed in code. What an
+#: OPERATOR may set is a separate and higher bar, stated per variable at the
+#: call site, because the two are answerable from different evidence.
+MIN_REPRESENTABLE_TTL_SECONDS = 1
 
 
 def _int_phrase(minimum: int) -> str:
@@ -183,3 +211,84 @@ def float_from_env(
     if value < minimum or (exclusive and value == minimum):
         raise ValueError(f"{name} must be {phrase}, got {value}. {because}")
     return value
+
+
+def int_arg_or_env(
+    passed: int | None,
+    *,
+    parameter: str,
+    name: str,
+    default: int,
+    minimum: int,
+    because: str,
+) -> int:
+    """Take the caller's number if there is one, else read ``name``.
+
+    Args:
+        passed: What the caller handed the constructor. ``None`` -- and only
+            ``None`` -- means "not supplied", so the environment is read.
+        parameter: The keyword argument's own name, echoed when the refusal
+            is about a value a PROGRAMMER passed. An operator cannot reach
+            this branch, so naming the environment variable there would send
+            them to a line they did not write.
+        name: The environment variable, echoed when the refusal is about a
+            value an OPERATOR set.
+        default: Returned when ``name`` is unset or empty.
+        minimum: The operator's floor, INCLUSIVE, applied only to the
+            environment. The floor on ``passed`` is
+            `MIN_REPRESENTABLE_TTL_SECONDS` and no higher; the two differ on
+            purpose and the next paragraph says why.
+        because: One sentence, appended to the environment's refusals only.
+            The argument branch does not carry it: an operator cannot
+            reach that message, and the programmer who can is already
+            looking at the call.
+
+    Returns:
+        ``passed``, or the parsed variable, or ``default``.
+
+    Raises:
+        ValueError: if ``passed`` is below `MIN_REPRESENTABLE_TTL_SECONDS`,
+            or if the variable is not an integer or is below ``minimum``.
+
+    WHY THE ARGUMENT AND THE VARIABLE GET DIFFERENT FLOORS, which looks
+    inconsistent until the two callers are named.
+    ``POSTERN_REDIS_DEVICE_CODE_TTL`` is floored at 30 seconds, the same
+    number `services/confirm/settings.py` refuses
+    ``POSTERN_DEVICE_CODE_TTL_SECONDS`` below, because the two variables set
+    the lifetime of the same object and a floor one of them did not have
+    would be a way around the other. The ``default_ttl`` ARGUMENT is the
+    value `postern_core.auth.device_codes`'s ``create_device_code`` falls
+    back to when its caller passes no ``expires_in``, and ``expires_in``
+    itself is deliberately unfloored --
+    tests/test_device_grant.py::TestTheFloorIsNotOnCreateDeviceCode pins
+    that, and tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL uses
+    it at 2. A fallback held to a stricter bound than the thing it is a
+    fallback for would refuse in code what the same store accepts one
+    argument later.
+
+    WHY A PASSED ``0`` IS REFUSED RATHER THAN HONOURED. Refusing and
+    honouring are both improvements on what ``passed or read()`` did, which
+    was to discard the number and use the environment's, and neither is free.
+    Honouring is the worse of the two here because zero is not a short
+    lifetime, it is the OFF position of the control the number configures:
+    measured on 2026-09-25 against redis:7-alpine, a `RedisSessionStore` at
+    ``_ttl = 0`` writes each context with a one-second TTL (``_remaining_ttl``
+    floors there) and then answers ``None`` to the very next ``load``, so
+    every ZT-5 budget starts from zero on every call and bulk extraction (A6)
+    accumulates against nothing; a `RedisDeviceCodeStore` at
+    ``_default_ttl = 0`` gives every code an ``expires_at`` of now, which
+    ``_set_code`` truncates to a TTL of zero and declines to write at all.
+    This is the posture `services/confirm/settings.py`'s `_positive_int`
+    already stated for the rate limits: "there is deliberately no value that
+    turns the control off".
+    """
+    if passed is None:
+        return int_from_env(name, default, minimum=minimum, because=because)
+    if passed < MIN_REPRESENTABLE_TTL_SECONDS:
+        raise ValueError(
+            f"{parameter} must be {_int_phrase(MIN_REPRESENTABLE_TTL_SECONDS)}, got {passed}. "
+            f"A TTL of zero is not a short lifetime but no lifetime at all, and this "
+            f"argument used to discard it silently in favour of {name}. Pass None to read "
+            f"{name}, or a positive number of seconds to override it."
+        )
+    return passed
