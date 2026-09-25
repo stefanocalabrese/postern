@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -48,6 +49,7 @@ from joserfc.jwk import KeySet
 from postern_core.auth.device_codes import (
     DeviceCode,
     InMemoryDeviceCodeStore,
+    RedisDeviceCodeStore,
     _device_code_to_dict,
     _generate_device_code,
     _generate_user_code,
@@ -59,7 +61,13 @@ from starlette.requests import Request
 from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
 from services.confirm.device_auth import approve_callback
 from services.confirm.main import create_confirm_app
-from services.confirm.settings import ConfirmSettings
+from services.confirm.settings import MIN_DEVICE_CODE_TTL_SECONDS, ConfirmSettings
+
+# Imported for its VALUE, not to run it: `SHORTEST_STORED_TTL` is where the
+# truncation that bug B1 rides on was measured, and the floor's derivation
+# cites it. Reading it here rather than restating the number is what keeps
+# `TestTheFloorIsDerivedAndNotPicked` from becoming a second, drifting copy.
+from tests.test_redis_backed_stores import SHORTEST_STORED_TTL
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers.
@@ -1542,3 +1550,204 @@ class TestApproveCallbackHandlerFailsClosedWithoutMiddleware:
         # method on a *received* response); decode `.body` instead.
         assert resp.status_code == 400
         assert json.loads(bytes(resp.body))["error"] == "invalid_request"
+
+
+# ---------------------------------------------------------------------------
+# The floor under POSTERN_DEVICE_CODE_TTL_SECONDS (bug B1).
+# ---------------------------------------------------------------------------
+
+
+class TestTheDeviceCodeTtlFloor:
+    """A TTL an operator can set but the store cannot represent.
+
+    `postern_core.auth.device_codes`'s `RedisDeviceCodeStore` computes its
+    TTL with ``int()``, which TRUNCATES, so a code asked for one second has
+    roughly 0.9999 left by the time that line runs, floors to zero, and the
+    ``if ttl_seconds > 0`` guard skips both the ``SETEX`` and the ``ZADD``.
+    Measured on 2026-09-25 against redis:7-alpine::
+
+        expires_in=   1  raw=0.999982  int()=0  stored=NO -- nothing written
+        expires_in=   2  raw=1.999990  int()=1  stored=YES
+        expires_in= 900  raw=899.999992  int()=899  stored=YES
+
+    ``create_device_code`` returned a `DeviceCode` in all three rows. In the
+    first it had written nothing, so the browser polls ``/token`` and is told
+    ``invalid_grant`` -- "your code was never real" -- about a code this
+    service had just minted for it. `InMemoryDeviceCodeStore` stores that
+    same code, so the two backends disagree on the same call.
+
+    WHAT THIS BOUNDS, AND WHAT IT DOES NOT. The floor is on the SETTING,
+    ``POSTERN_DEVICE_CODE_TTL_SECONDS``, which is the only path an operator
+    can reach that arithmetic from. It is NOT on ``create_device_code``'s
+    ``expires_in`` parameter, which any library caller still passes freely
+    and which `TestTheFloorIsNotOnCreateDeviceCode` below pins as unchanged.
+    """
+
+    def test_the_variable_is_named_in_the_refusal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The operator has to find the variable to fix it.
+
+        Same posture as `services/confirm/settings.py`'s `_positive_int`: a
+        misconfiguration that would quietly change a control's meaning fails
+        when the app is assembled, and says which name to go and edit.
+        """
+        monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", "5")
+        with pytest.raises(ValueError, match="POSTERN_DEVICE_CODE_TTL_SECONDS"):
+            ConfirmSettings.from_env()
+
+    @pytest.mark.parametrize("below", ["0", "1", "2", "5", "29", "-1", "-900"])
+    def test_a_value_below_the_floor_refuses_at_startup(
+        self, monkeypatch: pytest.MonkeyPatch, below: str
+    ) -> None:
+        """Including ``2``, which the store CAN represent but a human cannot use.
+
+        Falling back to 900 would be worse than having no knob at all: the
+        operator would be running a lifetime they never chose, and would find
+        out from a customer who cannot pair a device.
+        """
+        monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", below)
+        with pytest.raises(ValueError, match=str(MIN_DEVICE_CODE_TTL_SECONDS)):
+            ConfirmSettings.from_env()
+
+    @pytest.mark.parametrize("bad", ["abc", "1.5", "9 00", "  ", "30s"])
+    def test_a_non_integer_refuses_at_startup(
+        self, monkeypatch: pytest.MonkeyPatch, bad: str
+    ) -> None:
+        monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", bad)
+        with pytest.raises(ValueError, match="POSTERN_DEVICE_CODE_TTL_SECONDS"):
+            ConfirmSettings.from_env()
+
+    def test_the_floor_itself_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A floor that refused its own value would be an off-by-one, not a bound."""
+        monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", str(MIN_DEVICE_CODE_TTL_SECONDS))
+        assert ConfirmSettings.from_env().device_code_ttl_seconds == MIN_DEVICE_CODE_TTL_SECONDS
+
+    @pytest.mark.parametrize("raised", ["31", "300", "900", "1800", "3600"])
+    def test_a_value_at_or_above_the_floor_is_read_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch, raised: str
+    ) -> None:
+        monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", raised)
+        assert ConfirmSettings.from_env().device_code_ttl_seconds == int(raised)
+
+    def test_an_unset_or_empty_variable_keeps_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("POSTERN_DEVICE_CODE_TTL_SECONDS", raising=False)
+        unset = ConfirmSettings.from_env().device_code_ttl_seconds
+        monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", "")
+        assert ConfirmSettings.from_env().device_code_ttl_seconds == unset == 900
+
+    def test_the_default_clears_the_floor(self) -> None:
+        """A floor above the default would refuse an unconfigured service."""
+        assert ConfirmSettings().device_code_ttl_seconds >= MIN_DEVICE_CODE_TTL_SECONDS
+        assert ConfirmSettings.for_testing().device_code_ttl_seconds >= MIN_DEVICE_CODE_TTL_SECONDS
+
+
+class TestTheFloorIsDerivedAndNotPicked:
+    """The three bounds the number sits above, each re-derived here.
+
+    If any of them moves, this fails and the working in
+    `services/confirm/settings.py` has to be rewritten rather than quietly
+    becoming wrong.
+    """
+
+    def test_it_clears_the_truncation_cliff(self) -> None:
+        """Below `SHORTEST_STORED_TTL` the Redis backend stores nothing at all.
+
+        tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL carries the
+        measurement. This asserts the floor is not merely AT that cliff but
+        well clear of it, so no rounding anywhere can reach it.
+        """
+        assert MIN_DEVICE_CODE_TTL_SECONDS >= SHORTEST_STORED_TTL * 10
+
+    def test_it_clears_the_browsers_first_poll(self) -> None:
+        """``token_endpoint`` answers ``slow_down`` before ``interval`` elapses.
+
+        A TTL at or under the poll interval expires before the browser is
+        allowed to ask for the first time, so every pairing would fail.
+        """
+        interval = ConfirmSettings().device_poll_interval_seconds
+        assert MIN_DEVICE_CODE_TTL_SECONDS > interval
+        assert MIN_DEVICE_CODE_TTL_SECONDS >= interval * 6, "room for several polls"
+
+    def test_it_clears_the_only_measured_leg_of_the_approval(self) -> None:
+        """Server-side identity verification: 5 to 15 seconds (CLAUDE.md).
+
+        It is the ONLY leg of scan-then-approve this repository puts a number
+        on. The human legs are unmeasured here and the floor deliberately
+        claims nothing about them.
+        """
+        longest_measured_identity_verification = 15
+        assert MIN_DEVICE_CODE_TTL_SECONDS >= longest_measured_identity_verification * 2
+
+
+class TestTheFloorIsNotOnCreateDeviceCode:
+    """The other knob, unchanged -- which is the point of bounding the setting.
+
+    A floor on ``expires_in`` would have rewritten
+    tests/test_confirm_rate_limit.py's reaper fixtures and
+    tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL's codes, and would
+    have bounded a parameter no operator can reach. The store's contract is
+    unchanged; the environment variable is what narrowed.
+    """
+
+    async def test_the_in_memory_store_still_takes_a_one_second_lifetime(self) -> None:
+        store = InMemoryDeviceCodeStore()
+        code = await store.create_device_code(
+            client_id="c", scopes="s", verification_uri="https://x.invalid/v", expires_in=1
+        )
+        assert await store.get_device_code(code.device_code) is code
+        assert (code.expires_at - datetime.now(UTC)).total_seconds() <= 1
+
+    def test_the_signature_defaults_are_untouched(self) -> None:
+        """900 on the in-memory store, ``None`` on Redis (its own default TTL)."""
+        assert (
+            inspect.signature(InMemoryDeviceCodeStore.create_device_code)
+            .parameters["expires_in"]
+            .default
+            == 900
+        )
+        assert (
+            inspect.signature(RedisDeviceCodeStore.create_device_code)
+            .parameters["expires_in"]
+            .default
+            is None
+        )
+
+
+class TestAPairingCompletesAtTheConfiguredTtl:
+    """End to end, through the real composition root, at two lifetimes.
+
+    A floor is only worth having if the values above it still work, so this
+    drives the whole grant -- authorize, poll, approve, poll -- rather than
+    reading the setting back off the dataclass.
+    """
+
+    @pytest.mark.parametrize("ttl", [900, 1800])
+    async def test_a_pairing_completes(self, key_pair: RSAKeyPair, ttl: int) -> None:
+        verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
+        app = create_confirm_app(
+            dataclasses.replace(ConfirmSettings.for_testing(), device_code_ttl_seconds=ttl),
+            assertion_verifier=verifier,
+            device_key_store=no_enrolled_devices(),
+        )
+        async with _client(app) as client:
+            device = await _start_device_grant(client, client_id="browser-ttl")
+            assert device["expires_in"] == ttl
+
+            pending = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+            assert pending.json()["error"] == "authorization_pending"
+
+            approved = await _approve(client, device, bearer(key_pair, subject="cust_abc"))
+            assert approved.status_code == 200
+
+            issued = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+            assert issued.status_code == 200
+            assert issued.json()["access_token"].count(".") == 2
+
+            stored = await app.state.device_code_store.get_device_code(device["device_code"])
+            assert stored is not None, "the code the pairing used was really stored"
+            assert not stored.is_expired

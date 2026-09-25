@@ -84,7 +84,7 @@ The table below lists every variable, grouped by service.
 | `POSTERN_WRITE_KEY_KID` | No | `write-1` | Key ID published in the write JWKS |
 | `POSTERN_WRITE_TOKEN_ISSUER` | No | `https://mcp-write.internal` | `iss` claim on internal write tokens |
 | `POSTERN_DEVICE_VERIFICATION_URI` | No | `https://auth.postern.internal/verify` | Base URI for the user verification page (QR code target) |
-| `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code |
+| `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code. Refused at startup below 30 seconds — the Redis store cannot represent a shorter one |
 | `POSTERN_DEVICE_POLL_INTERVAL_SECONDS` | No | `5` | Minimum seconds between token polls |
 | `POSTERN_READ_KEY_PEM_PATH` | No | - | Read key PEM path (needed for device grant token exchange) |
 | `POSTERN_READ_KEY_KID` | No | `read-1` | Read key ID (must match API service) |

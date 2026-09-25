@@ -601,6 +601,43 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         the value it points at. Both are skipped when the TTL has already
         passed, which is the existing behaviour for the value and keeps the
         index from gaining a member that is due the moment it lands.
+
+        THE ``int`` BELOW TRUNCATES, AND THAT IS STILL TRUE (bug B1). It
+        loses up to one whole second, so a code asked for one second has
+        roughly 0.9999 left by the time the line runs, floors to zero, and
+        the guard skips BOTH writes. ``create_device_code`` then returns a
+        `DeviceCode` this store never wrote, ``get_device_code`` answers
+        ``None`` for it immediately, and `InMemoryDeviceCodeStore` stores
+        that same code -- so the two backends disagree at the boundary.
+        Measured 2026-09-25 against redis:7-alpine: ``expires_in=1`` stores
+        nothing, ``expires_in=2`` stores a TTL of 1, ``expires_in=900``
+        stores 899.
+
+        WHAT WAS FIXED IS THE CONFIGURATION PATH ONLY.
+        `services/confirm/settings.py`'s `MIN_DEVICE_CODE_TTL_SECONDS`
+        refuses a ``POSTERN_DEVICE_CODE_TTL_SECONDS`` below 30 at startup,
+        which is the only route an OPERATOR had to this. What still reaches
+        it is any direct caller of ``create_device_code`` passing a small
+        enough ``expires_in``, which in this tree means this repository's own
+        tests -- tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL
+        exists precisely because of it.
+
+        NO GUARD IS RAISED HERE, deliberately. This method has three callers
+        and a zero TTL means a different thing in each: from
+        ``create_device_code`` it is a caller asking for a lifetime that
+        cannot be represented, but from ``approve_device_code`` and
+        ``update_device_code`` it is an ordinary race -- a customer who was
+        slow, whose code expired while they approved -- and turning that into
+        an exception would fail an approval on the write path for being
+        late. Nothing available here tells the two apart. Raising in
+        ``create_device_code`` instead, where they CAN be told apart, would
+        make this backend refuse a lifetime `InMemoryDeviceCodeStore`
+        accepts, which does not end the disagreement between them, it only
+        moves it from the outcome to the control flow and puts it in
+        `DeviceCodeStoreBase`'s contract, where no in-memory test can reach
+        it. Ending it properly means changing the arithmetic in BOTH
+        backends, which changes the expiry of every device code, and that is
+        a separate decision from putting a floor under a setting.
         """
         ttl_seconds = max(0, int((code.expires_at - datetime.now(UTC)).total_seconds()))
         if ttl_seconds > 0:

@@ -6,7 +6,9 @@ services/api/settings.py. The asymmetry is the control, and it is greppable.
 Device authorization (§7.3 of the handoff) adds:
 - ``device_verification_uri`` — base URI for the user verification page.
   The QR code encodes this + ``user_code``; the mobile app deep-links to it.
-- ``device_code_ttl_seconds`` — lifetime of a device code (default 900 = 15 min).
+- ``device_code_ttl_seconds`` — lifetime of a device code (default 900 = 15
+  min), refused below ``MIN_DEVICE_CODE_TTL_SECONDS`` because the Redis store
+  cannot represent a shorter one (bug B1; that constant carries the working).
 - ``device_poll_interval_seconds`` — minimum seconds between token polls (default 5).
 
 The confirm service also needs a READ key to mint read tokens during device
@@ -98,6 +100,106 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+#: The shortest device-code lifetime ``POSTERN_DEVICE_CODE_TTL_SECONDS`` accepts.
+#:
+#: WHY A FLOOR EXISTS AT ALL (bug B1). `postern_core.auth.device_codes`'s
+#: `RedisDeviceCodeStore` writes its key with
+#: ``max(0, int((expires_at - now).total_seconds()))``, and ``int``
+#: TRUNCATES. A code asked for one second has roughly 0.9999 of one left by
+#: the time that line runs, so it floors to zero and the ``if ttl_seconds >
+#: 0`` guard skips BOTH the ``SETEX`` and the ``ZADD``. Measured on
+#: 2026-09-25 against redis:7-alpine::
+#:
+#:     expires_in=   1  raw=0.999982  int()=0  stored=NO -- nothing written
+#:     expires_in=   2  raw=1.999990  int()=1  stored=YES
+#:     expires_in= 900  raw=899.999992  int()=899  stored=YES
+#:
+#: ``create_device_code`` returns a code in all three rows, so the first one
+#: hands a browser a device code the store never wrote; its next ``/token``
+#: poll is answered ``invalid_grant``, which tells a legitimate customer
+#: their code was never real. `InMemoryDeviceCodeStore` stores that same
+#: code, so dev and production disagree on the same call. This variable was
+#: the only path an operator could reach that from: before this floor it was
+#: read with a bare ``int()`` and validated nowhere.
+#:
+#: WHY 30, DERIVED. Three bounds sit under it, and
+#: tests/test_device_grant.py::TestTheFloorIsDerivedAndNotPicked re-derives
+#: each one so that this working fails rather than rots:
+#:
+#: - 2 IS WHERE THE ARITHMETIC BITES. Below it the Redis backend stores
+#:   nothing at all; tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL
+#:   is that number and carries the same measurement. 30 is 15x it, which is
+#:   far enough that no rounding anywhere can reach the cliff.
+#: - 5 IS THE BROWSER'S FIRST POLL, ``device_poll_interval_seconds`` below.
+#:   `services/confirm/device_auth.py`'s ``token_endpoint`` answers
+#:   ``slow_down`` to anything sooner, so a TTL at or under the interval
+#:   expires before the browser is permitted to ask even once. 30 is 6x it,
+#:   so a code at the floor survives several polls rather than exactly one.
+#: - 15 IS THE LONGEST MEASURED SERVER-SIDE LEG of the approval: CLAUDE.md
+#:   prices identity verification, which step 4 of the flow in
+#:   `postern_core.auth.device_codes` reaches, at 5 to 15 seconds. 30 is 2x
+#:   its worst case.
+#:
+#: WHAT THIS DELIBERATELY DOES NOT CLAIM, because a floor that reads as a
+#: recommendation is worse than none:
+#:
+#: - NOT that 30 is usable. It is not. 900 is the default and the only
+#:   lifetime in this tree derived for real use, and an operator who sets 30
+#:   will strand customers who take longer than half a minute to pick up a
+#:   phone. This bounds what is REPRESENTABLE, not what is SUFFICIENT.
+#: - NOT that a human can scan a QR, compare a pairing code and approve
+#:   within 30 seconds. Nothing here measures a human, and the number is
+#:   built only out of legs this repository has measured.
+#: - NOT that the truncation is fixed. It is not; see
+#:   `postern_core.auth.device_codes`'s ``_set_code``, which records what
+#:   still reaches it. This closes the CONFIGURATION path and no other.
+MIN_DEVICE_CODE_TTL_SECONDS = 30
+
+
+def _device_code_ttl(name: str, default: int) -> int:
+    """Read a device-code lifetime from the environment, or refuse to start.
+
+    Deliberately the same shape as `_positive_int` above -- read, refuse,
+    echo, name the variable -- rather than a second validation style, and
+    for the same stated reason: a value an operator typed and got wrong must
+    fail when the app is assembled, not silently revert to a default they
+    did not choose. What differs is only the bound, because the quantity is
+    a duration rather than a per-minute count, and `MIN_DEVICE_CODE_TTL_SECONDS`
+    carries its derivation.
+
+    THE CEILING IS DELIBERATELY ABSENT. A lifetime that is too LONG is a
+    real risk -- it widens the window in which a leaked ``device_code`` is
+    worth relaying (A2) -- but it is a risk an operator can reason about and
+    RFC 8628 sets no bound on. A value that is too SHORT is different in
+    kind: it does not weaken a control, it produces a service that cannot
+    complete a pairing at all, and on the Redis backend it does so silently.
+    Only the second one is unrepresentable, so only the second one is
+    refused here.
+
+    The offending value is echoed for the reason `_positive_int` gives: this
+    is an operator's own environment, not caller input.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be an integer of at least {MIN_DEVICE_CODE_TTL_SECONDS} seconds, "
+            f"got {raw!r}. It is the lifetime of a device code, and a shorter one cannot "
+            "outlive the browser's poll interval or the user's approval on their phone."
+        ) from None
+    if value < MIN_DEVICE_CODE_TTL_SECONDS:
+        raise ValueError(
+            f"{name} must be at least {MIN_DEVICE_CODE_TTL_SECONDS} seconds, got {value}. "
+            "It is the lifetime of a device code, and a shorter one cannot outlive the "
+            "browser's poll interval or the user's approval on their phone; at 1 second "
+            "the Redis store's truncation discards the code without storing it at all."
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class ConfirmSettings:
     write_key_pem_path: str | None = None
@@ -105,6 +207,9 @@ class ConfirmSettings:
     write_token_issuer: str = "https://mcp-write.internal"  # noqa: S105
     # Device authorization (§7.3): where the user goes to approve pairing.
     device_verification_uri: str = "https://auth.postern.internal/verify"
+    # Floored at `MIN_DEVICE_CODE_TTL_SECONDS` when it comes from the
+    # environment, which is where that constant's working lives. The field
+    # default stays 900 and is the only lifetime here derived for real use.
     device_code_ttl_seconds: int = 900
     device_poll_interval_seconds: int = 5
     # Read key for device grant token exchange (both read + write needed here).
@@ -267,7 +372,7 @@ class ConfirmSettings:
                 "POSTERN_DEVICE_VERIFICATION_URI",
                 "https://auth.postern.internal/verify",
             ),
-            device_code_ttl_seconds=int(os.environ.get("POSTERN_DEVICE_CODE_TTL_SECONDS", "900")),
+            device_code_ttl_seconds=_device_code_ttl("POSTERN_DEVICE_CODE_TTL_SECONDS", 900),
             device_poll_interval_seconds=int(
                 os.environ.get("POSTERN_DEVICE_POLL_INTERVAL_SECONDS", "5")
             ),
