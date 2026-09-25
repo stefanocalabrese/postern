@@ -16,6 +16,14 @@ on:
           - staging
           - production
 
+# Workflow-level floor. A job-level `permissions` block REPLACES this one
+# rather than merging with it, so each job below restates everything it needs;
+# the value of the floor is that a job added later with no block of its own
+# gets read-only and not `id-token: write`, which is the grant worth keeping
+# scarce here.
+permissions:
+  contents: read
+
 env:
   REGISTRY: ${{ secrets.AWS_ECR_REGISTRY }}
   AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-1' }}
@@ -26,6 +34,46 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    # `id-token: write` is not a hardening extra here, it is the difference
+    # between this job running and failing at its fourth step. It is never
+    # granted by a repository default -- GitHub issues no OIDC token unless a
+    # workflow asks for one -- so before this block existed the first real
+    # dispatch would have died at "Configure AWS credentials", before ECR
+    # login and before the build. Two steps need it:
+    #   - `aws-actions/configure-aws-credentials` assumes `AWS_ROLE_ARN` by
+    #     OIDC federation with no static keys; its README states the
+    #     requirement as "Need ID token write permission to use OIDC".
+    #   - cosign signs keylessly, which means exchanging a GitHub OIDC token
+    #     for a Fulcio certificate. `sigstore/cosign-installer`'s README
+    #     carries the same line: "id-token: write # needed for signing the
+    #     images with GitHub OIDC Token".
+    #
+    # `contents: read` covers `actions/checkout`, and covers the public-repo
+    # reads that `astral-sh/setup-uv` and `aquasecurity/trivy-action`
+    # (`token-setup-trivy`, defaulted to `github.token`) make to fetch their
+    # own binaries.
+    #
+    # Deliberately NOT granted, each checked rather than assumed:
+    #   - `packages: write`. Images go to ECR via `secrets.AWS_ECR_REGISTRY`,
+    #     authenticated by `aws-actions/amazon-ecr-login`. That scope governs
+    #     GHCR, which this workflow never touches.
+    #   - `security-events: write`. Both Trivy steps use `format: table` and
+    #     there is no SARIF upload step; trivy-action's README asks for that
+    #     scope only in its SARIF examples and declares plain `contents: read`
+    #     for a table scan.
+    #   - `contents: write` / `actions: read`, which `anchore/sbom-action`'s
+    #     README lists. Read against its source rather than its README: those
+    #     are for the release-asset path. `attachReleaseAssets` reaches a
+    #     GitHub API call only when `eventName === "release"`, or on a push to
+    #     `refs/tags/*`; on `workflow_dispatch` `release` stays undefined and
+    #     every API call in that function sits inside `if (release)`. The
+    #     workflow-artifact upload it does perform goes through
+    #     `@actions/artifact`, on `ACTIONS_RUNTIME_TOKEN`.
+    #   - any scope for `actions/upload-artifact`, whose `action.yml` declares
+    #     no `github-token` input at all.
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       api_digest: ${{ steps.push-api.outputs.digest }}
       confirm_digest: ${{ steps.push-confirm.outputs.digest }}
@@ -151,6 +199,25 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment }}  # manual approval gate
+    # Same two scopes, for one fewer reason. `id-token: write` is here for
+    # `aws-actions/configure-aws-credentials` only: `cosign verify` checks a
+    # Fulcio certificate against the Rekor log and mints no OIDC token, so
+    # signature verification would pass without it while the AWS role
+    # assumption above it would not.
+    #
+    # `contents: read` covers `actions/checkout`.
+    #
+    # `actions/download-artifact` gets nothing and needs nothing: its
+    # `github-token` input is documented as "required when downloading
+    # artifacts from a different repository or from a different workflow
+    # run", and this job is `needs: build` in the same run, so `run-id`
+    # keeps its `github.run_id` default and the download goes through the
+    # runtime token. The ECS steps are `echo` placeholders today; when they
+    # become real `aws ecs update-service` calls they will use the assumed
+    # role, which is an AWS permission and not a `GITHUB_TOKEN` scope.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 

@@ -17,6 +17,24 @@ name: ci
 on:
   workflow_dispatch:
 
+# Without this block the job inherits the repository or organisation default
+# for `GITHUB_TOKEN`, which on an older repository is write-all. Declaring any
+# scope sets every scope not named here to `none` ("If you specify the access
+# for any of these permissions, all of those that are not specified are set to
+# `none`", GitHub workflow-syntax reference), so this one line is the whole
+# least-privilege statement rather than the start of one.
+#
+# `contents: read` is what `actions/checkout` needs to clone. Nothing else in
+# this job touches the GitHub API as this repository: `astral-sh/setup-uv`
+# passes `github.token` only to download a uv release from a public repo, and
+# `enable-cache: true` goes to the Actions cache service, which authenticates
+# with `ACTIONS_RUNTIME_TOKEN` and not with `GITHUB_TOKEN`. Deliberately NOT
+# granted: `id-token` (no OIDC here -- that is deploy.yml), `packages` (no
+# registry), `actions` (no artifacts), `security-events` (no SARIF upload),
+# and every write scope, since this job only reads the tree and runs gates.
+permissions:
+  contents: read
+
 jobs:
   gates:
     runs-on: ubuntu-latest
