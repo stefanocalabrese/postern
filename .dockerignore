@@ -1,25 +1,39 @@
 # Never let secrets, VCS metadata or test material into the build context;
 # both the `api` and `confirm` targets do `COPY . .` in the builder stage,
 # so anything not excluded here is a candidate for landing in the image.
+#
+# Pattern semantics, measured 25 September 2026 against Docker 29.8.0 and
+# not assumed: a `.dockerignore` pattern is matched against the whole path
+# relative to the context root with Go's `filepath.Match`, whose `*` does
+# not cross a `/`. A bare `__pycache__/` therefore excludes `./__pycache__`
+# and nothing else -- a probe context carrying `nested/__pycache__/x.txt`
+# and `nested/.env` shipped both into the image under the old patterns, and
+# shipped neither under the `**/` forms below. `**` matches zero directories
+# too, so `**/__pycache__/` still covers the root-level one and the bare
+# form is redundant rather than complementary. This is why every pattern
+# that names a build artefact or a cache is written `**/`-prefixed.
 .git
 .gitignore
 .dockerignore
 
 # Local environments and caches -- never shipped, and `.env*` may hold
 # real secrets on a developer machine even though none is committed.
-.venv
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.import_linter_cache/
-.env
-.env.*
-.DS_Store
-dist/
-build/
-*.egg-info/
+# `.venv` matters twice: the builder creates `/app/.venv` in the layer
+# before `COPY . .`, so a host `.venv` reaching the context would overwrite
+# a Linux venv with whatever ABI the developer's machine built.
+**/.venv
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.import_linter_cache/
+**/.env
+**/.env.*
+**/.DS_Store
+**/dist/
+**/build/
+**/*.egg-info/
 
 # Test material and design docs: neither the API nor confirm runtime needs
 # them, and the adversarial requirement is that they never reach the image,
@@ -28,20 +42,56 @@ tests/
 docs/
 tools/
 
+# `dev-docs/` is the threat model itself: the zero-trust plan with the
+# A1..A11 attack scenarios and their unverified/residual rows, the design
+# handoff, the implementation guide and eleven decision records, ~280 KB of
+# it. It is gitignored, so a CI checkout never has it and its absence from
+# this list was invisible there -- but CLAUDE.md's Commands section tells
+# engineers to run `docker build --target api --platform linux/arm64 .` on
+# their own machine, where the directory is present and `COPY . .` took it.
+# Measured before this line existed: a probe file under `dev-docs/` was
+# readable at `/app/dev-docs/` in the built `api` image. An attacker who
+# reaches RCE in the read container should not also be handed the list of
+# attacks this design already knows it does not stop.
+dev-docs/
+
+# Session working notes for the local model, also gitignored and also
+# present on a developer machine. The glob covers the `.tmp-<pid>` file the
+# maintaining hook writes before renaming over it. Measured: the 28 KB
+# `handoff-for-local.md` shipped at `/app/handoff-for-local.md`.
+handoff-for-local.md*
+
 # The stub backend runs from the host source tree via a bind mount in
 # docker-compose.yml (`backend-stub` uses the builder base image directly,
 # not the `api`/`confirm` targets), so it never needs to be baked into
 # either shipped image.
 stub/
 
-# Editor/agent metadata, never relevant to a production image.
+# Editor/agent metadata, never relevant to a production image. This also
+# covers `.claude/worktrees/`, where concurrent sessions keep full second
+# copies of this repository.
 .claude/
+
+# Brand assets: 212 KB of SVG and PNG with no runtime reader. Neither
+# service serves them; the only reference anywhere is the `<img>` in
+# README.md, which this file already excludes. `logos/README.md` shipped
+# too under the old root-only patterns, which is the same bug as above.
+assets/
+logos/
+
+# CI/CD definitions. No runtime value, and the deploy workflow names the
+# secrets and the ECR/ECS shape an operator wires up; that belongs in the
+# repository, not in a container an attacker may land in.
+.github/
 
 # Repo-management and internal-design files: no runtime value, and
 # CLAUDE.md/README.md carry more of this project's internal security
 # reasoning than a shipped container image should hold, even though none of
 # it is a credential. `pyproject.toml` and `uv.lock` are excluded from this
-# list on purpose -- `uv sync` inside the image needs both.
+# list on purpose -- `uv sync` inside the image needs both. `migrations/`
+# and `alembic.ini` are deliberately kept too: `alembic upgrade head` is
+# run from this image as a one-off task, so dropping them would break a
+# deploy path rather than harden one.
 CLAUDE.md
 README.md
 Makefile
