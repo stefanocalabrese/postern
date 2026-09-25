@@ -50,7 +50,7 @@ this, is the bound that has to hold.
 THE LIMITER IS ITSELF AN ACCUMULATOR, which is the trap in fixing an
 accumulation defect. A map keyed by client address grows with the number of
 distinct addresses seen, and an attacker rotating addresses is exactly the
-traffic this module attracts. `_Buckets` is therefore a fixed-capacity LRU:
+traffic this module attracts. `Buckets` is therefore a fixed-capacity LRU:
 at ``max_buckets`` the least recently used entry is dropped. Eviction, not
 refusal, and the argument is the reverse of the store cap's: evicting a
 limiter entry only RESETS a counter, so it can never deny anyone, and an
@@ -74,6 +74,18 @@ verification, which for ``POST /challenges/{id}/approve`` is the expensive
 part. It reaches no store, no database and no handler, so the property
 ``AppAssertionMiddleware``'s docstring claims for its own placement is
 preserved exactly: this module holds counters and a clock.
+
+THERE IS A SECOND LIMITER, AND IT IS NOT THIS ONE RE-KEYED.
+`services/confirm/customer_rate_limit.py` bounds the two
+assertion-authenticated paths per CUSTOMER, which is the unit an address
+cannot express, and it must run AFTER `AppAssertionMiddleware` because that is
+where the verified ``sub`` appears. The two positions are mutually exclusive,
+so the two limiters are layered rather than alternative and this one stays
+outermost with its ceilings unchanged -- it is the backstop that keeps a
+``sub``-keyed refusal, which has already paid for a JWKS fetch and a signature
+verification, from being the cheapest thing an attacker can provoke. `Buckets`
+and `charge_one` below are public because that module reuses them: one
+implementation of fixed-window counting, rather than two that drift.
 """
 
 from __future__ import annotations
@@ -247,7 +259,7 @@ class _Counter:
 _Counters = dict[str, _Counter]
 
 
-class _Buckets:
+class Buckets:
     """A fixed-capacity LRU map of address bucket to its counters.
 
     ``OrderedDict`` with ``move_to_end`` on every touch, and ``popitem`` of
@@ -344,7 +356,7 @@ class RateLimit:
         self.limits = resolved
         self.fallback_limit = fallback_limit
         self.pairing_limit = pairing_limit
-        self._buckets = _Buckets(max_buckets)
+        self._buckets = Buckets(max_buckets)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Not only ``websocket``: ``lifespan`` reaches every middleware
@@ -407,10 +419,10 @@ class RateLimit:
         now = time.monotonic()
 
         limit = self.limits.get(route, self.fallback_limit)
-        wait = _charge_one(counters, route, limit, now)
+        wait = charge_one(counters, route, limit, now)
 
         if route == "/device_authorization":
-            pairing_wait = _charge_one(counters, "pairing", self.pairing_limit, now)
+            pairing_wait = charge_one(counters, "pairing", self.pairing_limit, now)
             if pairing_wait is not None and (wait is None or pairing_wait > wait):
                 wait = pairing_wait
 
@@ -482,7 +494,7 @@ class RateLimit:
         await send({"type": "http.response.body", "body": body})
 
 
-def _charge_one(counters: _Counters, name: str, limit: Limit, now: float) -> int | None:
+def charge_one(counters: _Counters, name: str, limit: Limit, now: float) -> int | None:
     """Add one to a named fixed window, or return the seconds left in it.
 
     ``time.monotonic``, never wall clock: a clock step backwards would extend

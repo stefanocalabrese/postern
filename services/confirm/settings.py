@@ -333,16 +333,38 @@ class ConfirmSettings:
     #   discovering it at 3am costs a restart, not a deploy.
     #
     # The honest limit of all five: a per-address bound is the wrong UNIT for
-    # an authenticated path, where the meaningful one is per customer. Keying
-    # the assertion-authenticated paths on the verified ``sub`` needs a second
-    # limiter running AFTER ``AppAssertionMiddleware``, which is a different
-    # shape from the outermost one these configure; see
-    # `services/confirm/rate_limit.py`'s module docstring.
+    # an authenticated path, where the meaningful one is per customer. That
+    # gap is now closed by a SECOND limiter rather than by re-keying these --
+    # the two ``customer_rate_limit_*`` fields below configure it -- and these
+    # five keep their numbers because that second limiter runs after
+    # authentication and needs this one in front of it as the backstop.
     rate_limit_device_authorization: int = 60
     rate_limit_token: int = 300
     rate_limit_approve: int = 60
     rate_limit_challenge_approve: int = 60
     rate_limit_default: int = 60
+    # How many requests ONE CUSTOMER may make to each assertion-authenticated
+    # path per minute. `services/confirm/customer_rate_limit.py`'s
+    # ``DEFAULT_CUSTOMER_LIMITS`` carries the working behind each default and
+    # these values reproduce it exactly.
+    #
+    # WHICH WAY TO SET THESE, and it is the opposite question from the five
+    # above. Those ask "how many customers sit behind one address?"; these ask
+    # "how fast can one person tap approve?", and the answer does not vary
+    # with the deployment's network shape at all. Both paths are one tap on a
+    # phone per unit of work, so an operator who finds these tight should look
+    # first at whether their app retries on a timeout, because a client-side
+    # retry loop is the only legitimate traffic that reaches ten a minute.
+    #
+    # THE DEFAULT SHARES ``POSTERN_REDIS_URL`` WITH THE OTHER THREE STORES.
+    # Unset, the counters are per replica, which for a per-customer ceiling
+    # means R replicas admit R times these numbers -- see
+    # `services/confirm/customer_rate_limit.py`'s
+    # ``InMemoryCustomerRateLimitStore``. A multi-replica deployment must set
+    # it, and the revocation list, session store and device code store all
+    # want it set for their own reasons already.
+    customer_rate_limit_approve: int = 10
+    customer_rate_limit_challenge_approve: int = 10
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -546,6 +568,18 @@ class ConfirmSettings:
                 "POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE", 60
             ),
             rate_limit_default=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_DEFAULT", 60),
+            # Through the SAME `_positive_int` as the five above, so the two
+            # families raise identical messages for identical mistakes and
+            # there is no fourth numeric-parsing style in this tree. The
+            # helper's `because` -- "It is a per-minute request count; there
+            # is no value that disables the limit" -- is true of these
+            # verbatim.
+            customer_rate_limit_approve=_positive_int(
+                "POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_APPROVE", 10
+            ),
+            customer_rate_limit_challenge_approve=_positive_int(
+                "POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_CHALLENGE_APPROVE", 10
+            ),
         )
 
     @classmethod

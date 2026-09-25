@@ -75,6 +75,11 @@ from starlette.routing import Route
 from services.confirm.auth import AppAssertionMiddleware, AssertionVerifier
 from services.confirm.body_limit import BodySizeLimit
 from services.confirm.callback import callback_routes
+from services.confirm.customer_rate_limit import (
+    CustomerRateLimit,
+    create_customer_rate_limit_store,
+    customer_limits_from_settings,
+)
 from services.confirm.device_auth import device_auth_routes
 from services.confirm.jwks import jwks_route
 from services.confirm.minter import build_write_minter
@@ -264,6 +269,18 @@ def create_confirm_app(
     # call sites.
     revocation_store = create_revocation_store()
 
+    # --- Per-customer approval counters (shared with every replica) ---
+    #
+    # THE FOURTH STORE BEHIND ONE ``POSTERN_REDIS_URL``, alongside the
+    # revocation list above, the session store and the device code store, and
+    # for the same reason the revocation store gives: pointing them at
+    # different backends by construction is the failure the shared factory
+    # shape removes. Unset, this one degrades to per-replica counters, which
+    # for a per-customer ceiling means R replicas admit R times the configured
+    # number -- `services/confirm/customer_rate_limit.py`'s
+    # ``InMemoryCustomerRateLimitStore`` is where that is priced.
+    customer_rate_limit_store = create_customer_rate_limit_store()
+
     # --- Database (for challenges table, §6.3 approval callback) ---
     db = Database(
         settings.database_url,
@@ -336,6 +353,35 @@ def create_confirm_app(
             # including why a request it refuses writes no `audit_log` row.
             Middleware(BodySizeLimit, max_body_bytes=settings.max_body_bytes),
             Middleware(AppAssertionMiddleware, verifier=verifier),
+            # LAST, AND THEREFORE INNERMOST -- the first middleware a request
+            # meets is entry zero, so this is the last one before routing.
+            # It has to be behind `AppAssertionMiddleware`, because the
+            # customer it counts against is the verified `sub` and that does
+            # not exist any further out.
+            #
+            # A SECOND LIMITER, NOT A RE-KEYING OF THE FIRST. The one at entry
+            # zero counts per client address bucket, which is the wrong unit
+            # for these two authenticated paths: sixty payment approvals a
+            # minute from one customer is a signal and sixty from a bank's
+            # egress address is a Tuesday. It stays where it is with its
+            # numbers untouched, because a refusal from HERE has already cost
+            # a JWKS fetch and a signature verification -- exactly the
+            # resource entry zero exists to protect -- so the two are layered
+            # and the outer one is the backstop.
+            #
+            # `services/confirm/customer_rate_limit.py` carries the rest: the
+            # derivation of the two ceilings, why the counters are shared
+            # through `POSTERN_REDIS_URL` rather than held per replica, why an
+            # unreachable counter refuses rather than admits, and why a
+            # refusal writes a log line and no `audit_log` row.
+            Middleware(
+                CustomerRateLimit,
+                store=customer_rate_limit_store,
+                limits=customer_limits_from_settings(
+                    approve=settings.customer_rate_limit_approve,
+                    challenge_approve=settings.customer_rate_limit_challenge_approve,
+                ),
+            ),
         ],
     )
     # Expose key sources on ``app.state`` for external consumers.
@@ -357,6 +403,12 @@ def create_confirm_app(
     # matches every other store this state dict carries, so a route table that
     # forgets one fails the same way the others do.
     app.state.postern_device_key_store = keys
+    # Exposed for the same reason every other store on this dict is: a test
+    # that must observe the counters, and an operator reading a route table,
+    # both find it where the others are. Nothing reads it at request time --
+    # `CustomerRateLimit` holds its own reference, because a middleware that
+    # resolved its store per request could be made to run without one.
+    app.state.postern_customer_rate_limit_store = customer_rate_limit_store
     app.state.settings = settings
 
     return app

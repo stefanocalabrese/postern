@@ -290,6 +290,27 @@ BOUNDED: tuple[Bounded, ...] = (
         ("0", "-1"),
         ("1",),
     ),
+    # The per-CUSTOMER pair, read through the same `_positive_int` as the five
+    # above so both families raise identical messages for identical mistakes.
+    # Their unit is the verified assertion `sub` rather than a client address
+    # bucket; `services/confirm/customer_rate_limit.py` carries the working
+    # behind the default of ten.
+    Bounded(
+        "POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_APPROVE",
+        "customer_rate_limit_approve",
+        "confirm",
+        10,
+        ("0", "-1"),
+        ("1",),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_CHALLENGE_APPROVE",
+        "customer_rate_limit_challenge_approve",
+        "confirm",
+        10,
+        ("0", "-1"),
+        ("1",),
+    ),
 )
 
 IDS = [f"{b.service}:{b.name}" for b in BOUNDED]

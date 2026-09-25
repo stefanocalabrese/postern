@@ -71,7 +71,7 @@ The table below lists every variable, grouped by service.
 | `POSTERN_REQUEST_DEADLINE_SECONDS` | No | `101.0` | Wall-clock bound on the whole HTTP request (see [Audit System](components/audit.md)). **Greater than 0**, and finite: there is no off switch, raise the number instead |
 | `POSTERN_REQUIRE_PEM_KEY` | No | - | Set to `"1"` to refuse startup with an ephemeral read key |
 | `POSTERN_REQUIRE_REDIS` | No | - | Set to `"1"` to refuse startup without `POSTERN_REDIS_URL` |
-| `POSTERN_REDIS_URL` | No | - | Redis connection string (for sessions, device codes, revocation lists) |
+| `POSTERN_REDIS_URL` | No | - | Redis connection string (for sessions, device codes, revocation lists, per-customer approval counters). Unset, each is per-replica: a deployment running R replicas admits R times the per-customer ceilings below. `POSTERN_REQUIRE_REDIS` is read by `services/api` only, so setting it does not guarantee the `services/confirm` counters are shared |
 | `POSTERN_REDIS_SESSION_TTL` | No | `1800` (30 min) | How long a risk context accumulates its ZT-5 budget, on the Redis session store. **At least 1**; at zero every load answers `None`, so every call starts from an empty budget |
 
 ### Confirm Service (`services/confirm/settings.py`)
@@ -95,6 +95,8 @@ The table below lists every variable, grouped by service.
 | `POSTERN_CONFIRM_RATE_LIMIT_APPROVE` | No | `60` | As above, for `/approve`. Raise this if the banking app calls from its own backend rather than from the phone |
 | `POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE` | No | `60` | As above, for the challenge approval callback |
 | `POSTERN_CONFIRM_RATE_LIMIT_DEFAULT` | No | `60` | As above, for every other path |
+| `POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_APPROVE` | No | `10` | Requests per minute per **customer** (the verified assertion `sub`), for `/approve`. A second limiter behind the assertion check; the address-keyed one above stays in front. **At least 1** |
+| `POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_CHALLENGE_APPROVE` | No | `10` | As above, for the challenge approval callback. One payment approval is one tap on a phone, so ten a minute is already well above what a person does |
 | `POSTERN_DEVICE_VERIFICATION_URI` | No | `https://auth.postern.internal/verify` | Base URI for the user verification page (QR code target) |
 | `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code. Refused at startup below 30 seconds — the Redis store cannot represent a shorter one |
 | `POSTERN_REDIS_DEVICE_CODE_TTL` | No | `900` (15 min) | Lifetime a device code gets when the caller passes no `expires_in`, on the Redis store. Refused below the same 30 seconds, and for the same reason: it sets the lifetime of the same object |
