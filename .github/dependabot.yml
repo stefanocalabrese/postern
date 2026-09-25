@@ -1,0 +1,46 @@
+# Keeps the commit-SHA pins in .github/workflows/ from going stale.
+#
+# A SHA pin with no maintenance path trades one supply-chain risk for
+# another: the workflow stops executing whatever the upstream maintainer
+# repoints a tag to, and starts executing one frozen commit forever,
+# including after that commit is found to be vulnerable. Dependabot is the
+# half that makes pinning safe rather than merely immutable. It opens a PR
+# that rewrites both the SHA and the trailing `# vX.Y.Z` comment (GitHub
+# changelog, 31 October 2022). One caveat worth knowing: it does not correct
+# a version comment that was already wrong, so every comment in the two
+# workflows was cross-checked against the tag its SHA resolves from rather
+# than typed from memory.
+#
+# THIS DOES NOT TRIGGER A WORKFLOW RUN, which is the constraint that governs
+# this repository. Two independent reasons, both checked rather than assumed:
+#
+#   1. Dependabot does not run on billed Actions minutes. GitHub's Actions
+#      billing page lists Dependabot alongside public repositories and Pages
+#      under "The use of standard GitHub-hosted runners is free", and the
+#      April 2024 changelog that moved Dependabot onto Actions infrastructure
+#      states "there will be no impact to billed Actions minutes (i.e.
+#      Dependabot runs are free)". The exception is larger runners, which
+#      this repository does not configure and this file does not request.
+#   2. Even if it did, there is nothing here for a PR to trigger. Both
+#      workflows are `workflow_dispatch` only, with no `push`, `pull_request`
+#      or `schedule` trigger, so a Dependabot PR starts no run.
+#
+# It does still open pull requests, which generate GitHub notifications.
+# `monthly` rather than `weekly`, one grouped PR rather than one per action,
+# and a limit of 3 are all set to keep that to roughly one notification a
+# month instead of eleven.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    # "/" is the required value for this ecosystem; it means
+    # .github/workflows, not the repository root.
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    groups:
+      # Every action in one PR. Eleven separate PRs for eleven pinned
+      # actions is the reason people turn Dependabot off.
+      actions:
+        patterns:
+          - "*"

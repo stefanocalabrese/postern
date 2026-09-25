@@ -78,10 +78,16 @@ jobs:
       api_digest: ${{ steps.push-api.outputs.digest }}
       confirm_digest: ${{ steps.push-confirm.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      # Every action below is pinned to a full commit SHA, not a major tag.
+      # This job assumes an IAM role and holds ECR push credentials, so a
+      # repointed `aws-actions/configure-aws-credentials@v4` would run
+      # attacker-chosen code with live AWS credentials in scope. The trailing
+      # comment names the release tag each SHA was resolved from on
+      # 25 September 2026, and is what dependabot matches on to bump it.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       # ── CI gates (must pass before build) ───────────────────────
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
         with:
           enable-cache: true
       - run: uv sync --frozen
@@ -94,21 +100,21 @@ jobs:
 
       # ── Docker buildx (multi-platform, cache to ECR) ────────────
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd  # v2.1.7
 
       - name: Build and push api image
         id: push-api
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
           push: true
@@ -121,7 +127,7 @@ jobs:
 
       - name: Build and push confirm image
         id: push-confirm
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
           push: true
@@ -134,20 +140,31 @@ jobs:
 
       # ── SBOM generation (syft → SPDX) ───────────────────────────
       - name: Generate SBOM — api
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
         with:
           image: ${{ env.REGISTRY }}/postern-api:${{ github.sha }}
           output-file: sbom-api.spdx.json
           format: spdx-json
 
       - name: Generate SBOM — confirm
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
         with:
           image: ${{ env.REGISTRY }}/postern-confirm:${{ github.sha }}
           output-file: sbom-confirm.spdx.json
           format: spdx-json
 
       # ── Vulnerability scanning (Trivy) ──────────────────────────
+      # The two steps below are the only unpinned `uses:` in either workflow,
+      # and deliberately so: `aquasecurity/trivy-action@v0` resolves to
+      # nothing, so there is no SHA to pin it to. Checked 25 September 2026
+      # against the GitHub API: that repository publishes full patch tags only
+      # (`v0.36.0`, `v0.35.0`, ... down to `v0.23.0`) and has no `v0` tag and
+      # no `v0` branch, so `repos/aquasecurity/trivy-action/commits/v0` answers
+      # 422 and `git/ref/tags/v0` answers 404. A run reaching this step fails
+      # to resolve the action. Pinning it means choosing a version, which is a
+      # behaviour change and a separate decision; guessing a SHA would be worse
+      # than the floating tag, because it would fail opaquely instead of
+      # loudly.
       - name: Run Trivy scan — api
         uses: aquasecurity/trivy-action@v0
         with:
@@ -166,7 +183,7 @@ jobs:
 
       # ── Cosign signing (keyless, OIDC from GitHub) ──────────────
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3.9.1
 
       - name: Sign api image
         env:
@@ -184,7 +201,7 @@ jobs:
 
       # ── Upload SBOMs as artifacts (audit retention) ─────────────
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sboms-${{ github.sha }}
           path: |
@@ -219,14 +236,14 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       # ── Cosign verification (ZT-3 hard gate) ────────────────────
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3.9.1
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -255,7 +272,7 @@ jobs:
 
       # ── SBOM presence check ─────────────────────────────────────
       - name: Download SBOM artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: sboms-${{ github.sha }}
 
