@@ -58,16 +58,17 @@ The table below lists every variable, grouped by service.
 | `POSTERN_TOKEN_ISSUER` | No | - | Expected issuer of customer JWTs. Leave unset for no-auth mode |
 | `POSTERN_AUDIENCE` | No | `postern` | Expected `aud` claim on customer JWTs |
 | `POSTERN_STRICT_HEADERS` | No | `0` | Enable strict MCP Streamable HTTP header validation (Mcp-Method/Mcp-Name must match body) |
-| `POSTERN_CACHE_TTL_SECONDS` | No | `60` | Consent domain cache TTL per request |
-| `POSTERN_BACKEND_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Backend connection timeout (seconds) |
-| `POSTERN_BACKEND_WRITE_TIMEOUT_SECONDS` | No | `2.0` | Backend write timeout (seconds) |
-| `POSTERN_BACKEND_READ_TIMEOUT_SECONDS` | No | `5.0` | Backend read timeout (seconds) |
-| `POSTERN_BACKEND_POOL_TIMEOUT_SECONDS` | No | `1.0` | Backend connection pool timeout (seconds) |
-| `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Database connection timeout (seconds) |
-| `POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS` | No | `3.0` | Database statement timeout (seconds) |
-| `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds) |
-| `POSTERN_MAX_BODY_BYTES` | No | `1048576` (1 MiB) | Maximum request body size in bytes |
-| `POSTERN_REQUEST_DEADLINE_SECONDS` | No | `101.0` | Wall-clock bound on the whole HTTP request (see [Audit System](components/audit.md)) |
+| `POSTERN_TRUSTED_PROXY_HOPS` | No | `0` | Proxies in front of this service that append to `X-Forwarded-For`; the risk engine reads the n-th entry from the right. **Zero or greater**; zero trusts the header for nothing and uses the socket peer |
+| `POSTERN_CACHE_TTL_SECONDS` | No | `60` | Consent domain cache TTL per request. **At least 1**; FastMCP refuses a cache TTL of zero when the server is built |
+| `POSTERN_BACKEND_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Backend connection timeout (seconds). **Greater than 0**; at zero every backend request fails `ConnectTimeout` |
+| `POSTERN_BACKEND_WRITE_TIMEOUT_SECONDS` | No | `2.0` | Backend write timeout (seconds). **Greater than 0** |
+| `POSTERN_BACKEND_READ_TIMEOUT_SECONDS` | No | `5.0` | Backend read timeout (seconds). **Greater than 0** |
+| `POSTERN_BACKEND_POOL_TIMEOUT_SECONDS` | No | `1.0` | Backend connection pool timeout (seconds). **Zero or greater**; zero sheds rather than queueing when the pool is saturated |
+| `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Database connection timeout (seconds). **Greater than 0**; at zero every connection raises `TimeoutError` |
+| `POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS` | No | `3.0` | Database statement timeout (seconds). **Greater than 0**; asyncpg rejects zero itself, at the first connect |
+| `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds). **Zero or greater**; zero sheds rather than queueing when the pool is saturated |
+| `POSTERN_MAX_BODY_BYTES` | No | `1048576` (1 MiB) | Maximum request body size in bytes. **At least 1**; at zero every request carrying a body is refused 413 |
+| `POSTERN_REQUEST_DEADLINE_SECONDS` | No | `101.0` | Wall-clock bound on the whole HTTP request (see [Audit System](components/audit.md)). **Greater than 0**, and finite: there is no off switch, raise the number instead |
 | `POSTERN_REQUIRE_PEM_KEY` | No | - | Set to `"1"` to refuse startup with an ephemeral read key |
 | `POSTERN_REQUIRE_REDIS` | No | - | Set to `"1"` to refuse startup without `POSTERN_REDIS_URL` |
 | `POSTERN_REDIS_URL` | No | - | Redis connection string (for sessions, device codes, revocation lists) |
@@ -79,21 +80,31 @@ The table below lists every variable, grouped by service.
 | `POSTERN_APP_ASSERTION_JWKS_URI` | **Yes** | - | JWKS of the operator's banking-app backend, used to verify inbound assertions |
 | `POSTERN_APP_ASSERTION_ISSUER` | **Yes** | - | Expected `iss` on inbound app assertions |
 | `POSTERN_APP_ASSERTION_AUDIENCE` | **Yes** | - | Expected `aud` on inbound app assertions. Must **not** equal the API service's `POSTERN_AUDIENCE` |
-| `POSTERN_USER_CODE_MAX_ATTEMPTS` | No | `3` | Wrong pairing codes at `/approve` before the device code is revoked (RFC 8628 §5.2) |
+| `POSTERN_USER_CODE_MAX_ATTEMPTS` | No | `3` | Wrong pairing codes at `/approve` before the device code is revoked (RFC 8628 §5.2). **At least 1**, which is already zero tolerance: one typo then revokes the code |
 | `POSTERN_WRITE_KEY_PEM_PATH` | No | - | Path to the PEM file for signing internal write tokens |
 | `POSTERN_WRITE_KEY_KID` | No | `write-1` | Key ID published in the write JWKS |
 | `POSTERN_WRITE_TOKEN_ISSUER` | No | `https://mcp-write.internal` | `iss` claim on internal write tokens |
+| `POSTERN_CONFIRM_MAX_BODY_BYTES` | No | `65536` (64 KiB) | Maximum request body size in bytes on the write path, separate from the API service's `POSTERN_MAX_BODY_BYTES`. **At least 1** |
+| `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS` | No | `0` | Proxies in front of this service that append to `X-Forwarded-For`. **Zero or greater**; zero trusts the header for nothing and uses the socket peer |
+| `POSTERN_MAX_DEVICE_CODES` | No | `10000` | Device codes the store will hold before refusing new pairings. **At least 1**; at zero the cap is met by an empty store |
+| `POSTERN_MAX_SCOPES_LENGTH` | No | `512` | Ceiling on the `scopes` string at `/device_authorization`. **At least 42**, the length of the default this endpoint substitutes when a caller sends none |
+| `POSTERN_MAX_CLIENT_ID_LENGTH` | No | `256` | Ceiling on the `client_id` string. **At least 1**; `client_id` is required and non-empty |
+| `POSTERN_CONFIRM_RATE_LIMIT_DEVICE_AUTHORIZATION` | No | `60` | Requests per minute per client address bucket. **At least 1**; there is no value that disables the limit |
+| `POSTERN_CONFIRM_RATE_LIMIT_TOKEN` | No | `300` | As above, for `/token` |
+| `POSTERN_CONFIRM_RATE_LIMIT_APPROVE` | No | `60` | As above, for `/approve`. Raise this if the banking app calls from its own backend rather than from the phone |
+| `POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE` | No | `60` | As above, for the challenge approval callback |
+| `POSTERN_CONFIRM_RATE_LIMIT_DEFAULT` | No | `60` | As above, for every other path |
 | `POSTERN_DEVICE_VERIFICATION_URI` | No | `https://auth.postern.internal/verify` | Base URI for the user verification page (QR code target) |
 | `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code. Refused at startup below 30 seconds — the Redis store cannot represent a shorter one |
-| `POSTERN_DEVICE_POLL_INTERVAL_SECONDS` | No | `5` | Minimum seconds between token polls |
+| `POSTERN_DEVICE_POLL_INTERVAL_SECONDS` | No | `5` | Minimum seconds between token polls. **At least 1**; must also stay below `POSTERN_DEVICE_CODE_TTL_SECONDS`, which is not checked: an interval at or above the lifetime expires the code before the browser may poll once |
 | `POSTERN_READ_KEY_PEM_PATH` | No | - | Read key PEM path (needed for device grant token exchange) |
 | `POSTERN_READ_KEY_KID` | No | `read-1` | Read key ID (must match API service) |
 | `POSTERN_READ_TOKEN_ISSUER` | No | `https://mcp-read.internal` | Read token issuer (must match API service) |
 | `POSTERN_BACKEND_BASE_URL` | No | `https://backend.internal` | Base URL for backend write endpoints (payments.svc, cards.svc) |
 | `POSTERN_DATABASE_URL` | No | `postgresql+asyncpg://postern:postern@localhost:5432/postern` | Postgres connection string for challenges table |
-| `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Database connection timeout (seconds) |
-| `POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS` | No | `3.0` | Database statement timeout (seconds) |
-| `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds) |
+| `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Database connection timeout (seconds). **Greater than 0**; at zero every connection raises `TimeoutError` |
+| `POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS` | No | `3.0` | Database statement timeout (seconds). **Greater than 0**; asyncpg rejects zero itself, at the first connect |
+| `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds). **Zero or greater**; zero sheds rather than queueing when the pool is saturated |
 
 The three `POSTERN_APP_ASSERTION_*` variables are the only **required** settings on
 either service. `create_confirm_app()` raises `ValueError` and the process does not
@@ -111,7 +122,14 @@ requirement, not something a gate here will catch.
 
 - **Empty string = off**: For optional settings like `POSTERN_JWKS_URI`, setting the value
   to `""` is treated as unset (collapsed to `None`). This lets docker-compose use
-  `POSTERN_JWKS_URI=""` to disable a feature.
+  `POSTERN_JWKS_URI=""` to disable a feature. Numeric settings follow the same rule: an empty
+  string means "keep the default", never "zero".
+- **Numeric settings are bounded at startup**: every number above is checked when
+  `from_env()` runs, and a value outside its stated range raises a `ValueError` naming the
+  variable, the bound and the value that was set. The process then fails to start rather
+  than serving requests on a setting that cannot work. A bound says what is
+  *representable*, never what is *advisable*: `POSTERN_MAX_BODY_BYTES=1` is accepted and
+  is still a service that refuses almost every request.
 - **Production hardening flags**: `POSTERN_REQUIRE_PEM_KEY=1` and `POSTERN_REQUIRE_REDIS=1`
   cause the service to refuse startup if the required resource is not configured. These
   should be set in all production deployments.

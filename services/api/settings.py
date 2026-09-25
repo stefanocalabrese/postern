@@ -1,7 +1,33 @@
-"""Runtime configuration for the API service (Task 4)."""
+"""Runtime configuration for the API service (Task 4).
+
+Every numeric field below is read through `postern_core/config.py`'s
+`int_from_env` or `float_from_env` rather than a bare ``int()`` / ``float()``,
+which does three things and no more: an empty string means unset, a value
+outside the stated bound raises with the VARIABLE's name in the message, and
+the reason travels with the refusal. That module carries why the refusal
+belongs at parse time rather than at first use; the bounds themselves are
+stated one per call below, because each has a different reason.
+
+THE ONE ASYMMETRY WORTH READING BEFORE THE CALLS. Three of the four backend
+phases and two of the three database ones refuse zero; both POOL timeouts
+accept it. Measured on 2026-09-25, against a real socket and a real Postgres:
+``connect``/``read``/``write`` at zero make httpx2 2.12.0 fail EVERY request
+(``ConnectTimeout``, ``ReadTimeout``, ``WriteTimeout``) against a server that
+answers in a millisecond, and a pool timeout at zero serves the same request
+200 -- because a pool timeout bounds a wait for a free connection, and on an
+unsaturated pool there is no wait to bound. Under saturation (one connection,
+two concurrent requests, a 0.3s handler) ``pool=1.0`` answered both 200 while
+``pool=0.0`` answered the second ``PoolTimeout`` immediately. That is a
+coherent thing for an operator to want -- shed load rather than queue -- so
+zero stays legal there and only negatives are refused. It is the distinction
+`services/confirm/settings.py`'s `MIN_DEVICE_CODE_TTL_SECONDS` insists on: a
+bound refuses what is UNREPRESENTABLE, not what is unwise.
+"""
 
 import os
 from dataclasses import dataclass
+
+from postern_core.config import float_from_env, int_from_env
 
 
 @dataclass(frozen=True)
@@ -193,32 +219,139 @@ class Settings:
             customer_token_issuer=os.environ.get("POSTERN_TOKEN_ISSUER") or None,
             audience=os.environ.get("POSTERN_AUDIENCE", "postern"),
             strict_headers=os.environ.get("POSTERN_STRICT_HEADERS") == "1",
-            cache_ttl_seconds=int(os.environ.get("POSTERN_CACHE_TTL_SECONDS", "60")),
-            trusted_proxy_hops=int(os.environ.get("POSTERN_TRUSTED_PROXY_HOPS", "0")),
-            backend_connect_timeout_seconds=float(
-                os.environ.get("POSTERN_BACKEND_CONNECT_TIMEOUT_SECONDS", "2.0")
+            # NO CEILING here or on any number below, and the argument is the
+            # one `services/confirm/settings.py`'s `_device_code_ttl` made for
+            # the device-code lifetime: a value that is too LARGE is a risk an
+            # operator can reason about and trade off, while a value that is
+            # too SMALL does not weaken a control, it produces a process that
+            # cannot serve a request at all. Only the second kind is refused.
+            cache_ttl_seconds=int_from_env(
+                "POSTERN_CACHE_TTL_SECONDS",
+                60,
+                minimum=1,
+                because=(
+                    "It is the seconds behind the `ttlMs` this server advertises on every "
+                    "discovery result; FastMCP 4.0.3 refuses a cache_ttl at or below zero "
+                    "when the server is built, and nothing here can express 'no hint'."
+                ),
             ),
-            backend_write_timeout_seconds=float(
-                os.environ.get("POSTERN_BACKEND_WRITE_TIMEOUT_SECONDS", "2.0")
+            trusted_proxy_hops=int_from_env(
+                "POSTERN_TRUSTED_PROXY_HOPS",
+                0,
+                minimum=0,
+                because=(
+                    "It is how many proxies in front of this process append to "
+                    "X-Forwarded-For; zero is the default and already means 'trust the "
+                    "header for nothing', so there is nothing below it left to express."
+                ),
             ),
-            backend_read_timeout_seconds=float(
-                os.environ.get("POSTERN_BACKEND_READ_TIMEOUT_SECONDS", "5.0")
+            backend_connect_timeout_seconds=float_from_env(
+                "POSTERN_BACKEND_CONNECT_TIMEOUT_SECONDS",
+                2.0,
+                minimum=0,
+                exclusive=True,
+                because=(
+                    "It bounds the TCP connect and TLS handshake to the operator's "
+                    "backend; at zero httpx2 answers every request ConnectTimeout, so the "
+                    "server reaches no backend at all."
+                ),
             ),
-            backend_pool_timeout_seconds=float(
-                os.environ.get("POSTERN_BACKEND_POOL_TIMEOUT_SECONDS", "1.0")
+            backend_write_timeout_seconds=float_from_env(
+                "POSTERN_BACKEND_WRITE_TIMEOUT_SECONDS",
+                2.0,
+                minimum=0,
+                exclusive=True,
+                because=(
+                    "It bounds sending the request body to the backend; at zero httpx2 "
+                    "answers every request WriteTimeout."
+                ),
             ),
-            database_connect_timeout_seconds=float(
-                os.environ.get("POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS", "2.0")
+            backend_read_timeout_seconds=float_from_env(
+                "POSTERN_BACKEND_READ_TIMEOUT_SECONDS",
+                5.0,
+                minimum=0,
+                exclusive=True,
+                because=(
+                    "It bounds reading the backend's response; at zero httpx2 answers "
+                    "every request ReadTimeout."
+                ),
             ),
-            database_command_timeout_seconds=float(
-                os.environ.get("POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS", "3.0")
+            # ZERO IS LEGAL HERE, unlike the three phases above. See the module
+            # docstring for the measurement: a pool timeout bounds the wait for
+            # a free connection, so zero means 'do not queue, shed the request',
+            # which is a bulkhead an operator may genuinely want. A NEGATIVE
+            # value behaves identically to zero and so cannot express the one
+            # thing an operator would reach for it to mean.
+            backend_pool_timeout_seconds=float_from_env(
+                "POSTERN_BACKEND_POOL_TIMEOUT_SECONDS",
+                1.0,
+                minimum=0,
+                because=(
+                    "It bounds how long a request waits for a free pooled connection to "
+                    "the backend; zero sheds instead of queueing, and a negative value "
+                    "does the same thing while reading as 'wait forever'."
+                ),
             ),
-            database_pool_timeout_seconds=float(
-                os.environ.get("POSTERN_DATABASE_POOL_TIMEOUT_SECONDS", "1.0")
+            database_connect_timeout_seconds=float_from_env(
+                "POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS",
+                2.0,
+                minimum=0,
+                exclusive=True,
+                because=(
+                    "It becomes asyncpg's connect(timeout=); at zero every connection to "
+                    "a reachable Postgres raises TimeoutError, so no consent lookup and "
+                    "no audit write can complete."
+                ),
             ),
-            max_body_bytes=int(os.environ.get("POSTERN_MAX_BODY_BYTES", str(1_048_576))),
-            request_deadline_seconds=float(
-                os.environ.get("POSTERN_REQUEST_DEADLINE_SECONDS", "101.0")
+            database_command_timeout_seconds=float_from_env(
+                "POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS",
+                3.0,
+                minimum=0,
+                exclusive=True,
+                because=(
+                    "It becomes asyncpg's command_timeout, which asyncpg itself refuses "
+                    "at or below zero -- but not until the first connect, with a message "
+                    "naming the parameter and not this variable."
+                ),
+            ),
+            database_pool_timeout_seconds=float_from_env(
+                "POSTERN_DATABASE_POOL_TIMEOUT_SECONDS",
+                1.0,
+                minimum=0,
+                because=(
+                    "It becomes SQLAlchemy's pool_timeout; zero sheds instead of queueing "
+                    "when the pool is saturated, and a negative value does the same thing "
+                    "while reading as 'wait forever'."
+                ),
+            ),
+            # A FLOOR OF ONE BYTE, stated as what it is rather than dressed up.
+            # At zero `_drain` raises on any body at all, so every tools/call --
+            # every request this server exists to serve -- is refused 413 while
+            # GETs still pass, which is a service that looks up and answers
+            # nothing. Above one byte nothing here can say what is enough: the
+            # smallest JSON-RPC envelope measures 51 bytes, but the useful floor
+            # is whatever the largest legitimate tool argument set costs, and
+            # that is a property of the tool surface rather than of this line.
+            max_body_bytes=int_from_env(
+                "POSTERN_MAX_BODY_BYTES",
+                1_048_576,
+                minimum=1,
+                because=(
+                    "It is the ceiling on a request body this server will buffer; at zero "
+                    "every request carrying a body is refused 413, which is every "
+                    "tools/call."
+                ),
+            ),
+            request_deadline_seconds=float_from_env(
+                "POSTERN_REQUEST_DEADLINE_SECONDS",
+                101.0,
+                minimum=0,
+                exclusive=True,
+                because=(
+                    "It is a wall-clock bound on the whole request; at zero every request "
+                    "expires before the app runs a line, and there is deliberately no off "
+                    "switch -- raise the number instead."
+                ),
             ),
         )
 

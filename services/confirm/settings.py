@@ -56,6 +56,32 @@ forbids reading its settings — so the requirement is stated in
 import os
 from dataclasses import dataclass
 
+from postern_core.config import float_from_env, int_from_env
+
+#: The scope string ``POST /device_authorization`` substitutes when the caller
+#: sends none. It lives here rather than inline in
+#: `services/confirm/device_auth.py` because ``max_scopes_length`` below is
+#: floored at its LENGTH, and a floor derived from a literal in another module
+#: is a floor that rots the first time someone edits the literal.
+DEFAULT_DEVICE_SCOPES = "accounts:read transactions:read cards:read"
+
+#: The shortest ``POSTERN_MAX_SCOPES_LENGTH`` that leaves the endpoint able to
+#: serve its own default, which is 42 characters as of 2026-09-25.
+#:
+#: DERIVED, NOT PICKED, and it is the one length in this file that can be. A
+#: request to ``POST /device_authorization`` that carries no ``scopes`` gets
+#: `DEFAULT_DEVICE_SCOPES` substituted for it, and the length check runs
+#: AFTER the substitution -- so a ceiling below this length refuses the
+#: request an ordinary browser sends, with ``invalid_scope``, naming a scope
+#: string the caller never wrote. The endpoint cannot serve its own default,
+#: which is not a tighter control but an unreachable one.
+#:
+#: WHAT IT DELIBERATELY DOES NOT CLAIM: that 42 is a usable ceiling. It is
+#: not; 512 is the default and the comment on ``max_scopes_length`` carries
+#: why. This bounds what is REPRESENTABLE, in the same sense
+#: `MIN_DEVICE_CODE_TTL_SECONDS` below uses the word, and nothing more.
+MIN_SCOPES_LENGTH = len(DEFAULT_DEVICE_SCOPES)
+
 
 def _positive_int(name: str, default: int) -> int:
     """Read a positive integer from the environment, or refuse to start.
@@ -81,23 +107,23 @@ def _positive_int(name: str, default: int) -> int:
     environment, not caller input -- the opposite of the rule
     `services/confirm/device_auth.py` follows for a malformed customer
     reference, which is attacker-reachable and never logged.
+
+    THE BODY MOVED ON 2026-09-25 AND THE MESSAGES DID NOT. Everything above
+    is now `postern_core/config.py`'s `int_from_env`, which the rest of this
+    module's numbers and both of `services/api/settings.py`'s families also
+    read through -- the alternative was a second validation style for the
+    variables this function never covered. ``minimum=1`` is what makes that
+    helper say "a positive integer" rather than "an integer of at least 1",
+    so the two strings this raises are unchanged to the byte and
+    ``tests/test_settings_bounds.py::TestPositiveIntMessagesAreUnchanged``
+    pins both against the literals that were here.
     """
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        raise ValueError(
-            f"{name} must be a positive integer, got {raw!r}. "
-            "It is a per-minute request count; there is no value that disables the limit."
-        ) from None
-    if value < 1:
-        raise ValueError(
-            f"{name} must be a positive integer, got {value}. "
-            "It is a per-minute request count; there is no value that disables the limit."
-        )
-    return value
+    return int_from_env(
+        name,
+        default,
+        minimum=1,
+        because=("It is a per-minute request count; there is no value that disables the limit."),
+    )
 
 
 #: The shortest device-code lifetime ``POSTERN_DEVICE_CODE_TTL_SECONDS`` accepts.
@@ -373,8 +399,28 @@ class ConfirmSettings:
                 "https://auth.postern.internal/verify",
             ),
             device_code_ttl_seconds=_device_code_ttl("POSTERN_DEVICE_CODE_TTL_SECONDS", 900),
-            device_poll_interval_seconds=int(
-                os.environ.get("POSTERN_DEVICE_POLL_INTERVAL_SECONDS", "5")
+            # FLOOR OF ONE SECOND, and no ceiling from this line -- though one
+            # is derivable and is deliberately not taken here. At zero or below
+            # `services/confirm/device_auth.py`'s ``elapsed <
+            # settings.device_poll_interval_seconds`` is never true, so the RFC
+            # 8628 poll throttle never fires and there is no value that turns
+            # the control off, which is `_positive_int`'s posture above. The
+            # ceiling that exists is a RELATION rather than a number: an
+            # interval at or above ``device_code_ttl_seconds`` expires the code
+            # before the browser is permitted to poll even once, which is the
+            # second of the three bounds `MIN_DEVICE_CODE_TTL_SECONDS` is built
+            # from. Enforcing that pair is a cross-field check this function
+            # does not make, and the hazard is real: 1000 against the default
+            # 900 parses today and pairs nothing.
+            device_poll_interval_seconds=int_from_env(
+                "POSTERN_DEVICE_POLL_INTERVAL_SECONDS",
+                5,
+                minimum=1,
+                because=(
+                    "It is the minimum seconds between /token polls (RFC 8628 §3.2); at "
+                    "zero the slow_down throttle never fires, and there is no value that "
+                    "disables it."
+                ),
             ),
             read_key_pem_path=os.environ.get("POSTERN_READ_KEY_PEM_PATH") or None,
             read_key_kid=os.environ.get("POSTERN_READ_KEY_KID", "read-1"),
@@ -386,27 +432,153 @@ class ConfirmSettings:
                 "POSTERN_DATABASE_URL",
                 "postgresql+asyncpg://postern:postern@localhost:5432/postern",
             ),
-            database_connect_timeout_seconds=float(
-                os.environ.get("POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS", "2.0")
+            # The same three bounds, the same three reasons and the same
+            # asymmetry as `services/api/settings.py` -- these are one variable
+            # each, read by both services, so they must not disagree about what
+            # they accept. That module's docstring carries the measurement
+            # behind "connect and command refuse zero, pool does not".
+            database_connect_timeout_seconds=float_from_env(
+                "POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS",
+                2.0,
+                minimum=0,
+                exclusive=True,
+                because=(
+                    "It becomes asyncpg's connect(timeout=); at zero every connection to "
+                    "a reachable Postgres raises TimeoutError, so no challenge row can be "
+                    "read or written."
+                ),
             ),
-            database_command_timeout_seconds=float(
-                os.environ.get("POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS", "3.0")
+            database_command_timeout_seconds=float_from_env(
+                "POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS",
+                3.0,
+                minimum=0,
+                exclusive=True,
+                because=(
+                    "It becomes asyncpg's command_timeout, which asyncpg itself refuses "
+                    "at or below zero -- but not until the first connect, with a message "
+                    "naming the parameter and not this variable."
+                ),
             ),
-            database_pool_timeout_seconds=float(
-                os.environ.get("POSTERN_DATABASE_POOL_TIMEOUT_SECONDS", "1.0")
+            database_pool_timeout_seconds=float_from_env(
+                "POSTERN_DATABASE_POOL_TIMEOUT_SECONDS",
+                1.0,
+                minimum=0,
+                because=(
+                    "It becomes SQLAlchemy's pool_timeout; zero sheds instead of queueing "
+                    "when the pool is saturated, and a negative value does the same thing "
+                    "while reading as 'wait forever'."
+                ),
             ),
             app_assertion_jwks_uri=os.environ.get("POSTERN_APP_ASSERTION_JWKS_URI") or None,
             app_assertion_issuer=os.environ.get("POSTERN_APP_ASSERTION_ISSUER") or None,
             app_assertion_audience=os.environ.get("POSTERN_APP_ASSERTION_AUDIENCE") or None,
             device_keys_path=os.environ.get("POSTERN_DEVICE_KEYS_PATH") or None,
-            user_code_max_attempts=int(os.environ.get("POSTERN_USER_CODE_MAX_ATTEMPTS", "3")),
-            max_body_bytes=int(
-                os.environ.get("POSTERN_CONFIRM_MAX_BODY_BYTES", str(65_536)),
+            # FLOOR OF ONE, and the trace behind it, because the obvious
+            # reading of zero is wrong in an instructive way. Measured through
+            # `create_confirm_app` on 2026-09-25: at zero a CORRECT pairing
+            # code still approves and /token still issues, because
+            # `services/confirm/device_auth.py`'s ``_record_user_code_failure``
+            # is only reached on a MISMATCH. What zero costs is the tolerance:
+            # ``attempts = existing.user_code_attempts + 1`` makes the first
+            # wrong code ``1 >= 0``, so one typo revokes the device code and
+            # the user's next attempt -- with the right code -- is answered
+            # ``invalid_grant: device code not found``. One is therefore the
+            # SMALLEST REPRESENTABLE zero-tolerance budget: ``1`` behaves
+            # identically to ``0`` and to ``-5``, so nothing below one
+            # expresses anything the value one does not already.
+            #
+            # NO CEILING, because the TTL and the rate limit already impose
+            # one. The pairing code is six characters from a 32-symbol
+            # alphabet (`postern_core.auth.device_codes`'s
+            # ``_generate_user_code``), so 1,073,741,824 codes; at the default
+            # ``rate_limit_approve`` of 60/min a device code that lives the
+            # default 900 seconds can be guessed at most ~900 times before it
+            # expires, whatever this number says.
+            user_code_max_attempts=int_from_env(
+                "POSTERN_USER_CODE_MAX_ATTEMPTS",
+                3,
+                minimum=1,
+                because=(
+                    "It is how many wrong pairing codes revoke a device code (RFC 8628 "
+                    "§5.2); one is already zero tolerance, so nothing below it means "
+                    "anything different."
+                ),
             ),
-            trusted_proxy_hops=int(os.environ.get("POSTERN_CONFIRM_TRUSTED_PROXY_HOPS", "0")),
-            max_device_codes=int(os.environ.get("POSTERN_MAX_DEVICE_CODES", str(10_000))),
-            max_scopes_length=int(os.environ.get("POSTERN_MAX_SCOPES_LENGTH", str(512))),
-            max_client_id_length=int(os.environ.get("POSTERN_MAX_CLIENT_ID_LENGTH", str(256))),
+            # A FLOOR OF ONE BYTE, and deliberately NOT the 8,192 the comment
+            # on ``max_body_bytes`` derives. That derivation is of the bottom
+            # of the USEFUL interval -- below `postern_core/store/audit.py`'s
+            # `MAX_ARGUMENTS_BYTES` the cap on that column stops being
+            # reachable -- and a service configured under it still serves every
+            # legitimate body, all of which measure under 300 bytes. At zero it
+            # does not: `services/confirm/body_limit.py` refuses any request
+            # carrying a body at all with 413, which is /device_authorization,
+            # /token and /approve, so the whole flow is dead. Only the second
+            # one is unrepresentable, and only it is refused.
+            max_body_bytes=int_from_env(
+                "POSTERN_CONFIRM_MAX_BODY_BYTES",
+                65_536,
+                minimum=1,
+                because=(
+                    "It is the ceiling on a request body this service will read; at zero "
+                    "every request carrying a body is refused 413, which is every route "
+                    "on the device grant and the approval callback."
+                ),
+            ),
+            trusted_proxy_hops=int_from_env(
+                "POSTERN_CONFIRM_TRUSTED_PROXY_HOPS",
+                0,
+                minimum=0,
+                because=(
+                    "It is how many proxies in front of this process append to "
+                    "X-Forwarded-For; zero is the default and already means 'trust the "
+                    "header for nothing', so there is nothing below it left to express."
+                ),
+            ),
+            # FLOOR OF ONE. Measured on 2026-09-25: at zero
+            # ``InMemoryDeviceCodeStore``'s ``len(self._codes) >=
+            # self._max_codes`` is true on an EMPTY store, so the first
+            # /device_authorization of the process raises ``DeviceCodeStoreFull
+            # ('device code store holds 0 codes, at its cap of 0')`` and no
+            # pairing can ever start. Negatives do the same.
+            max_device_codes=int_from_env(
+                "POSTERN_MAX_DEVICE_CODES",
+                10_000,
+                minimum=1,
+                because=(
+                    "It is how many device codes the store will hold; at zero the cap is "
+                    "met by an empty store and every pairing is refused."
+                ),
+            ),
+            # FLOOR OF `MIN_SCOPES_LENGTH`, which is the only length here that
+            # is derived rather than asserted -- that constant carries why.
+            max_scopes_length=int_from_env(
+                "POSTERN_MAX_SCOPES_LENGTH",
+                512,
+                minimum=MIN_SCOPES_LENGTH,
+                because=(
+                    "It is the ceiling on the `scopes` string; below the length of the "
+                    "default this endpoint substitutes for a caller that sends none, "
+                    "every ordinary request is refused invalid_scope."
+                ),
+            ),
+            # FLOOR OF ONE, asserted rather than derived, and that is the
+            # honest state of it: `client_id` is required and non-empty, so at
+            # zero ``len(client_id) > 0`` refuses every request that reaches
+            # the check. Nothing in this repository measures how long a real
+            # OAuth client identifier is -- the comment on
+            # ``max_client_id_length`` reasons from UUIDs and short labels, not
+            # from a measurement -- so no larger floor would be more than a
+            # number someone liked. A ceiling is unnecessary: `max_body_bytes`
+            # already bounds this value on the wire.
+            max_client_id_length=int_from_env(
+                "POSTERN_MAX_CLIENT_ID_LENGTH",
+                256,
+                minimum=1,
+                because=(
+                    "It is the ceiling on the `client_id` string, which is required and "
+                    "non-empty; at zero every /device_authorization is refused."
+                ),
+            ),
             rate_limit_device_authorization=_positive_int(
                 "POSTERN_CONFIRM_RATE_LIMIT_DEVICE_AUTHORIZATION", 60
             ),

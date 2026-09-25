@@ -97,7 +97,7 @@ from services.confirm.revocation import (
     revoked_response,
     store_unavailable_response,
 )
-from services.confirm.settings import ConfirmSettings
+from services.confirm.settings import DEFAULT_DEVICE_SCOPES, ConfirmSettings
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +220,10 @@ async def device_authorization(request: Request) -> JSONResponse:
         body = dict(form)
 
     client_id = body.get("client_id", "")
-    scopes = body.get("scopes", "accounts:read transactions:read cards:read")
+    # The same string it always was, now named in `services/confirm/settings.py`
+    # so that `MIN_SCOPES_LENGTH` -- the floor under ``max_scopes_length`` --
+    # can be its length rather than a copy of its length.
+    scopes = body.get("scopes", DEFAULT_DEVICE_SCOPES)
 
     if not isinstance(client_id, str) or not isinstance(scopes, str):
         return _error(400, "invalid_request", "client_id and scopes must be strings")

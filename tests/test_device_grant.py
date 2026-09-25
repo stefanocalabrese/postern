@@ -1751,3 +1751,92 @@ class TestAPairingCompletesAtTheConfiguredTtl:
             stored = await app.state.device_code_store.get_device_code(device["device_code"])
             assert stored is not None, "the code the pairing used was really stored"
             assert not stored.is_expired
+
+
+# ---------------------------------------------------------------------------
+# The floor under POSTERN_USER_CODE_MAX_ATTEMPTS.
+# ---------------------------------------------------------------------------
+
+
+class TestTheUserCodeAttemptBudgetFloor:
+    """What a budget of zero actually costs, which is not what it looks like.
+
+    Traced through `create_confirm_app` on 2026-09-25, because the obvious
+    reading -- "zero attempts, so pairing is dead" -- is wrong, and a floor
+    justified by it would rest on a claim the code does not support.
+    ``_record_user_code_failure`` is reached ONLY from the mismatch branch of
+    ``approve_callback``, so at zero a correct pairing code on the first try
+    still approves and ``/token`` still issues a read token.
+
+    What zero costs is the TOLERANCE. ``attempts =
+    existing.user_code_attempts + 1`` makes the first wrong code ``1 >= 0``,
+    so one mistyped pairing code revokes the device code outright and the
+    customer's next attempt -- with the RIGHT code -- is answered
+    ``invalid_grant: device code not found``. The default of 3 absorbs two.
+
+    WHY THE FLOOR IS ONE AND NOT THREE. ``1`` is already zero tolerance and
+    behaves identically to ``0`` and to ``-5``, so nothing below one
+    expresses anything ``1`` does not. An operator who wants no slack for a
+    typo can still say so; one who writes ``0`` reaching for "no limit" gets
+    the opposite, and that is the reading `_positive_int` refuses to guess.
+    """
+
+    def test_zero_refuses_at_startup_naming_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("POSTERN_USER_CODE_MAX_ATTEMPTS", "0")
+        with pytest.raises(ValueError, match="POSTERN_USER_CODE_MAX_ATTEMPTS"):
+            ConfirmSettings.from_env()
+
+    def _app(self, key_pair: RSAKeyPair, attempts: int) -> Starlette:
+        verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
+        return create_confirm_app(
+            dataclasses.replace(ConfirmSettings.for_testing(), user_code_max_attempts=attempts),
+            assertion_verifier=verifier,
+            device_key_store=no_enrolled_devices(),
+        )
+
+    async def test_the_floor_still_pairs_when_the_code_is_right_first_time(
+        self, key_pair: RSAKeyPair
+    ) -> None:
+        """A budget of one bounds MISTAKES, never the happy path."""
+        app = self._app(key_pair, 1)
+        async with _client(app) as client:
+            device = await _start_device_grant(client)
+            approved = await _approve(client, device, bearer(key_pair))
+            assert approved.status_code == 200
+            issued = await client.post(
+                "/token",
+                data={"grant_type": "device_code", "device_code": device["device_code"]},
+            )
+            assert issued.status_code == 200
+
+    async def test_the_floor_revokes_on_the_first_typo(self, key_pair: RSAKeyPair) -> None:
+        """And the right code afterwards cannot recover it: a fresh QR is the only way."""
+        app = self._app(key_pair, 1)
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        async with _client(app) as client:
+            device = await _start_device_grant(client)
+
+            wrong = await _approve(client, device, bearer(key_pair), user_code="ZZZZZZ")
+            assert wrong.status_code == 400
+            assert "revoked" in wrong.json()["error_description"]
+            assert await store.get_device_code(device["device_code"]) is None
+
+            retry = await _approve(client, device, bearer(key_pair))
+            assert retry.status_code == 400
+            assert retry.json()["error"] == "invalid_grant"
+
+    async def test_the_default_absorbs_two_typos_before_revoking(
+        self, key_pair: RSAKeyPair
+    ) -> None:
+        """Which is the difference the floor exists to keep reachable."""
+        app = self._app(key_pair, ConfirmSettings().user_code_max_attempts)
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        async with _client(app) as client:
+            device = await _start_device_grant(client)
+            for _ in range(2):
+                typo = await _approve(client, device, bearer(key_pair), user_code="ZZZZZZ")
+                assert typo.status_code == 400
+            assert await store.get_device_code(device["device_code"]) is not None
+            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
