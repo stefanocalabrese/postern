@@ -283,15 +283,45 @@ jobs:
       # `refs/heads/main`, and that is a decision, not an oversight. The
       # deploy job verifies a signature the build job of the SAME dispatch
       # produced, so the signer's ref is always this run's `github.ref`.
-      # Pinning `main` would fail every dispatch from any other branch at the
-      # last step, after two multi-platform builds, two ECR pushes, two SBOMs,
-      # two Trivy scans and two signings had already run -- the most expensive
-      # place available to fail. This pipeline has never completed a dispatch,
-      # so the first ones come from a branch. "Only main reaches production"
-      # is a real requirement, and it belongs in the `production` environment's
-      # deployment-branch rule (operator checklist item 4), which rejects the
-      # run before any of that work starts. A regex in the final step is the
-      # wrong layer and the wrong moment for a branch policy.
+      #
+      # The reason is not cost, and this comment said it was until
+      # 25 September 2026. `environment:` appears exactly once as a job key in
+      # this file, on `deploy`, which is `needs: build`. `build` declares
+      # none, and `build` is what runs both multi-platform builds, both ECR
+      # pushes, both SBOMs, both Trivy scans and both signings. A `deploy` job
+      # that cannot start until `build` has succeeded cannot refuse a run any
+      # earlier than `build` finishing, so the environment's branch policy and
+      # a `main` pinned into this regexp fail at the same boundary, with all
+      # of that already paid for.
+      #
+      # The `production` environment's deployment-branch rule (operator
+      # checklist item 4) is still the better control, for its reach and not
+      # its timing. It gates the whole `deploy` job, so it stops "Configure
+      # AWS credentials", which assumes `AWS_ROLE_ARN` immediately before the
+      # first verify step below, and it stops the two ECS steps at the end.
+      # This regexp sits inside a step of that job, so by the time it can
+      # refuse anything the AWS role is already held.
+      #
+      # That rule is configured here as of 25 September 2026: one
+      # environment, `production`, one `branch_policy` protection rule, one
+      # custom branch policy `{name: main, type: branch}` -- type `branch`, so
+      # no tag ref satisfies it. `staging` does not exist, and a dispatch
+      # naming it auto-creates it with no protection.
+      #
+      # Whether GitHub enforces that rule on this plan has not been
+      # established. The repository is private and the account plan is free,
+      # and GitHub's deployments-and-environments reference, fetched
+      # 25 September 2026, scopes the feature to "all public repositories"
+      # plus private repositories on GitHub Pro or GitHub Team. `main` is not
+      # a protected branch here and cannot be: the branch-protection and
+      # rulesets REST endpoints both answer 403, "Upgrade to GitHub Pro or
+      # make this repository public to enable this feature", which is why the
+      # rule is a custom branch policy rather than `protected_branches: true`,
+      # a setting that on this repository would match nothing and refuse every
+      # deploy including from `main`. The REST write was accepted and reads
+      # back, and storage is not enforcement. Settling it would take a
+      # dispatch from a side branch, which bills minutes and, if the rule does
+      # not hold, performs a real deploy.
       #
       # So this forbids, and is tested to forbid: any other repository,
       # including owner-prefix and repo-suffix typosquats; any other workflow
