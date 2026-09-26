@@ -70,8 +70,8 @@ The table below lists every variable, grouped by service.
 | `POSTERN_MAX_BODY_BYTES` | No | `1048576` (1 MiB) | Maximum request body size in bytes. **At least 1**; at zero every request carrying a body is refused 413 |
 | `POSTERN_REQUEST_DEADLINE_SECONDS` | No | `101.0` | Wall-clock bound on the whole HTTP request (see [Audit System](components/audit.md)). **Greater than 0**, and finite: there is no off switch, raise the number instead |
 | `POSTERN_REQUIRE_PEM_KEY` | No | - | Set to `"1"` to refuse startup with an ephemeral read key |
-| `POSTERN_REQUIRE_REDIS` | No | - | Set to `"1"` to refuse startup without `POSTERN_REDIS_URL` |
-| `POSTERN_REDIS_URL` | No | - | Redis connection string (for sessions, device codes, revocation lists, per-customer approval counters). Unset, each is per-replica: a deployment running R replicas admits R times the per-customer ceilings below. `POSTERN_REQUIRE_REDIS` is read by `services/api` only, so setting it does not guarantee the `services/confirm` counters are shared |
+| `POSTERN_REQUIRE_REDIS` | No | - | Set to exactly `"1"` to refuse startup without `POSTERN_REDIS_URL`. Enforced by **both** services since 26 September 2026; `services/api` alone before that. No other spelling arms it — `true` and `yes` are silently ignored |
+| `POSTERN_REDIS_URL` | No | - | Redis connection string (for sessions, device codes, revocation lists, per-customer approval counters). Unset, each is per-replica: a revocation cuts one replica, a spent device code stays redeemable on the others, and R replicas admit R times the per-customer ceilings below. Point **both** services at the same instance — nothing checks that they agree |
 | `POSTERN_REDIS_SESSION_TTL` | No | `1800` (30 min) | How long a risk context accumulates its ZT-5 budget, on the Redis session store. **At least 1**; at zero every load answers `None`, so every call starts from an empty budget |
 
 ### Confirm Service (`services/confirm/settings.py`)

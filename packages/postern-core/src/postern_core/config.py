@@ -1,4 +1,13 @@
-"""Bounded readers for the numeric settings both services take from the environment.
+"""How both services read, bound and enforce their environment.
+
+TWO KINDS OF THING LIVE HERE, and the second arrived later. The bounded
+numeric readers are most of the module: they RETURN a value, and each caller
+states its own bound at the call site. `enforce_redis_requirement` at the
+bottom does not return anything -- it RAISES, or it does nothing -- because
+what it enforces is not a number but a contract about where state lives. It is
+here for the reason the readers are here, stated under "WHY IN
+``postern_core``" below: both composition roots must apply it identically, and
+the alternative was a second copy that drifts.
 
 WHY THIS EXISTS. Every number in `services/api/settings.py` and
 `services/confirm/settings.py` was read with a bare ``int()`` or ``float()``
@@ -65,6 +74,10 @@ import os
 
 __all__ = [
     "MIN_REPRESENTABLE_TTL_SECONDS",
+    "REDIS_URL_ENV",
+    "REQUIRE_REDIS_ENV",
+    "REQUIRE_REDIS_ON",
+    "enforce_redis_requirement",
     "float_from_env",
     "int_arg_or_env",
     "int_from_env",
@@ -292,3 +305,84 @@ def int_arg_or_env(
             f"{name}, or a positive number of seconds to override it."
         )
     return passed
+
+
+# ---------------------------------------------------------------------------
+# The shared-state contract. One variable, two composition roots.
+# ---------------------------------------------------------------------------
+
+#: The switch an operator sets to refuse per-replica state.
+REQUIRE_REDIS_ENV = "POSTERN_REQUIRE_REDIS"
+
+#: The one value that arms it.
+#:
+#: EXACTLY THIS STRING, AND THAT IS A SHARP EDGE RATHER THAN A DESIGN.
+#: ``POSTERN_REQUIRE_REDIS=true`` arms nothing, on either service, silently.
+#: The comparison is `services/api/main.py`'s, unchanged from when it was the
+#: only half of this contract, and widening it here would change that service's
+#: condition as a side effect of sharing it -- so the literal is exported
+#: instead, which at least makes the two call sites read one constant and puts
+#: the edge somewhere a reader trips over it.
+#: ``tests/test_require_redis_guard.py::TestOnlyTheLiteralOne`` pins the
+#: current answer so a future widening is a deliberate act.
+REQUIRE_REDIS_ON = "1"
+
+#: The variable every Redis-backed store in this repository reads.
+REDIS_URL_ENV = "POSTERN_REDIS_URL"
+
+#: The sentence both services' refusals open with.
+#:
+#: Shared because the CONDITION is shared: an operator reading either refusal
+#: learns the same fact about their own configuration, and only what it costs
+#: them differs. The trailing space belongs to it, so a caller's ``consequence``
+#: appends cleanly.
+_REQUIRE_REDIS_PREFIX = f"{REQUIRE_REDIS_ENV}={REQUIRE_REDIS_ON} but {REDIS_URL_ENV} is not set. "
+
+
+def enforce_redis_requirement(*, consequence: str) -> None:
+    """Raise when the operator demanded shared state and named no Redis.
+
+    Args:
+        consequence: What THIS service loses without it, appended to the
+            shared first sentence. Required, with no default, because the two
+            services lose different things and a default would let a third
+            caller inherit whichever one was written first.
+
+    Raises:
+        RuntimeError: if `REQUIRE_REDIS_ENV` is exactly `REQUIRE_REDIS_ON` and
+            `REDIS_URL_ENV` is unset or empty.
+
+    WHY THE MESSAGE IS SPLIT AND NOT WHOLLY SHARED. The variable names and the
+    condition are one fact and belong in one place. What per-replica state
+    COSTS is not one fact: the read path loses a session store, and the write
+    path loses a revocation list, the single-use property of a device code and
+    a per-customer approval ceiling. A message general enough to cover both
+    would name none of them, and naming them is the only reason a startup
+    crash at 3am is better than a silent misconfiguration.
+
+    WHY ``RuntimeError`` AND NOT ``ValueError``. `create_confirm_app`'s own two
+    guards raise `ValueError`, and this deliberately does not match them. Those
+    say a value this service needs is missing; this says a deployment-wide
+    contract was requested and not met. `create_app` already chose
+    `RuntimeError` for exactly that, and one contract gets one type.
+
+    WHY AN EMPTY URL COUNTS AS ABSENT. ``POSTERN_REDIS_URL=`` is how this
+    repository's ``docker-compose.yml`` spells "unset", and it is what
+    `int_from_env` above already treats as unset for the numeric variables. A
+    guard that accepted it would pass an operator straight through to
+    `postern_core.risk.session`'s in-memory store, which is the state this
+    variable exists to refuse.
+
+    WHAT IT DOES NOT CHECK, and the gap is deliberate: whether the URL points
+    at a reachable Redis, or at the SAME Redis both services use. It reads two
+    environment variables and returns. A URL that names nothing listening
+    still satisfies this and fails later at the first store operation, where
+    each store's own unavailability handling takes over -- and those differ by
+    store, so collapsing them into a startup probe here would make one
+    decision on behalf of four.
+    """
+    if os.environ.get(REQUIRE_REDIS_ENV) != REQUIRE_REDIS_ON:
+        return
+    if os.environ.get(REDIS_URL_ENV):
+        return
+    raise RuntimeError(_REQUIRE_REDIS_PREFIX + consequence)

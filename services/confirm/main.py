@@ -67,6 +67,7 @@ from postern_core.auth.device_keys import DeviceKeyStoreBase, FileDeviceKeyStore
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource, warn_ephemeral_signing_key
 from postern_core.auth.revocation import create_revocation_store
+from postern_core.config import enforce_redis_requirement
 from postern_core.store.engine import Database
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -223,6 +224,41 @@ def create_confirm_app(
     # authentication first -- it is the outer control, and a service that
     # authenticates nobody has nothing to verify a signature for.
     keys = device_key_store or _device_key_store(settings)
+
+    # THE SHARED-STATE CONTRACT, and until 2026-09-26 this service ignored it.
+    # ``POSTERN_REQUIRE_REDIS=1`` means "refuse to run with per-replica state".
+    # It was read in `services/api/main.py` and nowhere else, so an operator
+    # who set it got the guarantee on the read path and none here -- where all
+    # three of the stores built below degrade to per replica without a URL, and
+    # the cost of each is what the message names.
+    #
+    # THIS IS A BREAKING CHANGE, said plainly because an operator will meet it
+    # as a crash loop: a deployment running with the variable set and no URL
+    # starts today and will not after this. That is the variable finally
+    # meaning what it says, and the message is the only thing that will explain
+    # it at 3am, which is why it names both variables, all three stores and
+    # both ways out.
+    #
+    # PLACED AFTER THE TWO GUARDS ABOVE AND BEFORE ANY KEY IS BUILT. After,
+    # because the priority those two established -- authentication first -- is
+    # a decision a newer guard does not get to jump: an operator missing
+    # authentication AND Redis is told about authentication.
+    # `tests/test_require_redis_guard.py::TestTheWritePathStillFailsOnAuthenticationFirst`
+    # pins that order. Before `build_write_minter`, because that generates an
+    # RSA key, and a process that is about to refuse should not first spend one.
+    enforce_redis_requirement(
+        consequence=(
+            "This service keeps three kinds of state in Redis: the ZT-7 "
+            "revocation list, the device code store and the per-customer "
+            "approval rate limit counters. Without POSTERN_REDIS_URL each is "
+            "per replica, so a revocation cuts only the replica that happens "
+            "to receive the next request, a device code spent on one replica "
+            "stays redeemable on every other, and R replicas admit R times "
+            "every per-customer approval ceiling. Set POSTERN_REDIS_URL to the "
+            "same instance the read path uses, or unset POSTERN_REQUIRE_REDIS "
+            "to accept per-replica state."
+        )
+    )
 
     # --- Write key / minter (existing path) ---
     _write_minter, write_key_source = build_write_minter(settings)

@@ -66,6 +66,7 @@ from postern_core.auth.keys import (
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
 from postern_core.auth.revocation import create_revocation_store, decision_scope
+from postern_core.config import enforce_redis_requirement
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
@@ -351,16 +352,31 @@ def create_app(
     # in process memory (lost on restart), revocation is lost on restart,
     # and JTI replay protection is lost on restart. A production deployment
     # that sets POSTERN_REQUIRE_REDIS=1 must also set POSTERN_REDIS_URL.
-    if os.environ.get("POSTERN_REQUIRE_REDIS") == "1":
-        redis_url = os.environ.get("POSTERN_REDIS_URL")
-        if not redis_url:
-            raise RuntimeError(
-                "POSTERN_REQUIRE_REDIS=1 but POSTERN_REDIS_URL is not set. "
-                "This guard only checks that POSTERN_REDIS_URL is configured, "
-                "which backs the session store; revocation lists and JTI "
-                "replay protection remain in-process per replica regardless "
-                "of this setting."
-            )
+    #
+    # THE CONDITION AND THE MESSAGE ARE UNCHANGED; only their location moved,
+    # on 2026-09-26. This guard was read here and nowhere else, so an operator
+    # who set the variable got the guarantee on this path and none on
+    # `services/confirm`, which holds three Redis-backed stores of its own.
+    # `postern_core.config.enforce_redis_requirement` is now the one
+    # implementation and that service calls it too. The sentence below is the
+    # read path's own consequence and is passed in rather than shared, because
+    # the two services lose different things.
+    #
+    # THE SECOND HALF OF THIS SENTENCE IS STALE and is left alone on purpose:
+    # it says revocation lists "remain in-process per replica regardless of
+    # this setting", which stopped being true two days after it was written,
+    # when `create_revocation_store` above gained a Redis backend. Correcting
+    # it changes this path's observable output, which is not what a commit
+    # extending a guard should do. The claim about JTI replay is still exact --
+    # `JtiReplayCache` has no shared backend at all.
+    enforce_redis_requirement(
+        consequence=(
+            "This guard only checks that POSTERN_REDIS_URL is configured, "
+            "which backs the session store; revocation lists and JTI "
+            "replay protection remain in-process per replica regardless "
+            "of this setting."
+        )
+    )
 
     # ONE resolver object, handed to both `build_server` and `RiskMiddleware`
     # below. The middleware charges a call's record and account budgets to

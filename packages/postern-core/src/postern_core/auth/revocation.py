@@ -93,9 +93,13 @@ PERSISTENCE AND REPLICA REACH. `create_revocation_store` reads
 `postern_core.risk.session.create_session_store` already use. A deployment
 that does not set it gets a store that is per replica and dies on restart,
 which for a revocation list is worse than useless, because an operator would
-believe they had acted. `services/api/main.py`'s existing
-``POSTERN_REQUIRE_REDIS`` guard is what a production deployment sets to
-refuse startup without one.
+believe they had acted. ``POSTERN_REQUIRE_REDIS=1`` is what a production
+deployment sets to refuse startup without one;
+`postern_core.config.enforce_redis_requirement` is the one implementation and
+both composition roots call it. It was read in `services/api/main.py` alone
+until 2026-09-26, which meant the read path refused to start and
+`services/confirm` -- holding this list, the device code store and the
+per-customer approval counters -- started anyway.
 
 NO TTL. Revocation keys never expire. A kill switch that silently lapsed
 after thirty minutes, the way a risk context does, would be worse than no
@@ -480,8 +484,9 @@ class InMemoryRevocationStore(RevocationStoreBase):
     Per process, so under more than one replica an entry written here applies
     to whichever replica the writer reached and to no other, and a restart
     forgets it. That is a deployment property and it is why production sets
-    ``POSTERN_REDIS_URL``; `services/api/main.py`'s ``POSTERN_REQUIRE_REDIS``
-    guard is how an operator refuses to start without one.
+    ``POSTERN_REDIS_URL``; ``POSTERN_REQUIRE_REDIS=1`` is how an operator
+    refuses to start without one, on both services since 2026-09-26 and on
+    `services/api` alone before that.
 
     The three sets beside the list are what `entries` reads. `RevocationList`
     indexes for O(1) lookup and exposes only counts, and the CLI's ``list``

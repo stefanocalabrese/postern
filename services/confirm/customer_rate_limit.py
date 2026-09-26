@@ -433,16 +433,22 @@ def create_customer_rate_limit_store() -> CustomerRateLimitStoreBase:
     store and the device code store all degrade the same way from the same
     omission, and the log line below is the same one they emit.
 
-    AND THE GUARD FOR IT DOES NOT COVER THIS SERVICE, which is worth writing
-    down here because this is where the next reader will assume it does.
-    ``POSTERN_REQUIRE_REDIS=1`` refuses to start without a URL, and it is read
-    in `services/api/main.py` ONLY -- a grep on 2026-09-25 finds it in that
-    one file. So an operator who sets it gets the guarantee on the read path
-    and not on the write path, where this counter and the ZT-7 revocation list
-    both live. Extending it is a change to this service's startup contract
-    rather than to this factory, so it is not made here; it is named so that
-    "we set POSTERN_REQUIRE_REDIS" is not mistaken for "the approval counters
-    are shared".
+    AN OPERATOR CAN NOW REFUSE THAT, WHICH THEY COULD NOT UNTIL 2026-09-26.
+    ``POSTERN_REQUIRE_REDIS=1`` refuses startup without a URL, and until that
+    date it was read in `services/api/main.py` and nowhere else, so setting it
+    bought the guarantee on the read path and nothing at all here -- these
+    counters, the ZT-7 revocation list and the device code store all stayed per
+    replica while the operator believed otherwise.
+    `postern_core.config.enforce_redis_requirement` is now the one
+    implementation of that contract and `services/confirm/main.py` calls it
+    beside `services/api/main.py`, so "we set POSTERN_REQUIRE_REDIS" does now
+    mean the approval counters are shared.
+
+    WHAT IS STILL THE OPERATOR'S, because the guard reads two environment
+    variables and nothing more: it does not check that the URL is reachable,
+    and it does not check that both services point at the SAME Redis. Pointing
+    them at two instances satisfies every check in this repository and gives
+    the read path one revocation list and the write path another.
     """
     redis_url = os.environ.get("POSTERN_REDIS_URL")
     if redis_url:
