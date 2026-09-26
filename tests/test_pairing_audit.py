@@ -71,6 +71,7 @@ from starlette.applications import Starlette
 from services.confirm.audit import (
     DETAIL_ALREADY_APPROVED,
     DETAIL_DEVICE_CODE_NOT_FOUND,
+    DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
     DETAIL_REVOKED,
     DETAIL_STORED_IDENTITY_MALFORMED,
@@ -1043,3 +1044,74 @@ async def test_a_mint_that_fails_leaves_no_row_claiming_one(
     assert row.outcome == OUTCOME_RAISED, "a row claimed a mint that never happened"
     assert row.detail == "RuntimeError"
     assert row.customer_ref == CUSTOMER
+
+
+# ---------------------------------------------------------------------------
+# 9. A replay against a spent code, which is this table's most interesting row.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_replay_of_a_spent_device_code_is_recorded(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """Both halves of ``PairingAudit``'s rule are met, so a row is owed.
+
+    The identity is resolved -- ``customer_ref`` is read off the code, written
+    there by a verified assertion at ``POST /approve`` -- and the server then
+    concludes something about that identity's authority: this grant is spent
+    and will not mint again. That is not a browser waiting, which is what the
+    unrecorded exits of this endpoint all are.
+
+    It is also the only place the event is visible. The browser is told
+    ``invalid_grant`` in exactly the body an unknown code gets, so the
+    response says nothing; and `services/confirm/device_auth.py` has no
+    client id to put in a log line, which is the argument
+    ``services/confirm/revocation.py``'s ``log_refusal`` already makes for the
+    revocation refusal beside it.
+
+    WHY THE ROW EXISTS AT ALL rather than the code being revoked: revoking
+    deletes the store row, a replay is then answered by the unknown-code
+    branch before any identity is read, and this row is the thing that would
+    be lost.
+    """
+    code = await paired(app, key_pair)
+    assert (await exchange(app, code.device_code)).status_code == 200
+    await _wipe(clean)
+
+    replay = await exchange(app, code.device_code)
+    assert replay.status_code == 400
+    assert replay.json()["error"] == "invalid_grant"
+    assert "access_token" not in replay.json()
+
+    row = await one_row(clean)
+    assert row.tool_name == TOKEN_TOOL_NAME
+    assert row.outcome == OUTCOME_RAISED
+    assert row.detail == DETAIL_DEVICE_CODE_SPENT
+    assert row.customer_ref == CUSTOMER
+    assert row.reaching_at is None
+    assert row.arguments["route"] == TOKEN_ROUTE
+    assert row.arguments["device_code_handle"] == handle_of(code.device_code)
+    assert row.arguments["paired_client_id"] == BROWSER_CLIENT
+
+
+async def test_a_replayed_code_produces_one_row_per_attempt_under_one_handle(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """What the handle buys here, which is counting the attempts on one pairing.
+
+    ``device_code_handle``'s own docstring makes the claim -- "a caller
+    guessing codes produces many handles and a caller retrying one produces
+    one" -- and a replay is the retrying case. Three rows, one handle, three
+    distinct ``call_id`` values, because three requests arrived.
+    """
+    code = await paired(app, key_pair)
+    assert (await exchange(app, code.device_code)).status_code == 200
+    await _wipe(clean)
+
+    for _ in range(3):
+        assert (await exchange(app, code.device_code)).status_code == 400
+
+    written = await rows(clean)
+    assert [r.detail for r in written] == [DETAIL_DEVICE_CODE_SPENT] * 3
+    assert {r.arguments["device_code_handle"] for r in written} == {handle_of(code.device_code)}
+    assert len({r.call_id for r in written}) == 3

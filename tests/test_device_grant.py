@@ -55,6 +55,7 @@ from postern_core.auth.device_codes import (
     _generate_user_code,
 )
 from postern_core.auth.device_keys import no_enrolled_devices
+from postern_core.auth.revocation import RevocationStoreUnavailable
 from starlette.applications import Starlette
 from starlette.requests import Request
 
@@ -984,6 +985,51 @@ class TestSerialization:
         assert dc.customer_ref == ""
         assert dc.user_code_attempts == 0
 
+    def test_exchanged_at_round_trips_through_json(self) -> None:
+        """The field a replay is refused on has to survive a Redis round trip.
+
+        Without it in both directions the two backends disagree on whether a
+        code is spent, and the one that forgets hands out a second token.
+        """
+        spent_at = datetime.now(UTC)
+        dc = DeviceCode(
+            device_code="spent-json",
+            user_code="ABCDEF",
+            verification_uri="https://auth.example.com/verify",
+            expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            approved=True,
+            approved_at=datetime.now(UTC),
+            customer_ref="cust_7f3a",
+            exchanged_at=spent_at,
+        )
+
+        dc2 = DeviceCode.from_json(dc.to_json())
+
+        assert dc2.exchanged_at is not None
+        assert abs((dc2.exchanged_at - spent_at).total_seconds()) < 0.001
+
+    def test_from_dict_without_exchanged_at_reads_as_unspent(self) -> None:
+        """A `.get` default, for the reason ``customer_ref`` has one.
+
+        The direction is the opposite of ``customer_ref``'s and deliberately
+        so: a code serialized by the previous release was written by a build
+        that could not spend one, so "unspent" is the true reading of its
+        absence rather than a fail-closed guess. What it costs is bounded by
+        the code's own 900-second life.
+        """
+        legacy: dict[str, Any] = {
+            "device_code": "legacy-unspent",
+            "user_code": "ABCDEF",
+            "verification_uri": "https://auth.example.com/verify",
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=15)).timestamp(),
+            "approved": True,
+            "approved_at": datetime.now(UTC).timestamp(),
+            "customer_ref": "cust_7f3a",
+            # No "exchanged_at" key at all.
+        }
+
+        assert DeviceCode.from_dict(legacy).exchanged_at is None
+
 
 # ---------------------------------------------------------------------------
 # Endpoint wiring — JSON vs form body, content-type handling.
@@ -1864,3 +1910,241 @@ class TestTheUserCodeAttemptBudgetFloor:
                 assert typo.status_code == 400
             assert await store.get_device_code(device["device_code"]) is not None
             assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# One approved device code buys one read token.
+# ---------------------------------------------------------------------------
+
+
+async def _exchange(client: httpx2.AsyncClient, device_code: str) -> httpx2.Response:
+    """``POST /token`` with the device code grant, as the browser sends it."""
+    return await client.post(
+        "/token",
+        data={"grant_type": "device_code", "device_code": device_code},
+    )
+
+
+class TestASuccessfulExchangeSpendsTheDeviceCode:
+    """An approved code is spent by the exchange that succeeds on it.
+
+    RFC 8628 DOES NOT SAY THIS, and ``dev-docs/decisions/0012-device-code-
+    single-use.md`` carries the reading. §3.5 lists four error codes and names
+    exactly one thing that ends a device authorization session:
+    ``expired_token``, "The 'device_code' has expired, and the device
+    authorization session has concluded." A successful token response appears
+    in no such sentence. What the RFC does say, in §5.2, is that an attacker
+    who guesses a device code "would be able to potentially obtain the
+    authorization code once the user completes the flow" -- it calls what this
+    value redeems an authorization code, and RFC 6749 §10.5 makes those "short
+    lived and single-use".
+
+    WHAT THE GAP WAS WORTH, in this deployment's own numbers. The 5-second
+    poll interval is enforced only while a code is unapproved, so an approved
+    one was bounded by `services/confirm/rate_limit.py`'s 300 requests a
+    minute per address bucket and by nothing else. A read token lives 60
+    seconds (`postern_core.auth.internal_jwt`) and a device code 900, so
+    fifteen exchanges a minute apart bought uninterrupted account-read access
+    for a leaked code's whole remaining life, with 4,500 as the ceiling on the
+    count rather than on the access. One token and 60 seconds is what it buys
+    now.
+    """
+
+    async def test_a_second_exchange_of_the_same_code_mints_nothing(
+        self, app: Starlette, key_pair: RSAKeyPair
+    ) -> None:
+        """The defect, as one assertion: the same code twice, two outcomes."""
+        async with _client(app) as client:
+            device = await _start_device_grant(client)
+            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+
+            first = await _exchange(client, device["device_code"])
+            assert first.status_code == 200
+            assert "access_token" in first.json()
+
+            second = await _exchange(client, device["device_code"])
+
+        assert second.status_code == 400
+        assert second.json()["error"] == "invalid_grant"
+        assert "access_token" not in second.json()
+
+    async def test_the_spent_code_stays_in_the_store_and_records_when(
+        self, app: Starlette, key_pair: RSAKeyPair
+    ) -> None:
+        """MARKED, never revoked, and the audit story is what decides it.
+
+        Revoking would delete the row, and a replay would then be answered by
+        the unknown-code branch, which resolves no identity and so writes no
+        ``audit_log`` row -- losing the one event on this endpoint most worth
+        recording. It would also break the join
+        ``services/confirm/audit.py``'s ``_arguments`` relies on, where the
+        scopes a pairing granted are "on the device code, which the handle
+        joins to while it lives".
+        """
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        async with _client(app) as client:
+            device = await _start_device_grant(client)
+            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+            assert (await _exchange(client, device["device_code"])).status_code == 200
+
+        spent = await store.get_device_code(device["device_code"])
+        assert spent is not None, "the row a replay must be recorded against was deleted"
+        assert spent.exchanged_at is not None
+        assert spent.approved is True
+
+    async def test_the_refusal_is_the_one_an_unknown_code_gets(
+        self, app: Starlette, key_pair: RSAKeyPair
+    ) -> None:
+        """The response is not an oracle, and the table is where the two differ.
+
+        A party holding a guessed device code must not learn from a status or
+        a body that the value existed, was approved and was spent. That
+        distinction is worth recording and worth withholding, so it goes in
+        ``audit_log.detail`` where only the operator reads it -- the same
+        division this module already documents for ``access_denied``, which
+        deliberately cannot be told apart from a customer declining on their
+        phone.
+        """
+        async with _client(app) as client:
+            device = await _start_device_grant(client)
+            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+            assert (await _exchange(client, device["device_code"])).status_code == 200
+
+            spent = await _exchange(client, device["device_code"])
+            never_existed = await _exchange(client, "no-such-device-code")
+
+        assert spent.status_code == never_existed.status_code == 400
+        assert spent.json() == never_existed.json()
+
+    async def test_a_replay_is_refused_without_consulting_the_revocation_store(
+        self, app: Starlette, key_pair: RSAKeyPair
+    ) -> None:
+        """A spent code is refused on the row, before ZT-7 is asked anything.
+
+        Which is why the check on the stored ``exchanged_at`` exists at all
+        beside the atomic claim below it: the claim alone would leave a replay
+        arriving during a revocation-store outage answered 503
+        ``temporarily_unavailable``, a code that promises retryability for a
+        grant no retry can ever redeem. The browser would poll a dead code
+        until it expired.
+        """
+        async with _client(app) as client:
+            device = await _start_device_grant(client)
+            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+            assert (await _exchange(client, device["device_code"])).status_code == 200
+
+            class Unavailable:
+                async def is_customer_revoked(self, customer_ref: str) -> bool:
+                    raise RevocationStoreUnavailable("the revocation store is gone")
+
+            app.state.postern_revocation_store = Unavailable()
+            replay = await _exchange(client, device["device_code"])
+
+        assert replay.status_code == 400
+        assert replay.json()["error"] == "invalid_grant"
+
+    async def test_two_exchanges_racing_past_the_spent_check_mint_once(
+        self, app: Starlette, key_pair: RSAKeyPair
+    ) -> None:
+        """The race, forced, because ``asyncio.gather`` alone does not produce it.
+
+        MEASURED, NOT ASSUMED. Two gathered exchanges of one code do not race:
+        the first request runs from the form parse to the audit write without
+        reaching an ``await`` that yields to the loop -- the in-memory device
+        code and revocation stores never suspend -- so it has already spent the
+        code before the second one starts, and the stored-``exchanged_at``
+        check answers that one. A test written that way passes against a build
+        that ignores the claim's return value entirely, which is exactly the
+        defect it looks like it is covering.
+
+        So the two requests are held INSIDE the revocation check, which is the
+        last step before the claim: a barrier of two releases them together,
+        both having passed the spent check while the code was unspent, and both
+        arriving at the claim. That is the shape a real deployment reaches with
+        two replicas and one shared store, where every step between is a socket.
+        """
+        held_at_the_revocation_check = asyncio.Barrier(2)
+
+        class BothAtOnce:
+            async def is_customer_revoked(self, customer_ref: str) -> bool:
+                await held_at_the_revocation_check.wait()
+                return False
+
+        async with _client(app) as client:
+            device = await _start_device_grant(client)
+            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+
+            app.state.postern_revocation_store = BothAtOnce()
+            both = await asyncio.gather(
+                _exchange(client, device["device_code"]),
+                _exchange(client, device["device_code"]),
+            )
+
+        tokens = [r.json().get("access_token") for r in both if r.status_code == 200]
+        assert len(tokens) == 1, f"{len(tokens)} tokens came out of one device code"
+        assert sorted(r.status_code for r in both) == [200, 400]
+        refused = next(r for r in both if r.status_code == 400)
+        assert refused.json()["error"] == "invalid_grant"
+
+
+class TestConsumingADeviceCodeInTheStore:
+    """``consume_device_code``, the atomic claim the mint sits behind.
+
+    A separate contract from ``approve_device_code``'s and the same shape:
+    ``True`` to the caller that moved the code, ``False`` to every other,
+    including one that arrives at the same instant.
+    """
+
+    async def test_the_first_call_wins_and_a_second_is_refused(
+        self, store: InMemoryDeviceCodeStore
+    ) -> None:
+        code = await store.create_device_code(
+            client_id="browser-1",
+            scopes="accounts:read",
+            verification_uri="https://auth.example.com/verify",
+        )
+
+        assert await store.consume_device_code(code.device_code) is True
+        assert await store.consume_device_code(code.device_code) is False
+
+    async def test_it_marks_the_code_rather_than_removing_it(
+        self, store: InMemoryDeviceCodeStore
+    ) -> None:
+        code = await store.create_device_code(
+            client_id="browser-1",
+            scopes="accounts:read",
+            verification_uri="https://auth.example.com/verify",
+        )
+
+        await store.consume_device_code(code.device_code)
+
+        stored = await store.get_device_code(code.device_code)
+        assert stored is not None
+        assert stored.exchanged_at is not None
+        assert stored.device_code == code.device_code
+
+    async def test_a_code_the_store_never_held_cannot_be_consumed(
+        self, store: InMemoryDeviceCodeStore
+    ) -> None:
+        assert await store.consume_device_code("never-existed") is False
+
+    async def test_two_concurrent_claims_answer_true_to_exactly_one(
+        self, store: InMemoryDeviceCodeStore
+    ) -> None:
+        """The contract the endpoint's one-token property rests on.
+
+        A claim that read, awaited anything, and then wrote would answer
+        ``True`` to both of these.
+        """
+        code = await store.create_device_code(
+            client_id="browser-1",
+            scopes="accounts:read",
+            verification_uri="https://auth.example.com/verify",
+        )
+
+        won = await asyncio.gather(
+            store.consume_device_code(code.device_code),
+            store.consume_device_code(code.device_code),
+        )
+
+        assert sorted(won) == [False, True]

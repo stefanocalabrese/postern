@@ -183,6 +183,7 @@ __all__ = [
     "DETAIL_CHALLENGE_NOT_OWNED",
     "DETAIL_CHALLENGE_VANISHED",
     "DETAIL_DEVICE_CODE_NOT_FOUND",
+    "DETAIL_DEVICE_CODE_SPENT",
     "DETAIL_DEVICE_NOT_ENROLLED",
     "DETAIL_EXPIRED",
     "DETAIL_INVALID_SUBJECT",
@@ -857,6 +858,29 @@ DETAIL_INVALID_SUBJECT = "invalid_subject"
 #: A device code that names nothing. The enumeration signal on this endpoint,
 #: and the analogue of ``DETAIL_CHALLENGE_NOT_FOUND`` one endpoint over.
 DETAIL_DEVICE_CODE_NOT_FOUND = "device_code_not_found"
+#: A second exchange of a code the first one spent, at ``POST /token``. The
+#: replay signal, and the highest-value row this table can hold about the
+#: device grant: the code was approved by a verified assertion, so something
+#: presenting it again either copied it from the browser that earned it or
+#: guessed 256 bits of ``secrets`` entropy.
+#:
+#: A DISTINCT LITERAL FROM ``DETAIL_DEVICE_CODE_NOT_FOUND``, and the response
+#: deliberately does not make the same distinction: both answer
+#: ``invalid_grant`` in one identical body, so a party holding a guessed code
+#: cannot learn from it that the value ever existed. That asymmetry is the
+#: point. ``WHERE detail = 'device_code_spent'`` is the whole replay query and
+#: there is no other trace of the event -- `services/confirm/device_auth.py`
+#: has no client id to put in a log line, which is the argument
+#: `services/confirm/revocation.py`'s ``log_refusal`` already makes for the
+#: revocation refusal beside it.
+#:
+#: WHY THE STORE ROW HAS TO SURVIVE FOR THIS TO EXIST. Revoking a spent code
+#: instead of marking it would answer a replay from ``token_endpoint``'s
+#: unknown-code branch, which runs before ``customer_ref`` is read, so
+#: ``PairingAudit``'s rule would owe nothing and this literal would be
+#: unreachable. ``dev-docs/decisions/0012-device-code-single-use.md`` carries
+#: that trade.
+DETAIL_DEVICE_CODE_SPENT = "device_code_spent"
 #: A second approval of a code already approved. Refused before anything is
 #: written, because otherwise a caller holding an assertion of their own could
 #: swap ``customer_ref`` to themselves in the window before the browser polls

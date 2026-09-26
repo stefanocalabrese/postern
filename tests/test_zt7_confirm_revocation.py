@@ -690,22 +690,39 @@ async def test_a_revoked_customers_device_code_exchange_mints_nothing(
     ``services/api`` would refuse the minted token on use, so the practical
     exposure is narrow -- but ZT-7's bar is that a revoked identity stops
     OBTAINING access, and a freshly signed token is access obtained. Both
-    directions in one test: the same device code yields a token before the
-    revocation and nothing after it.
-    """
-    device_code = await paired(app, key_pair, OWNER)
-    form = {"grant_type": "device_code", "device_code": device_code}
+    directions in one test: one device code yields a token before the
+    revocation, another yields nothing after it.
 
-    served = await post_form(app, "/token", form)
+    TWO CODES, WHERE THIS WAS ONE UNTIL 2026-09-26, and the change is forced
+    rather than stylistic. A successful exchange now spends the code
+    (`dev-docs/decisions/0012-device-code-single-use.md`), so re-presenting the
+    one that was served is refused ``invalid_grant`` for being spent, before the
+    ZT-7 check it is here to exercise is reached. Reusing it would leave this
+    test passing on a build with no revocation check at all. Both codes are
+    paired BEFORE the revocation because they have to be: ``POST /approve``
+    refuses a revoked customer too, one step earlier, which is what
+    ``test_a_revoked_customer_cannot_approve_a_device_pairing_at_all`` below
+    asserts.
+    """
+    served_code = await paired(app, key_pair, OWNER)
+    held_back = await paired(app, key_pair, OWNER)
+
+    served = await post_form(
+        app, "/token", {"grant_type": "device_code", "device_code": served_code}
+    )
     assert served.status_code == 200, served.text
     assert served.json()["access_token"]
 
     await store_of(app).revoke_customer_client(customer_ref=OWNER, client_id=CLIENT)
 
-    refused = await post_form(app, "/token", form)
+    refused = await post_form(
+        app, "/token", {"grant_type": "device_code", "device_code": held_back}
+    )
 
     assert refused.status_code == 400, refused.text
-    assert refused.json()["error"] == "access_denied"
+    assert refused.json()["error"] == "access_denied", (
+        "a redeemable code for a revoked customer must be refused by ZT-7, not by anything else"
+    )
     assert "access_token" not in refused.json()
 
 

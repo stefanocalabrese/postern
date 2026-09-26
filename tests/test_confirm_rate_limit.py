@@ -985,13 +985,27 @@ class TestTheSlowDownInteraction:
         assert errors[limit - 1] == "invalid_grant"
         assert errors[limit] == "slow_down"
 
-    async def test_an_approved_code_is_bounded_only_by_the_ip_limit(
+    async def test_an_approved_code_is_bounded_by_being_spent_and_not_by_a_limit(
         self, key_pair: RSAKeyPair
     ) -> None:
-        """Named rather than implied: the per-code ``slow_down`` is skipped
-        entirely once a code is approved, so for an approved code this limit
-        is the only one, and at 300/min it is loose. Each poll costs an RSA
-        signature and a revocation lookup."""
+        """The per-code ``slow_down`` is still skipped once a code is approved,
+        and the thing that bounds an approved code is now the code itself.
+
+        THIS TEST ASSERTED THE OPPOSITE UNTIL 2026-09-26, and what it asserted
+        was a defect rather than a property: 20 exchanges of one approved code,
+        ``statuses == [200] * 20``, with a docstring explaining that at 300/min
+        the address-bucket limit was "loose" and each poll cost "an RSA
+        signature and a revocation lookup". It cost a READ TOKEN as well.
+        ``dev-docs/decisions/0012-device-code-single-use.md`` carries what that
+        was worth and why the code is spent by the exchange that succeeds on it.
+
+        Two things survive the change and both are still worth pinning here,
+        because they are this file's subject and not that record's. The per-code
+        ``slow_down`` block runs only while a code is UNAPPROVED, so none of
+        these 20 requests is answered with it however fast they arrive. And 20
+        requests are far inside the 300-per-minute bucket, so the limiter is not
+        what refuses the last 19 either.
+        """
         app = _app(key_pair)
         async with _client(app) as client:
             device = (await client.post("/device_authorization", json={"client_id": "b"})).json()
@@ -1001,9 +1015,14 @@ class TestTheSlowDownInteraction:
                 headers=bearer(key_pair),
             )
             body = {"grant_type": "device_code", "device_code": device["device_code"]}
-            statuses = [(await client.post("/token", data=body)).status_code for _ in range(20)]
+            answers = [await client.post("/token", data=body) for _ in range(20)]
 
-        assert statuses == [200] * 20
+        statuses = [r.status_code for r in answers]
+        assert statuses == [200] + [400] * 19
+        errors = [r.json()["error"] for r in answers[1:]]
+        assert errors == ["invalid_grant"] * 19
+        assert 429 not in statuses, "the address-bucket limit fired inside its own budget"
+        assert "slow_down" not in errors, "the per-code interval applied to an approved code"
 
 
 # ---------------------------------------------------------------------------

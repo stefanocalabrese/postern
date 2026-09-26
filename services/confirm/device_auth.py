@@ -96,6 +96,7 @@ from starlette.routing import Route
 from services.confirm.audit import (
     DETAIL_ALREADY_APPROVED,
     DETAIL_DEVICE_CODE_NOT_FOUND,
+    DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
     DETAIL_REVOKED,
     DETAIL_STORED_IDENTITY_MALFORMED,
@@ -132,6 +133,46 @@ def _error(status: int, code: str, description: str) -> JSONResponse:
             "error_description": description,
         },
     )
+
+
+def _unredeemable_response() -> JSONResponse:
+    """The one answer ``POST /token`` gives for a code it will not redeem.
+
+    THREE BRANCHES SHARE IT, AND THAT IS THE CONTROL. A code this store never
+    held, a code a previous exchange spent, and a code a concurrent exchange is
+    spending all get this response, byte for byte, so nothing in a status or a
+    body tells a caller that a value it presented ever existed, was approved,
+    or belonged to anybody. Returning it from one function rather than
+    assembling it at three call sites is what keeps that true as any of the
+    three is edited.
+
+    WHAT IS WITHHELD HERE IS RECORDED ELSEWHERE. The distinction the caller
+    does not get is exactly the distinction an operator needs, so it lives in
+    ``audit_log.detail`` -- ``device_code_not_found`` against
+    ``device_code_spent`` -- where the party holding the code cannot read it.
+    The module already takes this shape for ``access_denied``, which
+    deliberately cannot be told apart from a customer declining on their phone.
+
+    ``invalid_grant`` IS THE HONEST CODE, and RFC 8628 §3.5 leaves no better
+    one. Its own four codes are ``authorization_pending``, ``slow_down``,
+    ``access_denied`` and ``expired_token``: the first two are the only ones
+    the RFC tells a client to keep polling through, so neither can be used
+    here without making a browser loop until the code's TTL runs out;
+    ``expired_token`` is false, because a spent code has not reached its
+    expiry; and ``access_denied`` says the authorization was refused, when it
+    was granted and then used. That leaves RFC 6749 §5.2, whose
+    ``invalid_grant`` covers a grant that "is invalid, expired, revoked, does
+    not match the redirection URI used in the authorization request, or was
+    issued to another client" -- and §3.5 makes every code other than the two
+    polling ones terminal, so the browser stops and starts a fresh pairing,
+    which is the only recovery that exists.
+
+    THE DESCRIPTION IS TRUE OF ALL THREE, which it was not before 2026-09-26:
+    it read "device code not found or already revoked", and a spent code is
+    neither. A response the caller cannot act on differently is no reason to
+    describe it wrongly.
+    """
+    return _error(400, "invalid_grant", "device code cannot be redeemed")
 
 
 def _store_full_response(retry_after: int) -> JSONResponse:
@@ -338,7 +379,19 @@ async def device_authorization(request: Request) -> JSONResponse:
 
 
 async def token_endpoint(request: Request) -> JSONResponse:
-    """Exchange a device code for access tokens, and record the mint.
+    """Spend a device code for one read token, and record the mint.
+
+    ONE APPROVED CODE IS WORTH ONE TOKEN. Until 2026-09-26 it was worth every
+    token a caller cared to ask for until the code expired: this handler minted
+    and returned without marking the code, and the 5-second poll interval is
+    enforced only while a code is UNAPPROVED, so an approved one was bounded by
+    `services/confirm/rate_limit.py`'s 300 requests a minute per address bucket
+    and by nothing else. A read token lives 60 seconds and a device code 900,
+    so fifteen exchanges a minute apart bought uninterrupted account-read
+    access for a leaked code's whole remaining life. RFC 8628 does not require
+    this to be closed -- it says nothing either way, which is why
+    ``dev-docs/decisions/0012-device-code-single-use.md`` exists and what it
+    argues from.
 
     Handles ``grant_type=device_code`` (RFC 8628 §3.4) and forwards all
     other grant types to the existing JWKS-only app (which will 404).
@@ -373,17 +426,32 @@ async def token_endpoint(request: Request) -> JSONResponse:
             deliberately indistinguishable here; see the comment at the check.
         expired_token — device code has passed its TTL.
 
-    And one that is not RFC 8628's, answered with 503:
+    And two that are RFC 6749 §5.2's, because RFC 8628 has no code for either:
+        invalid_grant — the code is unknown, or a previous exchange already
+            spent it, or a concurrent one is spending it. One body for all
+            three, so the response is not an oracle; ``_unredeemable_response``
+            above carries why this code and not one of the four.
         temporarily_unavailable — the revocation store could not be consulted,
-            so nothing was minted. Retryable on purpose.
+            so nothing was minted and nothing was spent. Answered 503 and
+            retryable on purpose.
 
     WHAT IS RECORDED, AND HOW LITTLE OF IT. This endpoint wrote no
     ``audit_log`` row until 2026-09-26, which left the device grant's chain
     with a hole in the middle: the pairing was recorded, the tool calls the
     minted token made were recorded twice each, and the mint between them was
-    invisible. It now writes exactly one row on each of FOUR exits -- the mint,
-    a ZT-7 refusal, a stored identity that will not parse, and a revocation
-    store that could not answer -- and nothing on the other six.
+    invisible. It now writes exactly one row on each of SIX exits -- the mint, a
+    ZT-7 refusal, a stored identity that will not parse, a revocation store that
+    could not answer, and the two ways a spent code is refused -- and nothing on
+    the other seven. Both spent exits carry ``DETAIL_DEVICE_CODE_SPENT``,
+    because they are one conclusion reached at two places.
+
+    THOSE TWO COUNTS ARE RE-DERIVED AND THE OLD ONES WERE WRONG. This paragraph
+    said "FOUR exits ... the other six" when four was right, and six was not:
+    there were seven unrecorded exits then and there are seven now, since the
+    two this change adds are both recorded. Counted from the ``return``
+    statements of this function and ``_exchange`` together on 2026-09-26, which
+    is the only way to count them -- ``_exchange`` is where half the endpoint's
+    exits live.
 
     EVERY UNRECORDED EXIT IS ONE THAT RESOLVED NOBODY, and that is the rule
     rather than a list: ``services/confirm/audit.py``'s ``PairingAudit`` owes a
@@ -437,7 +505,7 @@ async def token_endpoint(request: Request) -> JSONResponse:
         # would attribute the guess to nobody while letting an
         # unauthenticated party drive an INSERT 300 times a minute per address
         # bucket (``rate_limit_token``).
-        return _error(400, "invalid_grant", "device code not found or already revoked")
+        return _unredeemable_response()
 
     if code.is_expired:
         # NO ROW. This runs before the identity is read, so it resolves nobody
@@ -528,9 +596,7 @@ async def token_endpoint(request: Request) -> JSONResponse:
     audit.names(device_code=device_code_value, paired_client_id=code.client_id)
 
     try:
-        response, detail = await _exchange(
-            request, audit, customer_ref=stored_customer_ref, device_code_value=device_code_value
-        )
+        response, detail = await _exchange(request, audit, code=code)
     except Exception as exc:
         # `raise exc from audit_exc`, the shape `approve_callback` and
         # `services/confirm/callback.py` both use: an audit-write failure must
@@ -574,19 +640,47 @@ async def _exchange(
     request: Request,
     audit: PairingAudit,
     *,
-    customer_ref: str,
-    device_code_value: str,
+    code: DeviceCode,
 ) -> tuple[JSONResponse, str | None]:
-    """The ZT-7 check and the mint, returning ``(response, detail)``.
+    """The spend, the ZT-7 check and the mint, returning ``(response, detail)``.
 
     ``detail`` is ``None`` when a token was minted and one of
     ``services/confirm/audit.py``'s ``DETAIL_*`` literals otherwise. Split out
     from ``token_endpoint`` so the row is written in exactly one place, which
     is the same division ``approve_callback`` and
     ``services/confirm/callback.py`` both make.
+
+    THE ORDER OF THE THREE IS DECIDED, and two of the three orders are wrong.
+
+    The spent check comes FIRST because a code that can never be redeemed again
+    must not be answered with a retryable code. Put it after the ZT-7 check and
+    a replay arriving while the revocation store is down is answered 503
+    ``temporarily_unavailable``, which tells the browser to come back for a
+    grant no retry will ever redeem; it would poll a dead code until it
+    expired.
+
+    The CLAIM comes after the ZT-7 check, which is the opposite ordering, and
+    for the mirror-image reason: the claim is irreversible and 503 means the
+    server failed to decide. Claiming first would spend a legitimate
+    customer's code on a revocation-store outage, so their retry -- the one the
+    503 invited -- would be refused, and it would hand anyone holding a leaked
+    code a way to destroy a pairing during an outage. Nothing is spent on a
+    question this service could not answer.
+
+    So the spent check and the claim are the same property asked twice, and
+    they are not redundant: the first refuses a code an EARLIER request spent
+    and needs no round trip, the second refuses one a CONCURRENT request is
+    spending and is the only one of the two that can. Both answer with the same
+    response and the same ``detail``.
     """
+    store: DeviceCodeStoreBase = request.app.state.device_code_store
+    device_code_value = code.device_code
+
+    if code.exchanged_at is not None:
+        return _unredeemable_response(), DETAIL_DEVICE_CODE_SPENT
+
     try:
-        customer = CustomerRef(value=customer_ref)
+        customer = CustomerRef(value=code.customer_ref)
     except ValidationError:
         # Never let this one propagate. `CustomerRef` sets
         # `hide_input_in_errors=True`, which covers `str()` and `repr()` of the
@@ -646,6 +740,27 @@ async def _exchange(
     if revoked:
         log_refusal("a device-grant token exchange")
         return _error(400, "access_denied", "authorization was refused"), DETAIL_REVOKED
+
+    # SPEND THE CODE BEFORE SIGNING ANYTHING. One approved device code is
+    # worth one read token, and this line is where that becomes true rather
+    # than intended: `postern_core.auth.device_codes`'s ``consume_device_code``
+    # answers ``True`` to exactly one caller, so a burst of concurrent polls
+    # mints once and the rest arrive here having lost.
+    #
+    # BEFORE THE MINT AND NOT AFTER. Claiming afterwards would have every
+    # racing request sign a credential and all but one throw it away, which is
+    # a signing key used for work this service has already decided not to
+    # honour. Nothing is signed that this request is not entitled to sign.
+    #
+    # A LOST CLAIM IS NOT UNDONE, HERE OR ANYWHERE. If the mint below raises,
+    # or `token_endpoint`'s audit write does, the code stays spent and the
+    # customer starts again from a fresh QR -- the direction
+    # ``_withdraw_pairing`` already chose one endpoint earlier, for the same
+    # reason: a device code is in this deployment's own store, so refusing and
+    # making them re-pair costs a scan, while leaving a redeemable code behind
+    # a 500 is fail-open in substance.
+    if not await store.consume_device_code(device_code_value):
+        return _unredeemable_response(), DETAIL_DEVICE_CODE_SPENT
 
     read_minter: InternalTokenMinter = request.app.state.read_minter
     read_token = read_minter.mint(

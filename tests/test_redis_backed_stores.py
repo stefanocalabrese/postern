@@ -596,6 +596,95 @@ async def test_the_key_dies_before_the_index_says_its_member_is_due(
     )
 
 
+async def test_consuming_a_code_marks_it_once_against_a_real_server(
+    stores: RedisStores,
+) -> None:
+    """``consume_device_code`` on the backend production actually runs.
+
+    The claim is a WATCH/MULTI/EXEC round trip here and a dict write in
+    `InMemoryDeviceCodeStore`, so the two are different code and only the
+    contract is shared. Asserted against redis:7-alpine rather than
+    ``fakeredis`` because what is under test is the server refusing the second
+    writer, which a library emulating transactions in the test process is the
+    wrong witness for.
+    """
+    store = stores.device_codes()
+    code = await _create(store)
+
+    assert await store.consume_device_code(code.device_code) is True
+    assert await store.consume_device_code(code.device_code) is False
+
+    stored = await store.get_device_code(code.device_code)
+    assert stored is not None, "the claim deleted the key instead of marking it"
+    assert stored.exchanged_at is not None
+
+
+async def test_two_concurrent_claims_on_one_key_answer_true_to_exactly_one(
+    stores: RedisStores,
+) -> None:
+    """The property a replica pair actually needs from this backend.
+
+    Two browsers polling one leaked code land on two replicas sharing one
+    Redis, and a read-then-write claim would answer ``True`` to both. Only the
+    server can settle that, which is why the optimistic transaction is here
+    rather than a lock held in a process.
+    """
+    store = stores.device_codes()
+    code = await _create(store)
+
+    won = await asyncio.gather(
+        store.consume_device_code(code.device_code),
+        store.consume_device_code(code.device_code),
+    )
+
+    assert sorted(won) == [False, True]
+
+
+async def test_the_claim_does_not_move_a_device_codes_expiry(
+    stores: RedisStores,
+) -> None:
+    """``KEEPTTL``, and the defect it is there instead of.
+
+    Any ``SET`` without it drops the key's TTL, so the claim has to say
+    something about the expiry, and the two things it could say are both
+    wrong. A bare ``SET`` makes a spent code immortal -- outliving both its own
+    ``expires_at`` and the index member the cap counts. A ``SET`` carrying the
+    store's default TTL, or ``_set_code``'s recomputed one, moves the expiry to
+    whatever the write decides: at the default that is a code alive for 900
+    seconds after being spent at second 780 of its life.
+
+    Asserted as a band rather than equality because the round trip itself
+    consumes time. One second of tolerance is enough for that and nowhere near
+    enough to hide either defect above, which move the expiry by hundreds of
+    seconds. What is NOT asserted here is the index, because ``KEEPTTL`` and
+    ``_set_code`` are indistinguishable on it: the score is ``expires_at``,
+    spending a code does not move that, so a redundant ``ZADD`` writes the
+    value that is already there.
+    """
+    store = stores.device_codes()
+    code = await _create(store, expires_in=120)
+    before = await store._redis.ttl(store._key(code.device_code))
+
+    assert await store.consume_device_code(code.device_code) is True
+
+    after = await store._redis.ttl(store._key(code.device_code))
+    assert after <= before, f"the claim extended a device code's life from {before}s to {after}s"
+    assert after >= before - 1, f"the claim cut a device code's life from {before}s to {after}s"
+
+
+async def test_a_code_the_server_never_held_cannot_be_claimed(stores: RedisStores) -> None:
+    """A missing key answers ``False`` rather than creating one.
+
+    A claim that wrote through would resurrect a code the expiry sweep had
+    already dropped, with no ``expires_at`` a caller could trust and no index
+    member the cap counts.
+    """
+    store = stores.device_codes()
+
+    assert await store.consume_device_code("never-existed") is False
+    assert await store._redis.exists(store._key("never-existed")) == 0
+
+
 # ---------------------------------------------------------------------------
 # The session store: the two clocks, and a TTL the server enforces.
 # ---------------------------------------------------------------------------

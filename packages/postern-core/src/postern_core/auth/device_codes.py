@@ -226,6 +226,21 @@ class DeviceCode:
             verified ``sub`` of the banking app's assertion at approval time
             and from nowhere else. Empty until approved.
         user_code_attempts: Failed ``user_code`` comparisons at ``/approve``.
+        exchanged_at: When this code was spent at ``POST /token``, or ``None``
+            while it is still redeemable. Written only by
+            ``consume_device_code`` below, which is the atomic claim the mint
+            sits behind, and never cleared.
+
+    ``exchanged_at`` IS WHY A SPENT CODE IS STILL HERE. The alternative was
+    revoking the code on a successful exchange, which is one fewer field and
+    frees a slot against the cap; it was rejected because the store row is
+    what a replay is recorded AGAINST. Delete the row and a second exchange is
+    answered by ``token_endpoint``'s unknown-code branch, which runs before
+    any identity is read, so the attempt that most deserves an ``audit_log``
+    row is the one that cannot have one.
+    ``dev-docs/decisions/0012-device-code-single-use.md`` carries the
+    reasoning, and ``services/confirm/audit.py``'s ``_arguments`` carries the
+    other half: a device code handle "joins to" the code "while it lives".
 
     ``customer_ref`` used to be ``client_id``, reused for two purposes: the
     OAuth client id before approval and the customer reference after it. That
@@ -250,6 +265,7 @@ class DeviceCode:
     approved_at: datetime | None = None
     customer_ref: str = ""
     user_code_attempts: int = 0
+    exchanged_at: datetime | None = None
 
     @property
     def user_code_display(self) -> str:
@@ -331,6 +347,32 @@ class DeviceCodeStoreBase(ABC):
     @abstractmethod
     async def approve_device_code(self, device_code: str) -> bool:
         """Mark a device code as approved. Returns True if found and updated."""
+
+    @abstractmethod
+    async def consume_device_code(self, device_code: str) -> bool:
+        """Claim a device code for one token exchange. ``True`` to one caller only.
+
+        Sets ``exchanged_at`` on a code that has none and answers ``True``;
+        answers ``False`` for a code this store does not hold and for one
+        already spent. The code is MARKED, never removed -- see
+        ``DeviceCode.exchanged_at`` for why the row has to survive.
+
+        MUST BE ATOMIC, and this line is the whole contract rather than a
+        preference. The caller is `services/confirm/device_auth.py`'s
+        ``token_endpoint``, which mints a read token only for the caller that
+        wins here. A backend that read the code, awaited anything, and then
+        wrote would answer ``True`` to every request in a concurrent burst,
+        which is the defect this method exists to close in a form that needs
+        two sockets instead of two minutes. Both implementations below say how
+        they hold it, and they hold it differently: one never yields, the other
+        makes the server settle it.
+
+        A LOST CLAIM IS NOT ROLLED BACK ANYWHERE. Whatever fails after a
+        successful claim -- the signing key, the audit store -- leaves the code
+        spent and the customer re-pairing from a fresh QR. That is the
+        direction ``services/confirm/device_auth.py``'s ``_withdraw_pairing``
+        already chose for the endpoint before this one.
+        """
 
     @abstractmethod
     async def revoke_device_code(self, device_code: str) -> None:
@@ -481,6 +523,25 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         )
         return True
 
+    async def consume_device_code(self, device_code: str) -> bool:
+        """Claim this code for one exchange. ``True`` to one caller only.
+
+        ATOMIC BY NOT YIELDING, which is the whole implementation and is worth
+        naming because it is invisible. There is no ``await`` between the read
+        and the write, so no other task can run between them: a coroutine only
+        suspends at a point that actually yields to the loop, and a dict
+        lookup, a comparison and a dict assignment are none. Put an ``await``
+        of any kind inside this method and two concurrent polls both see an
+        unspent code and both mint.
+        """
+        existing = self._codes.get(device_code)
+        if existing is None or existing.exchanged_at is not None:
+            return False
+        self._codes[device_code] = existing.__class__(
+            **{**asdict_frozen(existing), "exchanged_at": datetime.now(UTC)}
+        )
+        return True
+
     async def revoke_device_code(self, device_code: str) -> None:
         """Remove a device code."""
         self._codes.pop(device_code, None)
@@ -501,6 +562,24 @@ def asdict_frozen(obj: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Redis backend — compatible with AWS ElastiCache, Google Memorystore, etc.
 # ---------------------------------------------------------------------------
+
+#: How many times ``RedisDeviceCodeStore.consume_device_code`` re-reads a key
+#: another writer moved under its ``WATCH`` before it gives up and refuses.
+#:
+#: WHY IT IS BOUNDED AT ALL. An unbounded retry on a contended key is a spin
+#: loop against the one Redis both replicas share, driven by whoever is
+#: replaying the code. Three is generous against the only contention that
+#: exists at exchange time, which is other consumers: a competing claim that
+#: wins writes ``exchanged_at``, so the next read answers ``False`` and
+#: returns rather than retrying. Reaching this bound means three writers each
+#: beat this one, and the approval that also writes this key has already
+#: happened by the time any of them arrives.
+#:
+#: EXHAUSTION REFUSES, and that is the fail-closed direction: a claim this
+#: store could not establish must not mint a token. What the caller is told is
+#: `services/confirm/device_auth.py`'s ``invalid_grant``, which is true of a
+#: code some other request has by then almost certainly spent.
+_CLAIM_ATTEMPTS = 3
 
 
 class RedisDeviceCodeStore(DeviceCodeStoreBase):
@@ -680,6 +759,67 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         await self._set_code(device_code, updated)
         return True
 
+    async def consume_device_code(self, device_code: str) -> bool:
+        """Claim this code for one exchange. ``True`` to one caller only.
+
+        ATOMIC BY MAKING THE SERVER SETTLE IT, which is the only place that can
+        settle it: two replicas share one Redis by design, so no lock either
+        process holds is a bound on the other. ``WATCH`` the key, read it,
+        queue the write in a ``MULTI``, and ``EXEC`` fails if anything touched
+        the key in between -- including its own expiry, which Redis counts as a
+        modification. The loser retries, reads the ``exchanged_at`` the winner
+        wrote, and answers ``False``.
+
+        NOT ``_set_code``, and the difference is two defects rather than a
+        style. That helper recomputes the TTL as ``int((expires_at - now))``
+        and truncates, so routing the claim through it would shorten every
+        code it marked by up to a second (bug B1's arithmetic, one call site
+        further on); and it re-``ZADD``s an index score that has not changed.
+        ``KEEPTTL`` keeps the server's own remaining time and leaves the index
+        alone, which is correct because spending a code does not move its
+        expiry.
+
+        A CORRUPT STORED VALUE ANSWERS ``False``, matching
+        ``get_device_code``'s choice one method up: a code this store cannot
+        deserialize is a code ``token_endpoint`` must not mint against, and
+        refusing the claim is how that is said here.
+        """
+        from redis.exceptions import WatchError
+
+        key = self._key(device_code)
+        for _ in range(_CLAIM_ATTEMPTS):
+            async with self._redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if raw is None:
+                        return False
+                    try:
+                        code = DeviceCode.from_json(raw)
+                    except (KeyError, ValueError, TypeError):
+                        logger.warning(
+                            "refusing to claim device code %s: its stored value will not "
+                            "deserialize",
+                            device_code,
+                        )
+                        return False
+                    if code.exchanged_at is not None:
+                        return False
+                    spent = DeviceCode(**{**asdict_frozen(code), "exchanged_at": datetime.now(UTC)})
+                    pipe.multi()
+                    pipe.set(key, spent.to_json(), keepttl=True)
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+        logger.warning(
+            "refusing to claim device code %s: %d attempts were each beaten by another "
+            "writer on the same key",
+            device_code,
+            _CLAIM_ATTEMPTS,
+        )
+        return False
+
     async def revoke_device_code(self, device_code: str) -> None:
         """Remove a device code, and its index member with it.
 
@@ -778,6 +918,7 @@ def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
         "approved_at": dc.approved_at.timestamp() if dc.approved_at else None,
         "customer_ref": dc.customer_ref,
         "user_code_attempts": dc.user_code_attempts,
+        "exchanged_at": dc.exchanged_at.timestamp() if dc.exchanged_at else None,
     }
 
 
@@ -786,6 +927,9 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
     approved_at = None
     if data.get("approved_at") is not None:
         approved_at = datetime.fromtimestamp(data["approved_at"], tz=_UTC)
+    exchanged_at = None
+    if data.get("exchanged_at") is not None:
+        exchanged_at = datetime.fromtimestamp(data["exchanged_at"], tz=_UTC)
     return DeviceCode(
         device_code=data["device_code"],
         user_code=data["user_code"],
@@ -804,6 +948,13 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
         # rather than minting from a stale `client_id`.
         customer_ref=str(data.get("customer_ref", "")),
         user_code_attempts=int(data.get("user_code_attempts", 0)),
+        # ``None`` when the key is absent, and here that default is the TRUE
+        # reading rather than the fail-closed one: a record written by the
+        # previous release came from a build that could not spend a code, so
+        # it had not. The two directions differ on purpose -- ``customer_ref``
+        # above defaults to empty so an old record mints nothing, while an old
+        # record here stays redeemable for the rest of its 900-second life.
+        exchanged_at=exchanged_at,
     )
 
 
