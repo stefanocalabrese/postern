@@ -23,10 +23,12 @@ This repo is a **framework**, not a turnkey deployment. Every company that wants
 ### 1. Backend domain service subject enforcement (ZT-2 — CRITICAL PATH)
 **You must audit every handler in your backend services.** Each one must scope queries by the JWT `sub` claim, not by any request body field. If a handler accepts an account ID from the request instead of deriving it from the token, cross-customer data access (A5) is live. This is not a code change in this repo — it lives in your backend repos. **Answer this before writing any other ZT control.** If the domain services don't enforce on `sub`, nothing else matters.
 
+**And they own the delegation token's replay check, which is on no other list.** The internal JWT this server mints is replay-protected by nothing here and cannot be: an issuer sees a token once, at creation, and never learns what happened to it. Detecting a second presentation is the recipient's job, so it belongs in your Istio gateway or your domain services, tracking `jti` values they have accepted. `JtiReplayCache` in this repository is not that control despite its name — it is fed a `uuid4` this same process generated three statements earlier, so it detects a UUID collision. Decision record 0014 has the argument. Answer this in the same week as `sub` enforcement; they are the same conversation with the same team.
+
 ### 2. Infrastructure (Terraform repo — gate 5)
 This repo has zero Terraform files. You must create them:
 
-- **ECR repositories** — one per image (`postern-api`, `postern-confirm`) with lifecycle rules
+- **ECR repositories** — one per image (`postern-api`, `postern-confirm`, `postern-migrate`) with lifecycle rules. `postern-migrate` is the third target as of 26 September 2026: the serving images no longer carry `alembic` or the revision scripts, because a container holding those plus a database URL can reverse `f1860c110112` and erase the rows recording what it did. It runs as a one-off ECS task, never a service, and it is the only one of the three that should hold a database role with DDL rights
 - **ECS cluster + services** — Fargate tasks, each referencing images by sha256 digest (not tag)
 - **Separate task roles** — read role must NOT be able to assume the write role or access its Vault path
 - **VPC / subnets** — private subnets, NAT Gateway (or egress deny per ZT-8), PrivateLink to your Istio gateway
