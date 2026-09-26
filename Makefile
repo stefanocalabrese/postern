@@ -24,7 +24,10 @@ lock:
 # the possessive prose form -- against the tree and against the installed
 # site-packages, and counts, without ever checking, every bare `file:line`.
 # The count is ratcheted per file by tools/citations-baseline.json, so the
-# 183 bare citations already here stay put and a 184th does not land. Reach
+# bare citations already here stay put and a new one in a file at its
+# allowance does not land. 84 remain against a baseline of 91 as of
+# 26 September 2026, down from the 183 this line recorded when it was
+# written: renames since then let references resolve by symbol. Reach
 # for `citations-baseline` when a bare line range really is the only way to
 # point at something (a block inside a third-party file with no symbol at its
 # head); it rewrites the file, and the diff is what shows a reviewer the

@@ -68,8 +68,10 @@ WHAT THIS PROVABLY CANNOT CATCH
   42 resolve while two cross-references still claimed something their
   referent does not say. A green gate here means the citations point
   somewhere real, NOT that the prose is true.
-- The 183 bare `file:line` citations already in the tree. They are counted,
-  never checked, and no existence check would have caught any of the 28.
+- The bare `file:line` citations already in the tree, 84 of them against a
+  baseline of 91 on 26 September 2026, down from the 183 this line recorded
+  when it was written. They are counted, never checked, and no existence
+  check would have caught any of the 28.
 - Claims that look like citations but name no location: "two import-linter
   contracts", "nine migrations", "945 tests". Nothing here reads a count.
 - Anchors into anything that is not Python. `<path>.py::<name>` is a

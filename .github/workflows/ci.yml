@@ -2,7 +2,7 @@ name: ci
 
 # workflow_dispatch ONLY. Do not add `push` or `pull_request` triggers:
 # Actions minutes are billed on this private repository and the owner has
-# none to spend. `make ci` runs the same six gates below locally for free and
+# none to spend. `make ci` runs the same seven gates below locally for free
 # is the actual gate that must pass before any commit (see CLAUDE.md). Since
 # Task 3, `test` starts its own disposable `testcontainers` Postgres for the
 # consent-repository tests (measured ~2s added, session-scoped so paid once),

@@ -319,7 +319,7 @@ class ConfirmSettings:
     # store holds at all.
     #
     # 512 and 256 characters. The default scope string this service issues is
-    # 41 characters ("accounts:read transactions:read cards:read"), and the
+    # 42 characters ("accounts:read transactions:read cards:read"), and the
     # four domains the architecture names could not plausibly exceed 200;
     # OAuth client identifiers are UUIDs or short labels. Both are ~12x the
     # largest legitimate value, which is the same shape of margin
