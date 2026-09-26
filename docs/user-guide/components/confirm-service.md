@@ -101,9 +101,12 @@ route on this service is denied by default.
      Authorization: Bearer <assertion from the operator's app backend>
      { "device_code": "...", "user_code": "ABC-DEF" }
    ← 200 OK
-   The customer is the assertion's verified `sub`. There is NO body field
-   naming the customer; `user_code` is required and compared in constant time.
+```
 
+The customer is the assertion's verified `sub`. There is NO body field naming the
+customer; `user_code` is required and compared in constant time.
+
+```
 4. Browser → POST /token (grant_type=device_code, device_code=...)
    ← 400 authorization_pending (until approved)
    ← 200 { access_token, token_type, expires_in } (after approval)
@@ -167,15 +170,17 @@ Handles verification challenge approvals for write operations (payments, card wr
 
 2. Agent shows payload to user → user approves on mobile device
    Mobile app → POST /challenges/{challenge_id}/approve (signed)
+```
 
 3. Callback handler:
-   a. Verifies the app assertion; the customer is its `sub` (401 if absent/invalid)
-   b. Looks up challenge by ID
-   c. Rejects with 404 unless `challenge.customer_ref` equals that `sub`
-   d. Validates state (must be "pending" + not expired)
-   e. Marks challenge as "approved" in Postgres
-   f. Executes backend write endpoint server-side (POST to payments.svc)
-   g. Marks challenge as "executed"
+
+- a. Verifies the app assertion; the customer is its `sub` (401 if absent/invalid)
+- b. Looks up challenge by ID
+- c. Rejects with 404 unless `challenge.customer_ref` equals that `sub`
+- d. Validates state (must be "pending" + not expired)
+- e. Marks challenge as "approved" in Postgres
+- f. Executes backend write endpoint server-side (POST to payments.svc)
+- g. Marks challenge as "executed"
 
 Step (c) returns the **same 404 body** as an unknown challenge id, deliberately:
 a distinct 403 would be an existence oracle for ids that travel back through the
@@ -183,12 +188,31 @@ model's channel into a third-party AI vendor's chat history. It runs before the
 expiry branch, which writes, so a stranger cannot drive a state transition on
 another customer's challenge.
 
-The `signature` body field is **recorded, never verified** — presence is the whole
-check. Verifying it needs a per-customer device public-key registry, which this
-repository does not have. The local variable is named `unverified_signature` at
-every use site, and `services/confirm/callback.py`'s module docstring states the
-residual risk and what would close it.
+Since 2026-09-24 the `signature` field is verified, not merely recorded.
+`services/confirm/device_signature.py` checks it against the Ed25519 public keys
+the operator has enrolled for that customer (`postern_core.auth.device_keys`),
+over bytes built entirely from the **stored challenge row** — challenge id,
+customer, tool name, payload, and expiry (`postern_core.auth.approval_signature`).
+Nothing the caller sends reaches the signed message except the signature itself.
+The check runs after the ownership check and before the row is claimed, so a bad
+signature leaves the challenge exactly `pending` rather than burning it into a
+terminal state — the customer's own phone can still approve it.
 
+A missing device enrollment, a malformed signature, and a well-formed signature
+that verifies against none of the customer's enrolled keys all return **403**,
+each recorded under its own `detail` in `audit_log` (`device_not_enrolled`,
+`signature_malformed`, `signature_invalid`) so an operator can tell a support
+issue from an attack. An unreachable device-key store is not treated as "no
+device enrolled" — it raises, and the request fails with 500, challenge
+untouched. `create_confirm_app` refuses to start without a device-key store
+configured, the same way it refuses without the app-assertion verifier.
+
+What this does **not** establish: that a human looked at the payment, or that
+the phone itself is uncompromised. Both depend on the device's secure element
+and its own unlock step, which live on the phone, outside anything this
+repository can attest.
+
+```
 4. Agent polls GET /challenges/{challenge_id}/status
    ← returns challenge status (pending/approved/executed/declined/expired)
 ```

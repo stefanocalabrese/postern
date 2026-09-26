@@ -232,7 +232,7 @@ Before deploying, ensure the following configuration items are set:
 |------|-------------|---------|
 | Persisted read key | `POSTERN_READ_KEY_PEM_PATH` | Not ephemeral: survives restarts |
 | Persisted write key | `POSTERN_WRITE_KEY_PEM_PATH` | Not ephemeral: survives restarts |
-| Redis backend | `POSTERN_REDIS_URL`, `POSTERN_REQUIRE_REDIS=1` | Session store and device code persistence |
+| Redis backend | `POSTERN_REDIS_URL`, `POSTERN_REQUIRE_REDIS` enabled | Session store, device code persistence, revocation list, and per-customer approval rate limits; without it, a spent device code stays redeemable on another replica |
 | JWKS / issuer URIs | `POSTERN_JWKS_URI`, `POSTERN_TOKEN_ISSUER` | Customer JWT validation |
 | Strict headers | `POSTERN_STRICT_HEADERS=1` | Enforce MCP Streamable HTTP header compliance |
 | Require PEM key | `POSTERN_REQUIRE_PEM_KEY=1` | Refuse startup with ephemeral keys |

@@ -208,7 +208,9 @@ and details dict. Examples: `RECORD_BUDGET_80PCT`, `ACCOUNT_DIVERSITY_EXHAUSTED`
 ### Revocation List
 Three-scope revocation with O(1) set lookups: per-session (ends that session),
 per-customer+client (ends all sessions for a pair), and kill switch (ends ALL sessions
-for a client). In-memory only, production requires Redis (`POSTERN_REQUIRE_REDIS=1`).
+for a client). Pluggable backend — in-memory (dev/test) or Redis (production) — via
+`create_revocation_store()`; a production deployment enables `POSTERN_REQUIRE_REDIS` to
+refuse startup without `POSTERN_REDIS_URL`.
 
 ## S
 

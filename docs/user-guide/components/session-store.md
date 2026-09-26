@@ -11,7 +11,7 @@ class (`StoreBase`) with in-memory (dev/test) and Redis (production) implementat
 ```
 packages/postern-core/src/postern_core/risk/session.py      Risk context session store
 packages/postern-core/src/postern_core/auth/device_codes.py  Device code store
-packages/postern-core/src/postern_core/auth/revocation.py    Revocation list (in-memory only)
+packages/postern-core/src/postern_core/auth/revocation.py    Revocation list
 ```
 
 ## Session Store Pattern
@@ -203,9 +203,11 @@ class RevocationList:
 - **Per-customer+client**: Revokes all sessions for a customer-client pair
 - **Kill switch**: Revokes ALL sessions for a client (nuclear option)
 
-> **Note:** The revocation list is in-memory only. A production deployment would back
-> it with Redis or a database table for persistence across restarts. The
-> `POSTERN_REQUIRE_REDIS=1` flag enforces Redis in production to avoid this limitation.
+> **Note:** The revocation list has had a Redis backend since 2026-09-23
+> (`RedisRevocationStore`), the same `create_revocation_store()` pattern as the session
+> store and device code store above. Enabling `POSTERN_REQUIRE_REDIS` refuses startup
+> without `POSTERN_REDIS_URL`, so production does not fall back to the in-memory,
+> per-replica list.
 
 ## Device Code Store (`packages/postern-core/src/postern_core/auth/device_codes.py`)
 

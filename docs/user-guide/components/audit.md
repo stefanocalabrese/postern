@@ -8,10 +8,15 @@ Every tool call produces **two audit rows** (when it reaches the backend): an en
 committed before the first backend request, and a completion row after the call finishes.
 A consent-denied or pre-backend-failure call produces exactly one row.
 
+This chapter describes the read path (`services/api`). The write path
+(`services/confirm`) writes to the same table through its own two writers; see
+"Write Path Audit Rows" below.
+
 ```
 packages/postern-core/src/postern_core/store/audit.py     audit.append (all parameters)
 packages/postern-core/src/postern_core/store/models.py    AuditEntry ORM model + CHECK constraints
 services/api/middleware/audit.py                          Two-row audit middleware (1263 lines)
+services/confirm/audit.py                                 Write-path audit writers (ApprovalAudit, PairingAudit)
 [ADR-0006](../dev-docs/decisions/0006-audit-write-failure.md)   Fail-closed design
 ```
 
@@ -81,6 +86,47 @@ ORDER BY reaching_at NULLS FIRST, raised_at NULLS FIRST;
 A call refused by consent enforcement produces exactly one row:
 `outcome='raised'`, `detail='NotFoundError'`, with the refusal reason. The entry row
 is never written because the backend is never reached.
+
+## Write Path Audit Rows (`services/confirm`)
+
+The confirm service writes to `audit_log` through two writers of its own,
+`services/confirm/audit.py`'s `ApprovalAudit` and `PairingAudit`. Both landed after
+the read path: `ApprovalAudit` on 2026-09-23, `PairingAudit` on 2026-09-26.
+
+### `POST /challenges/{challenge_id}/approve` — `ApprovalAudit`
+
+Same shape as the read path: up to **two** rows, an entry row committed before the
+backend write and a completion row after, correlated by `call_id`. A refused
+approval (revoked customer, unowned challenge, expired, already terminal, a
+signature that fails to verify) writes exactly one row, because none of those
+refusals reaches the backend.
+
+### `POST /approve` and `POST /token` (device grant) — `PairingAudit`
+
+One row per request, never two — a pairing and a token mint each touch this
+deployment's own store, not the operator's backend, so there is no early touch to
+record. A row is written only when the request both resolved a customer identity
+**and** reached a conclusion about that identity's authority; a request that fails
+on shape alone (a malformed body, an unknown grant type) resolves nobody and
+writes nothing.
+
+- `POST /approve` (the mobile app confirming a pairing) writes on every outcome
+  that reaches an identity check: success, a revoked customer, a `sub` that isn't
+  a valid customer reference, an unknown device code, a code already approved, and
+  both halves of a wrong pairing code.
+- `POST /token` (the browser's exchange) writes on a successful mint, a revoked
+  customer, a stored identity that fails to parse, and a revocation store that
+  could not answer. Most of its exits — an unknown or expired code, `slow_down`,
+  `authorization_pending` — write nothing, because none of them has read a
+  customer off the code yet.
+- `POST /device_authorization` (creating the code) writes nothing at all: it
+  resolves no identity, ever.
+
+A replay of an already-spent device code is recorded under its own `detail`,
+`device_code_spent` — `WHERE detail = 'device_code_spent'` is the whole replay
+query. `WHERE detail = 'revoked'` is the whole answer, on the write path, to
+whether a revocation took effect: the challenge approval and both device-grant
+endpoints all record a revocation refusal under this one shared detail.
 
 ## Fail-Closed Writes (ADR-0006)
 
@@ -241,5 +287,6 @@ The function is called from two places:
 | Audit append function | [`packages/postern-core/src/postern_core/store/audit.py`](../../../packages/postern-core/src/postern_core/store/audit.py) |
 | AuditEntry ORM model + CHECK constraints | [`packages/postern-core/src/postern_core/store/models.py`](../../../packages/postern-core/src/postern_core/store/models.py) |
 | Two-row audit middleware | [`services/api/middleware/audit.py`](../../../services/api/middleware/audit.py) |
+| Write-path audit writers (`ApprovalAudit`, `PairingAudit`) | [`services/confirm/audit.py`](../../../services/confirm/audit.py) |
 | ADR-0006: Fail-closed audit writes | [`docs/decisions/0006-audit-write-failure.md`](../dev-docs/decisions/0006-audit-write-failure.md) |
 | Masking in audit scrub | [`packages/postern-core/src/postern_core/domain/masking.py`](../../../packages/postern-core/src/postern_core/domain/masking.py) |
