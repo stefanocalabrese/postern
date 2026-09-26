@@ -157,6 +157,56 @@ def _step_scalars(step: dict[Any, Any]) -> list[tuple[str, str]]:
     return out
 
 
+# `<registry>/<name>@<digest>` or `<registry>/<name>:<tag>`, capturing the
+# image name so a step's reference can be matched back to the step that built
+# it without either name being written down here.
+_IMAGE_IN_REF_RE = re.compile(r"/(?P<name>[A-Za-z0-9._-]+)[@:]")
+
+
+def _built_images(doc: dict[Any, Any]) -> dict[str, set[str]]:
+    """Return each image the workflow builds, mapped to the platforms built.
+
+    Read off the `docker/build-push-action` steps, so both the image names and
+    the platform list come from the build rather than from this file. Adding a
+    platform to `platforms:` therefore widens what the coverage test demands,
+    instead of leaving a test that passes while the new architecture ships
+    unexamined.
+    """
+    out: dict[str, set[str]] = {}
+    for step in _steps_using(doc, "docker/build-push-action"):
+        with_block = step.get("with", {})
+        platforms = {
+            part.strip() for part in str(with_block.get("platforms", "")).split(",") if part.strip()
+        }
+        for line in str(with_block.get("tags", "")).splitlines():
+            tag = line.strip()
+            if not tag:
+                continue
+            name = tag.rsplit("/", 1)[-1].split(":")[0]
+            if name:
+                out.setdefault(name, set()).update(platforms)
+    return out
+
+
+def _platform_coverage(
+    doc: dict[Any, Any], action_prefix: str, ref_key: str, env_key: str
+) -> dict[str, set[str]]:
+    """Return each image these steps cover, mapped to the platforms selected.
+
+    A step that names an image but sets no platform selector contributes the
+    empty string, which fails the comparison against the built platforms with
+    a message naming it, rather than passing as though one platform were all.
+    """
+    out: dict[str, set[str]] = {}
+    for step in _steps_using(doc, action_prefix):
+        match = _IMAGE_IN_REF_RE.search(str(step.get("with", {}).get(ref_key, "")))
+        if match is None:
+            continue
+        platform = str(step.get("env", {}).get(env_key, "")).strip()
+        out.setdefault(match.group("name"), set()).add(platform)
+    return out
+
+
 def _flag_value(script: str, flag: str) -> str | None:
     """Return the value a shell script passes to ``--flag=value``.
 
@@ -581,6 +631,143 @@ def test_no_digest_reference_doubles_the_sha256_prefix() -> None:
         "A digest expression is prefixed with `sha256:` in the workflow. The "
         "`digest` output carries that prefix already, so this yields "
         "`name@sha256:sha256:...`."
+    )
+
+
+# ── Platform coverage ────────────────────────────────────────────
+
+
+def test_every_built_platform_is_scanned_and_sbomed() -> None:
+    """Each platform the build produces is both scanned and described.
+
+    The build pushes an image index, one manifest per entry in `platforms:`.
+    Until 26 September 2026 one Trivy step and one syft step per image read
+    the index digest with no platform selector, and both tools default to
+    linux/amd64, so the arm64 manifest was signed, retained and deployable
+    while never being scanned and never appearing in an SBOM. A HIGH or
+    CRITICAL finding present only there passed a gate built to block it.
+
+    Both sides of the comparison are derived, not listed: the images and the
+    platforms come from the `docker/build-push-action` steps. Adding a third
+    architecture to `platforms:` fails this test until its scan and its SBOM
+    exist, which a test naming amd64 and arm64 would not do.
+    """
+    doc = _parse(_WORKFLOW_PATH)
+    built = _built_images(doc)
+    assert built, (
+        "No docker/build-push-action step with a `tags:` and `platforms:` input "
+        "was found, so this test cannot tell what was built and is checking nothing."
+    )
+
+    consumers = (
+        ("Trivy scan", "aquasecurity/trivy-action", "image-ref", "TRIVY_PLATFORM"),
+        ("SBOM", "anchore/sbom-action", "image", "SYFT_PLATFORM"),
+    )
+    for image, platforms in sorted(built.items()):
+        assert platforms, f"The build step for {image} declares no `platforms:`."
+        for label, prefix, ref_key, env_key in consumers:
+            covered = _platform_coverage(doc, prefix, ref_key, env_key).get(image, set())
+            missing = platforms - covered
+            extra = covered - platforms
+            assert not missing, (
+                f"{image} is built for {sorted(platforms)} but no {label} step covers "
+                f"{sorted(missing)}. Add one step per platform, selecting it with "
+                f"`env: {env_key}: <platform>`; a manifest nobody examines is still "
+                "signed and still deployable."
+            )
+            assert not extra, (
+                f"A {label} step for {image} selects {sorted(extra)}, which the build "
+                f"does not produce (it builds {sorted(platforms)}). Either the build "
+                "lost a platform or the selector is a typo, and a typo here scans "
+                "nothing while reporting success."
+            )
+
+
+def test_each_platform_sbom_is_written_to_its_own_file() -> None:
+    """No two SBOM steps write to one filename.
+
+    Four syft steps sharing two filenames would leave each file holding
+    whichever platform ran last, which reads exactly like the single-platform
+    SBOM this change replaced.
+    """
+    steps = _steps_using(_parse(_WORKFLOW_PATH), "anchore/sbom-action")
+    assert steps, "no SBOM step found"
+
+    files = [str(step.get("with", {}).get("output-file", "")) for step in steps]
+    assert all(files), (
+        "Every SBOM step must set `output-file:`. Without it the file syft "
+        "writes is not the file the upload step collects."
+    )
+    duplicates = sorted({name for name in files if files.count(name) > 1})
+    assert not duplicates, (
+        f"These SBOM filenames are written by more than one step: {duplicates}. "
+        "The last step to run wins and the others are lost."
+    )
+
+
+def test_each_sbom_filename_names_the_platform_it_describes() -> None:
+    """The platform a step selects appears in the file that step writes.
+
+    Set equality over the selectors leaves the pairing free: an amd64 selector
+    writing the arm64 filename satisfies every other test here, and then the
+    deploy job's check for the arm64 document passes against amd64 content and
+    the arm64 SBOM does not exist under any name.
+    """
+    steps = _steps_using(_parse(_WORKFLOW_PATH), "anchore/sbom-action")
+    assert steps, "no SBOM step found"
+
+    for step in steps:
+        with_block = step.get("with", {})
+        platform = str(step.get("env", {}).get("SYFT_PLATFORM", "")).strip()
+        output = str(with_block.get("output-file", ""))
+        assert platform, (
+            f"SBOM step {step.get('name')!r} sets no SYFT_PLATFORM, so syft picks "
+            "its own default and the file does not describe a known platform."
+        )
+        slug = platform.replace("/", "-")
+        assert slug in output, (
+            f"SBOM step {step.get('name')!r} selects {platform!r} but writes "
+            f"{output!r}, which does not name it. A crossed pair here is invisible: "
+            "the file exists, the presence gate passes, and the contents are the "
+            "other architecture."
+        )
+
+
+def test_every_generated_sbom_is_uploaded_and_presence_checked() -> None:
+    """Each SBOM produced is retained, and the deploy job gates on it.
+
+    Generating a per-platform SBOM that no step uploads leaves the seven-year
+    artifact short, and one the deploy job does not check for is a gate that
+    passes on a missing document.
+    """
+    doc = _parse(_WORKFLOW_PATH)
+    produced = {
+        str(step.get("with", {}).get("output-file", ""))
+        for step in _steps_using(doc, "anchore/sbom-action")
+    }
+    produced.discard("")
+    assert produced, "no SBOM output-file found"
+
+    uploaded: set[str] = set()
+    for step in _steps_using(doc, "actions/upload-artifact"):
+        uploaded.update(
+            line.strip()
+            for line in str(step.get("with", {}).get("path", "")).splitlines()
+            if line.strip()
+        )
+    not_uploaded = sorted(produced - uploaded)
+    assert not not_uploaded, (
+        f"These SBOMs are generated but never uploaded: {not_uploaded}. "
+        "The retained artifact would describe fewer platforms than were built."
+    )
+
+    deploy_scripts = " ".join(
+        str(step["run"]) for job, step in _steps(doc) if job == "deploy" and "run" in step
+    )
+    unchecked = sorted(name for name in produced if name not in deploy_scripts)
+    assert not unchecked, (
+        f"The deploy job checks for no such file as {unchecked}, so a dispatch "
+        "where those SBOMs went missing would deploy anyway."
     )
 
 
