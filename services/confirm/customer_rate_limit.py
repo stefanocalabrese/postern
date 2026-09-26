@@ -575,23 +575,32 @@ class CustomerRateLimit:
            vocabulary describes outcomes of an attempt that got as far as
            having a parsed body and a named challenge, and neither exists at
            this point in the stack.
-        2. Only ONE of the two limited paths has an audit trail at all.
-           `services/confirm/device_auth.py`'s ``approve_callback`` writes no
-           ``audit_log`` row on any of its branches, so a row here would
-           appear for challenge approvals and be silently absent for pairing
-           approvals. A ``WHERE detail = ...`` that undercounts by exactly the
-           half nobody thought about is worse than one that returns nothing,
-           because the first is trusted. `services/confirm/callback.py`
-           already documents one such undercount deliberately, for
-           ``malformed_body``, and it is not a shape worth widening.
-        3. Getting the row would cost the position. `ApprovalAudit` is built
-           from the parsed JSON body, and
+        2. STRUCK 2026-09-26. This read "Only ONE of the two limited paths
+           has an audit trail at all", naming `services/confirm/
+           device_auth.py`'s ``approve_callback`` as writing no ``audit_log``
+           row on any branch. Commit 10496a3, the same day, gave it one:
+           `services/confirm/audit.py`'s ``PairingAudit`` now writes exactly
+           one row per ``POST /approve`` attempt, on the grant and on each of
+           revoked customer, invalid subject, unknown device code,
+           already-approved code, ``user_code`` mismatch and ``user_code``
+           budget exhaustion. Both limited paths have a trail now, so the
+           undercount this reason warned against does not exist.
+        3. Getting the row would cost the position, and for ``/approve`` this
+           is the harder of the two paths to reach, not the easier one.
+           `ApprovalAudit` is built from the parsed JSON body, and
            `services/confirm/revocation.py` records why that puts it out of
            reach here: "An ASGI middleware cannot reach that body without
-           draining ``receive``". Moving this check into the handlers to
-           reach one would put it behind the body read, the JSON parse and
-           the audit construction -- behind most of the cost it exists to
-           bound -- and would still leave point 2 standing.
+           draining ``receive``". `PairingAudit` is built the same way, from
+           ``device_code`` in ``POST /approve``'s own body -- where
+           `services/confirm/audit.py`'s ``APPROVE_ROUTE`` shows the
+           challenge carries its id in the URL instead. So a row from this
+           position could at least name a challenge without draining
+           anything, and could never name a pairing at all: the one
+           identifier this module could reach without draining ``receive``
+           is exactly the one the pairing path keeps out of the URL. Moving
+           this check into the handlers to reach either identifier would put
+           it behind the body read, the JSON parse and the audit
+           construction -- behind most of the cost it exists to bound.
 
         WHAT CARRIES THE SIGNAL INSTEAD, because "no row" must not mean "no
         trace": the distinct error code above, which an operator can alert on
