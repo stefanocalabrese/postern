@@ -173,6 +173,8 @@ __all__ = [
     "OUTCOME_RETURNED",
     "PAIRING_ROUTE",
     "PAIRING_TOOL_NAME",
+    "TOKEN_ROUTE",
+    "TOKEN_TOOL_NAME",
     "UNRESOLVED_TOOL_NAME",
     "ApprovalAudit",
     "DETAIL_ALREADY_APPROVED",
@@ -189,6 +191,7 @@ __all__ = [
     "DETAIL_REVOKED",
     "DETAIL_SIGNATURE_INVALID",
     "DETAIL_SIGNATURE_MALFORMED",
+    "DETAIL_STORED_IDENTITY_MALFORMED",
     "DETAIL_UPDATE_MATCHED_NO_ROW",
     "DETAIL_USER_CODE_BUDGET_EXHAUSTED",
     "DETAIL_USER_CODE_MISMATCH",
@@ -798,6 +801,35 @@ PAIRING_TOOL_NAME = "device_grant.approve"
 #: wrote the row when the two services' rows are read interleaved.
 PAIRING_ROUTE = "/approve"
 
+#: What ``tool_name`` carries on a token-exchange row.
+#:
+#: ITS OWN LITERAL AND NOT THE PAIRING'S, because the two questions are asked
+#: separately: "which pairings completed" and "which tokens were issued" have
+#: different answers whenever a device code is replayed, and one literal for
+#: both would hide exactly that. Both are ``device_grant.*`` so one prefix
+#: filter returns the whole flow, and neither is one of the five registered MCP
+#: tools (``start_session``, ``accounts.list``, ``accounts.get_balance``,
+#: ``transactions.list``, ``cards.list``), so neither can collide with a
+#: ``services/api`` row on a column no service name qualifies.
+TOKEN_TOOL_NAME = "device_grant.token"  # noqa: S105
+
+#: The route, in ``arguments`` for the reason ``PAIRING_ROUTE`` is there.
+TOKEN_ROUTE = "/token"  # noqa: S105
+
+#: The stored ``customer_ref`` on an approved device code will not parse as a
+#: ``CustomerRef``.
+#:
+#: A DIFFERENT LITERAL FROM ``DETAIL_INVALID_SUBJECT``, and the provenance is
+#: the whole reason. That one means the operator's app backend minted a
+#: non-conforming ``sub`` on an assertion this service verified. This one means
+#: a value read back off a device code that ``POST /approve`` had ALREADY
+#: validated through the same type does not validate any more -- so either the
+#: stored row was altered, or something other than ``approve_callback`` wrote
+#: ``customer_ref``, which is the field whose overload was half of audit
+#: finding C-01. Those are different incidents with different first responders,
+#: and one literal would make a reader guess which a row describes.
+DETAIL_STORED_IDENTITY_MALFORMED = "stored_identity_malformed"
+
 # THE CLOSED VOCABULARY OF ``detail`` ON A PAIRING ROW, and the same
 # ``refusal_reason`` gap applies: ``REFUSAL_REASONS`` is closed at
 # ``no_customer_ref`` and ``domain_not_consented``, both consent-specific,
@@ -911,15 +943,22 @@ def pairing_client_ip(request: Request, trusted_proxy_hops: int) -> str | None:
 
 
 class PairingAudit:
-    """One ``audit_log`` row per device-grant pairing attempt.
+    """One ``audit_log`` row per recorded device-grant request.
+
+    TWO ENDPOINTS, ONE WRITER. ``POST /approve`` pairs a client and
+    ``POST /token`` mints the read token that pairing authorises; both write
+    through this class, which is why ``tool_name`` and ``route`` are
+    constructor arguments. ``POST /device_authorization``, the third endpoint
+    of the grant, writes nothing at all -- see the rule below and that
+    handler's own docstring.
 
     ONE ROW, NOT THE READ PATH'S TWO, and the reason is that the second row's
-    reason is absent here. ``ApprovalAudit`` writes an entry row because the
+    reason is absent on both. ``ApprovalAudit`` writes an entry row because the
     request reaches an operator backend, the touch leaves nothing on this
     side, and a crash mid-call would otherwise erase that customer data was
-    reached at all. A pairing reaches no backend: it sets two fields on a
-    device code held in this deployment's own store. There is no touch to
-    record early.
+    reached at all. Neither endpoint here reaches a backend: one sets three
+    fields on a device code held in this deployment's own store, the other
+    signs a string in this process. There is no touch to record early.
 
     The same conclusion is forced by the schema, which matters more than the
     argument because it cannot be reasoned around. ``OUTCOME_REACHING`` is
@@ -934,32 +973,87 @@ class PairingAudit:
     paths: none of them reaches the backend either.
 
     WHICH ATTEMPTS GET A ROW, stated as a rule because a list of cases goes
-    stale the first time a branch is added:
+    stale the first time a branch is added. The rule is now in its second
+    form: the first one said "what the server CONCLUDED about a customer or
+    about a device code", and that second disjunct was wrong, because
+    ``POST /device_authorization`` concludes something about a device code on
+    every single call -- it creates one -- and that endpoint must write
+    nothing. The device code identifies WHICH pairing a row is about; it is
+    never the reason there is a row.
 
-        A row records what the server CONCLUDED about a customer or about a
-        device code. It does not record that a client sent a malformed
-        request.
+        A row is owed when the server resolved an identity AND then reached a
+        conclusion about that identity's authority. Neither half alone earns
+        one: an endpoint that resolves no identity writes nothing however much
+        state it creates, and a refusal that inspected only the request's
+        shape writes nothing however well the caller authenticated.
 
-    So a revoked customer, a subject that is not a customer reference, a
-    device code naming nothing, a code already approved, and both halves of a
-    wrong pairing code are each recorded, because each is a conclusion an
-    investigator can act on. A body that is not a JSON object, a missing
-    ``device_code`` and a ``user_code`` that arrives as a list are not:
-    each is answered by looking at the request and consulting nothing, each
-    names no device code, and recording them would hand a caller holding one
-    valid assertion an INSERT per malformed body -- a cheaper way to fill the
-    disk than the one ``bound_arguments`` was added to bound, on a table whose
-    exhaustion takes both services down under decision 0006. The 401 for an
-    absent assertion writes nothing for the reason
-    ``services/confirm/callback.py``'s first backstop gives: there is no
-    customer for a row to be about.
+    BOTH HALVES ARE LOAD-BEARING, and each excludes a different family.
 
-    WHAT THAT RULE COSTS, named rather than left to be discovered. A caller
-    who sends only malformed bodies is invisible to this table. What bounds
-    that caller is the two rate limiters in front of the handler, and what
-    records them is a log line; neither pairs anything, so the loss is
-    volume data an operator already has at the edge, not a pairing that
-    happened unseen.
+    The FIRST half excludes every unauthenticated exit.
+    ``POST /device_authorization`` resolves nobody at all: it is in
+    ``services/confirm/auth.py``'s ``PUBLIC_PATHS`` because the browser holds
+    no credential by the device grant's premise, so every row it could write
+    would carry a NULL ``customer_ref`` and ``no_access_token`` in
+    ``customer_ref_absence_reason`` -- a column whose value is constant across
+    an endpoint's entire population, which tells a reader nothing. And the row
+    would be an INSERT per unauthenticated request, bounded only by a
+    60-per-minute address bucket, on a table whose exhaustion takes both
+    services down under decision 0006. Fail-closed would then mean no pairing
+    can even BEGIN while the audit store is slow, bought for a row that names
+    nobody. It also excludes most of ``POST /token``: an unknown device code,
+    an expired one, ``slow_down`` and ``authorization_pending`` are all
+    answered before ``customer_ref`` is read off the code, so none of them has
+    resolved anybody either.
+
+    The SECOND half excludes the malformed-request exits of ``POST /approve``,
+    where the caller IS authenticated: a body that is not a JSON object, a
+    missing ``device_code``, a ``user_code`` that arrives as a list. Each is
+    answered by looking at the request and consulting nothing, and recording
+    them would hand a caller holding one valid assertion an INSERT per
+    malformed body. The 401 for an absent assertion is excluded by the first
+    half, for the reason ``services/confirm/callback.py``'s own first backstop
+    gives.
+
+    What the rule ADMITS, on each endpoint. At ``POST /approve``: a revoked
+    customer, a subject that is not a customer reference, a device code naming
+    nothing, a code already approved, and both halves of a wrong pairing code.
+    At ``POST /token``: the mint itself, a revoked customer, a stored identity
+    that will not parse, and a revocation store that could not answer -- four
+    exits, all of them past the point where the code named a customer.
+
+    THE VOLUME THIS BUYS, in the numbers this deployment actually ships.
+    ``device_poll_interval_seconds`` is 5 and ``device_code_ttl_seconds`` is
+    900, so a browser whose customer never picks up their phone polls up to
+    180 times and writes zero rows. A pairing that completes writes one row at
+    ``POST /approve`` and one at the exchange. So the table holds two rows per
+    pairing and none per poll, where a row-per-call design would have held up
+    to 182 and been mostly a record of a browser waiting.
+
+    TWO PLACES THAT VOLUME IS NOT BOUNDED, and both are worth knowing before
+    reading a result set. A device code is NOT consumed by a successful
+    exchange -- ``token_endpoint`` mints and returns without revoking -- so a
+    code replayed inside its 900 seconds writes one row per exchange. That is
+    a feature of the row rather than a cost: N mint rows under one handle is
+    exactly how a replayed device code becomes visible, and nothing else in
+    this system makes it so. A revoked customer's browser is the cost: it
+    resolves a customer on every poll, so it writes a ``revoked`` row per
+    poll, and the ``slow_down`` throttle does not apply to it because that
+    check only runs while the code is unapproved. The bound is
+    ``rate_limit_token``, 300 a minute per address bucket. A compliant client
+    stops, because RFC 8628 §3.5 makes ``access_denied`` terminal; a client
+    that does not stop is a bug or an attacker, and in both cases the rows are
+    the evidence.
+
+    WHAT THAT RULE COSTS, named rather than left to be discovered. Two
+    populations are invisible here. A caller who sends only malformed bodies to
+    ``POST /approve``, bounded by the two rate limiters in front of the
+    handler and recorded in a log line. And every device code that is created
+    and never approved: ``POST /device_authorization`` writes nothing, so what
+    bounds that population is the 10,000-code store cap and the address
+    bucket, not this table. The second is the larger admission and it is
+    narrower than it sounds: a code that ever reaches a customer is named on
+    the pairing row by its handle, so the unrecorded population is exactly the
+    codes that touched nobody.
 
     FAIL CLOSED, AND IT MEANS SOMETHING STRONGER HERE THAN ON THE MONEY PATH.
     Decision 0006 is fail closed everywhere, and one endpoint over that has to
@@ -972,6 +1066,34 @@ class PairingAudit:
     would have been fail-closed in the response and fail-open in substance --
     the browser polls ``POST /token``, is handed a read token, and no row
     anywhere names who authorised it.
+
+    FAIL CLOSED AT A MINT, WHICH IS A THIRD SHAPE AGAIN. ``POST /token``
+    signs a token, and once it has been returned nothing in this process can
+    unmint it: there is no revocation list for a 60-second read token and
+    ``services/api`` will accept it until it expires. So neither of the two
+    obvious orders is right. Writing the row first refuses a customer who did
+    nothing wrong whenever the store blinks, and still allows a row that
+    claims a mint the key source then failed to produce. Returning first and
+    writing after hands out a token no row accounts for, which is the
+    fail-open shape ``POST /approve`` rejected.
+
+    The order actually taken is: mint, commit the row, THEN return. It works
+    because the mint's only effect is a string in this process's memory -- it
+    reaches no store, no log and no other party -- so discarding it IS the
+    undo that a payment does not have. ``services/confirm/device_auth.py``
+    raises when this writer raises, the response object is dropped, and the
+    token is never serialised to anybody. NO ROW THEREFORE MEANS NO TOKEN
+    EVER LEFT THIS PROCESS, which is the property that matters rather than
+    "no token was computed".
+
+    The residual is the mirror image and is the licensed direction: a crash
+    between the commit and the response reaching the socket leaves a row
+    saying a token was minted that the caller never received.
+    ``OUTCOME_REACHING``'s own docstring argues for exactly this direction --
+    a row claiming something a crash then prevented is resolvable against
+    other evidence, where the reverse resolves to nothing -- and here the
+    over-report is bounded twice over, by the 60-second token life and by
+    ``services/api``'s own two rows for anything that token is used for.
 
     WHAT THAT COSTS, and it is the sharpest cost in this file: a customer
     standing at a browser with their phone out, mid-QR-scan, is refused
@@ -998,7 +1120,9 @@ class PairingAudit:
         "_device_code_handle",
         "_paired_client_id",
         "_redaction_budget_exhausted",
+        "_route",
         "_started",
+        "_tool_name",
     )
 
     def __init__(
@@ -1011,7 +1135,19 @@ class PairingAudit:
         subject: str,
         claims: dict[str, Any],
         client_ip_value: str | None,
+        tool_name: str = PAIRING_TOOL_NAME,
+        route: str = PAIRING_ROUTE,
     ) -> None:
+        # ONE WRITER FOR BOTH DEVICE-GRANT ENDPOINTS, parameterised rather
+        # than subclassed or copied. The row shape is identical -- same four
+        # ``arguments`` keys in the same order, same NULL columns, same
+        # ``_subject_columns`` -- and the only differences are these two
+        # literals and the fact that ``POST /token`` has no verified claims to
+        # read a client id from. A second near-identical class is how the
+        # three copies of ``_scrub`` that ``services/api/middleware/audit.py``
+        # records happened, and the weakest of those sat on the money path.
+        self._tool_name = tool_name
+        self._route = route
         self._db = db
         self._call_id = call_id
         self._at = at
@@ -1080,6 +1216,27 @@ class PairingAudit:
         """Record that this pairing was granted."""
         await self._write(OUTCOME_RETURNED, None)
 
+    async def minted(self) -> None:
+        """Record that a read token was signed for this customer.
+
+        The same row as ``approved`` above writes and a separate name on
+        purpose. Both are ``outcome='returned'`` with a NULL ``detail``,
+        because the table's vocabulary has one value for "this finished its
+        work" and inventing a fourth is a migration plus a widened CHECK. What
+        differs is what the caller is claiming when it calls one of them, and
+        the call site is where the next reader looks: at ``POST /approve``
+        a pairing was granted, at ``POST /token`` a credential was issued. A
+        single method named for neither would make both call sites read as
+        though nothing in particular had happened.
+
+        MUST BE AWAITED BEFORE THE TOKEN IS RETURNED, never after. The class
+        docstring's "FAIL CLOSED AT A MINT" section is the whole argument; the
+        short form is that a raise here has to be able to stop the token
+        reaching the caller, and it can only do that while the response is
+        still an object in this process.
+        """
+        await self._write(OUTCOME_RETURNED, None)
+
     async def refused(self, detail: str) -> None:
         """Record that this pairing was refused, and at which stage.
 
@@ -1103,7 +1260,7 @@ class PairingAudit:
                 reaching_at=None,
                 customer_ref=self._customer_ref,
                 customer_ref_absence_reason=self._customer_ref_absence_reason,
-                tool_name=PAIRING_TOOL_NAME,
+                tool_name=self._tool_name,
                 arguments=self._arguments(),
                 outcome=outcome,
                 detail=detail,
@@ -1153,7 +1310,7 @@ class PairingAudit:
         ``DEFAULT_DEVICE_SCOPES`` string on every pairing a browser starts
         without asking for something narrower.
         """
-        tree: dict[str, Any] = {"route": PAIRING_ROUTE}
+        tree: dict[str, Any] = {"route": self._route}
         if self._device_code_handle is not None:
             tree["device_code_handle"] = self._device_code_handle
         if self._client_ip is not None:

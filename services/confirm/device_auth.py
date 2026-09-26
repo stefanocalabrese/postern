@@ -98,8 +98,11 @@ from services.confirm.audit import (
     DETAIL_DEVICE_CODE_NOT_FOUND,
     DETAIL_INVALID_SUBJECT,
     DETAIL_REVOKED,
+    DETAIL_STORED_IDENTITY_MALFORMED,
     DETAIL_USER_CODE_BUDGET_EXHAUSTED,
     DETAIL_USER_CODE_MISMATCH,
+    TOKEN_ROUTE,
+    TOKEN_TOOL_NAME,
     PairingAudit,
     device_code_handle,
     pairing_client_ip,
@@ -208,6 +211,43 @@ async def device_authorization(request: Request) -> JSONResponse:
     67,252 bytes of objects, so the byte-counting body limit in front of this
     service was never a bound on what the store holds. The same ``isinstance``
     guard, for the same reason, is already in ``approve_callback`` below.
+
+    THIS ENDPOINT WRITES NO ``audit_log`` ROW, ON ANY BRANCH, AND THAT IS A
+    DECISION. It was reviewed on 2026-09-26, when ``POST /approve`` and
+    ``POST /token`` both gained one and this one deliberately did not.
+
+    It resolves no identity. The browser is in
+    ``services/confirm/auth.py``'s ``PUBLIC_PATHS`` because by the device
+    grant's premise it holds no credential at all, so there is no ``sub``,
+    there is no customer, and ``client_id`` is a string the caller chose --
+    which is the same reason ``services/confirm/revocation.py`` refuses to key
+    a kill switch on it. ``services/confirm/audit.py``'s ``PairingAudit``
+    carries the rule that makes that decisive rather than merely true: a row
+    is owed when the server resolved an identity AND concluded something about
+    its authority, and creating a device code is neither half. Every row this
+    endpoint could write would carry NULL in ``customer_ref`` and
+    ``no_access_token`` in ``customer_ref_absence_reason`` -- one value,
+    constant across the endpoint's entire population, which is a column that
+    tells a reader nothing.
+
+    And it would be one INSERT per unauthenticated request. Nothing
+    authenticates in front of this handler: what bounds it is
+    ``rate_limit_device_authorization``, 60 a minute per address bucket, and
+    an address bucket is not an identity. Under decision 0006 an audit write
+    that fails fails the request, so a row here would additionally mean that
+    no pairing can BEGIN while the audit store is merely slow -- bought for a
+    row naming nobody, on the one endpoint of the three that reaches no
+    customer data whatsoever.
+
+    WHAT IS INVISIBLE BECAUSE OF THIS, stated plainly. Device code creation.
+    An attacker can mint codes against any ``client_id`` they like and this
+    table will not show it. What bounds that population is
+    ``max_device_codes`` (10,000, and ``DeviceCodeStoreFull`` refuses rather
+    than evicting) and the address bucket above; what records the refusals is
+    the ``logger.warning`` below. The admission is narrower than it first
+    reads: a code that is ever approved appears on the pairing row by its
+    handle, and one that is ever exchanged appears again on the token row, so
+    the population no row names is exactly the codes that touched nobody.
     """
     settings: ConfirmSettings = request.app.state.settings
 
@@ -298,7 +338,7 @@ async def device_authorization(request: Request) -> JSONResponse:
 
 
 async def token_endpoint(request: Request) -> JSONResponse:
-    """Exchange a device code for access tokens.
+    """Exchange a device code for access tokens, and record the mint.
 
     Handles ``grant_type=device_code`` (RFC 8628 §3.4) and forwards all
     other grant types to the existing JWKS-only app (which will 404).
@@ -336,7 +376,34 @@ async def token_endpoint(request: Request) -> JSONResponse:
     And one that is not RFC 8628's, answered with 503:
         temporarily_unavailable — the revocation store could not be consulted,
             so nothing was minted. Retryable on purpose.
+
+    WHAT IS RECORDED, AND HOW LITTLE OF IT. This endpoint wrote no
+    ``audit_log`` row until 2026-09-26, which left the device grant's chain
+    with a hole in the middle: the pairing was recorded, the tool calls the
+    minted token made were recorded twice each, and the mint between them was
+    invisible. It now writes exactly one row on each of FOUR exits -- the mint,
+    a ZT-7 refusal, a stored identity that will not parse, and a revocation
+    store that could not answer -- and nothing on the other six.
+
+    EVERY UNRECORDED EXIT IS ONE THAT RESOLVED NOBODY, and that is the rule
+    rather than a list: ``services/confirm/audit.py``'s ``PairingAudit`` owes a
+    row only where the server resolved an identity and then decided something
+    about its authority. ``customer_ref`` is read off the device code AFTER the
+    grant type, the code lookup, the expiry check and the approval check, so a
+    wrong grant type, a missing or unknown ``device_code``, an expired code,
+    ``slow_down`` and ``authorization_pending`` are all answered before any
+    identity exists. That is what keeps this table from becoming a log of a
+    browser waiting: at the configured 5-second interval and 900-second
+    lifetime a poll loop can run 180 times and write nothing.
+
+    NOTHING OF THE TOKEN GOES ANYWHERE. Not the string, not a segment of it,
+    not a digest. The row says a token was minted for this customer off this
+    device code at this instant; ``services/api``'s own two rows per tool call
+    say what was then done with it.
     """
+    at = datetime.now(UTC)
+    started = time.monotonic()
+
     form = await request.form()
     grant_type_raw = form.get("grant_type", "")
     grant_type: str = (
@@ -363,9 +430,19 @@ async def token_endpoint(request: Request) -> JSONResponse:
 
     code: DeviceCode | None = await store.get_device_code(device_code_value)
     if code is None:
+        # NO ROW, AND THE ASYMMETRY WITH ``POST /approve`` IS DELIBERATE. The
+        # same shape one endpoint over IS recorded, as the enumeration signal,
+        # because there the caller presented a verified assertion and the row
+        # can name whose guess it was. Here the caller holds nothing, so a row
+        # would attribute the guess to nobody while letting an
+        # unauthenticated party drive an INSERT 300 times a minute per address
+        # bucket (``rate_limit_token``).
         return _error(400, "invalid_grant", "device code not found or already revoked")
 
     if code.is_expired:
+        # NO ROW. This runs before the identity is read, so it resolves nobody
+        # even for a code that HAD been approved, and it is the ordinary end of
+        # every abandoned pairing rather than an event.
         await store.revoke_device_code(device_code_value)
         return _error(400, "expired_token", "device code has expired")
 
@@ -399,10 +476,117 @@ async def token_endpoint(request: Request) -> JSONResponse:
     # `/device_authorization` put in it.
     stored_customer_ref: str = code.customer_ref
     if not stored_customer_ref:
+        # NO ROW, because no identity was resolved -- and structurally
+        # unreachable, since `approve_callback` writes `approved` and
+        # `customer_ref` in ONE store call and nothing else sets either.
+        #
+        # LOGGED, which it was not before 2026-09-26. A 500 with no row and no
+        # log line is the one refusal on this path an operator could not learn
+        # about at all, and the condition it reports -- an approved code with
+        # no customer on it -- is either a store that lost a field or a writer
+        # other than `approve_callback`. Neither is something to find out from
+        # a user complaint.
+        logger.error(
+            "device grant: device code %s is approved with no customer reference; "
+            "refusing to mint and writing no audit row, because no identity was resolved",
+            device_code_handle(device_code_value),
+        )
         return _error(500, "invalid_state", "approval missing customer identity")
 
+    # FROM HERE THE CODE NAMES A CUSTOMER, so every exit below writes exactly
+    # one row. Built here rather than at the top of the handler for that
+    # reason: this is the first line at which `PairingAudit`'s rule owes one.
+    #
+    # THE IDENTITY ON THIS ROW IS WEAKER THAN THE PAIRING ROW'S, and a reader
+    # comparing the two must know it. At `POST /approve` the customer came
+    # from a `sub` on an assertion `AppAssertionMiddleware` verified against a
+    # configured JWKS. Here it comes off a stored device code -- written there
+    # by that same verified approval, so its PROVENANCE is the assertion -- but
+    # the party presenting the code at this endpoint holds no credential
+    # beyond the code itself. So the row says "a token was minted for this
+    # customer", never "this customer asked for it".
+    db: Database = request.app.state.postern_database
+    audit = PairingAudit(
+        db=db,
+        call_id=str(uuid.uuid4()),
+        at=at,
+        started=started,
+        subject=stored_customer_ref,
+        # NO CLAIMS, so `client_id` is NULL on every row this endpoint writes.
+        # There is no OAuth client and no assertion here: the caller is
+        # whoever holds the device code. The `client_id` the browser supplied,
+        # unauthenticated, at `/device_authorization` goes in
+        # `arguments['paired_client_id']` instead -- the same key the pairing
+        # row uses, so one predicate returns both halves of a client's
+        # onboarding, and it stays out of the column that means "a client this
+        # service authenticated".
+        claims={},
+        client_ip_value=pairing_client_ip(request, settings.trusted_proxy_hops),
+        tool_name=TOKEN_TOOL_NAME,
+        route=TOKEN_ROUTE,
+    )
+    audit.names(device_code=device_code_value, paired_client_id=code.client_id)
+
     try:
-        customer = CustomerRef(value=stored_customer_ref)
+        response, detail = await _exchange(
+            request, audit, customer_ref=stored_customer_ref, device_code_value=device_code_value
+        )
+    except Exception as exc:
+        # `raise exc from audit_exc`, the shape `approve_callback` and
+        # `services/confirm/callback.py` both use: an audit-write failure must
+        # not replace the exception that ended the request.
+        try:
+            await audit.refused(type(exc).__name__)
+        except Exception as audit_exc:
+            logger.error(
+                "audit write failed for a device-grant token exchange after it raised %s: %s",
+                type(exc).__name__,
+                audit_exc,
+                exc_info=audit_exc,
+            )
+            raise exc from audit_exc
+        raise
+
+    # THE ROW IS COMMITTED BEFORE THE RESPONSE IS RETURNED, and on the success
+    # path that means before the token is serialised to anybody. A raise here
+    # drops `response` -- the minted string goes out of scope unreferenced and
+    # reaches no caller, no store and no log -- so "no row" means no token ever
+    # left this process. `PairingAudit`'s "FAIL CLOSED AT A MINT" section
+    # carries why neither of the two obvious orders works and what the
+    # residual is. Do not move this below the `return`.
+    try:
+        if detail is None:
+            await audit.minted()
+        else:
+            await audit.refused(detail)
+    except Exception as audit_exc:
+        logger.error(
+            "audit write failed for a device-grant token exchange that answered %d; "
+            "failing the request, so nothing it minted reaches the caller",
+            response.status_code,
+            exc_info=audit_exc,
+        )
+        raise
+    return response
+
+
+async def _exchange(
+    request: Request,
+    audit: PairingAudit,
+    *,
+    customer_ref: str,
+    device_code_value: str,
+) -> tuple[JSONResponse, str | None]:
+    """The ZT-7 check and the mint, returning ``(response, detail)``.
+
+    ``detail`` is ``None`` when a token was minted and one of
+    ``services/confirm/audit.py``'s ``DETAIL_*`` literals otherwise. Split out
+    from ``token_endpoint`` so the row is written in exactly one place, which
+    is the same division ``approve_callback`` and
+    ``services/confirm/callback.py`` both make.
+    """
+    try:
+        customer = CustomerRef(value=customer_ref)
     except ValidationError:
         # Never let this one propagate. `CustomerRef` sets
         # `hide_input_in_errors=True`, which covers `str()` and `repr()` of the
@@ -410,8 +594,17 @@ async def token_endpoint(request: Request) -> JSONResponse:
         # carry the raw offending value, and an unhandled exception here is
         # logged by whatever sits above us. A fixed string keeps that value out
         # of the log and off the wire.
+        #
+        # RECORDED, with `customer_ref` NULL and the class of absence in
+        # `customer_ref_absence_reason`. The identity WAS resolved -- a
+        # non-empty string was read off the code -- and refused, which is what
+        # the rule asks for; `DETAIL_STORED_IDENTITY_MALFORMED` carries why it
+        # is not `DETAIL_INVALID_SUBJECT`.
         logger.warning("device grant: stored customer reference is not well-formed")
-        return _error(500, "invalid_state", "approval identity is not a customer reference")
+        return (
+            _error(500, "invalid_state", "approval identity is not a customer reference"),
+            DETAIL_STORED_IDENTITY_MALFORMED,
+        )
 
     # ZT-7: refuse the MINT, not only the use.
     #
@@ -435,14 +628,24 @@ async def token_endpoint(request: Request) -> JSONResponse:
     # The store failing is NOT a denial. `store_unavailable_response` answers
     # 503 so the browser retries rather than treating an outage as a refusal;
     # either way no token is minted, which is the fail-closed half.
+    #
+    # BOTH OUTCOMES NOW LEAVE A ROW, and the refusal's is the only durable
+    # trace either way: this endpoint has no client id to put in a log line
+    # the way `services/api/middleware/revocation.py` does, which is exactly
+    # what `services/confirm/revocation.py`'s `log_refusal` says. The refusal
+    # keeps `DETAIL_REVOKED`, shared with the challenge path and the pairing
+    # path, so `WHERE detail = 'revoked'` stays the whole answer to "did my
+    # revocation take effect on the write path". The outage records the
+    # exception's own type instead, which is how an operator tells an outage
+    # from a refusal -- the caller cannot, and must not.
     try:
         revoked = await customer_revoked(request, customer.value)
-    except RevocationStoreUnavailable:
+    except RevocationStoreUnavailable as exc:
         logger.warning("device grant: revocation store unavailable, refusing to mint")
-        return store_unavailable_response()
+        return store_unavailable_response(), type(exc).__name__
     if revoked:
         log_refusal("a device-grant token exchange")
-        return _error(400, "access_denied", "authorization was refused")
+        return _error(400, "access_denied", "authorization was refused"), DETAIL_REVOKED
 
     read_minter: InternalTokenMinter = request.app.state.read_minter
     read_token = read_minter.mint(
@@ -451,13 +654,20 @@ async def token_endpoint(request: Request) -> JSONResponse:
         scope="accounts:read",
     )
 
-    return JSONResponse(
-        status_code=200,
-        content={
-            "access_token": read_token,
-            "token_type": "Bearer",
-            "expires_in": 60,
-        },
+    # THE TOKEN IS IN THIS RESPONSE OBJECT AND NOWHERE ELSE YET. It is not
+    # logged, not stored and not returned to a caller until `token_endpoint`
+    # has committed the row, which is what makes dropping this object the undo
+    # a mint would otherwise not have.
+    return (
+        JSONResponse(
+            status_code=200,
+            content={
+                "access_token": read_token,
+                "token_type": "Bearer",
+                "expires_in": 60,
+            },
+        ),
+        None,
     )
 
 

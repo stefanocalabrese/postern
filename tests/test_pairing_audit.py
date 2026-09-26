@@ -1,13 +1,24 @@
-"""``POST /approve`` -- the device-grant pairing -- against a real Postgres.
+"""The device grant's audit trail, against a real Postgres.
 
 WHAT THIS MODULE EXISTS FOR. Until 2026-09-26 ``services/confirm/device_auth
-.py`` wrote no ``audit_log`` row on any branch of ``POST /approve``. Every
-occurrence of the string ``audit`` in that file was prose about audit findings
-C-01 and C-04, not a call that wrote a row. So a payment approval through
-``POST /challenges/{challenge_id}/approve`` left two correlated rows, and the
-pairing that authorises a client to reach that endpoint at all left none: an
-attacker who paired a rogue client was visible only in the payments that
-followed it, and only if any followed.
+.py`` wrote no ``audit_log`` row on any branch of any of its three endpoints.
+Every occurrence of the string ``audit`` in that file was prose about audit
+findings C-01 and C-04, not a call that wrote a row. So a payment approval
+through ``POST /challenges/{challenge_id}/approve`` left two correlated rows,
+and the pairing that authorises a client to reach that endpoint at all left
+none: an attacker who paired a rogue client was visible only in the payments
+that followed it, and only if any followed.
+
+THE CHAIN, AND WHICH LINKS ARE RECORDED. ``POST /approve`` and
+``POST /token`` each write one row, so a pairing and the token minted off the
+back of it are both countable and join on ``arguments['device_code_handle']``.
+``POST /device_authorization`` writes none, deliberately, and
+``test_device_authorization_writes_nothing`` is where that is asserted rather
+than assumed. So is most of ``POST /token``: at the configured 5-second poll
+interval and 900-second code lifetime a browser can poll 180 times, and none
+of those polls resolves a customer, so none of them writes a row.
+``services/confirm/audit.py``'s ``PairingAudit`` carries the rule that
+partitions them.
 
 THE TWO ASSERTIONS THAT MATTER MOST, because they are the two an
 implementation can satisfy in appearance and miss in substance:
@@ -35,6 +46,7 @@ import json
 import os
 from collections.abc import AsyncGenerator, Generator
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import patch
 
@@ -43,7 +55,7 @@ import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from postern_core.auth.device_codes import DeviceCode, DeviceCodeStoreBase
 from postern_core.auth.device_keys import no_enrolled_devices
-from postern_core.auth.revocation import RevocationStoreBase
+from postern_core.auth.revocation import RevocationStoreBase, RevocationStoreUnavailable
 from postern_core.store import audit as audit_store
 from postern_core.store.engine import Database
 from postern_core.store.models import (
@@ -61,10 +73,13 @@ from services.confirm.audit import (
     DETAIL_DEVICE_CODE_NOT_FOUND,
     DETAIL_INVALID_SUBJECT,
     DETAIL_REVOKED,
+    DETAIL_STORED_IDENTITY_MALFORMED,
     DETAIL_USER_CODE_BUDGET_EXHAUSTED,
     DETAIL_USER_CODE_MISMATCH,
     PAIRING_ROUTE,
     PAIRING_TOOL_NAME,
+    TOKEN_ROUTE,
+    TOKEN_TOOL_NAME,
 )
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
@@ -233,6 +248,19 @@ async def one_row(db: Database) -> AuditEntry:
 def handle_of(device_code: str) -> str:
     """The digest the row is expected to carry in place of the credential."""
     return hashlib.sha256(device_code.encode("utf-8")).hexdigest()[:16]
+
+
+async def unwrap(store: DeviceCodeStoreBase, device_code: str) -> DeviceCode:
+    """The stored code, for tests that have to bend one out of shape.
+
+    Re-read rather than reusing the object ``issue`` returned, because
+    ``POST /approve`` has rewritten three of its fields by the time these
+    tests run and ``dataclasses.replace`` on the stale copy would silently
+    un-approve the code it is trying to corrupt.
+    """
+    stored = await store.get_device_code(device_code)
+    assert stored is not None
+    return stored
 
 
 # ---------------------------------------------------------------------------
@@ -637,3 +665,381 @@ async def test_a_pairing_that_cannot_be_audited_does_not_stand(
         "the pairing survived an audit write it could not make; "
         "POST /token would mint a read token no row accounts for"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. POST /token -- the mint, which is the middle link of the chain.
+# ---------------------------------------------------------------------------
+
+
+async def exchange(
+    app: Starlette, device_code: str, *, as_a_server_would: bool = False
+) -> httpx2.Response:
+    """``POST /token`` with the device-code grant, over ASGI.
+
+    Form-encoded, because that is what RFC 8628 §3.4 specifies and what
+    ``token_endpoint`` reads. ``as_a_server_would`` has the same meaning it
+    has in ``approve`` above and is what makes the fail-closed test below
+    assert on the response a real client receives.
+    """
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app, raise_app_exceptions=not as_a_server_would),
+        base_url="http://t",
+    ) as c:
+        return await c.post(
+            "/token", data={"grant_type": "device_code", "device_code": device_code}
+        )
+
+
+async def paired(app: Starlette, key_pair: RSAKeyPair) -> DeviceCode:
+    """A device code that has been through ``POST /approve`` successfully."""
+    code = await issue(app)
+    resp = await approve(
+        app,
+        {"device_code": code.device_code, "user_code": code.user_code_display},
+        bearer(key_pair),
+    )
+    assert resp.status_code == 200
+    return code
+
+
+async def test_a_token_exchange_writes_one_row(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """The mint, which until now was the one link of the chain with no record.
+
+    ``tool_name`` is its own literal rather than the pairing's, so an operator
+    can ask "which pairings completed" and "which tokens were issued"
+    separately. Both are ``device_grant.*``, neither is a registered MCP tool.
+    """
+    code = await paired(app, key_pair)
+
+    resp = await exchange(app, code.device_code)
+    assert resp.status_code == 200
+    assert "access_token" in resp.json()
+
+    written = await rows(clean)
+    assert [r.tool_name for r in written] == [PAIRING_TOOL_NAME, TOKEN_TOOL_NAME]
+    mint = written[1]
+    assert mint.outcome == OUTCOME_RETURNED
+    assert mint.detail is None
+    assert mint.customer_ref == CUSTOMER
+    assert mint.reaching_at is None
+    assert mint.arguments["route"] == TOKEN_ROUTE
+    assert mint.arguments["paired_client_id"] == BROWSER_CLIENT
+    # No verified client made this call -- the caller holds a device code and
+    # nothing else -- so the column that names a verified client is NULL and
+    # the unauthenticated one it did supply is in `arguments`.
+    assert mint.client_id is None
+
+
+async def test_the_two_rows_of_one_pairing_join_on_the_device_code_handle(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """The chain an investigator actually walks.
+
+    ``call_id`` deliberately does NOT join them: they are two requests,
+    minutes apart, from two different parties -- the banking app and the
+    browser -- and that column means one request. The handle is the join, and
+    it is the same handle the read path's rows can be tied back to through the
+    client the pairing named.
+    """
+    code = await paired(app, key_pair)
+    await exchange(app, code.device_code)
+
+    pairing, mint = await rows(clean)
+    assert pairing.arguments["device_code_handle"] == handle_of(code.device_code)
+    assert mint.arguments["device_code_handle"] == handle_of(code.device_code)
+    assert pairing.call_id != mint.call_id
+    assert pairing.customer_ref == mint.customer_ref == CUSTOMER
+
+
+async def test_the_row_names_no_part_of_the_minted_token(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """Nothing of the credential this endpoint issues reaches the table.
+
+    Asserted segment by segment rather than on the whole string: a JWT is
+    three base64url parts joined by dots, and a row carrying only the payload
+    would pass a naive ``token not in row`` check while holding the customer
+    reference, the audience and the scope in a form anybody can decode.
+    """
+    code = await paired(app, key_pair)
+    token: str = (await exchange(app, code.device_code)).json()["access_token"]
+
+    _, mint = await rows(clean)
+    serialised = json.dumps(
+        {
+            "arguments": mint.arguments,
+            "detail": mint.detail,
+            "tool_name": mint.tool_name,
+            "client_id": mint.client_id,
+        }
+    )
+    assert token not in serialised
+    for segment in token.split("."):
+        assert segment not in serialised
+    assert code.device_code not in serialised
+
+
+# ---------------------------------------------------------------------------
+# 6. Polling is not an event. This is the volume argument, as tests.
+# ---------------------------------------------------------------------------
+
+
+async def test_polling_before_approval_writes_nothing(app: Starlette, clean: Database) -> None:
+    """``authorization_pending`` is a browser waiting, not a decision.
+
+    At the configured 5-second interval and 900-second lifetime, a browser
+    whose customer never picks up their phone polls up to 180 times. A row per
+    poll would make this table mostly a record of waiting, and the 180 rows
+    would carry no customer: ``customer_ref`` is only read off the device code
+    after the approval check, so none of these polls has resolved anybody.
+    """
+    code = await issue(app)
+
+    first = await exchange(app, code.device_code)
+    assert first.json()["error"] == "authorization_pending"
+    # The second poll inside the interval is refused with `slow_down`, which
+    # is the same non-event one step louder.
+    second = await exchange(app, code.device_code)
+    assert second.json()["error"] == "slow_down"
+
+    assert await rows(clean) == []
+
+
+async def test_an_expired_device_code_writes_nothing(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """The ordinary end of an abandoned pairing, and it resolves nobody.
+
+    The expiry check runs before the identity is read, so this exit has no
+    customer even when the code had been approved. It also REVOKES the code,
+    which is a state change with no customer attached -- exactly the shape the
+    rule excludes.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await paired(app, key_pair)
+    await _wipe(clean)
+    await store.update_device_code(
+        code.device_code,
+        replace(
+            await unwrap(store, code.device_code),
+            expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        ),
+    )
+
+    resp = await exchange(app, code.device_code)
+    assert resp.json()["error"] == "expired_token"
+    assert await rows(clean) == []
+
+
+async def test_an_unknown_device_code_at_the_token_endpoint_writes_nothing(
+    app: Starlette, clean: Database
+) -> None:
+    """The deliberate asymmetry with ``POST /approve``, which DOES record this.
+
+    Same shape, opposite answer, and the difference is authentication. At
+    ``/approve`` an unknown device code is a conclusion about a customer the
+    assertion already named, so it is the enumeration signal. Here the caller
+    holds nothing at all, so there is nobody to attribute the guess to, and a
+    row would be an INSERT an unauthenticated caller can drive 300 times a
+    minute per address bucket.
+    """
+    resp = await exchange(app, "no-such-device-code")
+    assert resp.json()["error"] == "invalid_grant"
+
+    missing_grant = await exchange(app, "")
+    assert missing_grant.json()["error"] == "invalid_request"
+
+    assert await rows(clean) == []
+
+
+async def test_device_authorization_writes_nothing(app: Starlette, clean: Database) -> None:
+    """The unauthenticated endpoint records nothing, by rule and not by omission.
+
+    ``POST /device_authorization`` is in ``PUBLIC_PATHS`` because the browser
+    holds no credential by the device grant's premise. It resolves no
+    identity, so no row: ``customer_ref`` would be NULL on every row it ever
+    wrote and ``customer_ref_absence_reason`` would read ``no_access_token``
+    on every one of them, which is a column whose value is constant across the
+    endpoint's whole population and therefore tells a reader nothing. What it
+    creates is bounded by the 10,000-code store cap and the 60-per-minute
+    address bucket, not by this table.
+    """
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://t"
+    ) as c:
+        resp = await c.post("/device_authorization", json={"client_id": BROWSER_CLIENT})
+    assert resp.status_code == 200
+    assert "device_code" in resp.json()
+
+    assert await rows(clean) == []
+
+
+# ---------------------------------------------------------------------------
+# 7. The refusals at /token that ARE events.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_revoked_customer_at_the_token_endpoint_is_recorded_and_mints_nothing(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """ZT-7 at the mint, under the literal both other write paths already use.
+
+    The browser is told ``access_denied``, which is indistinguishable from the
+    customer declining on their phone, so a party holding only a device code
+    learns nothing about anyone's revocation state. The row is where the
+    operator learns it, and it is the only place: this endpoint has no client
+    id to put in a log line.
+    """
+    store: RevocationStoreBase = app.state.postern_revocation_store
+    code = await paired(app, key_pair)
+    await _wipe(clean)
+    await store.revoke_customer_client(customer_ref=CUSTOMER, client_id=BROWSER_CLIENT)
+
+    resp = await exchange(app, code.device_code)
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "access_denied"
+    assert "access_token" not in resp.json()
+
+    row = await one_row(clean)
+    assert row.tool_name == TOKEN_TOOL_NAME
+    assert row.outcome == OUTCOME_RAISED
+    assert row.detail == DETAIL_REVOKED
+    assert row.customer_ref == CUSTOMER
+    assert row.arguments["device_code_handle"] == handle_of(code.device_code)
+
+
+async def test_an_unreachable_revocation_store_is_recorded_and_mints_nothing(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """ "We tried to decide and could not" is a conclusion about this customer.
+
+    Reporting an outage as "not revoked" would un-revoke every entry the
+    operator holds at the moment they most believe they have acted, so the
+    endpoint answers 503 and mints nothing. The row names the exception type,
+    which is how an operator tells this apart from a real refusal -- the
+    caller cannot, and must not.
+    """
+    code = await paired(app, key_pair)
+    await _wipe(clean)
+
+    class Unavailable:
+        async def is_customer_revoked(self, customer_ref: str) -> bool:
+            raise RevocationStoreUnavailable("the revocation store is gone")
+
+    app.state.postern_revocation_store = Unavailable()
+
+    resp = await exchange(app, code.device_code)
+    assert resp.status_code == 503
+    assert "access_token" not in resp.json()
+
+    row = await one_row(clean)
+    assert row.outcome == OUTCOME_RAISED
+    assert row.detail == "RevocationStoreUnavailable"
+    assert row.customer_ref == CUSTOMER
+
+
+async def test_a_stored_identity_that_is_not_a_customer_reference_is_recorded(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """A distinct literal from ``/approve``'s, because the provenance differs.
+
+    At ``/approve`` a non-conforming subject means the operator's app backend
+    minted the wrong claim. Here the value was read back off a stored device
+    code that ``/approve`` had already validated, so it means the stored row
+    is wrong or something other than ``/approve`` wrote it. Those are
+    different incidents and a reader must not have to guess which one a row
+    describes.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await paired(app, key_pair)
+    await _wipe(clean)
+    await store.update_device_code(
+        code.device_code,
+        replace(await unwrap(store, code.device_code), customer_ref="4111111111111111"),
+    )
+
+    resp = await exchange(app, code.device_code)
+    assert resp.status_code == 500
+    assert "access_token" not in resp.json()
+
+    row = await one_row(clean)
+    assert row.outcome == OUTCOME_RAISED
+    assert row.detail == DETAIL_STORED_IDENTITY_MALFORMED
+    assert row.customer_ref is None
+    assert row.customer_ref_absence_reason == ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF
+    assert "4111111111111111" not in json.dumps({"arguments": row.arguments, "detail": row.detail})
+
+
+# ---------------------------------------------------------------------------
+# 8. Fail closed at a mint, which cannot be unminted.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_token_that_cannot_be_audited_is_never_returned(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """The ordering decision, asserted on the RESPONSE BODY rather than the status.
+
+    ``/approve`` fails closed by withdrawing the pairing, because the pairing
+    is in this deployment's own store. A mint cannot be withdrawn: the token is
+    signed and nothing here can revoke it inside its 60-second life. So the
+    order is mint, then commit the row, then return -- and the token is only
+    ever serialised to a caller after the row is durable. An implementation
+    that wrote the row first would refuse a customer who did nothing wrong
+    whenever the store blinked; one that returned before writing would hand out
+    a token no row accounts for, which is the fail-open shape this repository
+    already rejected one endpoint over.
+    """
+    code = await paired(app, key_pair)
+    await _wipe(clean)
+
+    async def unavailable(session: Any, **kw: Any) -> None:
+        raise RuntimeError("audit store unavailable")
+
+    with patch.object(audit_store, "append", unavailable):
+        resp = await exchange(app, code.device_code, as_a_server_would=True)
+
+    assert resp.status_code == 500
+    assert "access_token" not in resp.text, (
+        "a token reached the caller with no audit_log row behind it"
+    )
+    assert await rows(clean) == []
+
+
+async def test_a_mint_that_fails_leaves_no_row_claiming_one(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """The other half of the ordering, and the one prose alone cannot pin.
+
+    Writing the row BEFORE the mint is the obvious alternative and it has this
+    defect: a signing key source that raises leaves a durable row saying a
+    token was issued when none was. That is the direction this repository
+    refuses on a success row -- ``outcome='returned'`` with a NULL ``detail``
+    is a claim that the work finished -- so the row goes after the mint, and a
+    mint that raises produces a ``raised`` row naming the exception instead.
+    """
+    code = await paired(app, key_pair)
+    await _wipe(clean)
+
+    class Unsignable:
+        """Stands in for the minter. A stand-in rather than ``patch.object``:
+        ``InternalTokenMinter`` is a frozen dataclass, so patching an attribute
+        on an instance raises ``FrozenInstanceError`` when the patch unwinds."""
+
+        def mint(self, **kwargs: Any) -> str:
+            raise RuntimeError("the signing key source is unavailable")
+
+    app.state.read_minter = Unsignable()
+
+    resp = await exchange(app, code.device_code, as_a_server_would=True)
+
+    assert resp.status_code == 500
+    assert "access_token" not in resp.text
+
+    row = await one_row(clean)
+    assert row.outcome == OUTCOME_RAISED, "a row claimed a mint that never happened"
+    assert row.detail == "RuntimeError"
+    assert row.customer_ref == CUSTOMER
