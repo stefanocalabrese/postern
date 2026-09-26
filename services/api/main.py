@@ -48,7 +48,6 @@ is a validated token's subject to check it for, since consent has nowhere to
 read a customer from otherwise.
 """
 
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -66,7 +65,7 @@ from postern_core.auth.keys import (
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
 from postern_core.auth.revocation import create_revocation_store, decision_scope
-from postern_core.config import enforce_redis_requirement
+from postern_core.config import bool_from_env, enforce_redis_requirement
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
@@ -127,9 +126,27 @@ def _read_key_source(settings: Settings) -> KeySource:
     # Audit finding (2026-09-21): refuse to start with ephemeral key when
     # the operator has explicitly required a persisted PEM. Without this,
     # a restart changes the JWKS and every verifier rejects all tokens.
-    if os.environ.get("POSTERN_REQUIRE_PEM_KEY") == "1":
+    #
+    # READ THROUGH `bool_from_env` SINCE 2026-09-26, AND THAT CHANGED WHAT
+    # SOME DEPLOYMENTS DO. It was `== "1"`, so `POSTERN_REQUIRE_PEM_KEY=true`
+    # meant "do not require a PEM key" -- an operator who believed they had
+    # banned in-process signing keys had banned nothing, and would find out
+    # after a restart, from `BadSignatureError` against every token the
+    # previous process minted. That error reads like forgery, not like a flag
+    # that did nothing, which is why this one was worth converting rather
+    # than documenting. `true`, `yes` and `on` now arm it; an unreadable
+    # value refuses to start instead of defaulting to off.
+    if bool_from_env(
+        "POSTERN_REQUIRE_PEM_KEY",
+        False,
+        because=(
+            "It refuses startup on an ephemeral signing key. Left off, a restart "
+            "generates a new key, the published JWKS changes, and every token "
+            "minted before it stops verifying."
+        ),
+    ):
         raise RuntimeError(
-            "POSTERN_REQUIRE_PEM_KEY=1 but POSTERN_READ_KEY_PEM_PATH is not set. "
+            "POSTERN_REQUIRE_PEM_KEY is set but POSTERN_READ_KEY_PEM_PATH is not. "
             "A persisted PEM key is required for production: a restart with an "
             "ephemeral key changes the JWKS and invalidates all existing tokens."
         )
@@ -372,19 +389,23 @@ def create_app(
     # read path's own consequence and is passed in rather than shared, because
     # the two services lose different things.
     #
-    # THE SECOND HALF OF THIS SENTENCE IS STALE and is left alone on purpose:
-    # it says revocation lists "remain in-process per replica regardless of
-    # this setting", which stopped being true two days after it was written,
-    # when `create_revocation_store` above gained a Redis backend. Correcting
-    # it changes this path's observable output, which is not what a commit
-    # extending a guard should do. The claim about JTI replay is still exact --
-    # `JtiReplayCache` has no shared backend at all.
+    # THE MIDDLE CLAUSE WAS FALSE AND WAS CORRECTED ON 2026-09-26. It read
+    # "revocation lists and JTI replay protection remain in-process per
+    # replica regardless of this setting", which was true on 2026-09-21 when
+    # it was written and stopped being true on 2026-09-23, when
+    # `create_revocation_store` above gained a Redis backend. A message that
+    # tells an operator a control is per-replica when it is not is worse than
+    # no message: it argues them out of setting the variable that would have
+    # fixed it. The JTI half was exact then and is exact now -- `JtiReplayCache`
+    # has no shared backend anywhere in this repository, so it is the one
+    # thing here that POSTERN_REDIS_URL genuinely cannot help.
     enforce_redis_requirement(
         consequence=(
-            "This guard only checks that POSTERN_REDIS_URL is configured, "
-            "which backs the session store; revocation lists and JTI "
-            "replay protection remain in-process per replica regardless "
-            "of this setting."
+            "This guard checks only that POSTERN_REDIS_URL is configured. It "
+            "backs the session store and the ZT-7 revocation list, which are "
+            "then shared across replicas; the JTI replay cache has no shared "
+            "backend at all and stays per replica, and lost on restart, "
+            "whatever this is set to."
         )
     )
 

@@ -76,7 +76,9 @@ __all__ = [
     "MIN_REPRESENTABLE_TTL_SECONDS",
     "REDIS_URL_ENV",
     "REQUIRE_REDIS_ENV",
-    "REQUIRE_REDIS_ON",
+    "BOOL_FALSE",
+    "BOOL_TRUE",
+    "bool_from_env",
     "enforce_redis_requirement",
     "float_from_env",
     "int_arg_or_env",
@@ -314,18 +316,27 @@ def int_arg_or_env(
 #: The switch an operator sets to refuse per-replica state.
 REQUIRE_REDIS_ENV = "POSTERN_REQUIRE_REDIS"
 
-#: The one value that arms it.
+#: What an operator may write to mean yes.
 #:
-#: EXACTLY THIS STRING, AND THAT IS A SHARP EDGE RATHER THAN A DESIGN.
-#: ``POSTERN_REQUIRE_REDIS=true`` arms nothing, on either service, silently.
-#: The comparison is `services/api/main.py`'s, unchanged from when it was the
-#: only half of this contract, and widening it here would change that service's
-#: condition as a side effect of sharing it -- so the literal is exported
-#: instead, which at least makes the two call sites read one constant and puts
-#: the edge somewhere a reader trips over it.
-#: ``tests/test_require_redis_guard.py::TestOnlyTheLiteralOne`` pins the
-#: current answer so a future widening is a deliberate act.
-REQUIRE_REDIS_ON = "1"
+#: FOUR SPELLINGS, CHOSEN FROM WHAT CONFIG SYSTEMS EMIT rather than from what
+#: a shell idiom tolerates. ``1`` is the documented value every existing
+#: deployment already uses. ``true`` is how YAML, JSON, Helm and Terraform all
+#: render a boolean. ``yes`` and ``on`` are booleans in YAML 1.1, so an author
+#: who quotes them to stop that conversion arrives here with the literal word
+#: and unmistakably means yes.
+#:
+#: ``y`` and ``t`` are left out, though the old ``distutils.util.strtobool``
+#: took both. Nothing emits a single letter and nobody types one into a
+#: deployment manifest; what a one-character token buys is a typo that reads
+#: as intent, on a variable whose whole job is to be a safety switch. They are
+#: refused loudly by `bool_from_env` rather than read as no.
+BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+
+#: What an operator may write to mean no. The mirror of `BOOL_TRUE`, and
+#: disjoint from it, which `tests/test_require_redis_guard.py` asserts: a token
+#: in both sets would make the answer depend on the order the branches below
+#: happen to be written in.
+BOOL_FALSE = frozenset({"0", "false", "no", "off"})
 
 #: The variable every Redis-backed store in this repository reads.
 REDIS_URL_ENV = "POSTERN_REDIS_URL"
@@ -336,7 +347,84 @@ REDIS_URL_ENV = "POSTERN_REDIS_URL"
 #: learns the same fact about their own configuration, and only what it costs
 #: them differs. The trailing space belongs to it, so a caller's ``consequence``
 #: appends cleanly.
-_REQUIRE_REDIS_PREFIX = f"{REQUIRE_REDIS_ENV}={REQUIRE_REDIS_ON} but {REDIS_URL_ENV} is not set. "
+#:
+#: IT NAMES NO VALUE. It read ``POSTERN_REQUIRE_REDIS=1`` while one spelling
+#: armed the guard; four do now, and quoting one of them would misdescribe the
+#: other three ways an operator can arrive here.
+_REQUIRE_REDIS_PREFIX = f"{REQUIRE_REDIS_ENV} is set but {REDIS_URL_ENV} is not. "
+
+
+def bool_from_env(name: str, default: bool, *, because: str) -> bool:
+    """Read ``name`` as a flag, or refuse to start.
+
+    Args:
+        name: The environment variable, echoed in the refusal so the operator
+            learns which line to edit.
+        default: Returned when the variable is unset, empty, or only
+            whitespace.
+        because: One sentence saying what the flag gates. Appended to the
+            refusal, so the reason is in the failure and not only in a comment
+            the operator would have to go and find.
+
+    Returns:
+        The parsed flag, or ``default``.
+
+    Raises:
+        ValueError: if the value is neither a `BOOL_TRUE` nor a `BOOL_FALSE`
+            token.
+
+    WHY AN UNRECOGNISED VALUE RAISES, which matters more than the accepting
+    set. Three readings are available for ``POSTERN_REQUIRE_REDIS=maybe`` and
+    two of them are bugs.
+
+    - AS NO: the defect this function was written to remove. It is exactly
+      what ``=true`` did before it -- a safety switch disarmed by a spelling,
+      in silence, while the operator believed they had armed it.
+    - AS YES: worse than it looks, because one reader serves every flag.
+      ``=disabled`` would then ENABLE the thing the operator was turning off,
+      which is the same failure pointing the other way and much harder to
+      notice, since nothing refuses and nothing logs.
+    - AS A REFUSAL: the operator typed something this program cannot
+      interpret, and learns so at startup, with the variable, the value and
+      the accepted spellings in one message.
+
+    The precedent is `int_from_env` in this module, which already made this
+    call for numbers: "a value an operator typed and got wrong must fail when
+    the app is assembled, because silently keeping the default means the
+    variable they set to fix an outage did nothing, and they find out from the
+    same alert they were already looking at." A flag is the same mistake with
+    fewer characters.
+
+    WHY EMPTY AND WHITESPACE MEAN UNSET RATHER THAN NO. It is this
+    repository's existing convention -- `int_from_env` treats ``POSTERN_X=``
+    as unset and `services/api/settings.py`'s `from_env` collapses ``""`` to
+    ``None`` for its string fields -- and it is what a templating system emits
+    for a variable that was absent upstream, which is the case worth
+    optimising for. For a flag defaulting to False the two readings cannot be
+    told apart; the rule is fixed here so that the first caller passing
+    ``default=True`` inherits a decision instead of making a new one.
+
+    CASE AND SURROUNDING WHITESPACE ARE DISCARDED. ``True`` from a YAML
+    renderer and ``1\n`` from a block scalar are unambiguous, and a value that
+    fails on an invisible trailing character is a support ticket rather than a
+    control.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    token = raw.strip().lower()
+    if not token:
+        return default
+    if token in BOOL_TRUE:
+        return True
+    if token in BOOL_FALSE:
+        return False
+    raise ValueError(
+        f"{name} must be one of {', '.join(sorted(BOOL_TRUE))} to turn it on, or "
+        f"{', '.join(sorted(BOOL_FALSE))} to turn it off, got {raw!r}. Case and "
+        f"surrounding whitespace are ignored, and an empty value means unset. "
+        f"{because}"
+    )
 
 
 def enforce_redis_requirement(*, consequence: str) -> None:
@@ -349,8 +437,14 @@ def enforce_redis_requirement(*, consequence: str) -> None:
             caller inherit whichever one was written first.
 
     Raises:
-        RuntimeError: if `REQUIRE_REDIS_ENV` is exactly `REQUIRE_REDIS_ON` and
-            `REDIS_URL_ENV` is unset or empty.
+        RuntimeError: if `REQUIRE_REDIS_ENV` reads as on and `REDIS_URL_ENV`
+            is unset or empty.
+        ValueError: if `REQUIRE_REDIS_ENV` is set to something `bool_from_env`
+            cannot read as either. Two failures, two types: a value that
+            cannot be parsed is the same class of mistake every numeric reader
+            in this module raises `ValueError` for, while the `RuntimeError`
+            is this function's own finding -- the value parsed, it said yes,
+            and the URL it demands is missing.
 
     WHY THE MESSAGE IS SPLIT AND NOT WHOLLY SHARED. The variable names and the
     condition are one fact and belong in one place. What per-replica state
@@ -381,7 +475,15 @@ def enforce_redis_requirement(*, consequence: str) -> None:
     store, so collapsing them into a startup probe here would make one
     decision on behalf of four.
     """
-    if os.environ.get(REQUIRE_REDIS_ENV) != REQUIRE_REDIS_ON:
+    required = bool_from_env(
+        REQUIRE_REDIS_ENV,
+        False,
+        because=(
+            "It refuses startup when state that must be shared between replicas "
+            "would instead be held per process."
+        ),
+    )
+    if not required:
         return
     if os.environ.get(REDIS_URL_ENV):
         return

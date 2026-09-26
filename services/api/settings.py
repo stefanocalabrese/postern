@@ -27,7 +27,7 @@ bound refuses what is UNREPRESENTABLE, not what is unwise.
 import os
 from dataclasses import dataclass
 
-from postern_core.config import float_from_env, int_from_env
+from postern_core.config import bool_from_env, float_from_env, int_from_env
 
 
 @dataclass(frozen=True)
@@ -240,7 +240,19 @@ class Settings:
             customer_jwks_uri=os.environ.get("POSTERN_JWKS_URI") or None,
             customer_token_issuer=os.environ.get("POSTERN_TOKEN_ISSUER") or None,
             audience=os.environ.get("POSTERN_AUDIENCE", "postern"),
-            strict_headers=os.environ.get("POSTERN_STRICT_HEADERS") == "1",
+            # WAS ``== "1"`` UNTIL 2026-09-26, so
+            # ``POSTERN_STRICT_HEADERS=true`` meant LAX headers -- the MCP
+            # Streamable HTTP checks an operator thought they had turned on
+            # were off, silently. Every spelling of yes now arms it and an
+            # unreadable value refuses the parse.
+            strict_headers=bool_from_env(
+                "POSTERN_STRICT_HEADERS",
+                False,
+                because=(
+                    "It enforces MCP Streamable HTTP header compliance. Left off, "
+                    "a non-conforming client is served rather than refused."
+                ),
+            ),
             # NO CEILING here or on any number below, and the argument is the
             # one `services/confirm/settings.py`'s `_device_code_ttl` made for
             # the device-code lifetime: a value that is too LARGE is a risk an

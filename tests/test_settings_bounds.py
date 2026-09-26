@@ -45,6 +45,8 @@ from postern_core.auth.device_codes import (
     MIN_DEVICE_CODE_TTL_SECONDS as CORE_MIN_DEVICE_CODE_TTL_SECONDS,
 )
 from postern_core.config import (
+    BOOL_FALSE,
+    BOOL_TRUE,
     MIN_REPRESENTABLE_TTL_SECONDS,
     float_from_env,
     int_from_env,
@@ -979,4 +981,87 @@ class TestNoBareNumericEnvironmentReadRemains:
             f"{offenders} wrap an environment read in a bare int()/float(). That accepts "
             "an empty string as a crash naming neither the variable nor the module, and "
             "zero and negatives in silence. Read it through postern_core.config instead."
+        )
+
+    def test_no_environment_read_is_compared_against_a_boolean_token(self) -> None:
+        """The same sweep, for flags rather than numbers.
+
+        WHY THIS ARRIVED SECOND. The numeric half above landed on 2026-09-25
+        and could not be extended to booleans then, because three flags were
+        still reading ``os.environ.get(X) == "1"`` and the check would have
+        failed the build on all three. They were converted on 2026-09-26, so
+        the objection is gone and the shape is closed the same way: not by
+        remembering, but by parsing every module that ships.
+
+        WHAT COUNTS AS A BOOLEAN READ, and the definition is deliberately
+        narrow so the rule has no false positives:
+
+        - an environment read compared with ``==`` or ``!=`` against a string
+          literal that is one of `BOOL_TRUE` or `BOOL_FALSE`;
+        - an environment read tested with ``in`` against a literal collection
+          holding one;
+        - an environment read wrapped in ``bool()``, which is the subtlest of
+          the three: ``bool("0")`` is ``True``, so that spelling turns every
+          off value into on.
+
+        Comparing an environment read against a NON-boolean literal is left
+        alone, because ``os.environ.get("POSTERN_ENV") == "production"`` is an
+        ordinary string test and not a flag. Keying the rule on the literal
+        rather than on the comparison is what separates the two.
+
+        WHAT IS DELIBERATELY NOT CAUGHT: bare truthiness, ``if
+        os.environ.get(X):``. It is indistinguishable at the syntax level from
+        "is this string configured?", which this repository does correctly in
+        five places for ``POSTERN_REDIS_URL`` -- `create_session_store`,
+        `create_revocation_store`, `create_device_code_store`,
+        `create_customer_rate_limit_store` and
+        `postern_core.auth.revoke_cli`. A rule that flagged those would be
+        switched off within a week, and a check nobody trusts is worse than no
+        check. It is named here so the gap is known rather than assumed
+        covered.
+        """
+        repo = Path(__file__).resolve().parent.parent
+        tokens = BOOL_TRUE | BOOL_FALSE
+        offenders: list[str] = []
+
+        def is_env_read(node: ast.AST) -> bool:
+            return any(_reads_the_environment(inner) for inner in ast.walk(node))
+
+        def is_boolean_literal(node: ast.AST) -> bool:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value.strip().lower() in tokens
+            if isinstance(node, ast.Tuple | ast.List | ast.Set):
+                return any(is_boolean_literal(element) for element in node.elts)
+            return False
+
+        for root in ("packages", "services"):
+            for path in sorted((repo / root).rglob("*.py")):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call):
+                        if (
+                            isinstance(node.func, ast.Name)
+                            and node.func.id == "bool"
+                            and is_env_read(node)
+                        ):
+                            offenders.append(f"{path.relative_to(repo)}:{node.lineno} bool()")
+                        continue
+                    if not isinstance(node, ast.Compare):
+                        continue
+                    if not any(
+                        isinstance(op, ast.Eq | ast.NotEq | ast.In | ast.NotIn) for op in node.ops
+                    ):
+                        continue
+                    sides = [node.left, *node.comparators]
+                    if any(is_env_read(side) for side in sides) and any(
+                        is_boolean_literal(side) for side in sides
+                    ):
+                        offenders.append(f"{path.relative_to(repo)}:{node.lineno} comparison")
+
+        assert offenders == [], (
+            f"{offenders} read a boolean environment variable by hand. Every spelling "
+            "other than the one compared against then means off, silently, which on a "
+            "safety switch is the wrong direction: POSTERN_REQUIRE_PEM_KEY=true used to "
+            "mean 'do not require a PEM key'. Read it through "
+            "postern_core.config.bool_from_env instead."
         )
