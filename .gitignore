@@ -35,5 +35,13 @@ build/
 # to commit.
 /handoff-for-local.md*
 
-# Internal development documentation (not for public consumption)
-dev-docs/
+# `dev-docs/` was ignored here until 26 September 2026, as "internal
+# development documentation (not for public consumption)". It is tracked now.
+# What it held: the three documents CLAUDE.md calls the architecture, and
+# fourteen decision records -- 312K of the reasoning behind decisions the code
+# cannot state, on one disk, with no second copy. A repository that carries
+# `postern-mcp` as its published name will one day be public, and these should
+# be reviewed before that happens; losing them to a disk failure in the
+# meantime is the larger risk, and the one that was live.
+# Scanned before tracking: no key material, no credential assignments, no
+# personal addresses, and every hostname in them is `.test` or `.internal`.
