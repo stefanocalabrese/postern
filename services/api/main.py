@@ -320,6 +320,16 @@ def create_app(
         connect_timeout_seconds=settings.database_connect_timeout_seconds,
         command_timeout_seconds=settings.database_command_timeout_seconds,
         pool_timeout_seconds=settings.database_pool_timeout_seconds,
+        # The ceiling, passed for the first time on 2026-09-26. Until then
+        # this engine took SQLAlchemy's 5 + 10 by omission, so the number of
+        # connections a replica could hold against the operator's Postgres
+        # was set by a library default and could not be changed without
+        # editing code. Same two values, now chosen: `services/api/settings.py`
+        # says why they did not move, and `Database.__init__` carries the
+        # replicas x ceiling <= max_connections arithmetic this cannot do on
+        # the operator's behalf.
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
     )
 
     # Consent is enforced against `AuthContext.token`, which only exists when

@@ -323,6 +323,12 @@ def create_confirm_app(
         connect_timeout_seconds=settings.database_connect_timeout_seconds,
         command_timeout_seconds=settings.database_command_timeout_seconds,
         pool_timeout_seconds=settings.database_pool_timeout_seconds,
+        # 5 + 5 here against the read path's 5 + 10, both chosen on
+        # 2026-09-26 where both were SQLAlchemy's by omission before.
+        # `services/confirm/settings.py` carries why this service asks for
+        # less and what raising it looks like.
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
     )
 
     # --- Assemble routes ---

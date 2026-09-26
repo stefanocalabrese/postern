@@ -67,6 +67,8 @@ The table below lists every variable, grouped by service.
 | `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Database connection timeout (seconds). **Greater than 0**; at zero every connection raises `TimeoutError` |
 | `POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS` | No | `3.0` | Database statement timeout (seconds). **Greater than 0**; asyncpg rejects zero itself, at the first connect |
 | `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds). **Zero or greater**; zero sheds rather than queueing when the pool is saturated |
+| `POSTERN_DATABASE_POOL_SIZE` | No | `5` | Connections this replica keeps open. **At least 1**; zero is SQLAlchemy's spelling of "unlimited", not of "small" |
+| `POSTERN_DATABASE_MAX_OVERFLOW` | No | `10` | Connections this replica may open above `POSTERN_DATABASE_POOL_SIZE` and close again on return. **Zero or greater**; zero means no burst, and `-1` is the off switch |
 | `POSTERN_MAX_BODY_BYTES` | No | `1048576` (1 MiB) | Maximum request body size in bytes. **At least 1**; at zero every request carrying a body is refused 413 |
 | `POSTERN_REQUEST_DEADLINE_SECONDS` | No | `101.0` | Wall-clock bound on the whole HTTP request (see [Audit System](components/audit.md)). **Greater than 0**, and finite: there is no off switch, raise the number instead |
 | `POSTERN_REQUIRE_PEM_KEY` | No | - | Set to `"1"` to refuse startup with an ephemeral read key |
@@ -109,6 +111,8 @@ The table below lists every variable, grouped by service.
 | `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Database connection timeout (seconds). **Greater than 0**; at zero every connection raises `TimeoutError` |
 | `POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS` | No | `3.0` | Database statement timeout (seconds). **Greater than 0**; asyncpg rejects zero itself, at the first connect |
 | `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds). **Zero or greater**; zero sheds rather than queueing when the pool is saturated |
+| `POSTERN_CONFIRM_DATABASE_POOL_SIZE` | No | `5` | Connections this replica keeps open, separate from the API service's `POSTERN_DATABASE_POOL_SIZE`. **At least 1** |
+| `POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW` | No | `5` | Burst above `POSTERN_CONFIRM_DATABASE_POOL_SIZE`. **Zero or greater**. Lower than the API service's 10 because one approval is one person tapping a phone, and both services draw on one `max_connections` |
 
 The three `POSTERN_APP_ASSERTION_*` variables are the only **required** settings on
 either service. `create_confirm_app()` raises `ValueError` and the process does not
@@ -121,6 +125,36 @@ Setting `POSTERN_APP_ASSERTION_AUDIENCE` to the same value as the API service's
 good enough to approve a payment. Neither process can detect that — they are separate
 deployments reading separate environments — so keeping them distinct is an operator
 requirement, not something a gate here will catch.
+
+### Sizing the connection pools
+
+The four pool variables above are the one set of numbers this repository cannot
+pick for you, because the constraint involves your replica count and your
+database's limit and neither is visible from here:
+
+```
+  api_replicas     x (POSTERN_DATABASE_POOL_SIZE + POSTERN_DATABASE_MAX_OVERFLOW)
++ confirm_replicas x (POSTERN_CONFIRM_DATABASE_POOL_SIZE + POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW)
++ migrations, psql, monitoring, backups
+<= max_connections - superuser_reserved_connections
+```
+
+Both services connect to the same database, so both sides count against one
+limit. On an unmodified PostgreSQL 17 those two server settings are 100 and 3
+(measured); a managed instance sets its own, so read them with
+`SHOW max_connections` against the instance you will actually deploy against.
+Going over is not a slowdown, it is a refusal at connect:
+`asyncpg.exceptions.TooManyConnectionsError: sorry, too many clients already`.
+
+At the defaults, four API replicas and two confirm replicas hold
+`4x15 + 2x10 = 80` connections, which leaves 17 of the default 100 once the 3
+reserved slots are taken. Six and three would need 120 and does not fit.
+
+A pool holds one connection per in-flight *request*, not per request's worth of
+work: a tool call costs two to seven checkouts one after another, and an
+approval costs four. `dev-docs/decisions/0013-connection-pool-ceiling.md` has
+the derivation, what a saturated pool looks like from the customer's side, and
+when raising these is the right response.
 
 ### Environment variable conventions
 

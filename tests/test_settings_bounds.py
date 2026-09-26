@@ -150,6 +150,35 @@ BOUNDED: tuple[Bounded, ...] = (
         ("-1", "-0.5", "nan", "inf"),
         ("0", "0.0", "1.0", "30"),
     ),
+    # THE ONE PAIR WHERE THE TWO SERVICES DISAGREE ON THE NUMBER, so unlike
+    # the three deadlines above they are four variables and not two. The
+    # confirm half carries the POSTERN_CONFIRM_ prefix this file already
+    # records for `max_body_bytes` and `trusted_proxy_hops`, for the same
+    # reason: one env file setting a read path's burst must not move the
+    # write path's ceiling as a side effect.
+    #
+    # The floors differ between the pair, and neither is "reject zero by
+    # habit". A `pool_size` of 0 is SQLAlchemy's spelling of "unlimited", so
+    # its floor is 1; a `max_overflow` of 0 is a legitimate "no burst" and it
+    # is -1 that means unlimited, so its floor is 0. Measured against
+    # postgres:17-alpine on 2026-09-26: an engine at either off switch held
+    # 25 connections at once against a ceiling that read as one.
+    Bounded(
+        "POSTERN_DATABASE_POOL_SIZE",
+        "database_pool_size",
+        "api",
+        5,
+        ("0", "-1"),
+        ("1", "5", "20"),
+    ),
+    Bounded(
+        "POSTERN_DATABASE_MAX_OVERFLOW",
+        "database_max_overflow",
+        "api",
+        10,
+        ("-1", "-5"),
+        ("0", "10", "50"),
+    ),
     Bounded(
         "POSTERN_MAX_BODY_BYTES",
         "max_body_bytes",
@@ -254,6 +283,22 @@ BOUNDED: tuple[Bounded, ...] = (
         1.0,
         ("-1", "-0.5", "nan", "inf"),
         ("0", "0.0", "1.0", "30"),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_DATABASE_POOL_SIZE",
+        "database_pool_size",
+        "confirm",
+        5,
+        ("0", "-1"),
+        ("1", "5", "20"),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW",
+        "database_max_overflow",
+        "confirm",
+        5,
+        ("-1", "-5"),
+        ("0", "5", "50"),
     ),
     Bounded(
         "POSTERN_CONFIRM_RATE_LIMIT_DEVICE_AUTHORIZATION",

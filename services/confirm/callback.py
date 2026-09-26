@@ -253,24 +253,37 @@ async def approve_challenge(request: Request) -> JSONResponse:
     # `services/confirm/audit.py` defines for "this request gets a completion
     # row". Everything below this line writes one.
     #
-    # TWO POOLED CONNECTIONS PER APPROVAL, WHERE THERE USED TO BE ONE, and
-    # that doubling is a real cost rather than an implementation detail. Both
-    # audit rows open their own session from `db.sessionmaker()` while
-    # `_approve` below still holds the session that claimed the challenge, and
-    # they must: an audit row that shared the approval's transaction would be
+    # FOUR POOLED CHECKOUTS PER APPROVAL, ONE AT A TIME, and the second half
+    # of that sentence is what this comment got wrong until 2026-09-26. Both
+    # audit rows open their own session from `db.sessionmaker()`, and they
+    # must: an audit row that shared the approval's transaction would be
     # rolled back with it, which is the opposite of what an append-only,
-    # regulator-facing table is for, and the entry row specifically has to be
-    # durable BEFORE the backend request that the same transaction has not
+    # regulator-facing table is for, and the entry row has to be durable
+    # BEFORE the backend request that the approval's own transaction has not
     # committed yet.
     #
-    # `Database.__init__` sets no `pool_size` and no `max_overflow`
-    # (`postern_core.store.engine`), so this service silently inherits
-    # SQLAlchemy's 5 + 10 -- a number nobody in this repository chose. This
-    # change makes that unchosen ceiling bind at half the concurrency it used
-    # to. Sizing the pool is a separate decision with production consequences
-    # and is deliberately NOT made here; what belongs here is that the next
-    # person reading a `pool_timeout` in this service's logs finds the cause
-    # written down rather than inferring it.
+    # WHAT THAT DOES NOT COST IS A SECOND CONNECTION HELD AT THE SAME TIME,
+    # which this comment previously implied by saying the audit rows open
+    # their sessions "while `_approve` still holds" its own. It holds the
+    # SESSION and not the connection: `_approve` commits its claim before
+    # `BackendWriteClient` is built, and an `AsyncSession` hands its
+    # connection back at COMMIT rather than at close. Measured through this
+    # handler at ``pool_size=1, max_overflow=0``, a pool that cannot serve two
+    # checkouts at once: a whole approval completes, four checkouts, peak
+    # concurrency of one, 200 (``tests/test_pool_sizing.py``). The difference
+    # is not academic -- a request that held one connection while waiting for
+    # a second would exhaust any pool at ``pool_size + max_overflow``
+    # concurrent approvals, with every waiter blocking every other and no
+    # size removing it. DO NOT move that commit below the backend write; that
+    # single change introduces the overlap, and it reads like a safety
+    # improvement.
+    #
+    # THE CEILING IS NOW CHOSEN. Neither `pool_size` nor `max_overflow` was
+    # passed until 2026-09-26, so this service inherited SQLAlchemy's 5 + 10;
+    # it now takes 5 + 5 from `services/confirm/settings.py`, which says why
+    # it asks for less than the read path, and
+    # `dev-docs/decisions/0013-connection-pool-ceiling.md` carries the
+    # arithmetic an operator redoes against their own `max_connections`.
     audit = ApprovalAudit(
         db=db,
         call_id=str(uuid.uuid4()),

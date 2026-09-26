@@ -206,6 +206,28 @@ class ConfirmSettings:
     database_connect_timeout_seconds: float = 2.0
     database_command_timeout_seconds: float = 3.0
     database_pool_timeout_seconds: float = 1.0
+    # LOWER THAN THE READ PATH'S, and the asymmetry is the point. Both
+    # services hold connections against one database, so a connection this
+    # one keeps is one an API replica cannot have, and the two paths are
+    # driven by different things: `services/api` serves whatever an LLM
+    # decides to call, at a rate nobody here controls, while one row through
+    # this service is one person tapping approve on a phone after a push
+    # notification. Ten per replica is 10 simultaneous approvals inside a
+    # database operation, where each operation is one indexed statement.
+    #
+    # An approval costs FOUR checkouts and holds ONE at a time (claim, entry
+    # audit row, executed transition, completion audit row), and none of them
+    # spans the backend write, so a slow payments service cannot drain this
+    # pool -- `tests/test_pool_sizing.py` measures both halves of that.
+    #
+    # RAISE IT if approvals here are refused: the symptom is a 500 whose log
+    # carries `sqlalchemy.exc.TimeoutError` and "QueuePool limit of size ...
+    # reached", about 2 seconds after the request arrived, since the audit
+    # row that records the failure waits the same pool_timeout again.
+    # `dev-docs/decisions/0013-connection-pool-ceiling.md` holds the
+    # arithmetic to redo before raising it.
+    database_pool_size: int = 5
+    database_max_overflow: int = 5
     # Inbound app assertion (C-01, C-02). All three required; see the module
     # docstring for why there is no audience default and why this service,
     # unlike `services/api`, has no no-auth path at all.
@@ -447,6 +469,39 @@ class ConfirmSettings:
                     "It becomes SQLAlchemy's pool_timeout; zero sheds instead of queueing "
                     "when the pool is saturated, and a negative value does the same thing "
                     "while reading as 'wait forever'."
+                ),
+            ),
+            # PREFIXED, WHERE THE THREE DEADLINES ABOVE ARE NOT, and the rule
+            # behind that split is already in this file: a number both
+            # services want the same answer to is one variable
+            # (POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS), and a number they
+            # want different answers to gets the POSTERN_CONFIRM_ prefix, the
+            # way POSTERN_CONFIRM_MAX_BODY_BYTES sits beside
+            # POSTERN_MAX_BODY_BYTES at 64 KiB against 1 MiB. The ceiling is
+            # the second kind: this service defaults to 5 + 5 and the read
+            # path to 5 + 10. A shared name would have meant an operator
+            # raising the read path's burst silently raised this one too, in
+            # a deployment where both containers read one env file.
+            database_pool_size=int_from_env(
+                "POSTERN_CONFIRM_DATABASE_POOL_SIZE",
+                5,
+                minimum=1,
+                because=(
+                    "It becomes SQLAlchemy's pool_size, the connections this replica keeps "
+                    "open, and replicas x (pool_size + max_overflow) has to clear the "
+                    "database's max_connections. Zero is not a small pool but an unbounded "
+                    "one: measured, an engine at pool_size=0 held 25 connections at once."
+                ),
+            ),
+            database_max_overflow=int_from_env(
+                "POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW",
+                5,
+                minimum=0,
+                because=(
+                    "It becomes SQLAlchemy's max_overflow, the connections this replica may "
+                    "open above pool_size and close again on return. Zero is a legitimate "
+                    "setting and means no burst; -1 is the off switch, and an engine set to "
+                    "it held 25 connections at once against a ceiling that read as one."
                 ),
             ),
             app_assertion_jwks_uri=os.environ.get("POSTERN_APP_ASSERTION_JWKS_URI") or None,

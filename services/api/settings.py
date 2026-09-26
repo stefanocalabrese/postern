@@ -98,6 +98,28 @@ class Settings:
     database_connect_timeout_seconds: float = 2.0
     database_command_timeout_seconds: float = 3.0
     database_pool_timeout_seconds: float = 1.0
+    # THE CEILING, and it is a deployment-wide number wearing a per-service
+    # name. At most `pool_size + max_overflow` connections from this replica
+    # at once; multiply by replicas, add what `services/confirm` holds against
+    # the same database, and the total has to clear `max_connections`.
+    # `postern_core.store.engine`'s `Database` carries that arithmetic and
+    # `dev-docs/decisions/0013-connection-pool-ceiling.md` carries the
+    # derivation.
+    #
+    # 5 + 10 IS WHAT THIS SERVICE HAS BEEN RUNNING, inherited rather than
+    # chosen: neither argument was passed until 2026-09-26 and SQLAlchemy's
+    # own defaults are these two numbers. Keeping them makes this change a
+    # configurability change and not a capacity change, which are two things
+    # to find out about separately when a deployment starts refusing.
+    #
+    # What the ceiling buys is concurrent REQUESTS, not connections per
+    # request: one `tools/call` costs two to seven checkouts (one to five
+    # consent lookups, since a lookup that raises is never cached, plus an
+    # entry and a completion audit row) and holds one at a time. Fifteen is
+    # therefore fifteen tool calls simultaneously inside a database
+    # operation, not fifteen tool calls in flight.
+    database_pool_size: int = 5
+    database_max_overflow: int = 10
     # Task 12: `HeaderBodyValidation.max_body_bytes` is opt-in and unset by
     # default (Task 5) because nothing in that task's scope could pick a
     # number on a deployment's behalf. This deployment's tool surface is
@@ -322,6 +344,28 @@ class Settings:
                     "It becomes SQLAlchemy's pool_timeout; zero sheds instead of queueing "
                     "when the pool is saturated, and a negative value does the same thing "
                     "while reading as 'wait forever'."
+                ),
+            ),
+            database_pool_size=int_from_env(
+                "POSTERN_DATABASE_POOL_SIZE",
+                5,
+                minimum=1,
+                because=(
+                    "It becomes SQLAlchemy's pool_size, the connections this replica keeps "
+                    "open, and replicas x (pool_size + max_overflow) has to clear the "
+                    "database's max_connections. Zero is not a small pool but an unbounded "
+                    "one: measured, an engine at pool_size=0 held 25 connections at once."
+                ),
+            ),
+            database_max_overflow=int_from_env(
+                "POSTERN_DATABASE_MAX_OVERFLOW",
+                10,
+                minimum=0,
+                because=(
+                    "It becomes SQLAlchemy's max_overflow, the connections this replica may "
+                    "open above pool_size and close again on return. Zero is a legitimate "
+                    "setting and means no burst; -1 is the off switch, and an engine set to "
+                    "it held 25 connections at once against a ceiling that read as one."
                 ),
             ),
             # A FLOOR OF ONE BYTE, stated as what it is rather than dressed up.

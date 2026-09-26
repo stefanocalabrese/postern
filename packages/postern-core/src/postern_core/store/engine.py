@@ -36,8 +36,10 @@ class Database:
         connect_timeout_seconds: float = 2.0,
         command_timeout_seconds: float = 3.0,
         pool_timeout_seconds: float = 1.0,
+        pool_size: int = 5,
+        max_overflow: int = 10,
     ) -> None:
-        """Three deadlines, one per phase, defaulting to the production values.
+        """Three deadlines and one ceiling, defaulting to the production values.
 
         `connect_timeout_seconds` becomes asyncpg's `connect(timeout=)`: the
         TCP connect, the TLS handshake and the startup/authentication
@@ -63,6 +65,54 @@ class Database:
         `Settings.backend_pool_timeout_seconds`, because a checkout that
         cannot be served in a second is queueing behind saturation that
         another second will not clear.
+
+        `pool_size` and `max_overflow` are the ceiling on this process:
+        ``pool_size + max_overflow`` connections at most, of which the first
+        `pool_size` stay open between checkouts while the rest are opened on
+        demand and closed again on return. Neither was passed until
+        2026-09-26, so both services ran on SQLAlchemy's own 5 + 10, a number
+        nobody in this repository had chosen. The defaults here are still 5
+        and 10, so a `Database` built directly -- which is every construction
+        outside the two composition roots -- behaves as it always has. Each
+        service now passes its own, and
+        `dev-docs/decisions/0013-connection-pool-ceiling.md` carries the
+        derivation.
+
+        THE CONSTRAINT THIS FILE CANNOT SEE, and the reason these are
+        configurable rather than constants:
+
+            replicas x (pool_size + max_overflow)
+                <= max_connections - superuser_reserved - everything else
+
+        Both services connect to the same database, so both sides of that sum
+        count against one limit. Postgres' compiled-in `max_connections` is
+        100 and its `superuser_reserved_connections` is 3; a managed instance
+        picks its own, usually from instance memory. Nothing in this
+        repository knows the replica count -- there is no Terraform here --
+        so the operator owns the arithmetic and the decision record is where
+        they substitute their numbers.
+
+        WHAT ONE REQUEST COSTS, which is the other term and is not one
+        connection. An approval takes FOUR checkouts in sequence and holds ONE
+        at a time: the transaction that reads and claims the challenge, the
+        entry audit row, the ``approved`` -> ``executed`` transition, the
+        completion audit row. So the pool bounds concurrent REQUESTS, not
+        connections per request. The property under that is that an
+        `AsyncSession` hands its connection back at COMMIT and not at close,
+        which is why `services/confirm/callback.py`'s commit before the
+        backend write keeps the audit row's own session from overlapping the
+        handler's; ``tests/test_pool_sizing.py`` drives a whole approval
+        through ``pool_size=1, max_overflow=0`` so that a refactor which
+        nested them fails instead of merely halving the concurrency at which
+        this service stops.
+
+        NEITHER VALUE IS BOUNDED HERE, matching the three deadlines above:
+        the floor lives in each service's ``from_env``, where the refusal can
+        name the environment variable an operator would have to edit. Both
+        have a value that reads as "small" and means "unlimited", measured
+        against postgres:17-alpine on 2026-09-26: at ``pool_size=0`` and at
+        ``max_overflow=-1`` an engine held 25 connections at once against a
+        ceiling that read as one.
 
         Passing the values in the URL query string instead of `connect_args`
         does not work and was tried: SQLAlchemy hands asyncpg the string and
@@ -133,15 +183,25 @@ class Database:
         the numbers above; one that is silently dropping every packet
         including a fresh connection's is bounded by the kernel, not by this.
         """
-        # `pool_timeout` is a QueuePool argument. `create_async_engine`
-        # consumes it only if the pool class in use accepts it, and rejects
+        # All three of these are QueuePool arguments. `create_async_engine`
+        # consumes one only if the pool class in use accepts it, and rejects
         # the whole call otherwise: measured against SQLAlchemy 2.0.52,
-        # passing it with `poolclass=NullPool` raises `TypeError: Invalid
-        # argument(s) 'pool_timeout' sent to create_engine()`. NullPool opens
-        # a connection per checkout and queues nothing, so there is no wait
-        # for the value to bound there -- the `null_pool=True` path (tests)
-        # is left with connect and command timeouts only.
-        pool_kwargs: dict[str, Any] = {} if null_pool else {"pool_timeout": pool_timeout_seconds}
+        # passing any of them with `poolclass=NullPool` raises `TypeError:
+        # Invalid argument(s) '...' sent to create_engine()`. NullPool opens a
+        # connection per checkout, queues nothing and keeps nothing, so there
+        # is neither a wait to bound nor a ceiling to set there -- the
+        # `null_pool=True` path (tests) is left with connect and command
+        # timeouts only, and is therefore bounded by Postgres'
+        # `max_connections` rather than by anything here.
+        pool_kwargs: dict[str, Any] = (
+            {}
+            if null_pool
+            else {
+                "pool_timeout": pool_timeout_seconds,
+                "pool_size": pool_size,
+                "max_overflow": max_overflow,
+            }
+        )
         # `poolclass=None` (the `null_pool=False` branch) was checked against
         # omitting the keyword entirely: both produce the same
         # `AsyncAdaptedQueuePool` for an asyncpg URL, because `None` is
