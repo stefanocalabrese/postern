@@ -1,6 +1,11 @@
-# Never let secrets, VCS metadata or test material into the build context;
-# both the `api` and `confirm` targets do `COPY . .` in the builder stage,
-# so anything not excluded here is a candidate for landing in the image.
+# Never let secrets, VCS metadata or test material into the build context.
+# The builder stage does `COPY . .`, so anything not excluded here reaches
+# that layer. Since 26 September 2026 the runtime stages copy named paths
+# rather than the whole tree, so this file is no longer the last thing
+# deciding what ships -- but it is still the thing deciding what is built
+# with and what is cached, and the deploy workflow exports build cache with
+# `cache-to: ...,mode=max`, which pushes intermediate builder layers to ECR.
+# A file that reaches no shipped image can still leave the machine.
 #
 # Pattern semantics, measured 25 September 2026 against Docker 29.8.0 and
 # not assumed: a `.dockerignore` pattern is matched against the whole path
@@ -67,6 +72,25 @@ handoff-for-local.md*
 # either shipped image.
 stub/
 
+# Developer-machine state, all of it gitignored, so a CI checkout never has
+# any of it and its absence from this list was invisible there. All three
+# were measured inside the built `api` image on 26 September 2026, back when
+# the runtime stage copied the tree wholesale:
+#
+#   - `.grimp_cache/` is import-linter's cache, and it holds this project's
+#     complete import graph: every `services.confirm` module named, with the
+#     statement that reaches each one. That is a map of the write path handed
+#     to whoever lands in the read container, and it survived every source
+#     exclusion because it is not source.
+#   - `.remember/` is session working state, mode 700 on the host. `find`
+#     inside the image reported it as "Permission denied" rather than absent,
+#     which is exactly how it stayed unnoticed.
+#   - `nonexistent/` is a cache tree some tool wrote after resolving an empty
+#     HOME, ~1 MB of `Library/Caches/...` with no relationship to this project.
+.grimp_cache/
+.remember/
+nonexistent/
+
 # Editor/agent metadata, never relevant to a production image. This also
 # covers `.claude/worktrees/`, where concurrent sessions keep full second
 # copies of this repository.
@@ -88,10 +112,11 @@ logos/
 # CLAUDE.md/README.md carry more of this project's internal security
 # reasoning than a shipped container image should hold, even though none of
 # it is a credential. `pyproject.toml` and `uv.lock` are excluded from this
-# list on purpose -- `uv sync` inside the image needs both. `migrations/`
-# and `alembic.ini` are deliberately kept too: `alembic upgrade head` is
-# run from this image as a one-off task, so dropping them would break a
-# deploy path rather than harden one.
+# list on purpose -- the builder's two `uv sync` runs need both, though
+# neither is copied into a runtime stage any more. `migrations/` and
+# `alembic.ini` are kept and ARE copied into both runtime stages: `alembic
+# upgrade head` is run from these images as a one-off task, so dropping
+# them would break a deploy path rather than harden one.
 CLAUDE.md
 README.md
 Makefile
