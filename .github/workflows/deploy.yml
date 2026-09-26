@@ -139,17 +139,30 @@ jobs:
           platforms: linux/amd64,linux/arm64
 
       # ── SBOM generation (syft → SPDX) ───────────────────────────
+      # The SBOM below and the Trivy scan after it address the image by
+      # digest, not by the `:${{ github.sha }}` tag the push step also
+      # applied. A tag is a mutable pointer, so a tag-addressed scan and SBOM
+      # describe whatever it resolved to when they ran, while cosign signs,
+      # and ECS deploys, the digest. A second dispatch re-pushing the same tag
+      # is enough to separate them; nobody has to be malicious for the
+      # artifact you scanned to stop being the artifact you ship.
+      #
+      # `steps.push-*.outputs.digest` is buildkit's `containerimage.digest`
+      # returned verbatim by the action's `resolveDigest`, and that value
+      # already carries its `sha256:` prefix, so the form is `name@<digest>`
+      # with no prefix written here. Both push steps run above all four
+      # consumers, so neither expression can resolve empty.
       - name: Generate SBOM — api
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
         with:
-          image: ${{ env.REGISTRY }}/postern-api:${{ github.sha }}
+          image: ${{ env.REGISTRY }}/postern-api@${{ steps.push-api.outputs.digest }}
           output-file: sbom-api.spdx.json
           format: spdx-json
 
       - name: Generate SBOM — confirm
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
         with:
-          image: ${{ env.REGISTRY }}/postern-confirm:${{ github.sha }}
+          image: ${{ env.REGISTRY }}/postern-confirm@${{ steps.push-confirm.outputs.digest }}
           output-file: sbom-confirm.spdx.json
           format: spdx-json
 
@@ -181,7 +194,7 @@ jobs:
       - name: Run Trivy scan — api
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/postern-api:${{ github.sha }}
+          image-ref: ${{ env.REGISTRY }}/postern-api@${{ steps.push-api.outputs.digest }}
           format: table
           severity: HIGH,CRITICAL
           exit-code: "1"
@@ -189,7 +202,7 @@ jobs:
       - name: Run Trivy scan — confirm
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/postern-confirm:${{ github.sha }}
+          image-ref: ${{ env.REGISTRY }}/postern-confirm@${{ steps.push-confirm.outputs.digest }}
           format: table
           severity: HIGH,CRITICAL
           exit-code: "1"

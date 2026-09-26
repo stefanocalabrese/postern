@@ -128,6 +128,35 @@ def _run_scripts_containing(doc: dict[Any, Any], needle: str) -> list[str]:
     ]
 
 
+# One of this repository's two images, followed by the character that decides
+# how it is addressed: `@` is a digest, `:` is a tag.
+_IMAGE_REF_RE = re.compile(r"postern-(?:api|confirm)(?P<sep>[:@])")
+
+# The three step inputs whose whole job is to name a tag. `tags:` is what the
+# push step applies, and the two cache refs address a buildcache manifest that
+# has no digest to address it by. Every other mention of an image is a
+# consumer of one and owes a digest.
+_TAG_ADDRESSED_KEYS = frozenset({"tags", "cache-from", "cache-to"})
+
+# `${{ steps.<id>.outputs.digest }}`, the only digest source inside `build`.
+_DIGEST_EXPR_RE = re.compile(r"steps\.([A-Za-z0-9_-]+)\.outputs\.digest")
+
+
+def _step_scalars(step: dict[Any, Any]) -> list[tuple[str, str]]:
+    """Return every string a step carries, paired with the key that holds it.
+
+    One level of nesting is enough: `with:` and `env:` are mappings of
+    scalars, and `run:` is a scalar itself.
+    """
+    out: list[tuple[str, str]] = []
+    for key, value in step.items():
+        if isinstance(value, str):
+            out.append((str(key), value))
+        elif isinstance(value, dict):
+            out.extend((str(k), v) for k, v in value.items() if isinstance(v, str))
+    return out
+
+
 def _flag_value(script: str, flag: str) -> str | None:
     """Return the value a shell script passes to ``--flag=value``.
 
@@ -426,6 +455,133 @@ def test_workflow_blocks_on_high_severity() -> None:
             f"Trivy step {step.get('name')!r} must scan HIGH and CRITICAL "
             f"(got {with_block.get('severity')!r})."
         )
+
+
+# ── Digest addressing ────────────────────────────────────────────
+
+
+def test_no_step_addresses_an_image_by_tag() -> None:
+    """Nothing consumes one of these images through a mutable pointer.
+
+    Stated over the whole document rather than over the four steps that were
+    wrong, so a step added later with a `:tag` reference fails here without
+    anyone remembering to extend a list. Until 26 September 2026 both syft
+    steps and both Trivy steps read `postern-<svc>:${{ github.sha }}` while
+    cosign signed and ECS deployed `postern-<svc>@<digest>`, so the SBOM
+    published and the scan gated on described an artifact that nothing
+    downstream was pinned to.
+
+    A tag is a pointer. Re-pushing it, which a second dispatch on the same
+    commit does, moves every tag-addressed reader onto a different image
+    while the signature keeps naming the old one.
+    """
+    doc = _parse(_WORKFLOW_PATH)
+
+    offenders: list[str] = []
+    digest_refs = 0
+    for job, step in _steps(doc):
+        label = str(step.get("name") or step.get("uses") or "<unnamed step>")
+        for key, value in _step_scalars(step):
+            if key in _TAG_ADDRESSED_KEYS:
+                continue
+            for match in _IMAGE_REF_RE.finditer(value):
+                if match.group("sep") == "@":
+                    digest_refs += 1
+                    continue
+                excerpt = value[match.start() : match.end() + 40].splitlines()[0]
+                offenders.append(f"{job} / {label} / {key}: {excerpt}")
+
+    assert not offenders, (
+        "Every consumer of these images must address it by digest, not by tag:\n  "
+        + "\n  ".join(offenders)
+        + "\nUse `name@${{ steps.push-<svc>.outputs.digest }}` inside `build`, or "
+        "`name@${{ needs.build.outputs.<svc>_digest }}` inside `deploy`."
+    )
+    assert digest_refs, (
+        "No digest-addressed image reference found at all. Either the images "
+        "were renamed and this test now checks nothing, or every reference "
+        "was removed."
+    )
+
+
+def test_sbom_scan_and_signature_name_the_same_digest() -> None:
+    """For each image, syft, Trivy and cosign resolve one identical digest.
+
+    Addressing all three by digest is not enough on its own: three different
+    digest expressions would still let them describe three different images.
+    They must read the same push step's output.
+    """
+    doc = _parse(_WORKFLOW_PATH)
+
+    for service in ("api", "confirm"):
+        image = f"postern-{service}"
+        expression = f"steps.push-{service}.outputs.digest"
+
+        sboms = [
+            str(step.get("with", {}).get("image", ""))
+            for step in _steps_using(doc, "anchore/sbom-action")
+            if image in str(step.get("with", {}).get("image", ""))
+        ]
+        scans = [
+            str(step.get("with", {}).get("image-ref", ""))
+            for step in _steps_using(doc, "aquasecurity/trivy-action")
+            if image in str(step.get("with", {}).get("image-ref", ""))
+        ]
+        signatures = [
+            script for script in _run_scripts_containing(doc, "cosign sign") if image in script
+        ]
+
+        for what, references in (("SBOM", sboms), ("Trivy scan", scans), ("signature", signatures)):
+            assert references, f"No {what} step covers {image}."
+            for reference in references:
+                assert expression in reference, (
+                    f"The {what} for {image} does not read {expression!r}, so the "
+                    f"artifact it describes is not provably the one the other two "
+                    f"steps cover. Got: {reference.strip()!r}"
+                )
+
+
+def test_every_digest_reference_follows_the_push_step_that_produces_it() -> None:
+    """A `steps.<id>.outputs.digest` reference sits after the step it names.
+
+    Referencing a step that has not run yet is not an error in Actions, it is
+    an empty string, which turns `name@` into a malformed reference and would
+    surface as a registry error rather than as the ordering bug it is.
+    """
+    doc = _parse(_WORKFLOW_PATH)
+
+    for job_name, job in doc["jobs"].items():
+        steps = job.get("steps", [])
+        positions = {str(step["id"]): index for index, step in enumerate(steps) if "id" in step}
+        for index, step in enumerate(steps):
+            label = str(step.get("name") or step.get("uses") or f"step {index}")
+            for _, value in _step_scalars(step):
+                for step_id in _DIGEST_EXPR_RE.findall(value):
+                    assert step_id in positions, (
+                        f"{job_name} / {label} reads steps.{step_id}.outputs.digest, "
+                        f"but no step in that job carries id {step_id!r}. The "
+                        "expression resolves to an empty string."
+                    )
+                    assert positions[step_id] < index, (
+                        f"{job_name} / {label} reads steps.{step_id}.outputs.digest "
+                        "before that step runs, so the digest is empty there."
+                    )
+
+
+def test_no_digest_reference_doubles_the_sha256_prefix() -> None:
+    """The workflow writes `name@<expr>`, never `name@sha256:<expr>`.
+
+    `docker/build-push-action` sets its `digest` output from buildkit's
+    `containerimage.digest`, which already reads `sha256:<64 hex>`. Writing
+    the prefix again produces `name@sha256:sha256:...`, which no registry
+    resolves.
+    """
+    content = _read_workflow()
+    assert "@sha256:${{" not in content, (
+        "A digest expression is prefixed with `sha256:` in the workflow. The "
+        "`digest` output carries that prefix already, so this yields "
+        "`name@sha256:sha256:...`."
+    )
 
 
 # ── Action pinning ───────────────────────────────────────────────
