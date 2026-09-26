@@ -210,7 +210,14 @@ class TestDeviceCodeGeneration:
             code = _generate_user_code()
             assert len(code) == 6
             assert code.isalnum()
-            assert code.isupper()
+            # NOT `code.isupper()`, which is False for a code that happens to
+            # be all digits because such a string has no cased characters at
+            # all. The alphabet below is 8 digits of 32, so P(all six digits)
+            # is 1/4096 and this loop draws 20: a 0.49% failure per run, about
+            # one `make ci` in 205. Observed on 26 September 2026 against
+            # '849463'. `code == code.upper()` is the assertion that actually
+            # means "carries no lowercase" for every string.
+            assert code == code.upper()
             # No ambiguous characters (0, O, 1, I, l).
             assert set(code) <= set("23456789ABCDEFGHJKLMNPQRSTUVWXYZ")
 
