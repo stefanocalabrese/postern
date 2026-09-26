@@ -11,8 +11,11 @@ JWT carries a ``jti`` that the revocation list checks.  Three scopes:
 - **Per-client kill switch**: revoke every session from one client (all customers).
 
 ZT-1 — Continuous authorization: ``ReadTokenMinter`` reads this call's
-revocation decision and the jti replay cache on every mint. A revoked session
-dies at mint, not at next refresh.
+revocation decision on every mint. A revoked session dies at mint, not at
+next refresh. The ``JtiReplayCache`` it also accepts is not a second half of
+that sentence and never was: it sees only jtis this process minted, so it
+detects a ``uuid4`` collision and not a replayed token
+(``dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md``).
 
 The scopes are stored in ``RevocationStoreBase`` (Redis-backed in production
 via ``POSTERN_REDIS_URL``), written by ``postern_core.auth.revoke_cli``, and

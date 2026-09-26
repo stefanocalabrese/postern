@@ -64,19 +64,25 @@ from tests.test_device_grant import AUDIENCE, ISSUER
 #: The read path's refusal, verbatim. Reproduced here as one literal so that a
 #: change to it fails this file rather than passing quietly.
 #:
-#: CORRECTED ON 2026-09-26, and the correction is the point. The middle clause
-#: used to read "revocation lists and JTI replay protection remain in-process
-#: per replica regardless of this setting", which was true when it was written
-#: and stopped being true two days later, when `create_revocation_store` gained
-#: a Redis backend. The JTI half was and remains exact. A message that tells an
-#: operator a control is per-replica when it is not is worse than no message:
-#: it argues them out of setting the variable that would have fixed it.
+#: CORRECTED TWICE, AND THE SECOND CORRECTION IS THE INTERESTING ONE. The
+#: middle clause first read "revocation lists and JTI replay protection remain
+#: in-process per replica regardless of this setting", which was true when it
+#: was written and stopped being true two days later, when
+#: `create_revocation_store` gained a Redis backend. The replacement fixed the
+#: revocation half and kept the jti half, which was accurate about the storage
+#: and wrong about what was being stored: it told an operator they were losing
+#: replay protection to a missing backend, when `JtiReplayCache` never carried
+#: replay protection in any backend. See
+#: `dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md`.
 API_MESSAGE = (
     "POSTERN_REQUIRE_REDIS is set but POSTERN_REDIS_URL is not. "
     "This guard checks only that POSTERN_REDIS_URL is configured. It backs "
     "the session store and the ZT-7 revocation list, which are then shared "
-    "across replicas; the JTI replay cache has no shared backend at all and "
-    "stays per replica, and lost on restart, whatever this is set to."
+    "across replicas. The jti cache stays per replica and should: it holds "
+    "only jtis this process minted itself, so a hit there means uuid4 "
+    "repeated itself, not that a token was replayed. Replay is detected by "
+    "the token's recipient, which is the gateway and the domain services, "
+    "and no backend configured here changes that."
 )
 
 #: The sentence both refusals open with, which is the shared half.

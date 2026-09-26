@@ -389,23 +389,32 @@ def create_app(
     # read path's own consequence and is passed in rather than shared, because
     # the two services lose different things.
     #
-    # THE MIDDLE CLAUSE WAS FALSE AND WAS CORRECTED ON 2026-09-26. It read
-    # "revocation lists and JTI replay protection remain in-process per
+    # THE MIDDLE CLAUSE HAS BEEN WRONG TWICE, IN TWO DIFFERENT WAYS. It first
+    # read "revocation lists and JTI replay protection remain in-process per
     # replica regardless of this setting", which was true on 2026-09-21 when
     # it was written and stopped being true on 2026-09-23, when
-    # `create_revocation_store` above gained a Redis backend. A message that
-    # tells an operator a control is per-replica when it is not is worse than
-    # no message: it argues them out of setting the variable that would have
-    # fixed it. The JTI half was exact then and is exact now -- `JtiReplayCache`
-    # has no shared backend anywhere in this repository, so it is the one
-    # thing here that POSTERN_REDIS_URL genuinely cannot help.
+    # `create_revocation_store` above gained a Redis backend. The 2026-09-26
+    # correction fixed the revocation half and kept the jti half, which was
+    # right about the storage and wrong about what was stored: "the JTI replay
+    # cache has no shared backend at all" reads as a control an operator is
+    # losing, and there is no such control to lose. `JtiReplayCache` sees only
+    # jtis this process minted, so it cannot observe a replay in any backend.
+    # Naming a per-replica limitation that costs the operator nothing is the
+    # same failure as the first version in the other direction: it spends
+    # their attention on a line that needs none.
+    # `dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md`
+    # carries the argument; `tests/test_require_redis_guard.py`'s
+    # `API_MESSAGE` pins the text.
     enforce_redis_requirement(
         consequence=(
             "This guard checks only that POSTERN_REDIS_URL is configured. It "
             "backs the session store and the ZT-7 revocation list, which are "
-            "then shared across replicas; the JTI replay cache has no shared "
-            "backend at all and stays per replica, and lost on restart, "
-            "whatever this is set to."
+            "then shared across replicas. The jti cache stays per replica and "
+            "should: it holds only jtis this process minted itself, so a hit "
+            "there means uuid4 repeated itself, not that a token was "
+            "replayed. Replay is detected by the token's recipient, which is "
+            "the gateway and the domain services, and no backend configured "
+            "here changes that."
         )
     )
 

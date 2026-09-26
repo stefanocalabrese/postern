@@ -7,8 +7,14 @@ key, a write token from here would carry the wrong scope, and Istio matches on
 claims as well as on the signature.
 
 ZT-1 — Continuous authorization: every mint consults the revocation decision
-for this call and the jti replay cache before issuing a token. A revoked
-session dies at mint, not at next refresh (ZT-1 acceptance criterion).
+for this call before issuing a token. A revoked session dies at mint, not at
+next refresh (ZT-1 acceptance criterion). That is the control on this path.
+
+THE JTI CACHE BELOW IS NOT A SECOND ONE, WHATEVER ITS NAME SAYS. It runs
+after the token is signed, on a jti this same call generated, and there is
+no other writer. Read `JtiReplayCache` and
+`dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md` before
+citing it as replay protection anywhere.
 
 WHAT CHANGED, AND WHY IT HAD TO. Until this commit the check here built its
 own claims dict as ``{"sub": customer.value, "client_id": audience}``, so
@@ -54,14 +60,38 @@ READ_SCOPES = {
 
 
 class JtiReplayCache:
-    """In-memory jti replay cache covering the token lifetime.
+    """A collision detector on this process's own ``uuid4``, misnamed since 2026-09-20.
+
+    THE NAME PROMISES A CONTROL THIS CLASS CANNOT HOLD. Its only writer is
+    `ReadTokenMinter.__call__`, which calls `add` on a jti that
+    `InternalTokenMinter.mint` produced from ``uuid.uuid4()`` two statements
+    earlier. Nothing in this repository ever hands it a jti that arrived from
+    outside, so the duplicate it raises on is a uuid4 that repeated inside
+    one process within one token lifetime: a failure of the RNG, not a
+    replayed token. `dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md`
+    works through why that is the only reachable case and why the class is
+    kept anyway.
+
+    Replay is a property the RECIPIENT of a token observes, by remembering
+    jtis it has accepted. The recipient of these tokens is the Istio gateway
+    and the operator's domain services, in repositories that are not this
+    one. A mint-side cache cannot substitute for that at any scale, because
+    it never sees the event.
 
     Tracks every ``jti`` minted since startup and evicts entries older than
-    the token lifetime. A duplicate jti within the window raises so the
-    caller can reject the request (ZT-1, A10).
+    the token lifetime, so the window it can detect a collision in is that
+    lifetime and not longer.
 
     Thread-safe enough for FastMCP's in-process test client (single-threaded
-    async). Not safe across processes — that requires a shared store.
+    async). Per process, and deliberately: a shared backend would let two
+    replicas notice a uuid4 they both generated, which is the same non-control
+    at higher cost on the hot path of every backend call. The RNG failure that
+    would make that reachable, a cloned VM or container resuming a duplicated
+    entropy state, already surfaces in `postern_core.auth.device_codes`, where
+    `_generate_device_code` draws ``secrets.token_urlsafe(32)`` into a single-use
+    store that is Redis-backed because correctness needs it to be. A duplicate
+    there is a duplicate credential, which is worth catching; a duplicate here
+    is a duplicate log line.
     """
 
     def __init__(self, *, max_age_seconds: float = 60.0) -> None:
@@ -93,8 +123,10 @@ class JtiReplayCache:
 class ReadTokenMinter:
     """Wraps ``InternalTokenMinter`` with ZT-1 continuous authorization.
 
-    Every call reads this request's revocation decision and the jti replay
-    cache before minting. A revoked session dies at mint, not at next refresh.
+    Every call reads this request's revocation decision before minting, so a
+    revoked session dies at mint and not at next refresh. The jti cache, when
+    one is supplied, runs after the signature and is not part of that: see
+    `JtiReplayCache` for what it does and does not detect.
 
     Args:
         minter: The underlying ``InternalTokenMinter`` that signs tokens.
@@ -106,8 +138,14 @@ class ReadTokenMinter:
             ``postern_core.auth.revocation.unchecked_revocation`` explicitly;
             defaulting to that instead is how a control stays inert while its
             tests stay green.
-        jti_cache: Optional ``JtiReplayCache`` for A10 (token replay prevention).
-            When provided, duplicate jtis within the token lifetime raise.
+        jti_cache: Optional ``JtiReplayCache``. When provided, a jti this
+            process already minted within the token lifetime raises. That is
+            a uuid4 collision, not a replay, and the class docstring says why
+            the distinction is the whole of it. Optional because nothing
+            depends on it: every caller in this repository except
+            `services/api/main.py`'s `create_app` leaves it ``None``, and the
+            device grant in `services/confirm/device_auth.py` mints from a
+            bare ``InternalTokenMinter`` with no cache reachable at all.
     """
 
     def __init__(
@@ -135,11 +173,22 @@ class ReadTokenMinter:
 
         token = self._minter.mint(subject=customer, audience=audience, scope=scope)
 
-        # ZT-1 A10: check jti replay cache after mint
+        # The jti collision check, after the signature because that is the
+        # only place the jti exists as a value this object can see. Not a
+        # replay check: `JtiReplayCache` carries why, and this ordering is
+        # itself the proof, since a token that has just been signed here has
+        # by definition not been anywhere to be captured from.
         if self._jti_cache is not None:
-            # Extract jti from the token to check for replays.
-            # We decode just enough to get the jti — the signature is already
-            # verified by InternalTokenMinter's caller (minter_probe).
+            # A FULL VERIFYING DECODE, PER BACKEND CALL, TO RECOVER A VALUE
+            # `mint` HELD. `import_key_set` reparses the JWKS and `decode`
+            # runs an RSA verification, on the hot path of every read a
+            # customer makes. The comment here used to justify that with "the
+            # signature is already verified by InternalTokenMinter's caller
+            # (minter_probe)", which describes a startup probe and not this
+            # call, and which argues for skipping the verification rather
+            # than for doing it. Widening `mint` to return its jti would
+            # remove both the decode and the reason to explain it; that is a
+            # signature change this task did not own.
             from joserfc import jwt as _jwt
             from joserfc.jwk import KeySet as _KeySet
 

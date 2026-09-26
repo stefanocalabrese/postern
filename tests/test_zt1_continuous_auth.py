@@ -185,11 +185,27 @@ def test_a_minter_with_no_published_decision_refuses(source: GeneratedKeySource)
         default_minter(CUST_A, "accounts.svc")
 
 
-# --- jti replay cache (A10) ---
+# --- the jti cache, which is not the A10 control it was filed as ---
+#
+# THESE FOUR CASES ARE WHAT SETTLED IT, and the first one settled it against
+# its own name. It was called `test_jti_cache_blocks_duplicate_token` and its
+# body already said, in a comment, that nothing is blocked; the name is what
+# a reader greps and the name was the false half. A green test whose title
+# claims replay protection is how `dev-docs/decisions/0010-dpop-sender-constraint.md`
+# came to list this cache as a compensating control for a stolen token.
+# `dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md` is the
+# correction.
 
 
-def test_jti_cache_blocks_duplicate_token(source: GeneratedKeySource) -> None:
-    """Minting the same token twice raises on the second call."""
+def test_the_cache_never_fires_on_the_mint_path_it_guards(
+    source: GeneratedKeySource,
+) -> None:
+    """Two mints of the identical request produce two tokens and no raise.
+
+    Which is the whole finding. `InternalTokenMinter.mint` draws a fresh
+    ``uuid.uuid4()`` per call, so the cache's only writer can only ever feed
+    it values it has not seen. Nothing a caller does reaches the raise.
+    """
     cache = JtiReplayCache(max_age_seconds=_LIFETIME.total_seconds())
     minter = ReadTokenMinter(
         InternalTokenMinter(issuer=ISS, key_source=source),
@@ -197,20 +213,22 @@ def test_jti_cache_blocks_duplicate_token(source: GeneratedKeySource) -> None:
         jti_cache=cache,
     )
 
-    # First mint succeeds
     token1 = minter(CUST_A, "accounts.svc")
-
-    # Second mint with same customer+audience generates a new jti (UUID),
-    # so it does NOT raise — each mint creates a unique token.
-    # The replay cache catches *actual* replays (same jti), not just
-    # repeated calls. This test verifies the cache is wired but doesn't
-    # trigger on normal usage.
     token2 = minter(CUST_A, "accounts.svc")
-    assert token1 != token2  # different jtis
+
+    assert token1 != token2
+    assert cache.size == 2
 
 
-def test_jti_cache_detects_manual_replay(source: GeneratedKeySource) -> None:
-    """Manually adding the same jti twice raises."""
+def test_a_repeated_jti_raises_and_only_a_collision_could_repeat_one(
+    source: GeneratedKeySource,
+) -> None:
+    """The raise exists and is reachable only by writing the string twice.
+
+    No production path can. This is the container's own behaviour under a
+    hand-built input, which is worth pinning and is not evidence that a
+    captured token gets stopped anywhere.
+    """
     cache = JtiReplayCache(max_age_seconds=60.0)
 
     cache.add("uuid-1")
@@ -243,8 +261,14 @@ def test_jti_cache_clear_removes_all(source: GeneratedKeySource) -> None:
 
 
 def test_revocation_checked_before_replay_cache(source: GeneratedKeySource) -> None:
-    """Revocation check happens before the jti cache, so a revoked
-    customer is rejected even if their previous token's jti is still in cache."""
+    """Revocation runs first, so a revoked customer gets `RevokedError`.
+
+    The ordering is what matters and it is the ordering the real control
+    wants: nothing is signed for a revoked customer. The cache's position
+    after the signature is a consequence of it needing a signed token to read
+    a jti out of, and `JtiReplayCache` carries why that placement means it
+    cannot see a replay.
+    """
     rev = RevocationList()
     cache = JtiReplayCache(max_age_seconds=_LIFETIME.total_seconds())
     minter = ReadTokenMinter(

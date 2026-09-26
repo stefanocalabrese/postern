@@ -127,10 +127,20 @@ The `ReadTokenMinter` wraps `InternalTokenMinter` and adds continuous authorizat
 ```python
 read_minter = ReadTokenMinter(
     InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source),
-    revocation_list=revocation_list,   # O(1) set lookups
-    jti_cache=jti_cache,               # In-memory replay cache (60s window)
+    jti_cache=jti_cache,   # uuid4 collision detector, not a replay check
 )
 ```
+
+Revocation is not an argument here. The revocation store is consulted once per
+request by the middleware, which holds the validated token and therefore the
+real `client_id`, and the minter reads that request's answer.
+
+**The `jti` cache is not replay protection, whatever its class name says.** It
+holds only the `jti` values this process generated while minting, so a hit
+means `uuid.uuid4()` repeated itself. A replayed token is recognised by
+whoever receives it, which for these tokens is your gateway and your domain
+services. If you want replay detection, that is where to build it. See
+`dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md`.
 
 `READ_SCOPES` maps audiences to OAuth scopes. The `payments.svc` audience is
 **deliberately absent**, read tokens cannot reach write endpoints.
