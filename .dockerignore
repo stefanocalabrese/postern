@@ -114,9 +114,13 @@ logos/
 # it is a credential. `pyproject.toml` and `uv.lock` are excluded from this
 # list on purpose -- the builder's two `uv sync` runs need both, though
 # neither is copied into a runtime stage any more. `migrations/` and
-# `alembic.ini` are kept and ARE copied into both runtime stages: `alembic
-# upgrade head` is run from these images as a one-off task, so dropping
-# them would break a deploy path rather than harden one.
+# `alembic.ini` are kept for the same reason and copied into exactly one
+# stage, `migrate`, which is the image `alembic upgrade head` runs from.
+# Excluding them here would break that deploy path rather than harden one;
+# copying them into the two serving stages, which is what happened until
+# 26 September 2026, put the migration runner in the same container as a
+# database URL and let an RCE there reverse `f1860c110112` and delete the
+# audit rows it had just written.
 CLAUDE.md
 README.md
 Makefile

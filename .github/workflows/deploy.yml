@@ -77,6 +77,7 @@ jobs:
     outputs:
       api_digest: ${{ steps.push-api.outputs.digest }}
       confirm_digest: ${{ steps.push-confirm.outputs.digest }}
+      migrate_digest: ${{ steps.push-migrate.outputs.digest }}
     steps:
       # Every action below is pinned to a full commit SHA, not a major tag.
       # This job assumes an IAM role and holds ECR push credentials, so a
@@ -136,6 +137,32 @@ jobs:
             ${{ env.REGISTRY }}/postern-confirm:${{ github.sha }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/postern-confirm:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/postern-confirm:buildcache,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      # The migration runner. It ships as its own image because the serving
+      # images must not carry `alembic` or the revision scripts: the api
+      # service holds a database URL, and `f1860c110112` -- the revision that
+      # makes `audit_log` refuse UPDATE, DELETE and TRUNCATE -- has a working
+      # `downgrade`. Scripts plus runner plus credential in one container is
+      # an RCE that can erase its own audit trail.
+      #
+      # OPERATOR: this needs an ECR repository named `postern-migrate`, beside
+      # `postern-api` and `postern-confirm`, with the same lifecycle rules. It
+      # does not exist yet, and this step is the first thing that will fail
+      # without it. It also needs an ECS task definition run as a one-off task
+      # rather than a service, and it is the only one of the three that should
+      # be given a database role with DDL rights.
+      - name: Build and push migrate image
+        id: push-migrate
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          push: true
+          target: migrate
+          tags: |
+            ${{ env.REGISTRY }}/postern-migrate:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/postern-migrate:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/postern-migrate:buildcache,mode=max
           platforms: linux/amd64,linux/arm64
 
       # ── SBOM generation (syft → SPDX) ───────────────────────────
@@ -224,6 +251,24 @@ jobs:
           output-file: sbom-confirm-linux-arm64.spdx.json
           format: spdx-json
 
+      - name: Generate SBOM — migrate (linux/amd64)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        env:
+          SYFT_PLATFORM: linux/amd64
+        with:
+          image: ${{ env.REGISTRY }}/postern-migrate@${{ steps.push-migrate.outputs.digest }}
+          output-file: sbom-migrate-linux-amd64.spdx.json
+          format: spdx-json
+
+      - name: Generate SBOM — migrate (linux/arm64)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        env:
+          SYFT_PLATFORM: linux/arm64
+        with:
+          image: ${{ env.REGISTRY }}/postern-migrate@${{ steps.push-migrate.outputs.digest }}
+          output-file: sbom-migrate-linux-arm64.spdx.json
+          format: spdx-json
+
       # ── Vulnerability scanning (Trivy) ──────────────────────────
       # The two steps that stood here carried `aquasecurity/trivy-action@v0`
       # until 25 September 2026 -- they are four now, one per built platform --
@@ -296,6 +341,26 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
 
+      - name: Run Trivy scan — migrate (linux/amd64)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ env.REGISTRY }}/postern-migrate@${{ steps.push-migrate.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Run Trivy scan — migrate (linux/arm64)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ${{ env.REGISTRY }}/postern-migrate@${{ steps.push-migrate.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
       # ── Cosign signing (keyless, OIDC from GitHub) ──────────────
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3.9.1
@@ -314,6 +379,13 @@ jobs:
           cosign sign --yes \
             "${{ env.REGISTRY }}/postern-confirm@${{ steps.push-confirm.outputs.digest }}"
 
+      - name: Sign migrate image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/postern-migrate@${{ steps.push-migrate.outputs.digest }}"
+
       # ── Upload SBOMs as artifacts (audit retention) ─────────────
       - name: Upload SBOM artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -324,6 +396,8 @@ jobs:
             sbom-api-linux-arm64.spdx.json
             sbom-confirm-linux-amd64.spdx.json
             sbom-confirm-linux-arm64.spdx.json
+            sbom-migrate-linux-amd64.spdx.json
+            sbom-migrate-linux-arm64.spdx.json
           retention-days: 2555  # ~7 years for regulated compliance
 
   # ── Deploy stage ───────────────────────────────────────────────
@@ -478,6 +552,17 @@ jobs:
             "${{ env.REGISTRY }}/postern-confirm@${{ needs.build.outputs.confirm_digest }}" \
             || (echo "::error::Cosign verification failed for confirm image — unsigned, tampered, or not signed by this repository's deploy workflow on a branch ref" && exit 1)
 
+      - name: Verify cosign signature — migrate
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign verify \
+            --certificate-identity-regexp='^https://github\.com/stefanocalabrese/postern/\.github/workflows/deploy\.yml@refs/heads/[A-Za-z0-9._/-]+$' \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            --rekor-url=https://rekor.sigstore.dev \
+            "${{ env.REGISTRY }}/postern-migrate@${{ needs.build.outputs.migrate_digest }}" \
+            || (echo "::error::Cosign verification failed for migrate image — unsigned, tampered, or not signed by this repository's deploy workflow on a branch ref" && exit 1)
+
       # ── SBOM presence check ─────────────────────────────────────
       - name: Download SBOM artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
@@ -504,7 +589,36 @@ jobs:
           test -f sbom-confirm-linux-arm64.spdx.json \
             || (echo "::error::SBOM missing for confirm image, linux/arm64" && exit 1)
 
+      - name: Verify SBOM presence — migrate (linux/amd64)
+        run: |
+          test -f sbom-migrate-linux-amd64.spdx.json \
+            || (echo "::error::SBOM missing for migrate image, linux/amd64" && exit 1)
+
+      - name: Verify SBOM presence — migrate (linux/arm64)
+        run: |
+          test -f sbom-migrate-linux-arm64.spdx.json \
+            || (echo "::error::SBOM missing for migrate image, linux/arm64" && exit 1)
+
       # ── ECS deploy (placeholder — handoff §12.4 leaves this to platform team) ──
+      # The migration runs first and the services roll after it, which is the
+      # only ordering that works while a deploy adds columns: a new service
+      # reading a column the old schema lacks fails on its first request,
+      # where an old service ignoring a column it does not know about does
+      # not. It is a `run-task`, not an `update-service`: the image serves no
+      # port and the task is expected to exit 0 and stay exited.
+      #
+      # OPERATOR: this task, and only this task, gets a database role with
+      # DDL rights. Handing the same role to the two services would put the
+      # credential back in the containers this split took it out of, and
+      # every other control here would be decoration again.
+      - name: Run database migrations
+        run: |
+          echo "Running ${{ env.REGISTRY }}/postern-migrate@${{ needs.build.outputs.migrate_digest }} as a one-off ECS task"
+          # TODO: aws ecs run-task --cluster <cluster> --task-definition <migrate-td-arn> \
+          #        --launch-type FARGATE --network-configuration <awsvpc-config> \
+          #        and wait for it, failing this step on a non-zero container exit.
+          # The task definition references the image by digest, not tag.
+
       - name: Deploy api to ECS
         run: |
           echo "Deploying ${{ env.REGISTRY }}/postern-api@${{ needs.build.outputs.api_digest }} to ECS"

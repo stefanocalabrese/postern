@@ -1,6 +1,7 @@
-# Two images from one repository and one build, differing in which service's
-# code the final stage carries (handoff §12.2): an RCE in the read (`api`)
-# container must not even find the write path's (`confirm`) code.
+# Three images from one repository and one build, differing in what the final
+# stage carries (handoff §12.2): an RCE in the read (`api`) container must not
+# even find the write path's (`confirm`) code, and neither serving container
+# may hold the tool that can undo the `audit_log` protections.
 #
 # That is a property of the copy layer below and of nothing else. It was false
 # until 26 September 2026: `runtime` did `COPY --from=builder /app /app` and
@@ -26,6 +27,23 @@
 # ECR; it is no longer the only thing standing between the context and a
 # shipped image.
 #
+# The third image, `migrate`, exists because the second version of this split
+# left a hole the first one hid. Both serving images carried `migrations/` and
+# the `alembic` console script, and the `api` service holds
+# `POSTERN_DATABASE_URL` because it needs one. Revision `f1860c110112` is what
+# makes `audit_log` refuse `UPDATE`, `DELETE` and `TRUNCATE`, and its own
+# `downgrade` says what reversing it costs: "after this runs, any SQL
+# injection or RCE in either service can erase the rows recording the calls it
+# made." An attacker in the read container had the scripts, the runner and the
+# credential in one place. Now the runner and the scripts live in an image
+# that serves no traffic and runs as a one-off task, and the serving images
+# hold neither.
+#
+# OPERATOR: `migrate` needs its own ECR repository, `postern-migrate`, beside
+# `postern-api` and `postern-confirm`, and its own ECS task definition run as
+# a one-off task rather than a service. It is the only one of the three that
+# should ever be given a database URL with DDL rights.
+#
 # Base images are pinned by digest, not tag (handoff §12.2); see
 # dev-docs/decisions/0004-base-images.md for the resolved digests, the date
 # they were resolved, and why both cover linux/arm64.
@@ -49,28 +67,36 @@ COPY . .
 # from the now-complete source tree, still refusing any lockfile update.
 RUN uv sync --frozen --no-dev
 
-# What both services need, and nothing either of them does not. Every path
+# A copy of the venv with the migration runner taken out of it, prepared here
+# rather than in a serving stage for a reason worth stating: `RUN rm` on top
+# of a layer that already holds the files only hides them behind an overlayfs
+# whiteout. The bytes stay in the lower layer, and anyone who can pull the
+# image can read them back out. Deleting before the copy means the serving
+# images never contain alembic at all, at the cost of not sharing the venv
+# layer with `migrate`.
+#
+# Nothing under `services/` or `postern_core` imports alembic -- grepped, and
+# the only four matches in the tree are prose inside comments -- so this
+# removes a capability and no functionality. Both services are started below
+# the way a deploy starts them to show that holds.
+FROM builder AS serving-venv
+RUN rm -rf /app/.venv/bin/alembic \
+           /app/.venv/lib/python3.12/site-packages/alembic \
+           /app/.venv/lib/python3.12/site-packages/alembic-*.dist-info
+
+# What all three images need, and nothing any of them does not. Every path
 # below was checked against a running image rather than read off the import
-# graph, because the graph does not know about `.pth` files or alembic.
+# graph, because the graph does not know about `.pth` files or console scripts.
 FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS runtime
 WORKDIR /app
-# The virtualenv, and the source tree two of its `.pth` files point back at.
-# `uv sync` installs both workspace members editable: `postern_core.pth` holds
+# The source tree two of the venv's `.pth` files point back at. `uv sync`
+# installs both workspace members editable: `postern_core.pth` holds
 # `/app/packages/postern-core/src` and `postern.pth` holds `/app`. So the
 # interpreter reads `postern_core` out of the source tree and not out of
 # site-packages, and that tree has to be present for any import to resolve.
 # `PYTHONPATH="/app"` below states the second half again; neither alone is
 # load-bearing, which is why dropping either one in isolation looks harmless.
-COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/packages/postern-core/src /app/packages/postern-core/src
-# `alembic upgrade head` runs from this image as a one-off task, so its two
-# inputs stay: `alembic.ini` resolves `script_location` to
-# `%(here)s/migrations`, and `migrations/env.py` imports
-# `postern_core.store.models` to register the tables. Neither service imports
-# either path at run time -- grepped, not assumed -- so these are a deploy
-# path being kept rather than a runtime dependency being satisfied.
-COPY --from=builder /app/alembic.ini /app/alembic.ini
-COPY --from=builder /app/migrations /app/migrations
 # `services` is a regular package, not a namespace one, so without this file
 # neither `services.api` nor `services.confirm` imports at all.
 COPY --from=builder /app/services/__init__.py /app/services/__init__.py
@@ -78,19 +104,44 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
-# Non-root (handoff §12.2). A fixed uid:gid, not a named user: neither stage
+# Non-root (handoff §12.2). A fixed uid:gid, not a named user: no stage
 # creates one, and the numeric form needs no `/etc/passwd` entry to be valid.
+# Set once here so every stage built on this one inherits it; a COPY after it
+# still runs as root, which is why the venv below lands readable.
 USER 1000:1000
 
 # The read path, and only the read path. `services/confirm` is never copied
 # into this stage, so an attacker who reaches RCE here finds no write-path
-# module to read, import or reuse.
+# module to read, import or reuse, and the venv it takes is the one with no
+# migration runner in it.
+#
+# Both serving stages repeat the venv copy rather than sharing an intermediate
+# `serving` stage, and that is not a style choice: `tests/test_zt3_digest_drift`
+# decides whether a `FROM` names an external image by comparing against the
+# literal set `("runtime", "builder")`, so any third internal stage name in a
+# `FROM` line is read as an unpinned external image and fails the digest gate.
+# `serving-venv` is fine because it is only ever a `--from=` target. The two
+# copies are byte-identical, so both images share the layer.
 FROM runtime AS api
+COPY --from=serving-venv /app/.venv /app/.venv
 COPY --from=builder /app/services/api /app/services/api
 CMD ["uvicorn", "services.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 # The write path, and only the write path. The read service's tool handlers,
 # consent checks and MCP surface are absent here for the same reason.
 FROM runtime AS confirm
+COPY --from=serving-venv /app/.venv /app/.venv
 COPY --from=builder /app/services/confirm /app/services/confirm
 CMD ["uvicorn", "services.confirm.main:app", "--host", "0.0.0.0", "--port", "8080"]
+
+# The migration runner: the whole venv, the scripts, and no service. It serves
+# no port and carries no request handler, so there is nothing in it to reach
+# over the network. `alembic.ini` resolves `script_location` to
+# `%(here)s/migrations`, and `migrations/env.py` imports
+# `postern_core.store.models` to register the tables on the metadata, which is
+# why this stage needs the library the serving images also carry.
+FROM runtime AS migrate
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/alembic.ini /app/alembic.ini
+COPY --from=builder /app/migrations /app/migrations
+CMD ["alembic", "upgrade", "head"]
