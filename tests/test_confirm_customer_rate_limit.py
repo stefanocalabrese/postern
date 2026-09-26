@@ -116,6 +116,23 @@ class _CountingVerifier:
         return await self._inner.verify_token(token)
 
 
+@pytest.fixture(autouse=True)
+def _a_reachable_database(pg_url: str) -> None:
+    """Every app in this file needs Postgres, as of 2026-09-26.
+
+    ``POST /approve`` writes one ``audit_log`` row per pairing attempt and
+    fails closed if it cannot, so an app pointed at the field default of
+    ``localhost:5432`` answers 500 to every request this file makes.
+    ``tests/conftest.py``'s session-scoped ``pg_url`` starts the container and
+    exports ``POSTERN_DATABASE_URL``; ``ConfirmSettings.for_testing`` reads
+    that variable, so depending on the fixture is all this file has to do.
+
+    Autouse rather than a parameter on each app builder: several of the
+    ``create_confirm_app`` calls here are inside test methods, and threading a
+    URL down to each would touch more lines than the behaviour being tested.
+    """
+
+
 def _settings(**overrides: Any) -> ConfirmSettings:
     return dataclasses.replace(ConfirmSettings.for_testing(), **overrides)
 

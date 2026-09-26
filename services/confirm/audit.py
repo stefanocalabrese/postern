@@ -1,7 +1,18 @@
-"""Up to two ``audit_log`` rows per approval callback: one before the operator
-reaches a backend write endpoint, one after the request finishes.
+"""What this service writes to ``audit_log``: up to two rows per challenge
+approval, and exactly one per device-grant pairing.
 
-WHY THIS EXISTS. Until 2026-09-23 this service wrote NO audit rows at all. A
+TWO WRITERS, ONE MODULE. ``ApprovalAudit`` records
+``POST /challenges/{challenge_id}/approve`` and is what everything above the
+heading "THE SHAPE IS THE READ PATH'S" describes. ``PairingAudit``, at the
+bottom of this file, records ``POST /approve`` -- the RFC 8628 pairing that
+authorises a client to reach the first endpoint at all -- and carries its own
+reasoning under its own heading. They share this module because
+``services/confirm/callback.py`` already says that every decision about this
+service's rows lives in one place, and a second writer in a second file would
+make that sentence false the day it landed.
+
+``ApprovalAudit``: WHY IT EXISTS. Until 2026-09-23 this service wrote NO
+audit rows at all. A
 grep for ``audit`` across ``services/confirm/*.py`` returned comments and
 nothing else, while ``services/api`` wrote two rows for every tool call. The
 asymmetry ran exactly backwards: reading a balance was fully recorded, and
@@ -133,6 +144,7 @@ the vocabulary is the right fix and is somebody's decision, not this module's.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from datetime import UTC, datetime
@@ -140,6 +152,7 @@ from typing import Any
 
 from postern_core.domain.masking import redaction_budget, scrub_text, scrub_tree
 from postern_core.identity import CustomerRef
+from postern_core.net import client_ip
 from postern_core.store import audit
 from postern_core.store.audit import TRUNCATED, bound_arguments, clamp
 from postern_core.store.engine import Database
@@ -150,6 +163,7 @@ from postern_core.store.models import (
     OUTCOME_RETURNED,
 )
 from pydantic import ValidationError
+from starlette.requests import Request
 
 logger = logging.getLogger(__name__)
 
@@ -157,20 +171,30 @@ __all__ = [
     "APPROVE_ROUTE",
     "OUTCOME_RAISED",
     "OUTCOME_RETURNED",
+    "PAIRING_ROUTE",
+    "PAIRING_TOOL_NAME",
     "UNRESOLVED_TOOL_NAME",
     "ApprovalAudit",
+    "DETAIL_ALREADY_APPROVED",
     "DETAIL_ALREADY_TERMINAL",
     "DETAIL_CHALLENGE_NOT_FOUND",
     "DETAIL_CHALLENGE_NOT_OWNED",
     "DETAIL_CHALLENGE_VANISHED",
+    "DETAIL_DEVICE_CODE_NOT_FOUND",
     "DETAIL_DEVICE_NOT_ENROLLED",
     "DETAIL_EXPIRED",
+    "DETAIL_INVALID_SUBJECT",
     "DETAIL_MALFORMED_BODY",
     "DETAIL_MISSING_SIGNATURE",
     "DETAIL_REVOKED",
     "DETAIL_SIGNATURE_INVALID",
     "DETAIL_SIGNATURE_MALFORMED",
     "DETAIL_UPDATE_MATCHED_NO_ROW",
+    "DETAIL_USER_CODE_BUDGET_EXHAUSTED",
+    "DETAIL_USER_CODE_MISMATCH",
+    "PairingAudit",
+    "device_code_handle",
+    "pairing_client_ip",
 ]
 
 #: What ``tool_name`` carries when no challenge was resolved -- the id named
@@ -736,3 +760,404 @@ def _arguments(challenge_id: str, body: dict[str, Any]) -> dict[str, Any]:
             "verification_result": scrub_tree(body.get("verification_result")),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# PairingAudit -- one row per ``POST /approve``.
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. Until 2026-09-26 ``services/confirm/device_auth.py`` wrote
+# no row on any branch of ``POST /approve``: every occurrence of the string
+# ``audit`` in that file was prose about findings C-01 and C-04. So the
+# highest-consequence action in the system was recorded twice over and the
+# pairing that grants a client the standing to attempt it was recorded not at
+# all. An attacker who paired a rogue client left exactly one trace, the
+# payments that followed, and left none if none followed. That is the same
+# asymmetry ``ApprovalAudit`` above was built to end, one endpoint later.
+
+#: What ``tool_name`` carries on a pairing row.
+#:
+#: Not a registered MCP tool name, for the reason ``UNRESOLVED_TOOL_NAME``
+#: gives: this column is shared with ``services/api``'s rows and nothing on
+#: the row says which service wrote it, so a value that could collide with a
+#: tool would make ``WHERE tool_name = ...`` ambiguous. The five registered
+#: tools are ``start_session``, ``accounts.list``, ``accounts.get_balance``,
+#: ``transactions.list`` and ``cards.list``, and this is none of them, so
+#: ``WHERE tool_name = 'device_grant.approve'`` is by itself the "every
+#: pairing, successful or refused" query.
+#:
+#: Distinct from ``UNRESOLVED_TOOL_NAME`` rather than reusing it: that literal
+#: means "a challenge approval that resolved no challenge", and an operator
+#: counting challenge-id enumeration must not have pairings mixed into the
+#: result.
+PAIRING_TOOL_NAME = "device_grant.approve"
+
+#: The route template, in ``arguments`` for the reason ``APPROVE_ROUTE`` is:
+#: constant on every row this writer produces, and therefore useless as a
+#: ``tool_name``, but the one value that says which service and which endpoint
+#: wrote the row when the two services' rows are read interleaved.
+PAIRING_ROUTE = "/approve"
+
+# THE CLOSED VOCABULARY OF ``detail`` ON A PAIRING ROW, and the same
+# ``refusal_reason`` gap applies: ``REFUSAL_REASONS`` is closed at
+# ``no_customer_ref`` and ``domain_not_consented``, both consent-specific,
+# with ``ck_audit_log_refusal_reason`` enforcing the closure at the database.
+# There is no admissible value for "this device code does not exist" or "the
+# pairing code did not match", so the refusal class lands in ``detail``, as
+# ``ApprovalAudit``'s refusals already do.
+#
+# ``DETAIL_REVOKED`` above is REUSED rather than duplicated, and that is the
+# one decision in this block worth arguing. Both endpoints refuse a revoked
+# customer through the same ``services/confirm/revocation.py`` call, and one
+# literal makes ``WHERE detail = 'revoked'`` the whole answer to "did my
+# revocation take effect on the write path". Two literals would make it an
+# answer that silently omits half of it, which is the failure mode
+# ``services/confirm/customer_rate_limit.py`` names: a query that undercounts
+# by exactly the half nobody thought about is worse than one that returns
+# nothing, because the first is trusted.
+
+#: The assertion verified and its ``sub`` is not a ``CustomerRef``. The
+#: compromised-issuer signal ``postern_core.identity`` warns about, and the
+#: one refusal here whose row carries a NULL ``customer_ref``:
+#: ``customer_ref_absence_reason`` names the class and the offending string
+#: is stored nowhere, for the reason ``_subject_columns`` gives.
+DETAIL_INVALID_SUBJECT = "invalid_subject"
+#: A device code that names nothing. The enumeration signal on this endpoint,
+#: and the analogue of ``DETAIL_CHALLENGE_NOT_FOUND`` one endpoint over.
+DETAIL_DEVICE_CODE_NOT_FOUND = "device_code_not_found"
+#: A second approval of a code already approved. Refused before anything is
+#: written, because otherwise a caller holding an assertion of their own could
+#: swap ``customer_ref`` to themselves in the window before the browser polls
+#: ``POST /token``; the attempt is the signal whether or not it succeeds.
+DETAIL_ALREADY_APPROVED = "already_approved"
+#: A wrong pairing code, with attempts left. The A2 relay shape: something
+#: holds the ``device_code`` and is guessing the six characters only a human
+#: reading the browser can supply.
+DETAIL_USER_CODE_MISMATCH = "user_code_mismatch"
+#: The wrong pairing code that spent the last attempt and REVOKED the device
+#: code. Told apart from the literal above because the consequences differ:
+#: one is a slip a customer retries, the other ends the pairing for the
+#: legitimate user and is the event on this endpoint worth an alert.
+DETAIL_USER_CODE_BUDGET_EXHAUSTED = "user_code_budget_exhausted"
+
+
+def device_code_handle(device_code: str) -> str:
+    """A non-reversing handle for a device code, for the audit row.
+
+    THE VALUE ITSELF NEVER REACHES THIS TABLE. ``device_code`` is 43
+    characters of ``secrets.token_urlsafe`` and is the entire authority to
+    exchange at ``POST /token``; ``audit_log`` is append-only, regulator-facing
+    and outlives the code's 900-second lifetime by years. Writing a live
+    bearer credential into it is the same class of mistake
+    ``ApprovalAudit``'s ``signature_present`` refuses one endpoint over, where
+    CLAUDE.md states the rule outright.
+
+    WHAT THE HANDLE BUYS, which is the reason it is not simply omitted. Two
+    rows carrying the same handle are two attempts on the same pairing, so a
+    caller guessing codes produces many handles and a caller retrying one
+    produces one; and an operator holding a device code from a support call
+    confirms the match by hashing it. Neither is possible against an absent
+    field.
+
+    Sixteen hex characters of SHA-256, the construction
+    ``services/confirm/customer_rate_limit.py``'s ``customer_handle`` already
+    uses, so this repository has one spelling of "a handle in a record" rather
+    than two. Unsalted for the same reason it is there: a salt would break the
+    confirm-by-hashing operation, which is the point.
+
+    The privacy claim ``customer_handle`` has to disclaim does not arise here
+    and the difference is worth stating, because the two functions look
+    identical and are not. A customer reference is drawn from a set the
+    operator enumerates, so hashing that set recovers the mapping. A device
+    code carries 256 bits of entropy from ``secrets``, so no enumeration
+    exists and the digest is non-reversing in fact and not only in form.
+    """
+    return hashlib.sha256(device_code.encode("utf-8")).hexdigest()[:16]
+
+
+def pairing_client_ip(request: Request, trusted_proxy_hops: int) -> str | None:
+    """Which address to attribute this pairing to, or ``None``.
+
+    ONE LINE OF ADAPTER AND NO LOGIC, which is the shape
+    ``postern_core.net``'s module docstring requires of both its callers.
+    ``services/confirm/rate_limit.py`` reads the same header from a raw ASGI
+    scope and ``services/api/middleware/risk.py`` from a Starlette request;
+    deriving an address from a hop count a second time in this file is the
+    defect that module was created to prevent, and ``.importlinter`` forbids
+    reaching the existing copy across services.
+
+    ``client_ip`` and not ``ip_bucket``: bucketing an IPv6 address to its /64
+    is a rate-limiting decision that makes two addresses in one prefix
+    indistinguishable, which is exactly the resolution an investigator asking
+    "where was this paired from" needs kept. The read path records the address
+    for the same reason.
+
+    NOT SCRUBBED, and that is safe rather than overlooked: every value this
+    returns has been through ``ipaddress.ip_address``, so it is dotted quads
+    or hex groups and cannot carry the twelve consecutive digits a PAN run
+    needs, nor an IBAN's letter-letter-digit-digit opener.
+
+    ``None`` on this deployment's default of zero trusted hops whenever the
+    transport has no peer, which is every in-process ASGI test client. That is
+    a missing field on the row and not an error: the alternative is trusting a
+    header the caller writes, which is the defect the zero default exists for.
+    """
+    peer = request.client
+    return client_ip(
+        forwarded=request.headers.get("x-forwarded-for"),
+        peer_host=peer.host if peer else None,
+        trusted_proxy_hops=trusted_proxy_hops,
+    )
+
+
+class PairingAudit:
+    """One ``audit_log`` row per device-grant pairing attempt.
+
+    ONE ROW, NOT THE READ PATH'S TWO, and the reason is that the second row's
+    reason is absent here. ``ApprovalAudit`` writes an entry row because the
+    request reaches an operator backend, the touch leaves nothing on this
+    side, and a crash mid-call would otherwise erase that customer data was
+    reached at all. A pairing reaches no backend: it sets two fields on a
+    device code held in this deployment's own store. There is no touch to
+    record early.
+
+    The same conclusion is forced by the schema, which matters more than the
+    argument because it cannot be reasoned around. ``OUTCOME_REACHING`` is
+    documented in ``postern_core.store.models`` as the operator being about to
+    issue its first backend request, ``ck_audit_log_reaching_at_matches
+    _outcome`` makes ``reaching_at`` non-NULL exactly on those rows, and both
+    are enforced at the database. Writing a ``reaching`` row for a store write
+    would put a second meaning into a closed vocabulary a CHECK constraint
+    holds, on a table shared with ``services/api``, and every existing query
+    for backend touches would start returning pairings. ``ApprovalAudit``
+    already refuses an entry row for the same reason on each of its refusal
+    paths: none of them reaches the backend either.
+
+    WHICH ATTEMPTS GET A ROW, stated as a rule because a list of cases goes
+    stale the first time a branch is added:
+
+        A row records what the server CONCLUDED about a customer or about a
+        device code. It does not record that a client sent a malformed
+        request.
+
+    So a revoked customer, a subject that is not a customer reference, a
+    device code naming nothing, a code already approved, and both halves of a
+    wrong pairing code are each recorded, because each is a conclusion an
+    investigator can act on. A body that is not a JSON object, a missing
+    ``device_code`` and a ``user_code`` that arrives as a list are not:
+    each is answered by looking at the request and consulting nothing, each
+    names no device code, and recording them would hand a caller holding one
+    valid assertion an INSERT per malformed body -- a cheaper way to fill the
+    disk than the one ``bound_arguments`` was added to bound, on a table whose
+    exhaustion takes both services down under decision 0006. The 401 for an
+    absent assertion writes nothing for the reason
+    ``services/confirm/callback.py``'s first backstop gives: there is no
+    customer for a row to be about.
+
+    WHAT THAT RULE COSTS, named rather than left to be discovered. A caller
+    who sends only malformed bodies is invisible to this table. What bounds
+    that caller is the two rate limiters in front of the handler, and what
+    records them is a log line; neither pairs anything, so the loss is
+    volume data an operator already has at the edge, not a pairing that
+    happened unseen.
+
+    FAIL CLOSED, AND IT MEANS SOMETHING STRONGER HERE THAN ON THE MONEY PATH.
+    Decision 0006 is fail closed everywhere, and one endpoint over that has to
+    settle for a 500 reported over a backend write that already happened,
+    because a payment cannot be unmade from this process. A pairing can:
+    the device code is in this deployment's own store and
+    ``revoke_device_code`` undoes it. ``services/confirm/device_auth.py``
+    therefore withdraws the pairing when this writer raises, so an
+    un-audited pairing does not survive its own audit failure. A 500 alone
+    would have been fail-closed in the response and fail-open in substance --
+    the browser polls ``POST /token``, is handed a read token, and no row
+    anywhere names who authorised it.
+
+    WHAT THAT COSTS, and it is the sharpest cost in this file: a customer
+    standing at a browser with their phone out, mid-QR-scan, is refused
+    because a database they will never hear of is slow. Decision 0006's
+    amendment makes that reachable rather than hypothetical -- a 3.0-second
+    command timeout means merely slow is enough. It is paid anyway, and the
+    reason is that the window costs the customer nothing they could have
+    used: while the audit store is unreachable every tool call in
+    ``services/api`` fails closed too, so the client this pairing would
+    authorise cannot read an account balance in that window either. Refusing
+    to pair adds no outage the deployment does not already have, which is the
+    same argument ``CustomerRateLimitStoreUnavailable`` makes for its own
+    refusal.
+    """
+
+    __slots__ = (
+        "_at",
+        "_call_id",
+        "_client_id",
+        "_client_ip",
+        "_customer_ref",
+        "_customer_ref_absence_reason",
+        "_db",
+        "_device_code_handle",
+        "_paired_client_id",
+        "_redaction_budget_exhausted",
+        "_started",
+    )
+
+    def __init__(
+        self,
+        *,
+        db: Database,
+        call_id: str,
+        at: datetime,
+        started: float,
+        subject: str,
+        claims: dict[str, Any],
+        client_ip_value: str | None,
+    ) -> None:
+        self._db = db
+        self._call_id = call_id
+        self._at = at
+        self._started = started
+        self._customer_ref, self._customer_ref_absence_reason = _subject_columns(subject)
+        self._client_ip = client_ip_value
+        # ONE ALLOWANCE FOR THE WHOLE REQUEST, the invariant
+        # ``ApprovalAudit.__init__`` holds for the same reason: without it
+        # every string validated gets a fresh checksum budget, and a caller
+        # who spreads junk across two fields buys two allowances instead of
+        # spending down one.
+        with redaction_budget() as scope:
+            self._client_id = _client_id(claims)
+        self._redaction_budget_exhausted = scope.exhausted
+        # Both filled in by ``names`` below as the request learns them, and
+        # both OMITTED from ``arguments`` while they are None rather than
+        # written as nulls: a key that is absent says the request never got
+        # far enough to know, where a key holding null reads as "we looked and
+        # there was nothing", which on the revoked path would be false.
+        self._device_code_handle: str | None = None
+        self._paired_client_id: str | None = None
+
+    @property
+    def call_id(self) -> str:
+        """The correlation key this request's row carries.
+
+        One row per request today, so nothing joins on it yet. It is still
+        minted and still written, because ``ck_audit_log_call_id_present``
+        requires it on every new row and because a future second row for one
+        pairing must be pairable with this one rather than orphaned beside it.
+        """
+        return self._call_id
+
+    def names(self, *, device_code: str | None = None, paired_client_id: str | None = None) -> None:
+        """Record which pairing this attempt was aimed at, as it becomes known.
+
+        Two values arriving at two different points, through one method, so
+        that the ORDER of the keys in ``arguments`` is decided once, at the
+        write, rather than by whichever call site happened to run first. That
+        order is load-bearing: ``cap_arguments`` keeps a first-fit prefix of
+        top-level entries, so ``_arguments`` below lists the server-chosen
+        keys before the caller-supplied one and an over-limit tree drops
+        exactly the field that carried the junk.
+
+        ``device_code`` is reduced to a handle immediately and the raw value
+        is never held on this object. ``paired_client_id`` is the
+        ``client_id`` the BROWSER supplied, unauthenticated, at
+        ``POST /device_authorization`` -- the only answer this system has to
+        "which client did this customer authorise" and, being caller-supplied,
+        scrubbed like every other such value.
+
+        SCRUBBED OUTSIDE THE CONSTRUCTOR'S BUDGET, exactly as
+        ``ApprovalAudit.resolve`` is and for the same reason: that scope has
+        closed by the time the device code is read and re-entering it is not
+        possible. The fresh per-string allowance cannot be spent to any
+        meaningful degree, because ``ConfirmSettings.max_client_id_length``
+        bounds this value at 256 characters at the endpoint that stored it and
+        ``/device_authorization`` rejects rather than truncates a longer one.
+        """
+        if device_code is not None:
+            self._device_code_handle = device_code_handle(device_code)
+        if paired_client_id is not None:
+            self._paired_client_id = scrub_text(paired_client_id)
+
+    async def approved(self) -> None:
+        """Record that this pairing was granted."""
+        await self._write(OUTCOME_RETURNED, None)
+
+    async def refused(self, detail: str) -> None:
+        """Record that this pairing was refused, and at which stage.
+
+        ``detail`` is one of the ``DETAIL_*`` literals above for a refusal
+        this handler decided, or ``type(exc).__name__`` for a genuine
+        exception -- never an exception's MESSAGE, which for a
+        ``pydantic.ValidationError`` embeds the raw offending value and would
+        put the thing a masked type exists to protect into a long-lived store.
+        """
+        await self._write(OUTCOME_RAISED, detail)
+
+    async def _write(self, outcome: str, detail: str | None) -> None:
+        async with self._db.sessionmaker() as session:
+            await audit.append(
+                session,
+                at=self._at,
+                # NULL, written as a literal: this path reaches no backend, so
+                # there is no touch instant in existence, and
+                # ``ck_audit_log_reaching_at_matches_outcome`` rejects a
+                # non-NULL value beside any outcome but ``reaching``.
+                reaching_at=None,
+                customer_ref=self._customer_ref,
+                customer_ref_absence_reason=self._customer_ref_absence_reason,
+                tool_name=PAIRING_TOOL_NAME,
+                arguments=self._arguments(),
+                outcome=outcome,
+                detail=detail,
+                redaction_budget_exhausted=self._redaction_budget_exhausted,
+                # ``time.monotonic()`` for the reason the challenge path uses
+                # it: a wall clock can step backwards under an NTP correction
+                # and write a negative duration into an append-only table.
+                # Rounded down, so the row never reports the operator slower
+                # than it was.
+                duration_ms=int((time.monotonic() - self._started) * 1000),
+                # NULL: this service speaks plain HTTP with no JSON-RPC
+                # envelope and no request-id header convention anywhere in
+                # this repository, so the handler looked and there was none.
+                request_id=None,
+                # NULL on every row this module writes, pairing or approval.
+                # The module docstring carries the vocabulary gap that forces
+                # it.
+                refusal_reason=None,
+                call_id=self._call_id,
+                client_id=self._client_id,
+                # NULL, not ``[]``: ``[]`` means a risk session ran and no
+                # signal fired. ``RiskEngine`` and ``IpAnomalyDetector`` are
+                # wired into ``services/api``'s tool middleware and nothing in
+                # this service establishes a session, so NULL is the true
+                # statement.
+                risk_signals=None,
+            )
+
+    def _arguments(self) -> dict[str, Any]:
+        """What this pairing attempt was, bounded the way both services bound it.
+
+        FOUR KEYS AT MOST, IN THIS ORDER, and the order is the first-fit rule
+        ``cap_arguments`` applies: server-chosen keys first, the one
+        caller-supplied key last, so an over-limit tree keeps what identifies
+        the request and drops what carried the junk.
+
+        WHAT IS DELIBERATELY ABSENT. The ``user_code`` presented, in every
+        branch including the mismatches. A correct one is the second half of
+        the A2 pairing credential and belongs in this table no more than the
+        device code does; a wrong one is a guess, and storing guesses would
+        let a reader of the table learn how close an attacker got, which is
+        worth less than not accumulating attacker-chosen strings. ``detail``
+        names the class, which is what a query filters on.
+
+        Also absent: the scopes the pairing grants. They are on the device
+        code, which the handle joins to while it lives, and they are the same
+        ``DEFAULT_DEVICE_SCOPES`` string on every pairing a browser starts
+        without asking for something narrower.
+        """
+        tree: dict[str, Any] = {"route": PAIRING_ROUTE}
+        if self._device_code_handle is not None:
+            tree["device_code_handle"] = self._device_code_handle
+        if self._client_ip is not None:
+            tree["client_ip"] = self._client_ip
+        if self._paired_client_id is not None:
+            tree["paired_client_id"] = self._paired_client_id
+        return bound_arguments(tree)

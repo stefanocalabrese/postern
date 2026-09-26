@@ -608,6 +608,26 @@ class ConfirmSettings:
         that needs an assertion refuses every token, and that is the correct
         default for a fixture.
 
+        ``database_url`` IS THE ONE VALUE READ FROM THE ENVIRONMENT HERE, and
+        the one dependency this helper cannot fake. It became necessary on
+        2026-09-26, when ``POST /approve`` started writing an ``audit_log``
+        row: 31 tests across ``tests/test_device_grant.py``,
+        ``tests/test_confirm_rate_limit.py``,
+        ``tests/test_confirm_customer_rate_limit.py`` and
+        ``tests/test_confirm_auth.py`` drive that endpoint through
+        ``create_confirm_app`` and then answered 500 against the field default
+        of ``localhost:5432``, which no test container listens on. Several of
+        those call sites are inside test methods with no fixture to thread a
+        URL through, so the honest fix is here rather than four autouse
+        fixtures that patch this classmethod.
+
+        ``POSTERN_DATABASE_URL`` and not a new variable, because that is the
+        name ``from_env`` above already reads for this field and the name
+        ``tests/conftest.py``'s session-scoped ``pg_url`` already exports when
+        it starts its Postgres. The fallback is this dataclass's own field
+        default, so an environment that sets nothing gets exactly what it got
+        before.
+
         This is deliberately NOT a generated key pair. Generating RSA material
         per call would put a key generation in the path of every test that
         merely wants an app object (``tests/test_ephemeral_key_warning.py``
@@ -622,4 +642,5 @@ class ConfirmSettings:
             app_assertion_jwks_uri=("https://app.postern-local-dev.invalid/.well-known/jwks.json"),
             app_assertion_issuer="https://app.postern-local-dev.invalid",
             app_assertion_audience="postern-confirm",
+            database_url=os.environ.get("POSTERN_DATABASE_URL") or cls.database_url,
         )
