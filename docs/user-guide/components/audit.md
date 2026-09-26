@@ -172,11 +172,11 @@ application code:
 
 | Constraint | Column | Allowed values |
 |------------|--------|----------------|
-| `ck_audit_log_refusal_reason` | `refusal_reason` | `consent_denied`, `tool_not_found`, or NULL |
+| `ck_audit_log_refusal_reason` | `refusal_reason` | `no_customer_ref`, `domain_not_consented`, `consent_store_unavailable`, or NULL |
 | `ck_audit_log_outcome` | `outcome` | `reaching`, `returned`, `raised` |
 | `ck_audit_log_call_id_present` | `call_id` | NOT NULL (every row must have a call_id) |
 | `ck_audit_log_reaching_at_matches_outcome` | `reaching_at` | Present when outcome='reaching', absent otherwise |
-| `ck_audit_log_customer_ref_absence_reason` | `absence_reason` | `no_access_token`, `no_string_subject`, `subject_not_customer_ref` |
+| `ck_audit_log_customer_ref_absence_reason` | `customer_ref_absence_reason` | `no_access_token`, `no_string_subject`, `subject_not_a_customer_ref` |
 | `ck_audit_log_customer_ref_xor_absence` | - | XOR: every row has EITHER customer_ref OR absence_reason, never both or neither |
 
 ### XOR Invariant
@@ -221,7 +221,7 @@ things left `customer_ref` NULL:
 |-------|---------|
 | `no_access_token` | Request carried no validated access token |
 | `no_string_subject` | Token had a `sub` claim but it was not a string |
-| `subject_not_customer_ref` | `sub` failed `CustomerRef` validation (pattern mismatch) |
+| `subject_not_a_customer_ref` | `sub` failed `CustomerRef` validation (pattern mismatch) |
 
 ### Tool name clamping (`_MAX_TOOL_NAME = 64`)
 
@@ -288,5 +288,5 @@ The function is called from two places:
 | AuditEntry ORM model + CHECK constraints | [`packages/postern-core/src/postern_core/store/models.py`](../../../packages/postern-core/src/postern_core/store/models.py) |
 | Two-row audit middleware | [`services/api/middleware/audit.py`](../../../services/api/middleware/audit.py) |
 | Write-path audit writers (`ApprovalAudit`, `PairingAudit`) | [`services/confirm/audit.py`](../../../services/confirm/audit.py) |
-| ADR-0006: Fail-closed audit writes | [`docs/decisions/0006-audit-write-failure.md`](../dev-docs/decisions/0006-audit-write-failure.md) |
+| ADR-0006: Fail-closed audit writes | [`dev-docs/decisions/0006-audit-write-failure.md`](../dev-docs/decisions/0006-audit-write-failure.md) |
 | Masking in audit scrub | [`packages/postern-core/src/postern_core/domain/masking.py`](../../../packages/postern-core/src/postern_core/domain/masking.py) |

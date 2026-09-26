@@ -130,8 +130,9 @@ table, and the verified one is already on the ``challenges`` row that
 
 ``refusal_reason`` IS NULL ON EVERY ROW THIS MODULE WRITES, which is a gap and
 not a decision anybody is happy with. ``REFUSAL_REASONS``
-(``postern_core.store.models``) is closed at ``no_customer_ref`` and
-``domain_not_consented``, both consent-specific, and ``ck_audit_log_refusal
+(``postern_core.store.models``) is closed at ``no_customer_ref``,
+``domain_not_consented`` and ``consent_store_unavailable``, all three about
+the read path's consent check, and ``ck_audit_log_refusal
 _reason`` enforces the closure at the database. There is no admissible value
 for "this challenge belongs to another customer", "this challenge was already
 terminal" or "this challenge had expired", and inventing one is a migration
@@ -833,8 +834,9 @@ DETAIL_STORED_IDENTITY_MALFORMED = "stored_identity_malformed"
 
 # THE CLOSED VOCABULARY OF ``detail`` ON A PAIRING ROW, and the same
 # ``refusal_reason`` gap applies: ``REFUSAL_REASONS`` is closed at
-# ``no_customer_ref`` and ``domain_not_consented``, both consent-specific,
-# with ``ck_audit_log_refusal_reason`` enforcing the closure at the database.
+# ``no_customer_ref``, ``domain_not_consented`` and
+# ``consent_store_unavailable``, all three about the read path's consent
+# check, with ``ck_audit_log_refusal_reason`` enforcing it at the database.
 # There is no admissible value for "this device code does not exist" or "the
 # pairing code did not match", so the refusal class lands in ``detail``, as
 # ``ApprovalAudit``'s refusals already do.

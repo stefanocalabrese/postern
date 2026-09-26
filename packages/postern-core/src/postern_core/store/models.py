@@ -42,9 +42,29 @@ from postern_core.store.base import Base
 # customer reference was read and the tool's domain was not among that
 # customer's currently granted domains (`consents.granted_domains`, which
 # already treats an expired grant as absent).
+# `consent_store_unavailable`: the check could not reach the consents table
+# at all, so it established nothing about this customer and denied on that
+# basis. It is the one value here that describes the OPERATOR'S OWN
+# INFRASTRUCTURE rather than the caller, and the wording is chosen so a
+# dashboard cannot read it the other way: a saturated pool and a revoked
+# consent produced the same row until 26 September 2026, and the reader most
+# likely to be looking is an operator during an incident deciding whether to
+# page a DBA or answer a customer. `services/confirm/customer_rate_limit.py`
+# made the same call one layer out, choosing 503 over 429 so a dashboard
+# would not attribute an outage to customer behaviour.
+#
+# It is a REFUSAL and not an error, because that is what the caller got:
+# `check` returns False and FastMCP reports no tool, exactly as it does for
+# the two values above. What the column adds is that an operator can now
+# count the three apart.
 REFUSAL_NO_CUSTOMER_REF = "no_customer_ref"
 REFUSAL_DOMAIN_NOT_CONSENTED = "domain_not_consented"
-REFUSAL_REASONS: tuple[str, ...] = (REFUSAL_NO_CUSTOMER_REF, REFUSAL_DOMAIN_NOT_CONSENTED)
+REFUSAL_CONSENT_STORE_UNAVAILABLE = "consent_store_unavailable"
+REFUSAL_REASONS: tuple[str, ...] = (
+    REFUSAL_NO_CUSTOMER_REF,
+    REFUSAL_DOMAIN_NOT_CONSENTED,
+    REFUSAL_CONSENT_STORE_UNAVAILABLE,
+)
 
 # The closed vocabulary of `AuditEntry.customer_ref_absence_reason`, kept here
 # for the same reason `REFUSAL_REASONS` above is: the CHECK constraint on that
@@ -401,8 +421,13 @@ class AuditEntry(Base):
     # the other is an agent spelling a name wrong.
     #
     # The vocabulary is `REFUSAL_REASONS` at the top of this module, held to
-    # two values by the CHECK constraint below; each names what the consent
-    # check established and not why the caller ended up in that state.
+    # three values by the CHECK constraint below; each names what the consent
+    # check established and not why the caller ended up in that state. Two of
+    # them are facts about the customer and the third,
+    # `consent_store_unavailable`, is a fact about the operator: the check
+    # reached nothing, so it established nothing. A query counting consent
+    # denials that does not exclude it is counting an outage as customer
+    # state.
     #
     # NULL is every other row: the call was not refused, or the row was
     # written before this column existed. The column cannot separate those
@@ -411,9 +436,15 @@ class AuditEntry(Base):
     # exists, because writing one would make a claim about pre-migration
     # rows that nothing in this table can support.
     #
-    # `String(32)`: the longest value is 20 characters, and a regulator or a
-    # DBA reads the values straight out of a `SELECT` with no enum catalog
-    # lookup and no join. A Postgres `ENUM` would put the same closed set
+    # `String(32)`: the longest value is `consent_store_unavailable` at 25
+    # characters, and a regulator or a DBA reads the values straight out of a
+    # `SELECT` with no enum catalog lookup and no join. That was 20 until
+    # 26 September 2026, so the headroom a fourth value has is now 7
+    # characters and the next one longer than that costs a width migration
+    # as well as a widened CHECK -- the trade `customer_ref_absence_reason`
+    # below took the other way, sizing itself at 64 for 26 characters of
+    # value. Migration 1c64b7ed3f4b is what a column sized at its own
+    # maximum costs. A Postgres `ENUM` would put the same closed set
     # one `ALTER TYPE` away from every future change, including one that
     # cannot run in the same transaction that uses it; a widened CHECK is a
     # one-statement migration.

@@ -258,7 +258,7 @@ a rule two branches have to remember.
 ## What this costs
 
 All three constraints are enforcement, and under the fail-closed policy of
-`docs/decisions/0006-audit-write-failure.md` a violation costs the audit row
+`dev-docs/decisions/0006-audit-write-failure.md` a violation costs the audit row
 AND fails the tool call, including a call that otherwise succeeded. For the
 vocabulary constraints that lands on exactly the rows these columns exist to
 record: a refusal, or a call with no customer.
@@ -342,7 +342,7 @@ code path and not about the data: the other two absence values and a non-NULL
 while `_customer_ref` and `_client_id` are fed the same token object. A second
 writer with its own token source, a provider yielding a token that carries no
 client id, would be filing an honest row this constraint would reject, and
-under `docs/decisions/0006-audit-write-failure.md` the rejection costs the row
+under `dev-docs/decisions/0006-audit-write-failure.md` the rejection costs the row
 and the call. `packages/postern-core/src/postern_core/store/models.py::AuditEntry.client_id` states that in the column's own
 comment.
 
@@ -363,3 +363,57 @@ constraints today -- `ck_audit_log_refusal_reason`,
 `ck_audit_log_reaching_at_matches_outcome` -- so "All three constraints" under
 "What this costs" counts the three this record introduced, which were the
 whole set when it was written.
+
+---
+
+## Amendment, 26 September 2026: `refusal_reason` widened to three values
+
+Migration `2d2aa72c0cb3`. A consent check that could not reach the consents
+table was recorded as a call nobody refused. `_refuse` sits on the two
+branches around the database read, so when that read raised, the row came out
+`outcome='raised'`, `detail='NotFoundError'`, `refusal_reason` NULL --
+byte-identical to a mistyped tool name.
+
+The masking was not in this repository's code. FastMCP's `_evaluate_check`
+catches `Exception` around every auth check, logs a WARNING and returns
+`False`, so the exception never reached a branch that could file anything.
+That is worth recording because it is where the fix had to go, and because
+catching it ourselves means this repository now owns that log line.
+
+Surfaced while sizing the connection pool: at the ceiling the next concurrent
+operation waits `pool_timeout` and the lookup raises, so a saturated pool and
+a revoked consent produced one row.
+
+`consent_store_unavailable` is the third admissible value, 25 characters in a
+`VARCHAR(32)`. It is the first value in this column that describes the
+OPERATOR'S OWN INFRASTRUCTURE rather than the caller, and it is deliberately
+not a security signal. `services/confirm/customer_rate_limit.py` chose 503
+over 429 so that a dashboard would not attribute an outage to customer
+behaviour; the same reasoning applies to a literal an alerting rule fires on.
+A query counting consent denials must exclude it or it counts an outage as
+customer state.
+
+The denial itself is unchanged and stays. `AuthorizationError` is re-raised
+ahead of the broad catch so a deliberate denial is never refiled as
+infrastructure, and `CancelledError` is a `BaseException`, so a cancelled
+request is not filed at all.
+
+`_clear_refusal` is new, and is the price of the value not being cached. A
+filing describes the evaluation the dispatch used, which is the last one; one
+`tools/call` evaluates a tool's check several times, and a store that
+recovers mid-request answers some and raises on others. Per-tool keying
+cannot catch that, because the stale filing and the live call share a name.
+Without the withdrawal, a call consent ALLOWED would carry a refusal reason
+on an append-only table.
+
+TWO LIMITS, STATED RATHER THAN LEFT TO BE FOUND. Production hands consent and
+audit one `Database`, so a saturation deep enough to fail the audit write
+costs the row entirely under record 0006, and this reason reaches the table
+only for calls whose write got a connection. And `tools/list` writes no audit
+row in any state, so a catalogue silently shrinking during an outage still
+looks exactly like a customer with no consent.
+
+`downgrade` fails by design against any database holding one of these rows.
+`audit_log` is append-only, so there is no `UPDATE` that could rewrite them,
+and inventing an admissible value would restate an outage as a customer's
+consent state.

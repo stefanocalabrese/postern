@@ -158,7 +158,7 @@ both listed; fixing was explicitly optional per finding, verification was not.
    middleware=[Middleware(HeaderBodyValidation, strict=...)])` wraps it, and a
    real request against that stack gets a real `400` with `-32020` --
    `test_real_stack_returns_a_genuine_400_through_build_server_and_http_app`.
-   `httpx` is not installed in this project (`docs/decisions/0001-facade-http-client.md`);
+   `httpx` is not installed in this project (`dev-docs/decisions/0001-facade-http-client.md`);
    this test uses `httpx2.ASGITransport`, which mirrors `httpx.ASGITransport`'s
    API and is already this project's HTTP stack, so no new dependency was
    added for it.

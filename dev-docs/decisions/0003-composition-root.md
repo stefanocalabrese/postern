@@ -94,7 +94,7 @@ day counts) -- there are no file uploads and no bulk-write bodies in this
 plan's tool set. 1 MiB is generous headroom over any legitimate request
 while still bounding the in-memory buffer `_drain` builds before any of
 this middleware's checks run, which is otherwise an unbounded
-denial-of-service surface (docs/decisions/0002-header-validation.md already
+denial-of-service surface (dev-docs/decisions/0002-header-validation.md already
 names this).
 
 **What a deployment should consider before changing it:** the number

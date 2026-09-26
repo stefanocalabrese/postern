@@ -1,15 +1,24 @@
-"""What a consent check that RAISES does. Characterisation, not endorsement.
+"""What a consent check that RAISES does. Characterisation, then a decision.
 
-`services/api/consent.py`'s `check()` reaches Postgres at line 190
-(`if domain in await _domains(db, customer)`). A store outage is not an
+`services/api/consent.py`'s `check` reaches Postgres through its
+`await _domains(db, customer)`. A store outage is not an
 exotic condition, and nothing in this repository had ever established what
 the check does when that line raises instead of returning a decision:
 `dev-docs/decisions/0006-audit-write-failure.md` made that call deliberately for
 audit writes and wrote the cost down, but consent never had the equivalent.
-These tests pin the answer measured on 2026-09-17, so it is a fact in the
-repository before anyone changes it. They assert what IS, not what should
-be; if the policy is ever chosen deliberately, these are the tests to
-rewrite, and their names say so.
+These tests pinned the answer measured on 2026-09-17, so it was a fact in
+the repository before anyone changed it, and the three whose names still
+carry "currently" assert what IS rather than what should be.
+
+ONE OF THEM WAS REWRITTEN ON 26 SEPTEMBER 2026, which is what the file said
+would happen when the policy was chosen deliberately. capo ruled that
+failing closed is correct and stays, and that denying SILENTLY and
+INDISTINGUISHABLY is not: `test_a_raising_consent_check_files_the_store
+_unavailable_reason` below asserted a NULL `refusal_reason` under its old
+name and now asserts `consent_store_unavailable`. The three tests around it
+are untouched, because what they measure -- hidden from the catalogue,
+denied on call, backend never reached, in both failure shapes -- is the half
+that was ruled correct.
 
 MEASURED ANSWER: it fails CLOSED, on both halves and in both failure shapes.
 
@@ -90,8 +99,14 @@ from postern_core.auth.keys import GeneratedKeySource
 from postern_core.auth.read_minter import ReadTokenMinter
 from postern_core.auth.revocation import unchecked_revocation
 from postern_core.facade.client import BackendClient
+from postern_core.store import consents
 from postern_core.store.engine import Database
-from postern_core.store.models import AuditEntry, ConsentRecord
+from postern_core.store.models import (
+    REFUSAL_CONSENT_STORE_UNAVAILABLE,
+    REFUSAL_DOMAIN_NOT_CONSENTED,
+    AuditEntry,
+    ConsentRecord,
+)
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware import Middleware
@@ -186,6 +201,20 @@ class RecordingBackend:
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.paths.append(request.url.path)
         return httpx2.Response(200, json={"accounts": [], "transactions": [], "cards": []})
+
+
+class FailingBackend:
+    """A backend that answers 500 to everything, so the TOOL BODY raises.
+
+    The third of the three states this file now separates, and the only one
+    that is not a refusal: `BackendClient` raises `BackendError` above 400
+    and FastMCP wraps it, so the row reads `detail='ToolError'` where both
+    refusals read `NotFoundError`. It records nothing, because whether the
+    body ran is already answered by the row it produces.
+    """
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"detail": "backend down"})
 
 
 def _settings(pg_url: str) -> Settings:
@@ -411,7 +440,7 @@ async def test_a_raising_consent_check_currently_denies_the_call_and_never_runs_
         await dead.close()
 
 
-async def test_a_raising_consent_check_currently_files_no_refusal_reason(
+async def test_a_raising_consent_check_files_the_store_unavailable_reason(
     audit_server: FastMCP,
     pg_url: str,
     key_pair: RSAKeyPair,
@@ -419,18 +448,20 @@ async def test_a_raising_consent_check_currently_files_no_refusal_reason(
     consent_session: AsyncSession,
     session: AsyncSession,
 ) -> None:
-    """The cost of failing closed this way: the audit row cannot say why.
+    """The row now says which of the three refusals happened.
 
-    `services/api/consent.py`'s `_refuse` is what puts a reason on the row,
-    and it sits on lines 188 and 192 -- both AFTER the `await _domains(...)`
-    on line 190 that raised. So a store outage produces exactly the row
-    `dev-docs/decisions/0006`-era code produced before `refusal_reason` existed:
-    `outcome='raised'`, `detail='NotFoundError'`, reason NULL, which is
-    byte-identical to a mistyped tool name. `tests/test_audit_refusal_reason.py`
-    exists to keep a real consent denial distinguishable from a typo; this
-    records that the outage case is the third thing none of them can tell
-    apart. Not a new bug -- a gap in the vocabulary, worth pinning because a
-    reviewer reading the table during an outage will see only typos.
+    This test asserted the opposite until 26 September 2026, and its old name
+    said so: `_refuse` sat on the two branches AFTER the `await _domains(...)`
+    that raised, so a store outage produced `outcome='raised'`,
+    `detail='NotFoundError'`, reason NULL, byte-identical to a mistyped tool
+    name and to each other. `services/api/consent.py`'s `check` now catches
+    what `_domains` raises, files `consent_store_unavailable` and returns
+    False, so the denial is unchanged and the row carries the class of it.
+
+    `detail` stays `NotFoundError`, and that is the point of asserting it
+    here rather than leaving it out: FastMCP answers no tool for a refusal
+    and for an unknown name alike, so the only column that separates the
+    three states is this one.
 
     `audit_server` is requested for its clear-`audit_log`-before-and-after
     behaviour (see `tests/conftest.py`), not for the server object: this call
@@ -449,7 +480,169 @@ async def test_a_raising_consent_check_currently_files_no_refusal_reason(
     assert rows[0].tool_name == GATED_TOOL
     assert rows[0].outcome == "raised"
     assert rows[0].detail == "NotFoundError"
-    assert rows[0].refusal_reason is None
+    assert rows[0].refusal_reason == REFUSAL_CONSENT_STORE_UNAVAILABLE
+
+
+async def test_the_three_states_an_operator_must_separate_are_three_different_rows(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    session: AsyncSession,
+) -> None:
+    """Consent absent, consent check unreachable, tool body raised.
+
+    One test rather than three, because the property is that the rows
+    DIFFER, and three tests each asserting one row can all pass while two of
+    the rows are identical. Read as a table: `detail` separates the tool body
+    from the two refusals, `refusal_reason` separates the two refusals from
+    each other, and nothing else on the row does either job.
+
+    The tool body case is driven by a backend that answers 500, which
+    `postern_core.facade.client.BackendClient` turns into a `BackendError`
+    and FastMCP wraps as `ToolError`.
+
+    Three calls, three rows, measured: `_app` above builds its
+    `BackendClient` with `before_backend_request=None`, so this harness
+    writes no `outcome='reaching'` row even for the call that does reach the
+    backend, and the filter below removes nothing today. It is there so that
+    wiring that hook into `_app` later fails this test on the assertion it
+    is about rather than on row order. Which calls write an entry row is
+    `tests/test_audit_entry_row.py`'s subject, not this file's.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    token = _token(key_pair)
+
+    unreachable = Database(REFUSED_URL)
+    try:
+        app = _app(unreachable, database, key_pair, RecordingBackend(), _settings(pg_url))
+        await _rpc(app, token, "tools/call", {"name": "accounts.list", "arguments": {}})
+    finally:
+        await unreachable.close()
+
+    consented = _app(database, database, key_pair, RecordingBackend(), _settings(pg_url))
+    await _rpc(
+        app=consented,
+        token=token,
+        method="tools/call",
+        params={"name": "cards.list", "arguments": {}},
+    )
+
+    failing = _app(database, database, key_pair, FailingBackend(), _settings(pg_url))
+    await _rpc(
+        app=failing,
+        token=token,
+        method="tools/call",
+        params={"name": "accounts.list", "arguments": {}},
+    )
+
+    completions = [row for row in await _audit_rows(session) if row.outcome != "reaching"]
+    assert [(r.tool_name, r.outcome, r.detail, r.refusal_reason) for r in completions] == [
+        ("accounts.list", "raised", "NotFoundError", REFUSAL_CONSENT_STORE_UNAVAILABLE),
+        ("cards.list", "raised", "NotFoundError", REFUSAL_DOMAIN_NOT_CONSENTED),
+        ("accounts.list", "raised", "ToolError", None),
+    ]
+
+
+async def test_the_caller_still_cannot_tell_an_unreachable_store_from_a_typo(
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+) -> None:
+    """The half that must NOT change, and the reason the reason went in a
+    column instead of the response.
+
+    `tests/test_audit_refusal_reason.py::test_the_caller_still_cannot_tell_a_denial_from_a_typo`
+    guards the same property for a consent denial. This one guards it for the
+    outage, where the pull in the other direction is real: an agent told
+    "the consent store is down" would retry, and a client told it by an
+    operator's own server learns that `accounts.list` exists and that this
+    customer reached a consent check at all.
+
+    Compared on raw text with the tool names substituted for one
+    placeholder, so a differing `Content-Length` fails rather than being
+    allowed for: `accounts.lost` is the same 13 characters as
+    `accounts.list`.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    dead = Database(REFUSED_URL)
+    try:
+        app = _app(dead, database, key_pair, RecordingBackend(), _settings(pg_url))
+        refused = await _rpc(
+            app, _token(key_pair), "tools/call", {"name": "accounts.list", "arguments": {}}
+        )
+        unknown = await _rpc(
+            app, _token(key_pair), "tools/call", {"name": "accounts.lost", "arguments": {}}
+        )
+    finally:
+        await dead.close()
+
+    assert refused.status_code == unknown.status_code == 200
+    assert "Unknown tool: 'accounts.list'" in refused.text
+    assert refused.text.replace("accounts.list", "X") == unknown.text.replace("accounts.lost", "X")
+    assert refused.headers["content-length"] == unknown.headers["content-length"]
+
+
+async def test_a_store_that_recovers_inside_one_request_does_not_stamp_the_call_it_allowed(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovered check must erase its own earlier refusal, or the reason
+    outlives the condition it describes.
+
+    One `tools/call` evaluates a tool's check more than once
+    (`services/api/consent.py`'s module docstring measures five evaluations
+    for one call), and a saturated pool is flaky rather than down: some of
+    those evaluations raise and later ones answer. `_refuse` files per tool
+    name, which is what keeps one tool's denial off another tool's row, and
+    it is not enough here -- the stale filing and the live call are the SAME
+    name. Only the returned path writes NULL by construction, so a call
+    consent ALLOWED whose body then raises reads the filing back and would
+    be recorded as refused by a store that was working by the time it
+    mattered.
+
+    The failure is injected at `postern_core.store.consents.granted_domains`
+    rather than by breaking a connection, because the shape being tested is
+    WHEN the check recovers, not what broke it: the first four evaluations
+    raise (none of them can hit the request cache, since nothing has
+    populated it yet) and the fifth, the real dispatch's own, succeeds. The
+    backend then answers 500, so the tool body raises and the middleware
+    reads the refusal cache -- the one path that does.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    healthy = consents.granted_domains
+    attempts = 0
+
+    async def flaky(db_session: AsyncSession, customer: Any) -> set[str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= len(GATED_TOOLS):
+            raise ConnectionRefusedError("pool exhausted")
+        return await healthy(db_session, customer)
+
+    monkeypatch.setattr(consents, "granted_domains", flaky)
+
+    app = _app(database, database, key_pair, FailingBackend(), _settings(pg_url))
+    await _rpc(
+        app,
+        _token(key_pair),
+        "tools/call",
+        {"name": "accounts.get_balance", "arguments": {"account_ref": "acc_7f3a"}},
+    )
+
+    assert attempts > len(GATED_TOOLS), "the recovery this test is about never happened"
+    completions = [row for row in await _audit_rows(session) if row.outcome != "reaching"]
+    assert len(completions) == 1
+    assert completions[0].tool_name == "accounts.get_balance"
+    assert completions[0].detail == "ToolError"
+    assert completions[0].refusal_reason is None
 
 
 async def test_a_blackholed_consent_store_currently_denies_only_after_the_driver_timeout(

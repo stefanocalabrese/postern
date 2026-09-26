@@ -32,10 +32,23 @@ A denial also FILES ITSELF, for the audit row. `auth=` answers a bare bool
 and the wire answer is `Unknown tool: '<name>'` either way, so before this
 the audit table recorded a consent refusal and a mistyped tool name as the
 same `outcome='raised'`, `detail='NotFoundError'` pair. Only this check
-knows which of the two happened, and only it knows which of its own two
+knows which of the two happened, and only it knows which of its own three
 refusals it made, so it records that here rather than leaving the
 middleware to infer a reason from an exception type or a message string --
 an inference that breaks the first time a third refusal reason exists.
+
+THAT THIRD REASON ARRIVED ON 26 SEPTEMBER 2026 and is not a fact about the
+caller at all. `consent_store_unavailable` is filed when the database read
+below raises, which until then left `check` through FastMCP's
+`_evaluate_check`, was masked there into the same bare False, and produced
+the row a mistyped tool name produces. A saturated connection pool and a
+customer who never granted access were one row. The denial did not change
+and must not: a check that established nothing has to refuse. What changed
+is that an operator reading `audit_log` during an incident can now tell
+which one they are looking at, and the value says infrastructure rather
+than intent so an alerting rule built on it cannot attribute an outage to
+customer behaviour.
+
 `refusal_for` is what `services/api/middleware/audit.py` reads back, after
 `call_next` raises: FastMCP evaluates `auth=` inside `_get_tool`
 (`fastmcp/server/server.py::_get_tool`), which the middleware's own `call_next`
@@ -61,18 +74,23 @@ name the client asked for -- keeps each decision attached to the tool it
 was made about.
 """
 
+import logging
 from collections.abc import Awaitable, Callable
 
+from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.auth import AuthContext
 from fastmcp.server.dependencies import get_http_request
 from postern_core.identity import CustomerRef
 from postern_core.store import consents
 from postern_core.store.engine import Database
 from postern_core.store.models import (
+    REFUSAL_CONSENT_STORE_UNAVAILABLE,
     REFUSAL_DOMAIN_NOT_CONSENTED,
     REFUSAL_NO_CUSTOMER_REF,
 )
 from pydantic import ValidationError
+
+logger = logging.getLogger(__name__)
 
 _CACHE_ATTR = "postern_consent_domains"
 _Cache = dict[str, set[str]]
@@ -152,6 +170,47 @@ def _refuse(ctx: AuthContext, reason: str) -> None:
     refusals[ctx.component.name] = reason
 
 
+def _clear_refusal(ctx: AuthContext) -> None:
+    """Withdraw an earlier refusal for this tool, because the check now allows.
+
+    A refusal is filed per tool name and read back once, after the tool
+    ran, so it has to describe the evaluation the dispatch actually used --
+    which is the LAST one, not the first. One `tools/call` evaluates a
+    tool's check more than once (the module docstring above measures five
+    evaluations for one call), and a consent store that is saturated rather
+    than down answers some of them and raises on others. Without this, an
+    evaluation that raised early would leave `consent_store_unavailable`
+    behind for a call that a later evaluation allowed, and the raised path
+    in `services/api/middleware/audit.py` -- the one path that reads the
+    cache -- would stamp it onto the row of a tool whose BODY failed. That
+    is a false statement on an append-only, regulator-facing table, and it
+    is the same class of error `_refuse`'s per-tool keying exists to
+    prevent, except that here the stale entry and the live call share a
+    name, so the keying cannot catch it.
+
+    Nothing was withdrawable before 26 September 2026 and this function
+    would have been dead code: the two refusals `check` could file were both
+    decided from a domain set that the request cache pins for the rest of
+    the request, so a tool refused once in a request was refused by every
+    later evaluation in it. The unreachable-store refusal is the first one
+    that a later evaluation can contradict, because the failure it records
+    is not cached.
+
+    Never raises, for `_refuse`'s reason applied in the other direction: a
+    withdrawal whose bookkeeping failed must still leave the call ALLOWED.
+    The caller returns True regardless, so the worst outcome is an audit row
+    over-reporting a refusal, which is why this is the one place in this
+    module where the safe direction is not NULL.
+    """
+    try:
+        request = get_http_request()
+    except Exception:
+        return
+    refusals: _Refusals | None = getattr(request.state, _REFUSALS_ATTR, None)
+    if isinstance(refusals, dict):
+        refusals.pop(ctx.component.name, None)
+
+
 def refusal_for(tool_name: str) -> str | None:
     """Why this request's consent check refused `tool_name`, or None.
 
@@ -161,6 +220,12 @@ def refusal_for(tool_name: str) -> str | None:
     call, or there is no HTTP request to have filed anything on. All three
     mean "this call was not refused by consent", which is exactly what NULL
     says on `audit_log.refusal_reason`.
+
+    A fourth state left that list on 26 September 2026: a check that could
+    not reach the consents table used to read as None here too, and now
+    answers `consent_store_unavailable`. It was the worst of the four to
+    have in this bucket, because it is the only one that is not a statement
+    about the caller.
 
     The lookup is by the name the client asked for, which is the name the
     tool is registered under and therefore the name `_refuse` filed the
@@ -196,7 +261,69 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
             # is where that question belongs.
             _refuse(ctx, REFUSAL_NO_CUSTOMER_REF)
             return False
-        if domain in await _domains(db, customer):
+        try:
+            granted = await _domains(db, customer)
+        except AuthorizationError:
+            # FastMCP's own denial, which `_evaluate_check` propagates
+            # rather than masking. Nothing under `_domains` raises it today
+            # -- it opens a session and runs one SELECT -- and this branch
+            # is here so that if anything ever does, a deliberate denial is
+            # not refiled as an outage. Recording infrastructure where the
+            # cause was authorization is the same error as the reverse, in
+            # the direction that hides a real refusal.
+            raise
+        except Exception as exc:
+            # DENIES, exactly as before. What changes is that the row now
+            # says which of the three things happened. Until 26 September
+            # 2026 this exception left `check` entirely and
+            # `fastmcp/utilities/authorization.py`'s `_evaluate_check`
+            # caught it, logged a warning and returned False, so the
+            # `domain_not_consented` refusal below this line was unreachable
+            # on an outage and the audit row read `outcome='raised'`,
+            # `detail='NotFoundError'`, reason NULL -- a row a mistyped tool
+            # name produces byte for byte. Catching it here is what puts a
+            # class on it; the verdict is the same denial FastMCP was
+            # already making.
+            #
+            # `Exception` and not `BaseException`, which is load-bearing
+            # rather than habitual: `asyncio.CancelledError` derives from
+            # `BaseException`, so a request the edge cancelled passes
+            # through untouched instead of being filed as a store outage.
+            # A cancelled call is not a call this check refused.
+            #
+            # LOGGED HERE BECAUSE FASTMCP NO LONGER SEES IT. `_evaluate_check`
+            # logged this at WARNING with a full traceback and was the only
+            # place an operator could learn the type of the failure, so
+            # catching it without logging would trade one blind spot for
+            # another. ERROR rather than WARNING: a consent store this
+            # process cannot reach is denying real customers, and the audit
+            # row now carries a matching literal an operator can join
+            # against. The volume is unchanged -- one line per evaluation,
+            # as before. Measured against a refused connection: one line for
+            # a `tools/call` carrying no arguments, and one per evaluation on
+            # the five-evaluation path the module docstring above measures.
+            #
+            # The traceback can carry the SQL and its bound parameters, so
+            # this line can put a `cust_`-prefixed customer reference in the
+            # log. That value is already written to `audit_log.customer_ref`
+            # in the clear on every call this customer makes, and `_customer`
+            # admits nothing that `CustomerRef` rejects, so the PAN-, IBAN-
+            # and DNI-shaped subjects `postern_core.identity`'s `_OPAQUE`
+            # warns about never reach this line.
+            logger.error(
+                "consent store unreachable, denying %s: %s",
+                ctx.component.name,
+                type(exc).__name__,
+                exc_info=exc,
+            )
+            _refuse(ctx, REFUSAL_CONSENT_STORE_UNAVAILABLE)
+            return False
+        if domain in granted:
+            # This evaluation allowed, so any refusal an earlier one in this
+            # same request filed for this same tool is now wrong. Only the
+            # unreachable-store refusal can be standing here; see
+            # `_clear_refusal`.
+            _clear_refusal(ctx)
             return True
         _refuse(ctx, REFUSAL_DOMAIN_NOT_CONSENTED)
         return False

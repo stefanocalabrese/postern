@@ -125,5 +125,5 @@ no hardcoded external URLs exist in the codebase. It scans all Python files
 in `packages/` and `services/` for HTTP(S) URLs that are not internal
 defaults or environment variable references.
 
-See also: `docs/decisions/0004-base-images.md` (base image pinning, ZT-3).
+See also: `dev-docs/decisions/0004-base-images.md` (base image pinning, ZT-3).
 

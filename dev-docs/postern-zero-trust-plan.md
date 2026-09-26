@@ -169,7 +169,7 @@ Bearer tokens are the classic zero-trust weakness: possession is authorization. 
 
 **DPoP investigation:** DPoP / RFC 9449 appears nowhere in the MCP `2026-07-28` spec. Zero hits across the specification, changelog, and extension mechanisms. Claude, ChatGPT (OpenAI), and Perplexity do not implement DPoP. FastMCP 4.x has no DPoP middleware. Unilateral adoption would break the bootstrap tool (§4.2 of the handoff), which is the only context-delivery mechanism that works everywhere.
 
-**Decision:** accept the risk with compensating controls (see `docs/decisions/0010-dpop-sender-constraint.md`).
+**Decision:** accept the risk with compensating controls (see `dev-docs/decisions/0010-dpop-sender-constraint.md`).
 
 **Compensating controls in place:**
 - **60-second token lifetime** (ZT-1) — narrow exploitation window.
@@ -180,7 +180,7 @@ Bearer tokens are the classic zero-trust weakness: possession is authorization. 
 
 **Residual gap:** client IP/ASN anomaly detection is wired into the risk engine and signals are stored in `audit_log.risk_signals` (JSONB) for Postgres-queryable anomaly tracking. The session store is pluggable — in-memory (dev/test) and Redis-compatible backend (production, via ``POSTERN_REDIS_URL``, works with AWS ElastiCache / Google Memorystore / Azure Cache for Redis). Sessions survive process restarts when backed by Redis with TTL.
 
-**Acceptance:** ✅ satisfied by decision record 0010 (`docs/decisions/0010-dpop-sender-constraint.md`).
+**Acceptance:** ✅ satisfied by decision record 0010 (`dev-docs/decisions/0010-dpop-sender-constraint.md`).
 
 ---
 
@@ -192,7 +192,7 @@ Bearer tokens are the classic zero-trust weakness: possession is authorization. 
 **Do:**
 - Verify cosign signatures **at deploy time** as a hard gate — reject unsigned or mismatched images. ✅ Done: ``.github/workflows/deploy.yml`` verifies against Sigstore Rekor transparency log before deploy; unsigned images fail.
 - Verify SBOM presence and scan results as part of the same gate. ✅ Done: syft generates SPDX SBOMs, deploy stage checks artifact presence; Trivy scans for HIGH/CRITICAL vulnerabilities and blocks on exit-code 1.
-- Pin base images by digest (already in §12.2) and fail the build on drift. ✅ Done: ``test_zt3_digest_drift.py`` validates all external FROM lines use sha256 digests matching ``docs/decisions/0004-base-images.md``.
+- Pin base images by digest (already in §12.2) and fail the build on drift. ✅ Done: ``test_zt3_digest_drift.py`` validates all external FROM lines use sha256 digests matching ``dev-docs/decisions/0004-base-images.md``.
 - Runtime threat detection on the Fargate tasks (GuardDuty Runtime Monitoring or equivalent) — the tasks are internet-facing. ⏸️ Pending: no ECS infrastructure in this repo yet; requires platform team (§12.4).
 - Confirm the read task role **cannot** assume the write role or read its Vault path; automated IAM policy test (§12.3). ⏸️ Pending: blocked on infrastructure (Terraform repo, gate 5).
 

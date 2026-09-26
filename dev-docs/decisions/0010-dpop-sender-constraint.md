@@ -74,7 +74,7 @@ DPoP. Three are implemented; one is partially in place.
 
 | Control | Status | Details |
 |---|---|---|
-| **Client IP/ASN anomaly detection** (ZT-5) | ⚠️ Framework exists, enforcement not wired | `RiskContext` tracks session age, record counts, distinct accounts touched. The risk engine (`RiskEngine`) evaluates thresholds and emits `RiskSignal` with severity levels (LOW/MEDIUM/HIGH). However, IP/ASN tracking is not yet implemented — no `client_ip` or `x-forwarded-for` extraction exists in the codebase. The framework is ready; the data collection layer needs to be added at the ASGI middleware level (D1 in the foundation plan). |
+| **Client IP/ASN anomaly detection** (ZT-5) | ✅ Shipped (entered as "not wired" 2026-09-20, corrected 2026-09-26) | `IpTracker` in `postern_core.risk.context` and `IpAnomalyDetector` in `postern_core.risk.ip_anomaly` detect impossible travel and excessive IP diversity; `postern_core.net` does the extraction and `services/api/middleware/risk.py` wires it. The original entry read "IP/ASN tracking is not yet implemented — no `client_ip` or `x-forwarded-for` extraction exists in the codebase", which was true when written and false by the time this record was being cited for it. **This is the only compensating control on the read path that can separate an attacker's presentation of a stolen token from the customer's**, because that token is multi-use for its 60 seconds by design (record 0014). |
 
 ## Decision: accept the risk with compensating controls
 
@@ -105,9 +105,11 @@ DPoP. Three are implemented; one is partially in place.
    (§7.2) means internal JWTs cannot be replayed across the read/write
    boundary, and Istio enforces issuer-based routing.
 
-4. **The remaining gap (IP/ASN) is a known, scoped risk.** Without client IP
-   tracking, an attacker who steals a token and replays it from different
-   infrastructure within the 60-second window is not detected. ~~(before jti
+4. **The IP/ASN gap is closed; this entry is kept for the record.** ~~Without
+   client IP tracking, an attacker who steals a token and replays it from
+   different infrastructure within the 60-second window is not detected.~~
+   Struck 2026-09-26: origin anomaly detection shipped, and the three bullets
+   below describe a state that no longer holds. ~~(before jti
    cache eviction)~~ struck 2026-09-26: eviction has nothing to do with it,
    and origin is the only signal on this side that separates the attacker's
    presentation from the customer's. This is a real gap, but:
@@ -162,7 +164,7 @@ The test `tests/test_zt1_continuous_auth.py` verifies the compensating controls:
   and whose name had always said the opposite. That name is how the row above
   got its ✅.
 
-See also: `docs/postern-zero-trust-plan.md` §4 (ZT-6 work item),
+See also: `dev-docs/postern-zero-trust-plan.md` §4 (ZT-6 work item),
 `docs/superpowers/plans/postern-foundation-and-read-surface-2026-09-12.md`
 (DPoP investigation, line 44).
 

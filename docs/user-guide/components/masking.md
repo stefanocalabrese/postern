@@ -179,4 +179,4 @@ the response model, regardless of masking layer behavior.
 | FreeText type | [`packages/postern-core/src/postern_core/domain/masking.py`](../../../packages/postern-core/src/postern_core/domain/masking.py) |
 | Projection wrapper (catches validation errors) | [`packages/postern-core/src/postern_core/facade/projection.py`](../../../packages/postern-core/src/postern_core/facade/projection.py) |
 | Audit scrub (redacts in tool arguments) | [`services/api/middleware/audit.py`](../../../services/api/middleware/audit.py) (see `_scrub()`) |
-| ADR-0008: Masking residual gaps | [`docs/decisions/0008-masking-residuals.md`](../dev-docs/decisions/0008-masking-residuals.md) |
+| ADR-0008: Masking residual gaps | [`dev-docs/decisions/0008-masking-residuals.md`](../dev-docs/decisions/0008-masking-residuals.md) |

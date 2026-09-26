@@ -2006,7 +2006,7 @@ async def test_the_database_refuses_a_reason_outside_the_documented_set(
             )
 
 
-async def test_both_documented_reasons_are_accepted_by_that_constraint(
+async def test_every_documented_reason_is_accepted_by_that_constraint(
     audit_server: FastMCP, session: AsyncSession
 ) -> None:
     """The companion the test above needs: a constraint that rejected every
@@ -2014,7 +2014,13 @@ async def test_both_documented_reasons_are_accepted_by_that_constraint(
     goes through the real `append` and is read back, so a migration listing
     fewer values than the code can produce fails here rather than in
     production, where the cost is the audit row itself (fail closed, see
-    dev-docs/decisions/0006-audit-write-failure.md)."""
+    dev-docs/decisions/0006-audit-write-failure.md).
+
+    It was named for two values until 26 September 2026, when
+    `consent_store_unavailable` made three, and it caught exactly what it
+    was built to catch: the vocabulary widened one commit before migration
+    2d2aa72c0cb3 widened the constraint, and this is the test that failed
+    in between."""
     for reason in REFUSAL_REASONS:
         await store_audit.append(
             session,
