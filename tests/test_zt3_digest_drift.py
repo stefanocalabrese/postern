@@ -21,6 +21,7 @@ the rationale for why both are multi-arch manifest-list digests.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 # Known-good digests from dev-docs/decisions/0004-base-images.md.
@@ -36,11 +37,15 @@ _KNOWN_DIGESTS: dict[str, str] = {
 
 # Regex: FROM <image>@sha256:<hex> AS <name>
 # Match image as everything up to @ (digest separator) or whitespace.
+# `FROM` and `AS` are matched case-insensitively via the inline `(?i:...)`
+# groups: `from ... as x` and `FROM ... As x` are both valid Dockerfile
+# syntax, and only those two keywords are case-folded — the image and digest
+# text is still matched case-sensitively.
 _FROM_RE = re.compile(
-    r"^FROM\s+"
+    r"^(?i:from)\s+"
     r"(?P<image>[^\s@]+)"
     r"(?:@(?P<digest>sha256:[a-f0-9]+))?"
-    r"(?:\s+AS\s+\S+)?",
+    r"(?:\s+(?i:as)\s+(?P<name>\S+))?",
     re.MULTILINE,
 )
 
@@ -50,19 +55,59 @@ def _read_dockerfile() -> str:
     return Path(__file__).resolve().parents[1].joinpath("Dockerfile").read_text()
 
 
+def _iter_from_lines(dockerfile: str) -> Iterator[tuple[str, str | None, bool]]:
+    """Yield ``(image, digest, is_internal)`` for each ``FROM`` line, in file order.
+
+    ``is_internal`` is derived from the Dockerfile's own ``AS`` clauses rather
+    than a hardcoded list of stage names: ``image`` counts as internal only if
+    an earlier ``FROM ... AS <name>`` in this same file already declared that
+    name as a stage. A new internal stage added to the Dockerfile (a shared
+    ``serving`` stage, ``migrate``, or anything else) is picked up automatically
+    without editing this file.
+
+    Order is enforced on purpose, not accepted loosely: a name is only internal
+    once it has actually been declared, which mirrors how `docker build` itself
+    resolves stage references (a `FROM` cannot forward-reference a stage that
+    is declared later in the file). This is the stricter of the two options
+    named in the task and it catches a real typo class — referencing a stage
+    name before it exists reads as an external, unpinned image and fails the
+    digest gate loudly, instead of silently passing as if the name were
+    special.
+
+    It also settles what happens when a stage name collides with a real
+    image name on some registry (e.g. a stage named ``builder`` when a
+    registry also hosts an image literally called ``builder``): this
+    resolves it to the stage, because that is what `docker build` itself
+    does — once a name is declared as a stage, every later bare `FROM <name>`
+    in the file is that stage, never a registry pull, so this function's
+    behaviour matches Docker's rather than merely approximating it.
+
+    Only `FROM` lines are considered. `COPY --from=<stage>` references stage
+    or build-context names too, but nothing in this file inspects `COPY`
+    lines at all — the digest gate only ever cared about base images named in
+    `FROM`, and `COPY --from=` never introduces a new external image for it
+    to check.
+    """
+    declared: set[str] = set()
+    for m in _FROM_RE.finditer(dockerfile):
+        image = m.group("image")
+        digest = m.group("digest")
+        name = m.group("name")
+        yield image, digest, image in declared
+        if name:
+            declared.add(name)
+
+
 # --- External images must be pinned by digest (not tag) ---
 
 
 def test_all_external_from_lines_use_digests() -> None:
     """Every external FROM line uses @sha256:, not a bare tag."""
     dockerfile = _read_dockerfile()
-    for m in _FROM_RE.finditer(dockerfile):
-        image = m.group("image")
-        digest = m.group("digest")
-
+    for image, digest, is_internal in _iter_from_lines(dockerfile):
         # Multi-stage references (e.g. "FROM runtime AS api") are internal
         # and don't need digest pinning — they resolve to a build stage.
-        if image in ("runtime", "builder"):
+        if is_internal:
             continue
 
         assert digest is not None, (
@@ -79,11 +124,8 @@ def test_digests_match_decision_record() -> None:
     dockerfile = _read_dockerfile()
 
     found: dict[str, str] = {}
-    for m in _FROM_RE.finditer(dockerfile):
-        image = m.group("image")
-        digest = m.group("digest")
-
-        if image in ("runtime", "builder"):
+    for image, digest, is_internal in _iter_from_lines(dockerfile):
+        if is_internal:
             continue
 
         assert digest is not None, f"External image '{image}' in FROM line is not pinned by digest."
@@ -107,11 +149,8 @@ def test_decision_record_lists_all_external_images() -> None:
     dockerfile = _read_dockerfile()
 
     found: dict[str, str] = {}
-    for m in _FROM_RE.finditer(dockerfile):
-        image = m.group("image")
-        digest = m.group("digest")
-
-        if image in ("runtime", "builder"):
+    for image, digest, is_internal in _iter_from_lines(dockerfile):
+        if is_internal:
             continue
 
         assert digest is not None, f"External image '{image}' in FROM line is not pinned by digest."
@@ -131,11 +170,8 @@ def test_no_bare_tags_in_from_lines() -> None:
     """No FROM line uses a bare tag without digest."""
     dockerfile = _read_dockerfile()
 
-    for m in _FROM_RE.finditer(dockerfile):
-        image = m.group("image")
-        digest = m.group("digest")
-
-        if image in ("runtime", "builder"):
+    for image, digest, is_internal in _iter_from_lines(dockerfile):
+        if is_internal:
             continue
 
         # If the image string itself contains @sha256, that's fine.
