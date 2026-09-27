@@ -111,6 +111,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware import Middleware
 
+from services.api import consent
 from services.api.asgi.header_validation import HeaderBodyValidation
 from services.api.middleware.audit import AuditMiddleware
 from services.api.server import build_server, token_customer_resolver
@@ -203,18 +204,110 @@ class RecordingBackend:
         return httpx2.Response(200, json={"accounts": [], "transactions": [], "cards": []})
 
 
+class BalanceBackend:
+    """Serves one real balance, for the healthy-store test.
+
+    `RecordingBackend` above answers every path with the same three empty
+    lists, which `accounts.list` accepts and `accounts.get_balance` cannot:
+    the facade reads `account_id`, `amount`, `currency` and `as_of` out of
+    the payload, so that handler makes a consented call fail inside the tool
+    body. Only the test that has to SUCCEED on the five-evaluation path
+    needs this, and only `accounts.get_balance` takes the non-empty
+    arguments that make the MCP SDK dispatch its internal `tools/list`.
+    """
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        self.paths.append(request.url.path)
+        return httpx2.Response(
+            200,
+            json={
+                "account_id": "acc_7f3a",
+                "amount": "1200.50",
+                "currency": "EUR",
+                "as_of": "2026-09-12T10:00:00Z",
+            },
+        )
+
+
 class FailingBackend:
     """A backend that answers 500 to everything, so the TOOL BODY raises.
 
     The third of the three states this file now separates, and the only one
     that is not a refusal: `BackendClient` raises `BackendError` above 400
     and FastMCP wraps it, so the row reads `detail='ToolError'` where both
-    refusals read `NotFoundError`. It records nothing, because whether the
-    body ran is already answered by the row it produces.
+    refusals read `NotFoundError`.
+
+    It records paths like `RecordingBackend` does, for the one test that
+    needs to distinguish "the body ran and the backend refused it" from "the
+    body never ran": `detail='ToolError'` proves the first, an empty
+    `paths` proves the second, and a test asserting a denial needs both.
     """
 
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        self.paths.append(request.url.path)
         return httpx2.Response(500, json={"detail": "backend down"})
+
+
+class _Probes:
+    """What one request ASKED of the consent store, counted at two levels.
+
+    The two numbers are the whole subject of the tests below and they are not
+    the same number.
+
+    `lookups` counts evaluations that reached `services/api/consent.py`'s
+    `_domains`, which is once per `auth=` evaluation for a customer this
+    check could name. `attempts` counts the ones that reached Postgres.
+    Every gap between them is a request-scoped cache absorbing an
+    evaluation, and a gap is the point: one `tools/call` carrying arguments
+    is five evaluations (the module docstring of that file measures it), and
+    an outage that costs five connection attempts costs five
+    `pool_timeout` waits during the event that exhausted the pool.
+
+    Patched at `_domains` rather than at the registered check because the
+    check is built inside `build_server` and closed over per domain, while
+    these two functions are exactly the two levels being separated. The
+    private name is deliberate: no public seam expresses "asked" versus
+    "reached the database", and inventing one for a test would put a
+    production indirection in the path this test exists to measure.
+    """
+
+    def __init__(self) -> None:
+        self.lookups: list[str] = []
+        self.attempts: list[str] = []
+
+
+def _count_probes(monkeypatch: pytest.MonkeyPatch, *, fail_first: int = 0) -> _Probes:
+    """Count both levels, optionally failing the first `fail_first` attempts.
+
+    `fail_first=0` leaves a healthy store and only counts. A positive value
+    raises `ConnectionRefusedError` from the first that many DATABASE
+    attempts and serves the rest normally, which is the shape a saturated
+    pool has: not down, contended, so whether an individual attempt lands
+    depends on whether a slot was free.
+    """
+    probes = _Probes()
+    real_domains = consent._domains
+    healthy = consents.granted_domains
+
+    async def counting_domains(db: Database, customer: Any) -> set[str]:
+        probes.lookups.append(customer.value)
+        return await real_domains(db, customer)
+
+    async def counting_query(db_session: AsyncSession, customer: Any) -> set[str]:
+        probes.attempts.append(customer.value)
+        if len(probes.attempts) <= fail_first:
+            raise ConnectionRefusedError("pool exhausted")
+        return await healthy(db_session, customer)
+
+    monkeypatch.setattr(consent, "_domains", counting_domains)
+    monkeypatch.setattr(consents, "granted_domains", counting_query)
+    return probes
 
 
 def _settings(pg_url: str) -> Settings:
@@ -585,7 +678,7 @@ async def test_the_caller_still_cannot_tell_an_unreachable_store_from_a_typo(
     assert refused.headers["content-length"] == unknown.headers["content-length"]
 
 
-async def test_a_store_that_recovers_inside_one_request_does_not_stamp_the_call_it_allowed(
+async def test_a_recovery_mid_request_no_longer_recovers_the_call(
     audit_server: FastMCP,
     pg_url: str,
     key_pair: RSAKeyPair,
@@ -594,42 +687,38 @@ async def test_a_store_that_recovers_inside_one_request_does_not_stamp_the_call_
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A recovered check must erase its own earlier refusal, or the reason
-    outlives the condition it describes.
+    """The first probe decides the request. This test IS the cost of that.
 
-    One `tools/call` evaluates a tool's check more than once
-    (`services/api/consent.py`'s module docstring measures five evaluations
-    for one call), and a saturated pool is flaky rather than down: some of
-    those evaluations raise and later ones answer. `_refuse` files per tool
-    name, which is what keeps one tool's denial off another tool's row, and
-    it is not enough here -- the stale filing and the live call are the SAME
-    name. Only the returned path writes NULL by construction, so a call
-    consent ALLOWED whose body then raises reads the filing back and would
-    be recorded as refused by a store that was working by the time it
-    mattered.
+    It asserted the opposite until 27 September 2026, under the longer
+    name `..._does_not_stamp_the_call_it_allowed`, and what it guarded was a
+    withdrawal: the check probed on every evaluation, so a store that raised
+    for the first four and answered the fifth ALLOWED the call, and a
+    `_clear_refusal` on the allow path had to erase the refusal the earlier
+    evaluations had filed under the same tool name.
 
-    The failure is injected at `postern_core.store.consents.granted_domains`
-    rather than by breaking a connection, because the shape being tested is
-    WHEN the check recovers, not what broke it: the first four evaluations
-    raise (none of them can hit the request cache, since nothing has
-    populated it yet) and the fifth, the real dispatch's own, succeeds. The
-    backend then answers 500, so the tool body raises and the middleware
-    reads the refusal cache -- the one path that does.
+    The failure is now remembered for the rest of the request, so the fifth
+    evaluation never reaches the database and the call is denied. That
+    retires the withdrawal -- no evaluation can contradict an earlier one,
+    so there is nothing to withdraw -- and it gives up a salvage: this exact
+    call used to succeed. It is a deliberate trade and not a regression.
+    Nobody chose five attempts; five is what the MCP SDK's internal
+    `tools/list` pass costs, the retry it amounts to is unbounded by any
+    policy, serial, and spends a `pool_timeout` per attempt during the event
+    that exhausted the pool. The client re-issues a dropped call anyway
+    (MCP 2026-07-28 has no SSE resumability, and CLAUDE.md's rule is that
+    every handler must be safe to re-run), so the retry still exists, one
+    layer out, where it holds no connection.
+
+    The backend answers 500 so that the old assertion's shape survives: if
+    the call were still allowed, the tool body would run and the row would
+    read `detail='ToolError'` with a NULL reason. It reads `NotFoundError`
+    with the outage reason instead, and the backend is never touched.
     """
     await _seed(consent_session, CUSTOMER, "accounts")
-    healthy = consents.granted_domains
-    attempts = 0
+    probes = _count_probes(monkeypatch, fail_first=1)
+    backend = FailingBackend()
 
-    async def flaky(db_session: AsyncSession, customer: Any) -> set[str]:
-        nonlocal attempts
-        attempts += 1
-        if attempts <= len(GATED_TOOLS):
-            raise ConnectionRefusedError("pool exhausted")
-        return await healthy(db_session, customer)
-
-    monkeypatch.setattr(consents, "granted_domains", flaky)
-
-    app = _app(database, database, key_pair, FailingBackend(), _settings(pg_url))
+    app = _app(database, database, key_pair, backend, _settings(pg_url))
     await _rpc(
         app,
         _token(key_pair),
@@ -637,12 +726,180 @@ async def test_a_store_that_recovers_inside_one_request_does_not_stamp_the_call_
         {"name": "accounts.get_balance", "arguments": {"account_ref": "acc_7f3a"}},
     )
 
-    assert attempts > len(GATED_TOOLS), "the recovery this test is about never happened"
+    assert len(probes.lookups) == 5, "this is not the five-evaluation path any more"
+    assert len(probes.attempts) == 1, "a remembered failure must not be re-probed"
     completions = [row for row in await _audit_rows(session) if row.outcome != "reaching"]
     assert len(completions) == 1
     assert completions[0].tool_name == "accounts.get_balance"
-    assert completions[0].detail == "ToolError"
-    assert completions[0].refusal_reason is None
+    assert completions[0].detail == "NotFoundError"
+    assert completions[0].refusal_reason == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    assert backend.paths == [], "a denied call must not reach the backend"
+
+
+async def test_an_unreachable_store_is_probed_once_per_request_not_once_per_evaluation(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Five evaluations, one database attempt, and the row still says why.
+
+    The measurement this change exists for. Before it, every one of the five
+    evaluations a `tools/call` with arguments performs opened its own
+    session and waited its own `pool_timeout`, so the request that was
+    denied because the pool was exhausted held a slot request open five
+    times over. The denial is unchanged; the number of times it asks is not.
+
+    THE ROW IS THE OTHER HALF and is why the assertions below are not just
+    counts. Caching the failure must not cost the record: the called tool's
+    own evaluation is the fifth, it never touches the database now, and it
+    still has to file `consent_store_unavailable` against its own name or
+    the audit table goes back to being unable to name the outage. One call,
+    one completion row, one reason -- the row count does not change, because
+    `AuditMiddleware` writes per call and never per evaluation.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    probes = _count_probes(monkeypatch, fail_first=99)
+
+    app = _app(database, database, key_pair, RecordingBackend(), _settings(pg_url))
+    response = await _rpc(
+        app,
+        _token(key_pair),
+        "tools/call",
+        {"name": "accounts.get_balance", "arguments": {"account_ref": "acc_7f3a"}},
+    )
+
+    assert len(probes.lookups) == 5
+    assert len(probes.attempts) == 1
+    assert _result(response)["isError"] is True
+    completions = [row for row in await _audit_rows(session) if row.outcome != "reaching"]
+    assert len(completions) == 1
+    assert completions[0].refusal_reason == REFUSAL_CONSENT_STORE_UNAVAILABLE
+
+
+async def test_a_store_that_fails_only_its_first_attempt_still_hides_the_whole_catalogue(
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incoherent catalogue is worse than an empty one, and this is the
+    test that says so.
+
+    `tools/list` evaluates one check per gated tool. While the failure was
+    re-probed per evaluation, a single contended moment produced a catalogue
+    that reflected no authorization state at all: the evaluation that raised
+    hid its tool, the next one populated the success cache, and the
+    remaining tools were listed. Measured here with consent granted to all
+    four domains and exactly one attempt failing -- the old code listed
+    three of the four, INCLUDING `accounts.get_balance` while hiding
+    `accounts.list`, two tools of the same domain answered two ways in one
+    response.
+
+    An agent cannot act sensibly on that, and it is invisible server-side:
+    `tools/list` writes no audit row in any state. With the failure
+    remembered, the whole gated surface is hidden on one probe, which is a
+    state that does correspond to something true -- the operator cannot say
+    what this customer consented to. `start_session` stays listed because it
+    carries no `auth=` at all, and it is the tool that tells a client to try
+    again.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts", "transactions", "cards")
+    probes = _count_probes(monkeypatch, fail_first=1)
+
+    app = _app(database, database, key_pair, RecordingBackend(), _settings(pg_url))
+    response = await _rpc(app, _token(key_pair), "tools/list", {})
+
+    listed = _tool_names(response)
+    assert listed & GATED_TOOLS == set(), f"partial catalogue: {sorted(listed & GATED_TOOLS)}"
+    assert "start_session" in listed
+    assert len(probes.lookups) == len(GATED_TOOLS)
+    assert len(probes.attempts) == 1
+
+
+async def test_a_healthy_store_is_still_probed_once_per_request(
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The success cache is untouched, asserted rather than assumed.
+
+    Remembering a failure is a second cache beside the domain cache that has
+    been there since 2026-09-14, and the constraint on this change was that
+    a SUCCESS is not cached one instant longer than it already was. Five
+    evaluations, one attempt, the call served: the same numbers the domain
+    cache produced before the failure memory existed, which is what makes
+    this a test of something unchanged rather than a duplicate of the one
+    above.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    probes = _count_probes(monkeypatch)
+    backend = BalanceBackend()
+
+    app = _app(database, database, key_pair, backend, _settings(pg_url))
+    response = await _rpc(
+        app,
+        _token(key_pair),
+        "tools/call",
+        {"name": "accounts.get_balance", "arguments": {"account_ref": "acc_7f3a"}},
+    )
+
+    assert _result(response)["isError"] is False
+    assert len(probes.lookups) == 5
+    assert len(probes.attempts) == 1
+    assert backend.paths == ["/accounts/acc_7f3a/balance"]
+
+
+async def test_a_hung_store_now_costs_one_connect_timeout_per_call_not_five(
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    blackhole_port: int,
+) -> None:
+    """The latency the counts above buy back, measured on the clock.
+
+    The count tests patch the query out, which is what makes them fast and
+    also what stops them saying anything about time. This one waits on a
+    real socket: a listener that completes the handshake and never speaks,
+    with `Database`'s connect timeout at 1 second, driven by a `tools/call`
+    carrying arguments so the full five evaluations run.
+
+    Before the failure was remembered this call took FIVE of those timeouts,
+    serially, because each evaluation opened its own session. The bound
+    below is 2.5s rather than 1.5s so that a loaded CI machine does not fail
+    it on scheduling noise while still being nowhere near the 5 seconds the
+    old path spent, and the lower bound is what proves it waited on the
+    socket at all rather than failing fast for some other reason -- the trap
+    the module docstring above records from the URL-query-string attempt.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    url = f"postgresql+asyncpg://postern:postern@127.0.0.1:{blackhole_port}/postern"
+    hanging = Database(url, connect_timeout_seconds=1.0)
+    try:
+        backend = RecordingBackend()
+        app = _app(hanging, database, key_pair, backend, _settings(pg_url))
+        started = time.monotonic()
+        response = await _rpc(
+            app,
+            _token(key_pair),
+            "tools/call",
+            {"name": "accounts.get_balance", "arguments": {"account_ref": "acc_7f3a"}},
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        await hanging.close()
+
+    assert elapsed >= 1.0, f"answered in {elapsed:.2f}s -- it cannot have waited on the socket"
+    assert elapsed < 2.5, f"took {elapsed:.2f}s -- that is more than one connect timeout"
+    assert _result(response)["isError"] is True
+    assert backend.paths == [], "a hung store must not let the tool body run"
 
 
 async def test_a_blackholed_consent_store_currently_denies_only_after_the_driver_timeout(

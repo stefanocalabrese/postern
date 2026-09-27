@@ -417,3 +417,69 @@ looks exactly like a customer with no consent.
 `audit_log` is append-only, so there is no `UPDATE` that could rewrite them,
 and inventing an admissible value would restate an outage as a customer's
 consent state.
+
+---
+
+## Second amendment, 27 September 2026: the failure is remembered per request
+
+The paragraph above describing `_clear_refusal` held for one day. The function
+is gone and the value it cleaned up is now cached.
+
+`_CACHE_ATTR` was written on the success path only, so an unreachable store
+was re-probed by every evaluation. Measured: one `tools/call` carrying
+arguments cost five connection attempts and five `pool_timeout` waits,
+serially, during the event that exhausted the pool. Against a blackholed
+listener with the connect timeout at 1.0s that call took 5.11 seconds to be
+denied. It now takes 1.18.
+
+THE LATENCY WAS THE SMALLER HALF. `tools/list` evaluates one check per gated
+tool, so a single contended moment produced a catalogue reflecting no
+authorization state at all: measured with consent granted to all four domains
+and exactly one attempt failing, the old code listed three of the four and
+split the two `accounts` tools, hiding `accounts.list` while listing
+`accounts.get_balance`. An agent cannot act on that, and `tools/list` writes
+no audit row in any state, so the only party who saw the incoherence was the
+one that could not diagnose it. One probe per request means the gated surface
+is present or absent together.
+
+`_FAILED_ATTR` holds the customer references whose lookup already raised in
+this request -- a set of strings, not of exceptions, so nothing keeps a
+traceback and the frames and connections it references alive for the rest of
+the request. A private `_ConsentStoreUnavailable` is raised instead of probing
+on later evaluations, carrying the one bit the driver's exception cannot:
+whether `check` is seeing this for the first time. The first failure
+propagates unchanged, is logged with its traceback and remembered; the rest
+file the same reason and log nothing. ERROR lines per outaged call went from
+five to one.
+
+ROWS DID NOT CHANGE. `AuditMiddleware` writes per call, never per evaluation,
+so an outage still produces one completion row carrying
+`consent_store_unavailable` -- and the sentinel branch files against its own
+tool name precisely because the called tool's evaluation is usually not the
+one that paid for the probe.
+
+`_clear_refusal` was deleted rather than kept as defence, and an invariant
+replaced it. Within one request the verdict for a (customer, tool) pair cannot
+change: `no_customer_ref` is pinned by `ctx.token`, the request's own
+validated token; `domain_not_consented` by the domain set the success cache
+holds; `consent_store_unavailable` by the failure memory. No evaluation can
+contradict an earlier one, so no filing can go stale. Keeping the withdrawal
+would have kept the one function the suite can no longer reach, since caching
+makes its scenario unreachable. `services/api/consent.py`'s module docstring
+carries this under "WHY NOTHING NEEDS WITHDRAWING", and
+`tests/test_consent_check_failure_mode.py::test_a_recovery_mid_request_no_longer_recovers_the_call`
+fails when someone restores a per-evaluation probe without a withdrawal.
+
+THE COST, STATED BECAUSE IT IS REAL. A store that raised on an early
+evaluation and answered a later one used to let the call through, and that
+exact call is now denied. Nobody chose five attempts: five is what the MCP
+SDK's internal `tools/list` pass costs, and the retry it amounts to has no
+policy, no backoff and no bound. A client re-issues a dropped call anyway --
+MCP `2026-07-28` has no SSE resumability and every handler must be safe to
+re-run -- so the retry survives one layer out, where it holds no connection.
+
+TWO THINGS THIS IS NOT. It is not a circuit breaker: one attempt per request
+still scales with request rate under a sustained outage. And `except
+Exception` still labels any lookup failure as unavailability, so a schema
+error against a reachable store files `consent_store_unavailable` and is now
+remembered for the rest of the request as well as filed.

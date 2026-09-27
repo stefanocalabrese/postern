@@ -28,6 +28,52 @@ this cache every one of those 5 hits the database; with it, only the first
 does, because all 5 share one `customer.value` cache key on
 `request.state` regardless of which domain's closure runs first.
 
+A FAILURE IS REMEMBERED THE SAME WAY, since 27 September 2026, and until
+then it was not: the cache above was written on the success path only, so an
+unreachable store was re-probed by every one of those 5 evaluations and each
+waited the full `pool_timeout`. Measured against a blackholed listener with
+the connect timeout at 1.0s, one `tools/call` took 5.11 seconds to be
+denied; it now takes 1.03. That is load the outage was adding to the pool
+whose exhaustion caused it, from evaluations that were all going to deny.
+
+The second thing that buys is COHERENCE, and on `tools/list` it matters
+more than the latency. That method evaluates one check per gated tool, so a
+single contended moment used to produce a catalogue reflecting no
+authorization state at all: measured with consent granted to all four
+domains and exactly one attempt failing, the catalogue listed three of the
+four and split the two `accounts` tools, hiding `accounts.list` while
+listing `accounts.get_balance`. `tools/list` writes no audit row in any
+state, so that was invisible to the operator and visible only to the agent.
+One probe per request means the whole gated surface is present or absent
+together.
+
+The cost is a salvage given up. A store that raised on an early evaluation
+and answered a later one used to let the call through; now the first probe
+decides the request. Nobody chose five attempts -- five is what the SDK's
+internal `tools/list` pass happens to cost -- and a client re-issues a
+dropped call anyway, so the retry still exists one layer out, where it holds
+no connection for five seconds.
+
+WHY NOTHING NEEDS WITHDRAWING, which is the second thing remembering a
+failure bought and the reason a function was deleted rather than added. A
+`_clear_refusal` stood on `check`'s allow path from 26 to 27 September 2026,
+erasing a `consent_store_unavailable` that an earlier evaluation of the same
+tool had filed before the store recovered mid-request: the filing is read
+back once, after the tool ran, so it has to describe the evaluation the
+dispatch used, and per-tool keying cannot separate a stale filing from a
+live one when both carry the same name.
+
+Remembering the failure removed the state it cleaned up. Within one request
+the verdict for a (customer, tool) pair cannot change, because each of the
+three ways `check` refuses is pinned by something that does not vary across
+evaluations: `no_customer_ref` by `ctx.token`, which is the request's own
+validated token; `domain_not_consented` by the domain set the success cache
+holds; and `consent_store_unavailable` by the failure memory. No evaluation
+can contradict an earlier one, so no filing can go stale, so there is
+nothing to withdraw. Restoring a per-evaluation probe without restoring a
+withdrawal reopens it, and this is the test that fails when someone does:
+`tests/test_consent_check_failure_mode.py::test_a_recovery_mid_request_no_longer_recovers_the_call`
+
 A denial also FILES ITSELF, for the audit row. `auth=` answers a bare bool
 and the wire answer is `Unknown tool: '<name>'` either way, so before this
 the audit table recorded a consent refusal and a mistyped tool name as the
@@ -95,8 +141,39 @@ logger = logging.getLogger(__name__)
 _CACHE_ATTR = "postern_consent_domains"
 _Cache = dict[str, set[str]]
 
+# The second request-scoped cache, and the only one that remembers a
+# FAILURE. It holds the customer references whose consent lookup already
+# raised in this request, so the rest of the request's evaluations deny
+# without opening another session. One `tools/call` carrying arguments is
+# five evaluations, and before 27 September 2026 an unreachable store cost
+# five connection attempts and five `pool_timeout` waits, serially, during
+# the event that exhausted the pool: measured at 5.11 seconds against a
+# blackholed listener with the connect timeout at 1.0s, where one attempt
+# costs 1.03. It is a set of customer references and not of exceptions, so
+# nothing here keeps a traceback (and the frames and connections a traceback
+# holds) alive for the rest of the request.
+_FAILED_ATTR = "postern_consent_lookup_failed"
+_Failed = set[str]
+
 _REFUSALS_ATTR = "postern_consent_refusals"
 _Refusals = dict[str, str]
+
+
+class _ConsentStoreUnavailable(Exception):
+    """Raised INSTEAD of probing, once this request has already failed once.
+
+    It exists to carry one bit that the original exception cannot: whether
+    `check` is seeing the failure for the first time. The first failure
+    propagates as whatever the driver raised, gets logged with its traceback
+    and is remembered; every later evaluation gets this instead, files the
+    same refusal reason and logs nothing, because nothing new happened. A
+    reader comparing the two branches in `check` is looking at "measure and
+    report" against "already measured".
+
+    Private, and never reaches a caller: `check` catches it, and FastMCP's
+    `_evaluate_check` would mask it as a denial anyway. It is not part of
+    `_domains`' contract with anything outside this module.
+    """
 
 
 def _customer(ctx: AuthContext) -> CustomerRef | None:
@@ -121,9 +198,41 @@ async def _domains(db: Database, customer: CustomerRef) -> set[str]:
         cached: _Cache | None = getattr(request.state, _CACHE_ATTR, None)
         if isinstance(cached, dict) and customer.value in cached:
             return cached[customer.value]
+        # A failure this request already paid for. Checked AFTER the success
+        # cache and not before it, which costs nothing today and keeps the
+        # order honest: a customer cannot be in both, because the two writes
+        # are on mutually exclusive paths, and if that ever stopped being
+        # true the answer this returns should be the one that was
+        # established, not the one that was not.
+        failed: _Failed | None = getattr(request.state, _FAILED_ATTR, None)
+        if isinstance(failed, set) and customer.value in failed:
+            raise _ConsentStoreUnavailable(customer.value)
 
-    async with db.sessionmaker() as session:
-        granted: set[str] = await consents.granted_domains(session, customer)
+    try:
+        async with db.sessionmaker() as session:
+            granted: set[str] = await consents.granted_domains(session, customer)
+    except Exception:
+        # REMEMBER, then re-raise unchanged. `check` still sees the driver's
+        # own exception for this first failure, so the log line it writes
+        # still names the real type and carries the real traceback.
+        #
+        # `Exception`, so `asyncio.CancelledError` (a `BaseException`) is
+        # neither remembered nor re-raised through here: a request the edge
+        # cancelled must not leave a verdict behind for evaluations that will
+        # never run, and it is not a statement about the store.
+        #
+        # No HTTP request means no memory and no coherence to protect -- the
+        # in-process `Client` transport has no `request.state` for any of
+        # this module's three stores, so it re-probes per evaluation exactly
+        # as before. Those calls carry no access token either, so their
+        # checks refuse on `no_customer_ref` long before reaching this line.
+        if request is not None:
+            remembered: _Failed | None = getattr(request.state, _FAILED_ATTR, None)
+            if not isinstance(remembered, set):
+                remembered = set()
+                setattr(request.state, _FAILED_ATTR, remembered)
+            remembered.add(customer.value)
+        raise
 
     if request is not None:
         cache: _Cache | None = getattr(request.state, _CACHE_ATTR, None)
@@ -168,47 +277,6 @@ def _refuse(ctx: AuthContext, reason: str) -> None:
         refusals = {}
         setattr(request.state, _REFUSALS_ATTR, refusals)
     refusals[ctx.component.name] = reason
-
-
-def _clear_refusal(ctx: AuthContext) -> None:
-    """Withdraw an earlier refusal for this tool, because the check now allows.
-
-    A refusal is filed per tool name and read back once, after the tool
-    ran, so it has to describe the evaluation the dispatch actually used --
-    which is the LAST one, not the first. One `tools/call` evaluates a
-    tool's check more than once (the module docstring above measures five
-    evaluations for one call), and a consent store that is saturated rather
-    than down answers some of them and raises on others. Without this, an
-    evaluation that raised early would leave `consent_store_unavailable`
-    behind for a call that a later evaluation allowed, and the raised path
-    in `services/api/middleware/audit.py` -- the one path that reads the
-    cache -- would stamp it onto the row of a tool whose BODY failed. That
-    is a false statement on an append-only, regulator-facing table, and it
-    is the same class of error `_refuse`'s per-tool keying exists to
-    prevent, except that here the stale entry and the live call share a
-    name, so the keying cannot catch it.
-
-    Nothing was withdrawable before 26 September 2026 and this function
-    would have been dead code: the two refusals `check` could file were both
-    decided from a domain set that the request cache pins for the rest of
-    the request, so a tool refused once in a request was refused by every
-    later evaluation in it. The unreachable-store refusal is the first one
-    that a later evaluation can contradict, because the failure it records
-    is not cached.
-
-    Never raises, for `_refuse`'s reason applied in the other direction: a
-    withdrawal whose bookkeeping failed must still leave the call ALLOWED.
-    The caller returns True regardless, so the worst outcome is an audit row
-    over-reporting a refusal, which is why this is the one place in this
-    module where the safe direction is not NULL.
-    """
-    try:
-        request = get_http_request()
-    except Exception:
-        return
-    refusals: _Refusals | None = getattr(request.state, _REFUSALS_ATTR, None)
-    if isinstance(refusals, dict):
-        refusals.pop(ctx.component.name, None)
 
 
 def refusal_for(tool_name: str) -> str | None:
@@ -272,6 +340,21 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
             # cause was authorization is the same error as the reverse, in
             # the direction that hides a real refusal.
             raise
+        except _ConsentStoreUnavailable:
+            # An evaluation earlier in THIS request already established that
+            # the store cannot be reached, logged it with its traceback and
+            # remembered it. This one files the same reason against its own
+            # tool name -- which is what `audit_log.refusal_reason` needs,
+            # since the called tool's evaluation is usually not the one that
+            # paid for the probe -- and neither probes nor logs again.
+            #
+            # The row count is unaffected: `AuditMiddleware` writes per call,
+            # never per evaluation, so an outage produced one completion row
+            # per `tools/call` before this and produces one after it. What
+            # dropped is connection attempts and ERROR lines, from one per
+            # evaluation to one per request.
+            _refuse(ctx, REFUSAL_CONSENT_STORE_UNAVAILABLE)
+            return False
         except Exception as exc:
             # DENIES, exactly as before. What changes is that the row now
             # says which of the three things happened. Until 26 September
@@ -298,10 +381,11 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
             # another. ERROR rather than WARNING: a consent store this
             # process cannot reach is denying real customers, and the audit
             # row now carries a matching literal an operator can join
-            # against. The volume is unchanged -- one line per evaluation,
-            # as before. Measured against a refused connection: one line for
-            # a `tools/call` carrying no arguments, and one per evaluation on
-            # the five-evaluation path the module docstring above measures.
+            # against. ONE LINE PER REQUEST, not one per evaluation: this
+            # branch is only reached by the evaluation that actually probed,
+            # and `_FAILED_ATTR` sends every later one to the branch above.
+            # It was one per evaluation until 27 September 2026, which on the
+            # five-evaluation path meant five tracebacks for one measurement.
             #
             # The traceback can carry the SQL and its bound parameters, so
             # this line can put a `cust_`-prefixed customer reference in the
@@ -319,11 +403,12 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
             _refuse(ctx, REFUSAL_CONSENT_STORE_UNAVAILABLE)
             return False
         if domain in granted:
-            # This evaluation allowed, so any refusal an earlier one in this
-            # same request filed for this same tool is now wrong. Only the
-            # unreachable-store refusal can be standing here; see
-            # `_clear_refusal`.
-            _clear_refusal(ctx)
+            # NOTHING TO WITHDRAW HERE, and that is a property of the two
+            # request-scoped caches rather than an omission. A
+            # `_clear_refusal` stood on this line until 27 September 2026;
+            # the module docstring's "WHY NOTHING NEEDS WITHDRAWING" carries
+            # what it did, why remembering a failure retired it, and the test
+            # that fails if the state it cleaned up ever comes back.
             return True
         _refuse(ctx, REFUSAL_DOMAIN_NOT_CONSENTED)
         return False
