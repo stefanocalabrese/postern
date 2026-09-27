@@ -4,6 +4,7 @@ from logging.config import fileConfig
 
 import postern_core.store.models  # noqa: F401  registers the tables on the metadata
 from alembic import context
+from postern_core.env_inventory import enforce_known_environment
 from postern_core.store.base import Base
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -12,6 +13,31 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
+
+# BEFORE THE READ BELOW, because the read below is the one with the silent
+# failure. A migration is the worst place in this repository for a misspelt
+# variable name: `POSTERN_DATABASE_UR` leaves the override untaken, and
+# `alembic upgrade` then runs against whatever `alembic.ini`'s `sqlalchemy.url`
+# names. In this repository that is the generated placeholder
+# `driver://user:pass@localhost/dbname`, so the failure is loud by accident; an
+# operator who puts a real URL there -- which is the ordinary way to use
+# alembic -- has a migration applying DDL to the wrong database and no
+# indication that it did.
+#
+# `enforce_known_environment` refuses on any `POSTERN_` name no code reads, so
+# the typo is caught here rather than diagnosed afterwards from a schema. The
+# service it claims is `migrations`, which reads exactly three variables:
+# `POSTERN_DATABASE_URL` and the guard's own two lists. That set is narrow
+# because this process imports only `postern_core.store`, which reads no
+# environment variable at all, which
+# `tests/test_settings_bounds.py::TestEveryEnvironmentReadNamesAnInventoriedVariable`
+# derives from the syntax tree rather than trusting this sentence.
+#
+# WHEN IT REFUSES, `alembic upgrade` exits non-zero and the deploy stops before
+# the migration runs. That is the correct direction and worth saying plainly: a
+# migration that would have altered the wrong schema does not run, and a
+# deployment that cannot migrate does not roll out behind it.
+enforce_known_environment(service="migrations")
 
 # `POSTERN_DATABASE_URL` overrides `alembic.ini`'s `sqlalchemy.url` when set,
 # which is how CI's Postgres service container and the drift-check target in

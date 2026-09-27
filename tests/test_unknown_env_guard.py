@@ -32,6 +32,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
@@ -40,6 +44,8 @@ from postern_core.env_inventory import (
     ALLOWED_UNREAD_ENV,
     INVENTORY,
     KNOWN_ENV,
+    REQUIRED_ENV,
+    SERVICES,
     classify_environment,
     enforce_known_environment,
     names_read_by,
@@ -530,3 +536,397 @@ class TestBothCompositionRootsCallIt:
         monkeypatch.setenv(ALLOWED_UNREAD_ENV, "POSTERN_SIDECAR_SCRAPE_TOKEN")
         assert create_app(Settings.for_testing()) is not None
         assert _confirm(key_pair) is not None
+
+
+# ---------------------------------------------------------------------------
+# The mirror: a variable that is absent and needed.
+# ---------------------------------------------------------------------------
+
+
+class TestWhatTheRequirementListIsForAndWhatItIsNot:
+    """The scope of this half, which is narrower than it first looks.
+
+    THE CASE IT DOES NOT COVER, and it is the one the idea is usually sold on:
+    the whole environment going missing. If a ConfigMap is dropped entirely then
+    ``POSTERN_REQUIRED_ENV`` is dropped with it, no requirement is declared, and
+    a list-in-the-environment is vacuous by construction.
+
+    THAT CASE IS ALREADY FATAL, which is why the gap is worth closing anyway
+    rather than being the whole point. Measured with every ``POSTERN_`` variable
+    deleted: `services/api`'s `Settings.from_env` raises ``KeyError:
+    'POSTERN_BACKEND_BASE_URL'`` because that one read is a subscript, and
+    `create_confirm_app` raises `ValueError` naming the three
+    ``POSTERN_APP_ASSERTION_*`` settings. Neither service can start on an empty
+    environment, so a total loss is loud without any help from here.
+
+    WHAT IS LEFT, AND IS SILENT TODAY: ONE key dropped or renamed, on a variable
+    that has a default. That is the whole remaining population and every member
+    of it is a control being disarmed -- ``POSTERN_REQUIRE_REDIS`` absent means
+    per-replica state accepted, ``POSTERN_REQUIRE_PEM_KEY`` absent means an
+    ephemeral signing key accepted, ``POSTERN_REDIS_URL`` absent means four
+    stores go in-memory, ``POSTERN_JWKS_URI`` absent means the read path serves
+    with no customer authentication at all. Each of those is a deployment that
+    starts, serves, and is weaker than the operator believes.
+    """
+
+    def test_a_required_variable_that_is_set_satisfies_the_requirement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_REDIS")
+        monkeypatch.setenv("POSTERN_REQUIRE_REDIS", "1")
+        report = classify_environment("api")
+        assert report.absent == ()
+        assert report.blank == ()
+
+    def test_a_required_variable_that_is_absent_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_REDIS")
+        assert classify_environment("api").absent == ("POSTERN_REQUIRE_REDIS",)
+
+    def test_several_requirements_separated_by_commas(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same format as the hatch, for the reason one format is better than two."""
+        monkeypatch.setenv(REQUIRED_ENV, " POSTERN_REQUIRE_REDIS , POSTERN_REDIS_URL ,, ")
+        monkeypatch.setenv("POSTERN_REDIS_URL", "redis://x")
+        assert classify_environment("api").absent == ("POSTERN_REQUIRE_REDIS",)
+
+    def test_an_empty_requirement_list_requires_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "")
+        report = classify_environment("api")
+        assert report.absent == ()
+        assert report.unsatisfiable == ()
+
+    def test_the_names_are_reported_in_a_stable_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sorted, not in the order the operator happened to type them."""
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REDIS_URL,POSTERN_JWKS_URI")
+        assert classify_environment("api").absent == ("POSTERN_JWKS_URI", "POSTERN_REDIS_URL")
+
+
+class TestPresentMeansCarryingAValue:
+    """Set but empty does NOT satisfy a requirement, and this is the ruling.
+
+    WHY, AND IT IS NOT MERELY CONSISTENCY. An empty value is what the failure
+    being guarded against PRODUCES. A Helm template rendering
+    ``{{ .Values.redisUrl }}`` with nothing behind it emits an empty string; an
+    ECS task definition carrying ``{"name": "POSTERN_REDIS_URL", "value": ""}``
+    emits an empty string; an ``env_file`` line left as ``POSTERN_REDIS_URL=``
+    emits an empty string. If empty satisfied the requirement, the control would
+    pass in the single most likely shape of the defect it exists for.
+
+    IT IS ALSO THE CONVENTION EVERYWHERE ELSE. `int_from_env`, `float_from_env`
+    and `bool_from_env` all return their default for ``""``;
+    `services/api/settings.py`'s `from_env` collapses ``""`` to ``None`` for its
+    string fields; `enforce_redis_requirement` treats an empty
+    ``POSTERN_REDIS_URL`` as absent. A requirement check that called ``""``
+    present would be the one place in this repository where an empty value means
+    something.
+
+    AND NO LEGITIMATE VALUE IS REFUSED. Every variable a deployment can be
+    asked to provide is a URL, a path, a key id, an issuer, an audience, a
+    number or a flag. None of them has a meaningful empty value, and for the
+    numbers and flags empty is definitionally unset one layer down.
+
+    THE TWO ARE REPORTED SEPARATELY, which is the part that earns its keep: an
+    absent variable says "nothing set this", and an empty one says "something
+    set this to nothing", which is a different line to go and look at.
+    """
+
+    def test_an_empty_value_does_not_satisfy_a_requirement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REDIS_URL")
+        monkeypatch.setenv("POSTERN_REDIS_URL", "")
+        report = classify_environment("api")
+        assert report.blank == ("POSTERN_REDIS_URL",)
+        assert report.absent == ()
+
+    def test_a_whitespace_only_value_does_not_either(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """What a YAML block scalar or a trailing-space env line produces.
+
+        `bool_from_env` already strips before deciding, so a flag set to a
+        newline is unset there too. `int_from_env` does NOT strip and would
+        raise on ``"  "`` instead -- the two readers disagree about whitespace
+        and that is left exactly as it is; this check reads no value for use, it
+        only asks whether one arrived.
+        """
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REDIS_URL")
+        monkeypatch.setenv("POSTERN_REDIS_URL", "  \n ")
+        assert classify_environment("api").blank == ("POSTERN_REDIS_URL",)
+
+    def test_absent_and_empty_are_never_both_reported_for_one_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REDIS_URL,POSTERN_JWKS_URI")
+        monkeypatch.setenv("POSTERN_REDIS_URL", "")
+        report = classify_environment("api")
+        assert report.blank == ("POSTERN_REDIS_URL",)
+        assert report.absent == ("POSTERN_JWKS_URI",)
+
+    def test_a_value_of_zero_or_false_still_satisfies_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The requirement is about ARRIVAL, never about what the value says.
+
+        ``POSTERN_REQUIRE_REDIS=0`` is an operator deliberately turning a switch
+        off, and a check that called that unsatisfied would be second-guessing a
+        decision it cannot see the reasons for.
+        """
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_REDIS,POSTERN_TRUSTED_PROXY_HOPS")
+        monkeypatch.setenv("POSTERN_REQUIRE_REDIS", "0")
+        monkeypatch.setenv("POSTERN_TRUSTED_PROXY_HOPS", "0")
+        report = classify_environment("api")
+        assert report.absent == ()
+        assert report.blank == ()
+
+
+class TestTheRequirementListIsCheckedAgainstTheInventory:
+    """A requirement naming a variable nothing reads can never be met usefully."""
+
+    def test_a_name_in_no_inventory_is_unsatisfiable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_REDDIS")
+        (bad,) = classify_environment("api").unsatisfiable
+        assert bad.name == "POSTERN_REQUIRE_REDDIS"
+        assert bad.suggestion == "POSTERN_REQUIRE_REDIS"
+
+    def test_it_is_unsatisfiable_whether_or_not_the_variable_is_also_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """THE TWO HALVES OF THIS GUARD COMPOSE, and this is where.
+
+        A typo in the requirement list is caught either way. Set the misspelt
+        variable and the unread-name half refuses it; leave it unset and that
+        half is silent by design -- an unset variable is invisible to it -- and
+        this half refuses the requirement instead. Neither alone covers both.
+        """
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_REDDIS")
+        unset = classify_environment("api")
+        assert [u.name for u in unset.unsatisfiable] == ["POSTERN_REQUIRE_REDDIS"]
+        assert unset.unknown == ()
+
+        monkeypatch.setenv("POSTERN_REQUIRE_REDDIS", "1")
+        both = classify_environment("api")
+        assert [u.name for u in both.unsatisfiable] == ["POSTERN_REQUIRE_REDDIS"]
+        assert [u.name for u in both.unknown] == ["POSTERN_REQUIRE_REDDIS"]
+
+    def test_the_hatch_does_not_make_a_requirement_satisfiable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Declaring a name as one Postern ignores cannot also make it required.
+
+        The two lists mean opposite things, and an operator who put a name in
+        both has said something contradictory. `ALLOWED_UNREAD_ENV` stops the
+        variable being refused as unread; it cannot put the name in `INVENTORY`,
+        which is what a requirement needs.
+        """
+        monkeypatch.setenv("POSTERN_SIDECAR_SCRAPE_TOKEN", "x")
+        monkeypatch.setenv(ALLOWED_UNREAD_ENV, "POSTERN_SIDECAR_SCRAPE_TOKEN")
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_SIDECAR_SCRAPE_TOKEN")
+        report = classify_environment("api")
+        assert report.unknown == ()
+        assert [u.name for u in report.unsatisfiable] == ["POSTERN_SIDECAR_SCRAPE_TOKEN"]
+
+    def test_no_wildcards(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_*")
+        assert len(classify_environment("api").unsatisfiable) == 1
+
+
+class TestRequiringAVariableTheOtherServiceReads:
+    """POPULATION 2 AGAIN, and the same ruling for the same reason.
+
+    One ``POSTERN_REQUIRED_ENV`` listing everything both deployables need is
+    what an operator with one environment file will write. Refusing the api
+    service because a confirm-only variable is absent from ITS environment would
+    be a crash loop on a correct deployment, so a requirement this service
+    cannot read is reported and never fatal.
+
+    WHAT THAT COSTS, stated rather than hidden: a dropped key belonging to the
+    other service is not caught here. An operator who wants it caught writes one
+    requirement list per service, which is the deployment shape that can
+    distinguish the two in the first place.
+    """
+
+    def test_it_is_reported_and_never_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_CONFIRM_MAX_BODY_BYTES")
+        report = classify_environment("api")
+        assert report.absent == ()
+        assert report.unsatisfiable == ()
+        assert report.unenforceable == ("POSTERN_CONFIRM_MAX_BODY_BYTES",)
+        enforce_known_environment(service="api")
+
+    def test_the_service_that_does_read_it_enforces_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same list, the same missing variable, the other deployable."""
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_CONFIRM_MAX_BODY_BYTES")
+        report = classify_environment("confirm")
+        assert report.absent == ("POSTERN_CONFIRM_MAX_BODY_BYTES",)
+        assert report.unenforceable == ()
+
+
+class TestWhatTheRequirementRefusalSays:
+    def test_an_absent_variable_refuses_naming_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_REDIS")
+        with pytest.raises(RuntimeError) as raised:
+            enforce_known_environment(service="api")
+        message = str(raised.value)
+        assert "POSTERN_REQUIRE_REDIS" in message
+        assert REQUIRED_ENV in message
+
+    def test_an_empty_variable_says_something_set_it_to_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REDIS_URL")
+        monkeypatch.setenv("POSTERN_REDIS_URL", "")
+        with pytest.raises(RuntimeError) as raised:
+            enforce_known_environment(service="api")
+        message = str(raised.value)
+        assert "POSTERN_REDIS_URL" in message
+        assert "empty" in message
+
+    def test_one_refusal_carries_every_finding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An operator fixing one class at a time redeploys once per class."""
+        monkeypatch.setenv("POSTERN_REQUIRE_REDDIS", "1")
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_REDIS,POSTERN_JWKS_URI,POSTERN_NONSENSE")
+        monkeypatch.setenv("POSTERN_JWKS_URI", "")
+        with pytest.raises(RuntimeError) as raised:
+            enforce_known_environment(service="api")
+        message = str(raised.value)
+        for expected in (
+            "POSTERN_REQUIRE_REDDIS",
+            "POSTERN_REQUIRE_REDIS",
+            "POSTERN_JWKS_URI",
+            "POSTERN_NONSENSE",
+        ):
+            assert expected in message, expected
+
+    def test_a_satisfied_list_raises_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(REQUIRED_ENV, "POSTERN_REQUIRE_REDIS,POSTERN_REDIS_URL")
+        monkeypatch.setenv("POSTERN_REQUIRE_REDIS", "1")
+        monkeypatch.setenv("POSTERN_REDIS_URL", "redis://localhost:6379/0")
+        enforce_known_environment(service="api")
+
+
+class TestTheRequirementListIsItselfInTheInventory:
+    def test_it_is_read_by_every_service(self) -> None:
+        """Or the guard would refuse the variable that configures it."""
+        assert REQUIRED_ENV in KNOWN_ENV
+        for service in sorted(SERVICES):
+            assert REQUIRED_ENV in names_read_by(service)
+
+    def test_a_misspelt_requirement_list_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same property the hatch has: a wrong list cannot fail quiet.
+
+        Misspelling it means no requirement is declared, which on its own is
+        silent -- the whole weakness of a list that lives in the environment.
+        What is NOT silent is the misspelt name itself: it is an unread
+        ``POSTERN_`` variable, so the unread half refuses and names this one as
+        the nearest name that is read.
+        """
+        monkeypatch.setenv("POSTERN_REQUIRED_EVN", "POSTERN_REQUIRE_REDIS")
+        with pytest.raises(RuntimeError) as raised:
+            enforce_known_environment(service="api")
+        message = str(raised.value)
+        assert "POSTERN_REQUIRED_EVN" in message
+        assert REQUIRED_ENV in message
+
+
+class TestMigrationsRunTheGuardToo:
+    """``alembic upgrade`` is the third caller, and the worst place for a typo.
+
+    WHY IT MATTERS MORE HERE THAN IN EITHER SERVICE. `migrations/env.py` applies
+    ``POSTERN_DATABASE_URL`` over ``alembic.ini``'s ``sqlalchemy.url`` only when
+    the variable is SET, so a misspelt name leaves the ini file's URL in place
+    and the migration applies DDL to whatever that names. In this repository the
+    ini file carries the generated placeholder
+    ``driver://user:pass@localhost/dbname``, so the failure happens to be loud;
+    an operator who put a real URL there -- the ordinary way to use alembic --
+    gets a migration against the wrong database and no sign that it happened.
+
+    DRIVEN AS A SUBPROCESS, not by importing `migrations/env.py`. That module
+    runs migrations at import, so importing it in-process is not a test but a
+    deployment. The guard fires while alembic is still loading ``env.py``, before
+    any engine is built, so no database is reached either way and the case needs
+    no fixture.
+    """
+
+    @staticmethod
+    def _alembic(**env: str) -> subprocess.CompletedProcess[str]:
+        repo = Path(__file__).resolve().parent.parent
+        environment = {k: v for k, v in os.environ.items() if not k.upper().startswith("POSTERN_")}
+        environment.update(env)
+        return subprocess.run(  # noqa: S603
+            # `sys.executable` rather than a bare "alembic": an absolute path,
+            # already inside this venv, and no dependency on what is on PATH.
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=repo,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_a_misspelt_database_url_stops_the_migration(self) -> None:
+        done = self._alembic(POSTERN_DATABASE_UR="postgresql+asyncpg://u:p@db/x")
+        assert done.returncode != 0
+        assert "POSTERN_DATABASE_UR" in done.stderr
+        assert "Did you mean POSTERN_DATABASE_URL?" in done.stderr
+
+    def test_it_refuses_before_reaching_any_database(self) -> None:
+        """The refusal is the whole output, not a symptom found after connecting.
+
+        If the guard ran after the engine were built, a stray variable would
+        surface as whatever the connection did first. Asserting on the absence of
+        a connection error is what pins the ORDER.
+        """
+        done = self._alembic(POSTERN_DATABASE_UR="postgresql+asyncpg://u:p@db/x")
+        assert "no code in this deployment reads" in done.stderr
+        for connection_noise in ("could not translate", "Connection refused", "asyncpg"):
+            assert connection_noise not in done.stderr
+
+    def test_a_requirement_the_migration_cannot_meet_stops_it_too(self) -> None:
+        """``POSTERN_REQUIRED_ENV`` is read here as well, and enforced here."""
+        done = self._alembic(**{REQUIRED_ENV: "POSTERN_DATABASE_URL"})
+        assert done.returncode != 0
+        assert "POSTERN_DATABASE_URL" in done.stderr
+        assert REQUIRED_ENV in done.stderr
+
+    def test_a_service_only_requirement_does_not_stop_it(self) -> None:
+        """One requirement list across all three callers must not break the third.
+
+        ``POSTERN_REQUIRE_REDIS`` is not read by the migration task, so requiring
+        it is reported there and never fatal -- the same ruling population 2 got,
+        and it is what lets an operator keep one list.
+        """
+        done = self._alembic(
+            POSTERN_DATABASE_URL="postgresql+asyncpg://postern:postern@127.0.0.1:1/postern",
+            **{REQUIRED_ENV: "POSTERN_REQUIRE_REDIS"},
+        )
+        assert "POSTERN_REQUIRED_ENV" not in done.stderr or "does not read" in done.stderr
+        assert "no code in this deployment reads" not in done.stderr
+
+    def test_it_claims_to_be_the_migration_and_not_the_read_path(self) -> None:
+        """The ``service`` argument, which no module path can pin.
+
+        `tests/test_settings_bounds.py`'s attribution test derives which
+        deployable reads a variable from where the READ is, so it says nothing
+        about which name a CALLER passes. A migration claiming ``service="api"``
+        would pass every check in this repository while enforcing the read path's
+        requirements and warning about nothing -- so it is pinned on behaviour
+        instead: ``POSTERN_CACHE_TTL_SECONDS`` is read by `services/api` and by
+        nothing else, so the migration must report it unread. Claiming to be the
+        api service would make that line disappear.
+        """
+        done = self._alembic(
+            POSTERN_DATABASE_URL="postgresql+asyncpg://postern:postern@127.0.0.1:1/postern",
+            POSTERN_CACHE_TTL_SECONDS="60",
+        )
+        assert "POSTERN_CACHE_TTL_SECONDS" in done.stderr
+        assert "does not read" in done.stderr

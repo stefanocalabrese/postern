@@ -63,6 +63,23 @@ A misspelling inside the list fails the same way, on the stray variable the
 entry was meant to cover. Every path through a wrong hatch is louder than the
 one it was trying to quiet, never quieter.
 
+THE MIRROR, ADDED 2026-09-28: a variable that is ABSENT and needed. Everything
+above fires on a name that is present and wrong. Nothing fired on one that was
+missing, because for all three flags "absent" and "deliberately off" are the
+same state, so the control an operator believed they had armed was simply not
+armed and nothing said so. `REQUIRED_ENV` is where a deployment declares which
+variables it must provide, and its own docstring carries what that can and
+cannot reach -- the short version is that a total environment loss is already
+fatal on both services, so what this closes is one key dropped or renamed.
+
+The two halves are one guard and one refusal, not two checks in sequence,
+because they are usually one mistake seen from two angles: a renamed key is
+simultaneously a name nothing reads and a requirement nothing meets. They also
+cover each other. A typo in the requirement list is caught whether or not the
+misspelt variable is also set -- set, and the namespace half refuses it; unset,
+and the namespace half cannot see it at all while the requirement half refuses
+the unsatisfiable entry.
+
 WHY THE INVENTORY LIVES HERE AND NOT IN THE TEST THAT POLICES IT. A runtime
 guard cannot import from ``tests``, so the list had to move into production
 code, and the question was whether the test keeps a second copy. It does not:
@@ -92,10 +109,12 @@ import dataclasses
 import difflib
 import logging
 import os
+from collections.abc import Mapping
 
 __all__ = [
     "ALLOWED_UNREAD_ENV",
     "ENV_PREFIX",
+    "REQUIRED_ENV",
     "INVENTORY",
     "KNOWN_ENV",
     "SERVICES",
@@ -117,8 +136,16 @@ logger = logging.getLogger(__name__)
 #: that has no business reading it.
 ENV_PREFIX = "POSTERN_"
 
-#: The two deployables. `names_read_by` refuses anything else.
-SERVICES = frozenset({"api", "confirm"})
+#: Everything that runs this repository's code and reads its environment.
+#:
+#: ``migrations`` joined the two services on 2026-09-28 and is not a deployable
+#: in the same sense: it is ``alembic upgrade``, a one-off task in its own image
+#: with a role holding DDL rights. It is here because it reads
+#: ``POSTERN_DATABASE_URL`` and because what a misspelling of that name does
+#: there is worse than anything the two services can suffer -- `migrations/env.py`
+#: falls back to ``alembic.ini``'s ``sqlalchemy.url``, so the migration runs
+#: against whatever THAT names.
+SERVICES = frozenset({"api", "confirm", "migrations"})
 
 #: Where an operator declares a ``POSTERN_*`` variable this service does not read.
 #:
@@ -127,6 +154,31 @@ SERVICES = frozenset({"api", "confirm"})
 #: typo inside that family through in silence, which is the defect the guard
 #: exists for.
 ALLOWED_UNREAD_ENV = "POSTERN_ALLOWED_UNREAD_ENV"
+
+#: Where an operator declares the variables this deployment MUST provide.
+#:
+#: The mirror of `ALLOWED_UNREAD_ENV` and deliberately the same format: comma
+#: separated, one exact name per entry, empty entries and surrounding whitespace
+#: ignored, no wildcards. Two lists that mean opposite things are easier to hold
+#: in one head when they are read the same way.
+#:
+#: WHAT IT CANNOT DO, said here because it is the first thing to understand about
+#: it: if the whole environment is lost, this is lost with it, no requirement is
+#: declared, and nothing is checked. A list that lives in the environment cannot
+#: guard the environment's own existence. What makes that acceptable rather than
+#: fatal to the idea is that a total loss is ALREADY loud -- measured with every
+#: ``POSTERN_`` variable deleted, `services/api`'s `Settings.from_env` raises
+#: ``KeyError: 'POSTERN_BACKEND_BASE_URL'`` and `create_confirm_app` raises
+#: `ValueError` naming the three assertion settings. Neither service starts.
+#:
+#: So the population this closes is ONE key dropped or renamed on a variable
+#: that has a default, which is every remaining case in which a deployment
+#: starts weaker than its operator believes: ``POSTERN_REQUIRE_REDIS`` gone means
+#: per-replica state accepted, ``POSTERN_REQUIRE_PEM_KEY`` gone means an
+#: ephemeral signing key accepted, ``POSTERN_REDIS_URL`` gone means four stores
+#: in memory, ``POSTERN_JWKS_URI`` gone means the read path serving with no
+#: customer authentication.
+REQUIRED_ENV = "POSTERN_REQUIRED_ENV"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,16 +196,25 @@ class EnvVar:
     services: tuple[str, ...]
 
 
-#: Read by both deployables. Spelled once so the table below stays readable.
+#: Read by both services. Spelled once so the table below stays readable.
 BOTH = ("api", "confirm")
+
+#: Read wherever the guard runs, which is everything in `SERVICES`.
+#:
+#: Only this module's own two variables carry it, and that is not an exception to
+#: the attribution rule but an instance of it: they are read by
+#: `classify_environment`, every caller of the guard reaches that read, and
+#: ``alembic upgrade`` is now one of those callers.
+EVERYWHERE = ("api", "confirm", "migrations")
 
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 56 rows: 18
-#: strings, 34 numbers, 3 flags, and this guard's own declaration variable.
+#: against it by `tests/test_settings_bounds.py` on every run. 57 rows: 20
+#: strings (18 settings plus this guard's own two lists), 34 numbers, 3 flags.
 INVENTORY: tuple[EnvVar, ...] = (
-    EnvVar(ALLOWED_UNREAD_ENV, "string", BOTH),
+    EnvVar(ALLOWED_UNREAD_ENV, "string", EVERYWHERE),
+    EnvVar(REQUIRED_ENV, "string", EVERYWHERE),
     EnvVar("POSTERN_APP_ASSERTION_AUDIENCE", "string", ("confirm",)),
     EnvVar("POSTERN_APP_ASSERTION_ISSUER", "string", ("confirm",)),
     EnvVar("POSTERN_APP_ASSERTION_JWKS_URI", "string", ("confirm",)),
@@ -182,7 +243,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_DATABASE_MAX_OVERFLOW", "number", ("api",)),
     EnvVar("POSTERN_DATABASE_POOL_SIZE", "number", ("api",)),
     EnvVar("POSTERN_DATABASE_POOL_TIMEOUT_SECONDS", "number", BOTH),
-    EnvVar("POSTERN_DATABASE_URL", "string", BOTH),
+    EnvVar("POSTERN_DATABASE_URL", "string", EVERYWHERE),
     EnvVar("POSTERN_DEVICE_CODE_TTL_SECONDS", "number", ("confirm",)),
     EnvVar("POSTERN_DEVICE_KEYS_PATH", "string", ("confirm",)),
     EnvVar("POSTERN_DEVICE_POLL_INTERVAL_SECONDS", "number", ("confirm",)),
@@ -248,21 +309,48 @@ class UnknownName:
 
 @dataclasses.dataclass(frozen=True)
 class EnvironmentReport:
-    """The three populations, plus what the operator declared.
+    """What is set and should not be, and what should be set and is not.
 
-    ``unknown`` is what `enforce_known_environment` raises on, ``unread`` is
-    what it logs, ``declared`` is what `ALLOWED_UNREAD_ENV` accounted for, and
-    a name this service reads appears in none of them.
+    THE FIRST THREE FIELDS ARE THE NAMESPACE HALF. ``unknown`` is a variable set
+    that nothing reads and is fatal; ``unread`` is one the OTHER service reads
+    and is logged; ``declared`` is one `ALLOWED_UNREAD_ENV` accounted for.
+
+    THE LAST FOUR ARE THE REQUIREMENT HALF, from `REQUIRED_ENV`. ``absent`` is
+    required and not set at all; ``blank`` is required and set to nothing, which
+    is a different sentence to put in front of an operator because something
+    rendered that empty value; ``unsatisfiable`` is a requirement naming a
+    variable no code reads, so no value could ever meet it; ``unenforceable`` is
+    a requirement this service cannot check because another deployable is what
+    reads it. The first three of those are fatal and the last is logged.
+
+    A variable this service reads, set to a value, appears in none of the seven.
     """
 
     unknown: tuple[UnknownName, ...]
     unread: tuple[str, ...]
     declared: tuple[str, ...]
+    absent: tuple[str, ...] = ()
+    blank: tuple[str, ...] = ()
+    unsatisfiable: tuple[UnknownName, ...] = ()
+    unenforceable: tuple[str, ...] = ()
 
 
-def _declared_names(environ: dict[str, str]) -> frozenset[str]:
-    raw = environ.get(ALLOWED_UNREAD_ENV) or ""
-    return frozenset(entry.strip() for entry in raw.split(",") if entry.strip())
+def _split_names(raw: str | None) -> frozenset[str]:
+    """The names in one comma-separated list variable's VALUE.
+
+    Shared by `ALLOWED_UNREAD_ENV` and `REQUIRED_ENV` so the two cannot drift
+    into two formats. Empty entries and surrounding whitespace are dropped, which
+    is what a templated list with a missing element leaves behind.
+
+    IT TAKES THE VALUE AND NOT THE NAME, which is a deliberate shape rather than
+    a preference. A helper that took the name would read the environment under a
+    name the syntax tree cannot resolve, and
+    `tests/test_settings_bounds.py`'s sweep would then see this module reading
+    something it cannot identify -- correctly, since that is exactly how a
+    variable goes missing from an inventory. Keeping the read at the call site,
+    where the constant is written out, keeps both names visible to it.
+    """
+    return frozenset(entry.strip() for entry in (raw or "").split(",") if entry.strip())
 
 
 def _nearest(name: str) -> str | None:
@@ -286,12 +374,14 @@ def _nearest(name: str) -> str | None:
     return None
 
 
-def classify_environment(service: str, environ: dict[str, str] | None = None) -> EnvironmentReport:
-    """Sort a deployment's ``POSTERN_*`` variables into the three populations.
+def classify_environment(
+    service: str, override: Mapping[str, str] | None = None
+) -> EnvironmentReport:
+    """Sort a deployment's ``POSTERN_*`` variables into the populations above.
 
     Args:
         service: Which deployable is asking. One of `SERVICES`.
-        environ: The environment to read. Defaults to the process's own. It is
+        override: The environment to read instead of the process's own. It is
             a parameter so the classification can be tested and reasoned about
             without mutating global state, and so a caller can ask what a
             DIFFERENT deployment's environment would do.
@@ -306,14 +396,26 @@ def classify_environment(service: str, environ: dict[str, str] | None = None) ->
     environment. ``PATH`` is not ours to have an opinion about.
     """
     names_read_by(service)  # rejects an unknown service before anything else
-    environment = os.environ if environ is None else environ
     mine = names_read_by(service)
-    declared = _declared_names(dict(environment))
+    # THE LOCAL IS NAMED ``environ`` ON PURPOSE AND RENAMING IT LOSES A CHECK.
+    # `tests/test_settings_bounds.py`'s sweep recognises an environment read by
+    # the accessor's name, so ``environ.get(...)`` below is a read it can see,
+    # carrying a module constant it can resolve. Spelled any other way, this
+    # module's own two list variables would vanish from the inventory this module
+    # is checked against, and the set-equality test would then fail in the
+    # direction that says they are declared and read nowhere. The parameter is
+    # ``override`` rather than ``environ`` so that this local is the only thing
+    # by that name. It is pinned by
+    # `tests/test_settings_bounds.py`'s attribution test, not hoped for.
+    environ: Mapping[str, str] = os.environ if override is None else override
+    snapshot = dict(environ)
+    declared = _split_names(environ.get(ALLOWED_UNREAD_ENV))
+    required = _split_names(environ.get(REQUIRED_ENV))
 
     unknown: list[UnknownName] = []
     unread: list[str] = []
     accounted: list[str] = []
-    for name in sorted(environment):
+    for name in sorted(environ):
         if not name.strip().upper().startswith(ENV_PREFIX):
             continue
         if name in mine:
@@ -325,33 +427,86 @@ def classify_environment(service: str, environ: dict[str, str] | None = None) ->
             accounted.append(name)
             continue
         unknown.append(UnknownName(name, _nearest(name)))
-    return EnvironmentReport(tuple(unknown), tuple(unread), tuple(accounted))
+
+    absent: list[str] = []
+    blank: list[str] = []
+    unsatisfiable: list[UnknownName] = []
+    unenforceable: list[str] = []
+    for name in sorted(required):
+        if name not in KNOWN_ENV:
+            unsatisfiable.append(UnknownName(name, _nearest(name)))
+        elif name not in mine:
+            unenforceable.append(name)
+        elif name not in snapshot:
+            absent.append(name)
+        elif not snapshot[name].strip():
+            blank.append(name)
+    return EnvironmentReport(
+        tuple(unknown),
+        tuple(unread),
+        tuple(accounted),
+        tuple(absent),
+        tuple(blank),
+        tuple(unsatisfiable),
+        tuple(unenforceable),
+    )
+
+
+def _hint_for(unknown: UnknownName) -> str:
+    """The sentence that follows a name the guard could not place."""
+    if unknown.suggestion == unknown.name.strip().upper():
+        return (
+            f"Did you mean {unknown.suggestion}? Variable names are matched byte for "
+            f"byte, so case and surrounding spaces make a different variable."
+        )
+    if unknown.suggestion:
+        return f"Did you mean {unknown.suggestion}?"
+    return "No name this codebase reads is close to it."
+
+
+def _count(names: tuple[str, ...] | tuple[UnknownName, ...]) -> str:
+    """ "1 POSTERN_ variable" or "3 POSTERN_ variables"."""
+    return "1 POSTERN_ variable" if len(names) == 1 else f"{len(names)} POSTERN_ variables"
+
+
+def _is_are(names: tuple[str, ...] | tuple[UnknownName, ...]) -> str:
+    return "is" if len(names) == 1 else "are"
 
 
 def enforce_known_environment(*, service: str) -> None:
-    """Refuse to start when a ``POSTERN_*`` variable is set that nothing reads.
+    """Refuse to start on a variable set that nothing reads, or missing and required.
 
     Args:
         service: Which deployable is starting. One of `SERVICES`. Keyword-only,
             matching `postern_core.config`'s `enforce_redis_requirement`, whose
-            shape this follows: one implementation in the library both services
-            import, called from each composition root, parameterised by the one
+            shape this follows: one implementation in the library every caller
+            imports, called from each composition root, parameterised by the one
             thing that differs between them.
 
     Raises:
-        RuntimeError: if any ``POSTERN_*`` variable is set that neither service
-            reads and that `ALLOWED_UNREAD_ENV` does not declare. `RuntimeError`
-            and not `ValueError` for the reason `enforce_redis_requirement`
-            gives: a `ValueError` in this family says a value this service needs
-            is malformed, and this says a deployment-wide contract about the
-            ``POSTERN_*`` namespace was not met.
+        RuntimeError: on any of four findings -- a ``POSTERN_*`` variable set
+            that no code reads and `ALLOWED_UNREAD_ENV` does not declare; a
+            `REQUIRED_ENV` entry this service reads and nothing set; one set to
+            an empty value; or one naming a variable no code reads at all.
+            `RuntimeError` and not `ValueError` for the reason
+            `enforce_redis_requirement` gives: a `ValueError` in this family says
+            a value this service needs is malformed, and this says a
+            deployment-wide contract about the ``POSTERN_*`` namespace was not
+            met.
         ValueError: if ``service`` is not one of `SERVICES`, which is a
             programming error in a composition root rather than anything an
             operator can cause.
 
-    A variable the OTHER service reads is logged at warning level, once, however
-    many there are: a line per variable on a shared env file is a log nobody
-    reads, and the whole point of the line is that somebody does.
+    ONE REFUSAL FOR ALL FOUR, not four guards in sequence. An operator fixing one
+    class of finding per deploy pays one deploy per class, and the four are
+    usually one mistake seen from different angles: a renamed key is
+    simultaneously a name nothing reads and a requirement nothing meets.
+
+    Two findings are logged at warning level rather than raised, both because
+    another deployable is the thing that reads the variable and refusing would
+    crash a correct deployment that runs one environment file against two
+    images. One line each however many names, because a line per variable on a
+    shared env file is a log nobody reads.
     """
     report = classify_environment(service)
     if report.unread:
@@ -361,34 +516,69 @@ def enforce_known_environment(*, service: str) -> None:
             "is worth checking when the variable is a safety switch: "
             "POSTERN_REQUIRE_PEM_KEY and POSTERN_STRICT_HEADERS are read by the api "
             "service only, so setting either on the confirm service arms nothing.",
-            "1 POSTERN_ variable is"
-            if len(report.unread) == 1
-            else f"{len(report.unread)} POSTERN_ variables are",
+            f"{_count(report.unread)} {_is_are(report.unread)}",
             service,
             ", ".join(report.unread),
         )
-    if not report.unknown:
+    if report.unenforceable:
+        logger.warning(
+            "%s in %s that this service (%s) does not read, so nothing here can check "
+            "%s: %s. Another deployable reads them and will. Write one requirement list "
+            "per service if you want a dropped key caught by whichever image starts.",
+            _count(report.unenforceable),
+            REQUIRED_ENV,
+            service,
+            "it" if len(report.unenforceable) == 1 else "them",
+            ", ".join(report.unenforceable),
+        )
+
+    sections: list[str] = []
+    if report.unknown:
+        lines = "\n".join(f"  {u.name} -- {_hint_for(u)}" for u in report.unknown)
+        sections.append(
+            f"{_count(report.unknown)} {_is_are(report.unknown)} set that no code in "
+            f"this deployment reads:\n{lines}\n"
+            "A variable this application does not read arms no control, and an unread "
+            "name is indistinguishable from one that was never set -- which is how "
+            "POSTERN_REQUIRE_PEM_KEY=true came to mean 'do not require a PEM key'. Fix "
+            f"the spelling, or list the name in {ALLOWED_UNREAD_ENV} (comma-separated, "
+            "exact names, no wildcards) if this deployment sets it for something other "
+            "than Postern. The value behind it is not shown here and is not read "
+            "anywhere."
+        )
+    if report.absent:
+        lines = "\n".join(f"  {name}" for name in report.absent)
+        sections.append(
+            f"{_count(report.absent)} named in {REQUIRED_ENV} that nothing set:\n"
+            f"{lines}\n"
+            "Any of these that has a default would otherwise have been taken at that "
+            "default, and the process would have started and served -- which for a "
+            "safety switch means the control is off while you believe it is on. Set the "
+            f"variable, or remove the name from {REQUIRED_ENV} if this deployment does "
+            "not need it."
+        )
+    if report.blank:
+        lines = "\n".join(f"  {name}" for name in report.blank)
+        sections.append(
+            f"{_count(report.blank)} named in {REQUIRED_ENV} that something set to an "
+            f"empty value:\n{lines}\n"
+            "This is not the same as unset and the difference is the diagnosis: a "
+            "template rendered here and produced nothing, so look at what feeds it "
+            "rather than at whether the key exists. An empty value is how this "
+            "repository spells 'unset' everywhere -- every reader takes its default for "
+            "one -- so it cannot satisfy a requirement."
+        )
+    if report.unsatisfiable:
+        lines = "\n".join(f"  {u.name} -- {_hint_for(u)}" for u in report.unsatisfiable)
+        sections.append(
+            f"{_count(report.unsatisfiable)} named in {REQUIRED_ENV} that no code in "
+            f"this deployment reads:\n{lines}\n"
+            "No value could satisfy this requirement, because nothing would read it. "
+            "That makes it a typo in the list rather than a missing variable, and it is "
+            "worth more than it looks: a misspelt name in this list is caught here even "
+            "when the variable itself is unset, which is exactly when the namespace "
+            "check above cannot see it."
+        )
+    if not sections:
         return
-    lines = []
-    for unknown in report.unknown:
-        if unknown.suggestion == unknown.name.strip().upper():
-            hint = (
-                f"Did you mean {unknown.suggestion}? Variable names are matched byte "
-                f"for byte, so case and surrounding spaces make a different variable."
-            )
-        elif unknown.suggestion:
-            hint = f"Did you mean {unknown.suggestion}?"
-        else:
-            hint = "No name this codebase reads is close to it."
-        lines.append(f"  {unknown.name} -- {hint}")
-    count = len(report.unknown)
-    subject = "1 POSTERN_ variable is" if count == 1 else f"{count} POSTERN_ variables are"
-    raise RuntimeError(
-        f"{subject} set that no code in this deployment reads:\n" + "\n".join(lines) + "\n"
-        "A variable this application does not read arms no control, and an unread name "
-        "is indistinguishable from one that was never set -- which is how "
-        "POSTERN_REQUIRE_PEM_KEY=true came to mean 'do not require a PEM key'. Fix the "
-        f"spelling, or list the name in {ALLOWED_UNREAD_ENV} (comma-separated, exact "
-        "names, no wildcards) if this deployment sets it for something other than "
-        "Postern. The value behind it is not shown here and is not read anywhere."
-    )
+    raise RuntimeError("\n\n".join(sections))

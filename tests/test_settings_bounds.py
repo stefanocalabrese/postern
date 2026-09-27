@@ -25,8 +25,8 @@ read. Measured on 2026-09-27 against planted shapes: ``raw =
 os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
 numeric rule completely, and it is the way a careless numeric read is most
 likely to be written. So the third rule keys on the one thing every spelling
-shares, the variable's NAME at the read site. The swept tree names 56
-``POSTERN_*`` variables in two disjoint populations: 19 read directly, all of
+shares, the variable's NAME at the read site. The swept tree names 57
+``POSTERN_*`` variables in two disjoint populations: 20 read directly, all of
 them strings, and 37 handed to a reader, which are `BOUNDED`'s 32,
 `STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both, nothing is in neither,
 and `TestEveryEnvironmentReadNamesAnInventoriedVariable` re-derives that from
@@ -1077,6 +1077,39 @@ GENERIC_READERS: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+#: Which deployables run the code under each path, longest prefix first.
+#:
+#: `postern_core/env_inventory.py` sits above the general ``packages`` entry
+#: because the guard's own list variables are read wherever the guard is called,
+#: and ``alembic upgrade`` calls it. Everything else under ``packages`` is
+#: reached only by the two services: the migrations process imports
+#: `postern_core.store` and nothing it pulls in reads the environment at all.
+RUNS_THE_CODE_UNDER: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("services/api/", ("api",)),
+    ("services/confirm/", ("confirm",)),
+    ("migrations/", ("migrations",)),
+    ("services/", ("api", "confirm")),
+    (
+        "packages/postern-core/src/postern_core/env_inventory.py",
+        ("api", "confirm", "migrations"),
+    ),
+    ("packages/", ("api", "confirm")),
+)
+
+
+def _services_reading(name: str) -> set[str]:
+    """Every deployable that runs a module reading ``name``."""
+    services: set[str] = set()
+    for where, source in _swept_modules():
+        if not any(site.name == name for site in env_sites(where, source)):
+            continue
+        for prefix, runners in RUNS_THE_CODE_UNDER:
+            if where.startswith(prefix):
+                services.update(runners)
+                break
+    return services
+
+
 #: The one function allowed to reach the environment without naming a variable.
 #:
 #: Enumerating what an operator set is the only job in this repository that
@@ -1120,7 +1153,7 @@ def _is_licensed(site: EnvSite) -> bool:
 #: name list, and what keeps that copy honest is the sweep further down, which
 #: re-derives the same names from the syntax tree of every shipping module.
 #:
-#: WHAT THE INVARIANT STILL IS. All nineteen are strings, and that is a rule
+#: WHAT THE INVARIANT STILL IS. All twenty are strings, and that is a rule
 #: rather than an observation: a number belongs in `BOUNDED` or `STORE_BOUNDED`
 #: and is read through `int_from_env` or `float_from_env`; a flag belongs in
 #: `FLAGS` and is read through `bool_from_env`. Only a value with no bound to
@@ -1825,11 +1858,11 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
     numeric read. A rule keyed on the CONSUMER can always be evaded by one
     assignment, because the consumer can be arbitrarily far from the read.
 
-    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 56 distinct
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 57 distinct
     ``POSTERN_*`` variables across the swept roots, in two disjoint
-    populations. 19 are read directly, and all 19 are strings -- a URL, a
-    path, a key id, an issuer, an audience, a key prefix, and one
-    comma-separated list of names. 37 are handed to a reader as its ``name``
+    populations. 20 are read directly, and all 20 are strings -- a URL, a
+    path, a key id, an issuer, an audience, a key prefix, and the guard's own
+    two comma-separated lists of names. 37 are handed to a reader as its ``name``
     argument, and those are the 32 in `BOUNDED`, the 2 in `STORE_BOUNDED` and
     the 3 in `FLAGS`. Nothing is in both and nothing is in neither, which
     `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
@@ -1915,7 +1948,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
 
     def test_the_two_inventories_are_the_whole_tree(self) -> None:
-        """56 variables, 19 read directly and 37 through a reader, disjoint."""
+        """57 variables, 20 read directly and 37 through a reader, disjoint."""
         direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
         through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
         assert direct & through == set(), (
@@ -1932,7 +1965,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         # accepting one that arms nothing -- the defect it exists for,
         # reintroduced inside the control itself.
         assert direct | through == set(KNOWN_ENV)
-        assert len(KNOWN_ENV) == 56
+        assert len(KNOWN_ENV) == 57
 
     def test_the_counts_the_docstrings_quote(self) -> None:
         """Every number the prose in this file states, re-derived.
@@ -1941,56 +1974,69 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         confidently as one that is right. A variable added anywhere fails here,
         which is the line that sends the author to the sentences.
         """
-        assert len(KNOWN_ENV) == 56
-        assert len(READ_AS_STRING) == 19
+        assert len(KNOWN_ENV) == 57
+        assert len(READ_AS_STRING) == 20
         assert len(FLAGS) == 3
         assert len(BOUNDED_NAMES) == 32
         assert len(STORE_BOUNDED_NAMES) == 2
         assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS) == 37
-        assert len(names_read_by("api")) == 30
-        assert len(names_read_by("confirm")) == 40
+        assert len(names_read_by("api")) == 31
+        assert len(names_read_by("confirm")) == 41
+        assert len(names_read_by("migrations")) == 3
 
     def test_each_rows_services_are_the_roots_that_actually_read_it(self) -> None:
         """`INVENTORY`'s ``services`` column, re-derived from the syntax tree.
 
-        This is the half of the runtime inventory an AST sweep can check that
-        no unit test can: which DEPLOYABLE reads a variable. The rule is the
-        module path -- a read under ``services/api`` is the read path's, one
-        under ``services/confirm`` is the write path's, and one under
-        ``packages`` or ``migrations`` counts for both, because both import that
-        library and both run those migrations.
+        This is the half of the runtime inventory an AST sweep can check that no
+        unit test can: which DEPLOYABLE reads a variable. `RUNS_THE_CODE_UNDER`
+        is the rule, declared rather than buried in this loop, and
+        `test_every_swept_module_is_attributed_to_something` asserts it covers
+        every module swept, so a new directory cannot arrive unattributed.
 
-        THAT LAST CLAUSE IS GENEROUS ON PURPOSE AND THE DIRECTION MATTERS.
+        WHY ``env_inventory.py`` IS ITS OWN ENTRY AND IT IS NOT A SPECIAL CASE.
+        The guard's own two list variables are read inside
+        `classify_environment`, and everything that calls the guard reaches that
+        read -- which is now ``alembic upgrade`` as well as the two services. The
+        rest of the shared library is different in fact, not by fiat: measured on
+        2026-09-28, importing `postern_core.store.models` pulls in ten
+        ``postern_core`` modules and not one of them contains an environment
+        read, so the migrations process cannot reach any of those variables.
+
+        THE REMAINING CLAUSE IS GENEROUS ON PURPOSE AND THE DIRECTION MATTERS.
         ``POSTERN_REDIS_SESSION_TTL`` is read by `postern_core.risk.session`'s
         ``RedisSessionStore``, which only `services/api` builds, so this records
-        it as read by both and the write path reads nothing. The error is always
-        toward calling a variable READ, so it can cost a report that was owed
-        and can never produce a refusal that was not.
+        it as read by both services and the write path reads nothing. The error
+        is always toward calling a variable READ, so it can cost a report that
+        was owed and can never produce a refusal that was not.
         """
-        reading_roots: dict[str, set[str]] = {}
-        for where, source in _swept_modules():
-            for site in env_sites(where, source):
-                if not site.name:
-                    continue
-                if where.startswith("services/api/"):
-                    root = "api"
-                elif where.startswith("services/confirm/"):
-                    root = "confirm"
-                else:
-                    root = "both"
-                reading_roots.setdefault(site.name, set()).add(root)
-
         wrong: list[str] = []
         for entry in INVENTORY:
-            roots = reading_roots[entry.name]
-            expected = {"api", "confirm"} if "both" in roots else roots
+            expected = _services_reading(entry.name)
             if set(entry.services) != expected:
-                wrong.append(f"{entry.name}: declared {entry.services}, read by {sorted(expected)}")
+                wrong.append(
+                    f"{entry.name}: declared {sorted(entry.services)}, read by {sorted(expected)}"
+                )
         assert wrong == [], (
             f"{wrong}. The services column drives which variables each composition root "
-            "reports as unread, so a wrong row either hides a safety switch that arms "
-            "nothing on this service or warns about one that works."
+            "reports as unread and which requirements it enforces, so a wrong row either "
+            "hides a safety switch that arms nothing here or warns about one that works."
         )
+
+    def test_every_swept_module_is_attributed_to_something(self) -> None:
+        """`RUNS_THE_CODE_UNDER` must cover the tree, or an entry means nothing.
+
+        A module matching no prefix would contribute no service to any variable
+        it reads, and the row would then be expected to declare an empty
+        ``services`` -- which `EnvVar` allows and which would make the guard
+        treat the variable as read by nobody. A new top-level directory in
+        `SWEPT_ROOTS` fails here rather than there.
+        """
+        unattributed = [
+            where
+            for where, _ in _swept_modules()
+            if not any(where.startswith(prefix) for prefix, _ in RUNS_THE_CODE_UNDER)
+        ]
+        assert unattributed == []
 
     def test_every_service_reads_a_name_the_other_one_does_not(self) -> None:
         """Or population 2 would be empty and the whole distinction moot."""

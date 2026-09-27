@@ -154,11 +154,84 @@ the service refuses and names this variable as the one you meant.
 | `POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW` | No | `5` | Burst above `POSTERN_CONFIRM_DATABASE_POOL_SIZE`. **Zero or greater**. Lower than the API service's 10 because one approval is one person tapping a phone, and both services draw on one `max_connections` |
 | `POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE` | No | `1` | Connections held back so an approval's **completion** row can still be written when the pool above is at its ceiling. **At least 1** — no value turns it off. Serves `ApprovalAudit`'s completion row and every `PairingAudit` row, and deliberately **not** the entry row: see the sizing section below |
 
+### Naming the variables this deployment must provide
+
+The check above fires on a name that is present and wrong. It cannot fire on one
+that is absent and needed, because for `POSTERN_REQUIRE_REDIS`,
+`POSTERN_REQUIRE_PEM_KEY` and `POSTERN_STRICT_HEADERS` "not set" and
+"deliberately off" are the same thing. List what your deployment must provide in
+`POSTERN_REQUIRED_ENV` and each service refuses to start without it:
+
+```
+POSTERN_REQUIRED_ENV=POSTERN_REQUIRE_REDIS,POSTERN_REDIS_URL,POSTERN_READ_KEY_PEM_PATH
+```
+
+```
+1 POSTERN_ variable named in POSTERN_REQUIRED_ENV that nothing set:
+  POSTERN_REQUIRE_REDIS
+```
+
+**What this is for, and what it is not.** If the whole ConfigMap is dropped then
+`POSTERN_REQUIRED_ENV` goes with it and nothing is checked — a list that lives in
+the environment cannot guard the environment's own existence. That case is
+already fatal without it: the API service raises `KeyError` on
+`POSTERN_BACKEND_BASE_URL` and the confirm service raises `ValueError` on the
+three `POSTERN_APP_ASSERTION_*` settings, so neither starts on an empty
+environment. What this list closes is **one key dropped or renamed** on a
+variable that has a default, which is the remaining way a deployment starts
+weaker than you think it is.
+
+Worth listing, because each of these is silent today and each is a control:
+`POSTERN_REQUIRE_REDIS`, `POSTERN_REQUIRE_PEM_KEY`, `POSTERN_STRICT_HEADERS`,
+`POSTERN_REDIS_URL`, `POSTERN_READ_KEY_PEM_PATH`, `POSTERN_WRITE_KEY_PEM_PATH`,
+`POSTERN_JWKS_URI`, `POSTERN_TOKEN_ISSUER`.
+
+**Set but empty does not count.** A Helm template rendering nothing, an ECS task
+definition carrying `"value": ""`, an `env_file` line left as `POSTERN_X=` — all
+produce an empty string, and every reader in Postern takes its default for one.
+An empty required variable gets its own message, because the fix is different:
+something rendered here and produced nothing, so look at what feeds it rather
+than at whether the key exists.
+
+**A name in the list that Postern does not read is refused**, with the name you
+probably meant. That catches a typo in the list itself even when the variable is
+unset, which is exactly when the namespace check cannot see it.
+
+**A name the *other* service reads is logged, not refused.** One list for both
+deployables is normal; the API service will not fail because a confirm-only
+variable is absent from its own environment. Write one list per service if you
+want a dropped key caught by whichever image starts first.
+
+### Migrations
+
+`alembic upgrade` runs the same check, as `service=migrations`. It reads three
+variables — `POSTERN_DATABASE_URL`, `POSTERN_ALLOWED_UNREAD_ENV` and
+`POSTERN_REQUIRED_ENV` — and refuses on any other `POSTERN_` name:
+
+```
+$ POSTERN_DATABASE_UR=postgresql+asyncpg://... alembic upgrade head
+RuntimeError: 1 POSTERN_ variable is set that no code in this deployment reads:
+  POSTERN_DATABASE_UR -- Did you mean POSTERN_DATABASE_URL?
+```
+
+This is the most valuable place the check runs. `migrations/env.py` applies
+`POSTERN_DATABASE_URL` over `alembic.ini`'s `sqlalchemy.url` **when it is set**,
+so a misspelt name silently leaves the ini file's URL in place and the migration
+applies DDL to whatever that names. The check runs before that read, so the typo
+stops the task instead of altering the wrong schema.
+
+When it refuses, `alembic upgrade` exits non-zero and your deploy stops before
+the migration runs — and before the application rolls out behind it. That is the
+direction you want. Put `POSTERN_DATABASE_URL` in `POSTERN_REQUIRED_ENV` for the
+migration task as well, and a dropped key stops it too rather than falling back
+to the ini file.
+
 ### Both services
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `POSTERN_ALLOWED_UNREAD_ENV` | No | - | `POSTERN_` variable names this deployment sets that Postern does not read, comma separated, exact names, no wildcards. Without it, any such name refuses startup — see the section above |
+| `POSTERN_REQUIRED_ENV` | No | - | `POSTERN_` variable names this deployment must provide, comma separated, exact names, no wildcards. Absent or empty refuses startup. Also read by `alembic upgrade` |
 
 The three `POSTERN_APP_ASSERTION_*` variables are the only **required** settings on
 either service. `create_confirm_app()` raises `ValueError` and the process does not
