@@ -483,3 +483,81 @@ still scales with request rate under a sustained outage. And `except
 Exception` still labels any lookup failure as unavailability, so a schema
 error against a reachable store files `consent_store_unavailable` and is now
 remembered for the rest of the request as well as filed.
+
+---
+
+## Third amendment, 27 September 2026: four values, and a catalogue fetch still writes none
+
+Migration `e08757299819`. `consent_store_unavailable` was being written for two
+unrelated causes, because `services/api/consent.py` caught `Exception` and
+filed that one value whatever had been raised. A connection pool at its
+ceiling and a migration nobody applied produced the same row, so an operator
+alerting on the value that names the operator's infrastructure was being woken
+for this repository's SQL. The second amendment made it worse before this
+fixed it: the cause is remembered for the request now, so one misclassified
+exception labels every refusal in that request rather than one.
+
+`consent_check_faulted`, 21 characters in the `VARCHAR(32)`, so no width
+change and 7 characters of headroom left. The column now separates three
+populations, and a query that does not separate them is wrong about at least
+one: the CUSTOMER (`no_customer_ref`, `domain_not_consented`), the OPERATOR'S
+INFRASTRUCTURE (`consent_store_unavailable`) and THIS SOFTWARE
+(`consent_check_faulted`).
+
+THE CLASS LISTS ARE READ OFF THE INSTALLED PACKAGES, not recalled, and they
+live beside the code that catches because they are a property of SQLAlchemy
+2.0.52 and asyncpg 0.31.0 rather than of the schema. Two findings from that
+reading drive them. `sqlalchemy.exc.TimeoutError` -- the pool at its ceiling,
+which is the condition this whole line of work started from -- descends from
+`SQLAlchemyError` and **not** from `DBAPIError`, so a list built out of the
+DBAPI tree misses saturation entirely. And `_asyncpg_error_translate` in the
+dialect keys on seven asyncpg classes and sends everything else under
+`PostgresError` to the bare DBAPI `Error`, so `TooManyConnectionsError`,
+`CannotConnectNowError` and `AdminShutdownError` arrive as a generic
+`DBAPIError`: naming only `OperationalError` and `InterfaceError` would file a
+database that is shutting down as a defect in our code.
+
+The fault families are consulted FIRST, because every one of them is a
+`DBAPIError` subclass and reversing the two checks would silently file a
+schema error as an outage. The DEFAULT is the fault reason, because an
+exception out of one `SELECT` with three bound predicates that is neither a
+database nor a socket error is ours -- and the most common such exception is an
+`AttributeError`. A design that enumerated reachability and defaulted the rest
+to unavailability would file the most obvious bug class there is as
+infrastructure.
+
+THE DENIAL DID NOT MOVE. A faulted check refuses exactly as an unreachable one
+does; a bug in the consent lookup must never become a reason to allow a call.
+The invariant that retired `_clear_refusal` survives, because the failure
+memory now holds the classified reason and not merely the fact -- which is also
+why a fault is remembered even though it fails fast and the latency argument
+does not apply to it.
+
+A `tools/list` WRITES NO ROW, IN ANY STATE, AND THAT IS A RULING. `PairingAudit`'s
+rule is satisfied by an authenticated catalogue fetch during an outage, so a
+row is owed -- and `audit_log` is not where it goes. `tool_name` is a per-tool
+column and a catalogue is not one tool; `outcome` is closed at `reaching`,
+`returned` and `raised`, none of which describes a tool filtered out of a list
+nobody called. The volume is measured: `on_list_tools` fires for the MCP SDK's
+internal param-validation dispatch as well as for a real fetch, so a row per
+withheld tool would turn one `tools/call` carrying arguments into five audit
+INSERTs during an outage instead of one, each fail-closed under record 0006,
+against the pool whose exhaustion caused the outage. A row per fetch was
+rejected on the reasoning that already refuses one per
+`POST /device_authorization`, and "a row when the catalogue was reduced" was
+rejected because partial consent is the normal state -- for a customer
+consented to one domain, every fetch is reduced.
+
+THE RECORD THEREFORE LIVES IN THE ERROR LINE, WHICH HAD TO BE FIXED TO CARRY
+IT. It read `denying accounts.list` while all four gated tools were denied,
+because only the evaluation that probes reaches the log and the rest are
+answered from the memory: an outage under-reported by three quarters.
+Remembering the failure is what makes the request-wide claim true, so the line
+now states it.
+
+THE RESIDUE, STATED. A data defect reaching PostgreSQL as a `PostgresError`
+outside `SyntaxOrAccessError` lands in the generic `DBAPIError` bucket and
+reads as an outage. Both reasons log at ERROR with distinct literals, so
+either mislabel costs a wrong first hypothesis and never silence -- which is
+what allowed the lists to be chosen on accuracy rather than on which
+misclassification would be safer.

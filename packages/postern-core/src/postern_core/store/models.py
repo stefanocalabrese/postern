@@ -57,13 +57,36 @@ from postern_core.store.base import Base
 # `check` returns False and FastMCP reports no tool, exactly as it does for
 # the two values above. What the column adds is that an operator can now
 # count the three apart.
+# `consent_check_faulted`: the lookup raised something that does NOT mean the
+# store was out of reach. A migration nobody applied, a model that has
+# drifted from the schema, an `AttributeError` in the query code: the store
+# answered, and what it answered was that this software is wrong. It exists
+# because `consent_store_unavailable` was being written for both, so an
+# operator paging on the operator's-infrastructure value was being woken for
+# defects in ours -- and since 27 September 2026 the cause is also remembered
+# for the rest of the request, which promoted a mislabel from one row to
+# every refusal in the request.
+#
+# WHICH EXCEPTIONS LAND HERE is `services/api/consent.py`'s decision, not
+# this module's: the two class tuples and the default are there, beside the
+# code that catches. This value's meaning is only "not a reachability
+# failure", and a reader must not infer from it that the lookup was
+# syntactically wrong, merely that nothing about the store's availability was
+# established.
+#
+# It is still a REFUSAL and still fails closed. The call is denied exactly as
+# the other three are, which is the property that must not move when the
+# cause is reclassified: a bug in the consent lookup cannot become a reason
+# to allow a call.
 REFUSAL_NO_CUSTOMER_REF = "no_customer_ref"
 REFUSAL_DOMAIN_NOT_CONSENTED = "domain_not_consented"
 REFUSAL_CONSENT_STORE_UNAVAILABLE = "consent_store_unavailable"
+REFUSAL_CONSENT_CHECK_FAULTED = "consent_check_faulted"
 REFUSAL_REASONS: tuple[str, ...] = (
     REFUSAL_NO_CUSTOMER_REF,
     REFUSAL_DOMAIN_NOT_CONSENTED,
     REFUSAL_CONSENT_STORE_UNAVAILABLE,
+    REFUSAL_CONSENT_CHECK_FAULTED,
 )
 
 # The closed vocabulary of `AuditEntry.customer_ref_absence_reason`, kept here
@@ -421,13 +444,16 @@ class AuditEntry(Base):
     # the other is an agent spelling a name wrong.
     #
     # The vocabulary is `REFUSAL_REASONS` at the top of this module, held to
-    # three values by the CHECK constraint below; each names what the consent
-    # check established and not why the caller ended up in that state. Two of
-    # them are facts about the customer and the third,
-    # `consent_store_unavailable`, is a fact about the operator: the check
-    # reached nothing, so it established nothing. A query counting consent
-    # denials that does not exclude it is counting an outage as customer
-    # state.
+    # four values by the CHECK constraint below; each names what the consent
+    # check established and not why the caller ended up in that state. They
+    # fall into three populations and a query that does not separate them is
+    # wrong about at least one: `no_customer_ref` and
+    # `domain_not_consented` are facts about the CUSTOMER,
+    # `consent_store_unavailable` is a fact about the OPERATOR'S
+    # INFRASTRUCTURE, and `consent_check_faulted` is a fact about THIS
+    # SOFTWARE. Counting consent denials without excluding the last two
+    # counts an outage and a bug as customer state; alerting on the third
+    # without excluding the fourth pages a DBA for our own SQL.
     #
     # NULL is every other row: the call was not refused, or the row was
     # written before this column existed. The column cannot separate those
@@ -439,12 +465,13 @@ class AuditEntry(Base):
     # `String(32)`: the longest value is `consent_store_unavailable` at 25
     # characters, and a regulator or a DBA reads the values straight out of a
     # `SELECT` with no enum catalog lookup and no join. That was 20 until
-    # 26 September 2026, so the headroom a fourth value has is now 7
-    # characters and the next one longer than that costs a width migration
-    # as well as a widened CHECK -- the trade `customer_ref_absence_reason`
-    # below took the other way, sizing itself at 64 for 26 characters of
-    # value. Migration 1c64b7ed3f4b is what a column sized at its own
-    # maximum costs. A Postgres `ENUM` would put the same closed set
+    # 26 September 2026. The fourth value arrived the next day at 21
+    # characters and did not need the width, so 7 characters of headroom
+    # remain and a fifth longer than that costs a width migration as well as
+    # a widened CHECK -- the trade `customer_ref_absence_reason` below took
+    # the other way, sizing itself at 64 for 26 characters of value.
+    # Migration 1c64b7ed3f4b is what a column sized at its own maximum
+    # costs. A Postgres `ENUM` would put the same closed set
     # one `ALTER TYPE` away from every future change, including one that
     # cannot run in the same transaction that uses it; a widened CHECK is a
     # one-statement migration.

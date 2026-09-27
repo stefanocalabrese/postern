@@ -28,11 +28,12 @@ this cache every one of those 5 hits the database; with it, only the first
 does, because all 5 share one `customer.value` cache key on
 `request.state` regardless of which domain's closure runs first.
 
-A FAILURE IS REMEMBERED THE SAME WAY, since 27 September 2026, and until
-then it was not: the cache above was written on the success path only, so an
-unreachable store was re-probed by every one of those 5 evaluations and each
-waited the full `pool_timeout`. Measured against a blackholed listener with
-the connect timeout at 1.0s, one `tools/call` took 5.11 seconds to be
+A FAILURE IS REMEMBERED THE SAME WAY, with its classified cause, since 27
+September 2026, and until then it was not: the cache above was written on the
+success path only, so an unreachable store was re-probed by every one of
+those 5 evaluations and each waited the full `pool_timeout`. Measured against
+a blackholed listener with the connect timeout at 1.0s, one `tools/call` took
+5.11 seconds to be
 denied; it now takes 1.03. That is load the outage was adding to the pool
 whose exhaustion caused it, from evaluations that were all going to deny.
 
@@ -65,14 +66,44 @@ live one when both carry the same name.
 
 Remembering the failure removed the state it cleaned up. Within one request
 the verdict for a (customer, tool) pair cannot change, because each of the
-three ways `check` refuses is pinned by something that does not vary across
+four ways `check` refuses is pinned by something that does not vary across
 evaluations: `no_customer_ref` by `ctx.token`, which is the request's own
 validated token; `domain_not_consented` by the domain set the success cache
-holds; and `consent_store_unavailable` by the failure memory. No evaluation
-can contradict an earlier one, so no filing can go stale, so there is
-nothing to withdraw. Restoring a per-evaluation probe without restoring a
-withdrawal reopens it, and this is the test that fails when someone does:
+holds; and both `consent_store_unavailable` and `consent_check_faulted` by
+the failure memory, which holds the classified reason and not merely the
+fact. No evaluation can contradict an earlier one, so no filing can go
+stale, so there is nothing to withdraw. Restoring a per-evaluation probe
+without restoring a withdrawal reopens it, and this is the test that fails
+when someone does:
 `tests/test_consent_check_failure_mode.py::test_a_recovery_mid_request_no_longer_recovers_the_call`
+
+TWO CAUSES, NOT ONE, and the second was being filed as the first until 27
+September 2026. `except Exception` wrote `consent_store_unavailable` for
+whatever had been raised, so a migration nobody applied and a connection pool
+at its ceiling produced the same row, and an operator alerting on the
+operator's-infrastructure value was being woken for this repository's SQL.
+Remembering the cause made that worse before it was fixed: one misclassified
+exception labelled every refusal in the request rather than one.
+`_classify` below is the split, its two class tuples are read off the
+installed SQLAlchemy and asyncpg rather than recalled, and the denial is
+identical either way -- a defect in the consent lookup must never become a
+reason to allow a call.
+
+A `tools/list` WRITES NO AUDIT ROW, in any state, and that is a ruling rather
+than an oversight. `services/confirm/audit.py`'s `PairingAudit` states when a
+row is owed -- the server resolved an identity AND reached a conclusion about
+that identity's authority -- and an authenticated catalogue fetch during an
+outage satisfies both halves, so a row is owed by that rule. `audit_log` is
+not where it goes: `tool_name` is a per-tool column and a catalogue is not
+one tool, `outcome` is a closed vocabulary of `reaching`, `returned` and
+`raised` and none of them describes a tool filtered out of a list nobody
+called, and the volume is measured rather than feared. `on_list_tools` fires
+for the SDK's internal dispatch as well as for a real fetch, so a row per
+withheld tool would turn one `tools/call` carrying arguments into five audit
+INSERTs during an outage instead of one, each of them fail-closed under
+decision 0006, against the pool whose exhaustion caused the outage. The
+record therefore lives in the ERROR line `check` writes, which is why that
+line has to describe the whole request.
 
 A denial also FILES ITSELF, for the audit row. `auth=` answers a bare bool
 and the wire answer is `Unknown tool: '<name>'` either way, so before this
@@ -123,6 +154,7 @@ was made about.
 import logging
 from collections.abc import Awaitable, Callable
 
+import sqlalchemy.exc as sa_exc
 from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.auth import AuthContext
 from fastmcp.server.dependencies import get_http_request
@@ -130,6 +162,7 @@ from postern_core.identity import CustomerRef
 from postern_core.store import consents
 from postern_core.store.engine import Database
 from postern_core.store.models import (
+    REFUSAL_CONSENT_CHECK_FAULTED,
     REFUSAL_CONSENT_STORE_UNAVAILABLE,
     REFUSAL_DOMAIN_NOT_CONSENTED,
     REFUSAL_NO_CUSTOMER_REF,
@@ -152,28 +185,135 @@ _Cache = dict[str, set[str]]
 # costs 1.03. It is a set of customer references and not of exceptions, so
 # nothing here keeps a traceback (and the frames and connections a traceback
 # holds) alive for the rest of the request.
+# Maps a customer reference to the refusal reason its lookup established, so
+# the four evaluations that never probe file what the one that did found.
+# `dict` and not `set` since 27 September 2026: the memory has to carry WHICH
+# kind of failure it was, because a misremembered kind is now wrong on every
+# refusal in the request rather than on one.
 _FAILED_ATTR = "postern_consent_lookup_failed"
-_Failed = set[str]
+_Failed = dict[str, str]
 
 _REFUSALS_ATTR = "postern_consent_refusals"
 _Refusals = dict[str, str]
 
+# COULD NOT REACH OR COMPLETE AGAINST THE STORE. Read off the installed
+# SQLAlchemy 2.0.52 and asyncpg 0.31.0 rather than recalled, and two findings
+# from that reading shape the list.
+#
+# `sqlalchemy.exc.TimeoutError` is the connection pool at its ceiling, raised
+# in `sqlalchemy/pool/impl.py`, and it descends straight from
+# `SQLAlchemyError` -- NOT from `DBAPIError`. Any list built out of the DBAPI
+# tree alone misses the exact condition this whole line of work started from.
+#
+# `DBAPIError` itself is here, the generic parent and not only its
+# operational children, because the asyncpg dialect's error map is coarse.
+# `_asyncpg_error_translate` in `sqlalchemy/dialects/postgresql/asyncpg.py`
+# keys on seven asyncpg classes and sends everything else under
+# `PostgresError` to the bare DBAPI `Error`, so `TooManyConnectionsError`,
+# `CannotConnectNowError`, `AdminShutdownError` and
+# `ConnectionDoesNotExistError` all arrive as a generic `DBAPIError` rather
+# than as `OperationalError`. Naming only `OperationalError` and
+# `InterfaceError` would file a database that is refusing connections because
+# it is shutting down as a defect in this software.
+#
+# `OSError` covers both raw shapes measured on this path, because the failure
+# can happen during connect, before SQLAlchemy has a DBAPI error to wrap:
+# `ConnectionRefusedError` from nothing listening, and the builtin
+# `TimeoutError` from a socket that accepts and never speaks, which is an
+# `OSError` subclass since it merged with `asyncio.TimeoutError`.
+_UNAVAILABLE: tuple[type[BaseException], ...] = (
+    sa_exc.TimeoutError,
+    sa_exc.DisconnectionError,
+    sa_exc.DBAPIError,
+    OSError,
+)
 
-class _ConsentStoreUnavailable(Exception):
-    """Raised INSTEAD of probing, once this request has already failed once.
+# THIS SOFTWARE IS WRONG. Every member is a `DBAPIError` subclass, which is
+# the only reason the tuple needs to exist at all: anything that is not a
+# database or socket error already falls to the default below, so this list
+# is exactly the specific DBAPI children that the generic entry above would
+# otherwise swallow.
+#
+# `ProgrammingError` is where the asyncpg dialect sends `SyntaxOrAccessError`,
+# and therefore `UndefinedTableError` and `UndefinedColumnError` -- a
+# migration nobody applied, or a model that has drifted from the schema, which
+# is the case that prompted the split. `DataError` and `IntegrityError` cannot
+# happen on this read except through a defect: the lookup is one `SELECT` with
+# three bound predicates and writes nothing.
+#
+# `InternalError` is deliberately NOT here, though it is tempting. The
+# dialect maps both asyncpg `InternalServerError` and `InternalClientError` to
+# it, meaning PostgreSQL or the driver malfunctioned. Neither is this
+# repository's code being wrong, so both stay on the operator's side of the
+# line.
+_FAULT: tuple[type[BaseException], ...] = (
+    sa_exc.ProgrammingError,
+    sa_exc.DataError,
+    sa_exc.IntegrityError,
+    sa_exc.NotSupportedError,
+)
 
-    It exists to carry one bit that the original exception cannot: whether
-    `check` is seeing the failure for the first time. The first failure
-    propagates as whatever the driver raised, gets logged with its traceback
-    and is remembered; every later evaluation gets this instead, files the
-    same refusal reason and logs nothing, because nothing new happened. A
-    reader comparing the two branches in `check` is looking at "measure and
-    report" against "already measured".
 
-    Private, and never reaches a caller: `check` catches it, and FastMCP's
-    `_evaluate_check` would mask it as a denial anyway. It is not part of
-    `_domains`' contract with anything outside this module.
+def _classify(exc: BaseException) -> str:
+    """Which refusal reason this exception earns.
+
+    ORDER IS THE DECISION, not the lists. `_FAULT` is consulted first
+    because every one of its members is a `DBAPIError` subclass and
+    `_UNAVAILABLE` carries `DBAPIError` itself, so reversing these two lines
+    files a schema error as an outage and this function silently becomes the
+    thing it was written to stop.
+
+    THE DEFAULT IS THE FAULT REASON, which is the other half of the design
+    and the half a reader is most likely to get backwards. `granted_domains`
+    is one `SELECT` with three bound predicates; an exception out of it that
+    is neither a database error nor a socket error is this repository's, and
+    the most obvious example is the most common bug there is -- an
+    `AttributeError`. A design that enumerated reachability and defaulted the
+    rest to unavailability would file that as infrastructure, which is the
+    complaint the split exists to answer.
+
+    THE RESIDUE IS STATED RATHER THAN HIDDEN, and it runs the other way: a
+    few genuine data defects reach the store as `PostgresError` subclasses
+    outside `SyntaxOrAccessError` -- `InvalidTextRepresentationError`, say --
+    and the coarse dialect map lands them in the generic `DBAPIError` bucket,
+    so they are called an outage. Both reasons log at ERROR with distinct
+    literals, so either mislabel costs an operator a wrong first hypothesis
+    and never silence.
     """
+    if isinstance(exc, _FAULT):
+        return REFUSAL_CONSENT_CHECK_FAULTED
+    if isinstance(exc, _UNAVAILABLE):
+        return REFUSAL_CONSENT_STORE_UNAVAILABLE
+    return REFUSAL_CONSENT_CHECK_FAULTED
+
+
+class _LookupFailed(Exception):
+    """The consent lookup did not answer, with the reason already classified.
+
+    `_domains` raises this for EVERY failure, first or repeat, so `check` has
+    one branch instead of two and cannot classify the same exception twice
+    and differently. Two attributes carry what that branch needs.
+
+    `reason` is the `audit_log.refusal_reason` value `_classify` chose. It is
+    decided once, where the exception was caught, and then remembered for the
+    request, so every evaluation files the same value.
+
+    `probed` says whether THIS evaluation is the one that reached the
+    database. Only that one logs: it holds the original exception as
+    `__cause__` and writes a line with its traceback, while the rest of the
+    request's evaluations file the reason and say nothing, because nothing
+    new happened. That is what took an outage from five ERROR lines per call
+    to one.
+
+    Private, and never reaches a caller: `check` is `_domains`' only caller
+    and catches it, and FastMCP's `_evaluate_check` would mask it as a denial
+    anyway.
+    """
+
+    def __init__(self, reason: str, *, probed: bool) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.probed = probed
 
 
 def _customer(ctx: AuthContext) -> CustomerRef | None:
@@ -205,34 +345,47 @@ async def _domains(db: Database, customer: CustomerRef) -> set[str]:
         # true the answer this returns should be the one that was
         # established, not the one that was not.
         failed: _Failed | None = getattr(request.state, _FAILED_ATTR, None)
-        if isinstance(failed, set) and customer.value in failed:
-            raise _ConsentStoreUnavailable(customer.value)
+        if isinstance(failed, dict) and customer.value in failed:
+            raise _LookupFailed(failed[customer.value], probed=False)
 
     try:
         async with db.sessionmaker() as session:
             granted: set[str] = await consents.granted_domains(session, customer)
-    except Exception:
-        # REMEMBER, then re-raise unchanged. `check` still sees the driver's
-        # own exception for this first failure, so the log line it writes
-        # still names the real type and carries the real traceback.
+    except AuthorizationError:
+        # FastMCP's own denial, which `_evaluate_check` propagates rather
+        # than masking. Nothing under here raises it today, and this branch
+        # is what stops the wrap below turning one into a refusal this module
+        # invented a reason for. `check` has the matching branch, and the two
+        # are not redundant: this one must not WRAP it, that one must not
+        # FILE it.
+        raise
+    except Exception as exc:
+        # CLASSIFY ONCE, HERE, and remember the answer rather than the
+        # exception. Doing it at the point of failure is what keeps every
+        # evaluation in the request agreeing: `check` cannot look at the same
+        # exception twice and reach two verdicts, because it never sees it
+        # again -- only `_LookupFailed`, carrying the reason this line chose.
+        # The original is attached as `__cause__` so the one evaluation that
+        # logs still has the real type and the real traceback.
         #
         # `Exception`, so `asyncio.CancelledError` (a `BaseException`) is
-        # neither remembered nor re-raised through here: a request the edge
-        # cancelled must not leave a verdict behind for evaluations that will
-        # never run, and it is not a statement about the store.
+        # neither classified nor remembered: a request the edge cancelled must
+        # not leave a verdict behind for evaluations that will never run, and
+        # it is not a statement about the store or about this code.
         #
         # No HTTP request means no memory and no coherence to protect -- the
         # in-process `Client` transport has no `request.state` for any of
         # this module's three stores, so it re-probes per evaluation exactly
         # as before. Those calls carry no access token either, so their
         # checks refuse on `no_customer_ref` long before reaching this line.
+        reason = _classify(exc)
         if request is not None:
             remembered: _Failed | None = getattr(request.state, _FAILED_ATTR, None)
-            if not isinstance(remembered, set):
-                remembered = set()
+            if not isinstance(remembered, dict):
+                remembered = {}
                 setattr(request.state, _FAILED_ATTR, remembered)
-            remembered.add(customer.value)
-        raise
+            remembered[customer.value] = reason
+        raise _LookupFailed(reason, probed=True) from exc
 
     if request is not None:
         cache: _Cache | None = getattr(request.state, _CACHE_ATTR, None)
@@ -340,52 +493,41 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
             # cause was authorization is the same error as the reverse, in
             # the direction that hides a real refusal.
             raise
-        except _ConsentStoreUnavailable:
-            # An evaluation earlier in THIS request already established that
-            # the store cannot be reached, logged it with its traceback and
-            # remembered it. This one files the same reason against its own
-            # tool name -- which is what `audit_log.refusal_reason` needs,
-            # since the called tool's evaluation is usually not the one that
-            # paid for the probe -- and neither probes nor logs again.
+        except _LookupFailed as failure:
+            # DENIES, exactly as before, and that is the half that has never
+            # moved through three changes to this branch. Until 26 September
+            # 2026 the exception left `check` entirely and
+            # `fastmcp/utilities/authorization.py`'s `_evaluate_check` caught
+            # it, logged a warning and returned False, so the audit row read
+            # `outcome='raised'`, `detail='NotFoundError'`, reason NULL -- the
+            # row a mistyped tool name produces byte for byte. The verdict is
+            # still the denial FastMCP was already making; what this branch
+            # adds is a row that says which of four things happened.
             #
-            # The row count is unaffected: `AuditMiddleware` writes per call,
-            # never per evaluation, so an outage produced one completion row
-            # per `tools/call` before this and produces one after it. What
-            # dropped is connection attempts and ERROR lines, from one per
-            # evaluation to one per request.
-            _refuse(ctx, REFUSAL_CONSENT_STORE_UNAVAILABLE)
-            return False
-        except Exception as exc:
-            # DENIES, exactly as before. What changes is that the row now
-            # says which of the three things happened. Until 26 September
-            # 2026 this exception left `check` entirely and
-            # `fastmcp/utilities/authorization.py`'s `_evaluate_check`
-            # caught it, logged a warning and returned False, so the
-            # `domain_not_consented` refusal below this line was unreachable
-            # on an outage and the audit row read `outcome='raised'`,
-            # `detail='NotFoundError'`, reason NULL -- a row a mistyped tool
-            # name produces byte for byte. Catching it here is what puts a
-            # class on it; the verdict is the same denial FastMCP was
-            # already making.
+            # THE REASON IS NOT DECIDED HERE. `_domains` classified it where
+            # the exception was caught and remembered it for the request, so
+            # every evaluation files the same value: an outage and a defect in
+            # this software cannot swap places between the internal
+            # `tools/list` pass and the real dispatch. This branch files it
+            # against its OWN tool name, which is what
+            # `audit_log.refusal_reason` needs, since the called tool's
+            # evaluation is usually not the one that paid for the probe.
             #
-            # `Exception` and not `BaseException`, which is load-bearing
-            # rather than habitual: `asyncio.CancelledError` derives from
-            # `BaseException`, so a request the edge cancelled passes
-            # through untouched instead of being filed as a store outage.
-            # A cancelled call is not a call this check refused.
+            # ONE LINE PER REQUEST, from the one evaluation that probed.
+            # `_evaluate_check` logged at WARNING with a traceback and was the
+            # only place an operator could learn the type, so catching without
+            # logging would trade one blind spot for another. ERROR on both
+            # paths, and distinct literals: a mislabel then costs a wrong
+            # first hypothesis, never silence, which is what makes the
+            # classifier's residue survivable.
             #
-            # LOGGED HERE BECAUSE FASTMCP NO LONGER SEES IT. `_evaluate_check`
-            # logged this at WARNING with a full traceback and was the only
-            # place an operator could learn the type of the failure, so
-            # catching it without logging would trade one blind spot for
-            # another. ERROR rather than WARNING: a consent store this
-            # process cannot reach is denying real customers, and the audit
-            # row now carries a matching literal an operator can join
-            # against. ONE LINE PER REQUEST, not one per evaluation: this
-            # branch is only reached by the evaluation that actually probed,
-            # and `_FAILED_ATTR` sends every later one to the branch above.
-            # It was one per evaluation until 27 September 2026, which on the
-            # five-evaluation path meant five tracebacks for one measurement.
+            # THE MESSAGE NAMES THE REQUEST, NOT A TOOL, and it used to name
+            # `ctx.component.name`. That was measured under-reporting: a
+            # `tools/list` against a refused connection logged
+            # `denying accounts.list` while all four gated tools were denied,
+            # because the other three were answered from the memory and never
+            # reached this line. Remembering the failure is what makes the
+            # request-wide claim true, so the line now makes it.
             #
             # The traceback can carry the SQL and its bound parameters, so
             # this line can put a `cust_`-prefixed customer reference in the
@@ -394,13 +536,23 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
             # admits nothing that `CustomerRef` rejects, so the PAN-, IBAN-
             # and DNI-shaped subjects `postern_core.identity`'s `_OPAQUE`
             # warns about never reach this line.
-            logger.error(
-                "consent store unreachable, denying %s: %s",
-                ctx.component.name,
-                type(exc).__name__,
-                exc_info=exc,
-            )
-            _refuse(ctx, REFUSAL_CONSENT_STORE_UNAVAILABLE)
+            if failure.probed:
+                cause = failure.__cause__
+                if failure.reason == REFUSAL_CONSENT_STORE_UNAVAILABLE:
+                    logger.error(
+                        "consent store unreachable, denying every consent-gated tool "
+                        "for this request: %s",
+                        type(cause).__name__,
+                        exc_info=cause,
+                    )
+                else:
+                    logger.error(
+                        "consent check FAULTED, denying every consent-gated tool for "
+                        "this request: %s. The store answered; this software is wrong",
+                        type(cause).__name__,
+                        exc_info=cause,
+                    )
+            _refuse(ctx, failure.reason)
             return False
         if domain in granted:
             # NOTHING TO WITHDRAW HERE, and that is a property of the two

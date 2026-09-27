@@ -94,6 +94,7 @@ from typing import Any
 import httpx2
 import pytest
 import pytest_asyncio
+import sqlalchemy.exc as sa_exc
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from fastmcp.server.http import StarletteWithLifespan
@@ -105,6 +106,7 @@ from postern_core.facade.client import BackendClient
 from postern_core.store import consents
 from postern_core.store.engine import Database
 from postern_core.store.models import (
+    REFUSAL_CONSENT_CHECK_FAULTED,
     REFUSAL_CONSENT_STORE_UNAVAILABLE,
     REFUSAL_DOMAIN_NOT_CONSENTED,
     AuditEntry,
@@ -946,3 +948,324 @@ async def test_a_blackholed_consent_store_denies_only_after_one_driver_timeout(
     assert response.status_code == 200
     assert _result(response)["isError"] is True
     assert backend.paths == [], "a hung store must not let the tool body run either"
+
+
+# -- Which failures are the operator's, and which are ours -------------------
+#
+# `except Exception` filed every lookup failure as `consent_store_unavailable`
+# until 27 September 2026, so a migration nobody applied and a typo in a
+# model woke somebody for infrastructure. The class lists live in
+# `services/api/consent.py`; these tests drive the two halves through the
+# real stack and then pin the classification table directly, because the
+# table is the decision and a couple of end-to-end cases cannot cover it.
+
+
+def _raise(exc: BaseException) -> Callable[[AsyncSession, Any], Any]:
+    """A `granted_domains` replacement that raises one given exception."""
+
+    async def failing(db_session: AsyncSession, customer: Any) -> set[str]:
+        raise exc
+
+    return failing
+
+
+async def test_a_pool_timeout_is_filed_as_an_outage(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The saturation case, with the class it actually raises.
+
+    Every test in this file until now broke the connection, which produces a
+    raw `ConnectionRefusedError` or `TimeoutError`. A pool at its ceiling
+    produces neither: SQLAlchemy raises its own `sqlalchemy.exc.TimeoutError`
+    from `sqlalchemy/pool/impl.py`, which is NOT a `DBAPIError` and is not an
+    `OSError` either. It is the condition that started this whole line of
+    work, so it gets the one test that names the class rather than a socket.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    monkeypatch.setattr(
+        consents,
+        "granted_domains",
+        _raise(
+            sa_exc.TimeoutError(
+                "QueuePool limit of size 15 overflow 0 reached, connection timed out, timeout 1.00"
+            )
+        ),
+    )
+
+    app = _app(database, database, key_pair, RecordingBackend(), _settings(pg_url))
+    response = await _rpc(
+        app, _token(key_pair), "tools/call", {"name": GATED_TOOL, "arguments": {}}
+    )
+
+    assert _result(response)["isError"] is True
+    rows = await _audit_rows(session)
+    assert len(rows) == 1
+    assert rows[0].refusal_reason == REFUSAL_CONSENT_STORE_UNAVAILABLE
+
+
+async def test_a_schema_error_is_not_filed_as_an_outage(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A migration nobody applied must not page a DBA about the network.
+
+    `sqlalchemy.exc.ProgrammingError` is where the asyncpg dialect sends
+    `UndefinedTableError` and `UndefinedColumnError`, so this is the shape a
+    model that has drifted from the schema has. The store was reachable and
+    answered; what it answered was that our query is wrong.
+
+    THE DENIAL IS UNCHANGED, which is the half that must not move: the call
+    is refused, the backend is never reached, and the row is written. Only
+    the reason differs, and it names our software instead of the operator's
+    infrastructure.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    monkeypatch.setattr(
+        consents,
+        "granted_domains",
+        _raise(
+            sa_exc.ProgrammingError(
+                "SELECT consents.domain FROM consents",
+                {},
+                Exception("column consents.doman does not exist"),
+            )
+        ),
+    )
+    backend = RecordingBackend()
+
+    app = _app(database, database, key_pair, backend, _settings(pg_url))
+    response = await _rpc(
+        app, _token(key_pair), "tools/call", {"name": GATED_TOOL, "arguments": {}}
+    )
+
+    assert _result(response)["isError"] is True
+    assert backend.paths == [], "a faulted check must deny, exactly as an outage does"
+    rows = await _audit_rows(session)
+    assert len(rows) == 1
+    assert rows[0].detail == "NotFoundError"
+    assert rows[0].refusal_reason == REFUSAL_CONSENT_CHECK_FAULTED
+
+
+async def test_a_python_bug_in_the_lookup_is_not_filed_as_an_outage(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of "our code is wrong", and the one that decides the
+    DEFAULT rather than a list.
+
+    An `AttributeError` out of the lookup is not a database exception at all.
+    It reaches the same `except` as a connection failure, and a design that
+    listed the reachability families and defaulted everything else to
+    unavailability would file the most obvious bug class there is as an
+    outage. So the default is the fault reason, and the reachability families
+    are the ones enumerated.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    monkeypatch.setattr(
+        consents,
+        "granted_domains",
+        _raise(AttributeError("'NoneType' object has no attribute 'domain'")),
+    )
+
+    app = _app(database, database, key_pair, RecordingBackend(), _settings(pg_url))
+    await _rpc(app, _token(key_pair), "tools/call", {"name": GATED_TOOL, "arguments": {}})
+
+    rows = await _audit_rows(session)
+    assert len(rows) == 1
+    assert rows[0].refusal_reason == REFUSAL_CONSENT_CHECK_FAULTED
+
+
+def test_the_classification_table_read_off_the_installed_packages() -> None:
+    """The decision itself, pinned class by class.
+
+    Read out of `sqlalchemy/exc.py`, `sqlalchemy/pool/impl.py` and
+    `sqlalchemy/dialects/postgresql/asyncpg.py` in the installed 2.0.52
+    against asyncpg 0.31.0, not recalled. Two facts from that reading drive
+    every row below.
+
+    THE POOL TIMEOUT IS NOT A `DBAPIError`. `sqlalchemy.exc.TimeoutError`
+    descends straight from `SQLAlchemyError`, so any list built out of the
+    DBAPI tree alone misses the saturation case entirely.
+
+    THE DIALECT'S ERROR MAP IS COARSE. `_asyncpg_error_translate` keys on
+    `IntegrityConstraintViolationError`, `PostgresError`,
+    `SyntaxOrAccessError`, `InterfaceError`, `InvalidCachedStatementError`,
+    `InternalServerError` and `InternalClientError`, and nothing else. So
+    `TooManyConnectionsError`, `CannotConnectNowError`, `AdminShutdownError`
+    and `ConnectionDoesNotExistError` all fall through `PostgresError` to the
+    bare DBAPI `Error` and arrive as a generic `DBAPIError` rather than as
+    `OperationalError`. A reachability list naming only `OperationalError`
+    and `InterfaceError` would call a database that is refusing connections
+    because it is shutting down a bug in our code.
+
+    ORDER IS LOAD-BEARING, and the last two rows are what pin it:
+    `ProgrammingError` and `DataError` are `DBAPIError` subclasses, so the
+    fault families have to be consulted first or the generic entry swallows
+    them.
+    """
+    assert consent._classify(sa_exc.TimeoutError("pool")) == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    assert consent._classify(sa_exc.DisconnectionError("gone")) == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    assert (
+        consent._classify(ConnectionRefusedError(61, "refused"))
+        == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    )
+    assert consent._classify(TimeoutError("connect")) == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    assert (
+        consent._classify(sa_exc.OperationalError("s", {}, Exception("server closed")))
+        == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    )
+    assert (
+        consent._classify(sa_exc.InterfaceError("s", {}, Exception("connection is closed")))
+        == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    )
+    assert (
+        consent._classify(sa_exc.DBAPIError("s", {}, Exception("too many connections for role")))
+        == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    )
+    assert (
+        consent._classify(sa_exc.InternalError("s", {}, Exception("internal")))
+        == REFUSAL_CONSENT_STORE_UNAVAILABLE
+    )
+
+    assert consent._classify(AttributeError("bug")) == REFUSAL_CONSENT_CHECK_FAULTED
+    assert consent._classify(TypeError("bug")) == REFUSAL_CONSENT_CHECK_FAULTED
+    assert consent._classify(sa_exc.InvalidRequestError("misuse")) == REFUSAL_CONSENT_CHECK_FAULTED
+    assert consent._classify(sa_exc.ArgumentError("misuse")) == REFUSAL_CONSENT_CHECK_FAULTED
+    assert (
+        consent._classify(sa_exc.ProgrammingError("s", {}, Exception("undefined column")))
+        == REFUSAL_CONSENT_CHECK_FAULTED
+    )
+    assert (
+        consent._classify(sa_exc.DataError("s", {}, Exception("invalid input syntax")))
+        == REFUSAL_CONSENT_CHECK_FAULTED
+    )
+
+
+async def test_a_fault_is_remembered_for_the_request_like_an_outage(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bug is remembered too, and the reason it is kept is the invariant
+    rather than the latency.
+
+    An outage is remembered because re-probing costs a `pool_timeout` each
+    time. A fault fails fast, so that argument does not carry, and the
+    tempting answer is to let it re-probe. The invariant forbids it: "the
+    verdict for a (customer, tool) pair cannot change within a request" is
+    what retired `_clear_refusal`, and a non-deterministic fault that raised
+    on one evaluation and returned on a later one would break it and put a
+    stale filing back on a call consent allowed.
+
+    So both kinds are remembered, and the memory holds WHICH kind, so the
+    four evaluations that never probe still file the reason the one that did
+    established.
+    """
+    await _seed(consent_session, CUSTOMER, "accounts")
+    # `_count_probes` counts LOOKUPS here and nothing else: the patch it
+    # installs on `granted_domains` is replaced below, so `attempts` stays
+    # empty and `calls` is what counts the trips to the database.
+    probes = _count_probes(monkeypatch)
+    calls = 0
+
+    async def faulting(db_session: AsyncSession, customer: Any) -> set[str]:
+        nonlocal calls
+        calls += 1
+        raise sa_exc.ProgrammingError("s", {}, Exception("undefined column"))
+
+    monkeypatch.setattr(consents, "granted_domains", faulting)
+
+    app = _app(database, database, key_pair, RecordingBackend(), _settings(pg_url))
+    await _rpc(
+        app,
+        _token(key_pair),
+        "tools/call",
+        {"name": "accounts.get_balance", "arguments": {"account_ref": "acc_7f3a"}},
+    )
+
+    assert len(probes.lookups) == 5, "this is not the five-evaluation path any more"
+    assert calls == 1, "a remembered fault must not be re-probed either"
+    rows = await _audit_rows(session)
+    assert len(rows) == 1
+    assert rows[0].tool_name == "accounts.get_balance"
+    assert rows[0].refusal_reason == REFUSAL_CONSENT_CHECK_FAULTED
+
+
+# -- What a catalogue fetch leaves behind ------------------------------------
+
+
+async def test_a_tools_list_outage_writes_no_audit_row_and_says_so_in_one_log_line(
+    audit_server: FastMCP,
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    database: Database,
+    consent_session: AsyncSession,
+    session: AsyncSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`tools/list` writes no row, deliberately, so the log line has to be
+    complete on its own.
+
+    THE RULING THIS RECORDS. `services/confirm/audit.py`'s `PairingAudit`
+    states when a row is owed: the server resolved an identity AND reached a
+    conclusion about that identity's authority. An authenticated `tools/list`
+    during an outage satisfies both, so a row IS owed by that rule -- and
+    `audit_log` is not where it goes. `tool_name` is a per-tool column and a
+    catalogue is not one tool; `outcome` is a closed vocabulary of
+    `reaching`, `returned` and `raised`, none of which describes a tool
+    filtered out of a list nobody called. And the volume is measured, not
+    feared: `on_list_tools` fires for the MCP SDK's internal dispatch as well
+    as for a real fetch, so a row per withheld tool would turn one
+    `tools/call` carrying arguments into five audit INSERTs during an outage
+    instead of one, every one of them fail-closed under record 0006, on the
+    pool whose exhaustion caused the outage.
+
+    So the record lives in the log, and this asserts what the log has to say
+    for that to be honest. ONE line, because the failure is remembered per
+    request, and it must describe the REQUEST rather than the single tool
+    whose evaluation happened to pay for the probe: before 27 September 2026
+    it read `denying accounts.list` while all four gated tools were denied,
+    which under-reports an outage by three quarters.
+    """
+    import logging
+
+    await _seed(consent_session, CUSTOMER, "accounts", "transactions", "cards")
+    dead = Database(REFUSED_URL)
+    with caplog.at_level(logging.ERROR, logger="services.api.consent"):
+        try:
+            app = _app(dead, database, key_pair, RecordingBackend(), _settings(pg_url))
+            listed = _tool_names(await _rpc(app, _token(key_pair), "tools/list", {}))
+        finally:
+            await dead.close()
+
+    assert listed & GATED_TOOLS == set()
+    assert await _audit_rows(session) == []
+
+    lines = [r for r in caplog.records if r.name == "services.api.consent"]
+    assert len(lines) == 1, f"one probe, one line: {[r.getMessage() for r in lines]}"
+    message = lines[0].getMessage()
+    assert "every consent-gated tool" in message
+    assert not (GATED_TOOLS & set(message.split())), (
+        f"names one tool where four were denied: {message}"
+    )
+    assert "ConnectionRefusedError" in message
