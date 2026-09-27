@@ -217,3 +217,77 @@ def test_joserfc_registry_aud_matches_a_list_containing_the_expected_value() -> 
     jwt.JWTClaimsRegistry(aud={"essential": True, "value": "accounts.svc"}).validate(
         claims
     )  # does not raise
+
+
+# --- the jti, handed out instead of signed away ---
+#
+# `mint` drew the jti, signed it in, and returned only the string. The one
+# caller that needs the value back, `ReadTokenMinter` feeding `JtiReplayCache`,
+# recovered it by importing the published JWKS and running a full RS256 decode
+# over a token it had itself produced two statements earlier. `mint_with_jti`
+# returns both halves. `mint` keeps its signature and its return type, because
+# three production call sites and every call in this file pass its result
+# straight on as a string.
+
+
+def test_mint_with_jti_returns_the_jti_that_is_in_the_token(
+    minter: InternalTokenMinter,
+) -> None:
+    """The returned jti is the token's own claim, so no caller needs a decode.
+
+    Verified here against a real decode, which is the one place that
+    verification earns its cost: it pins the pairing once, in a test, rather
+    than on every backend call a customer makes.
+    """
+    minted = minter.mint_with_jti(subject=CUST, audience="accounts.svc", scope="accounts:read")
+
+    assert minted.jti == decode(minter, minted.token)["jti"]
+
+
+def test_mint_with_jti_draws_a_fresh_jti_per_call(minter: InternalTokenMinter) -> None:
+    """Two calls, two jtis. Uniqueness stays inside the minter.
+
+    The alternative shape, letting a caller pass the jti in, would have moved
+    this guarantee to whoever calls and made a constant jti a caller's
+    privilege. The value is generated here and only reported outward.
+    """
+    a = minter.mint_with_jti(subject=CUST, audience="accounts.svc", scope="accounts:read")
+    b = minter.mint_with_jti(subject=CUST, audience="accounts.svc", scope="accounts:read")
+
+    assert a.jti != b.jti
+    assert a.token != b.token
+
+
+def test_the_wider_return_signs_the_same_claim_set_mint_does(
+    minter: InternalTokenMinter,
+) -> None:
+    """A second method, not a second claim set.
+
+    The token is the load-bearing artifact and its shape is pinned across this
+    file; this is the assertion that reporting the jti outward changed nothing
+    inside the signature.
+    """
+    wide = decode(
+        minter,
+        minter.mint_with_jti(subject=CUST, audience="accounts.svc", scope="accounts:read").token,
+    )
+    narrow = decode(
+        minter, minter.mint(subject=CUST, audience="accounts.svc", scope="accounts:read")
+    )
+
+    assert set(wide) == set(narrow) == _BASE_CLAIM_KEYS
+    fixed = ("iss", "sub", "act", "aud", "scope")
+    assert {k: wide[k] for k in fixed} == {k: narrow[k] for k in fixed}
+
+
+def test_mint_still_returns_a_bare_token_string(minter: InternalTokenMinter) -> None:
+    """`mint` was not widened, and this is what that promise costs to keep.
+
+    Three production call sites hand its result to an ``Authorization`` header
+    or a JSON body. A tuple or a result object there would have touched all of
+    them to serve one caller that wanted the jti.
+    """
+    token = minter.mint(subject=CUST, audience="accounts.svc", scope="accounts:read")
+
+    assert isinstance(token, str)
+    assert token.count(".") == 2

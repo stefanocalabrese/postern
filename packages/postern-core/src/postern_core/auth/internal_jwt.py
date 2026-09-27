@@ -3,6 +3,19 @@
 Pure: a key plus claims in, a signed string out, no I/O. Vault lives behind
 `KeySource` and never appears here.
 
+TWO METHODS, ONE BODY. `mint` returns the token. `mint_with_jti` returns the
+token and the ``jti`` that was signed into it, for the one caller that needs
+the second value. The wider return went on a new method rather than replacing
+`mint`. `ReadTokenMinter` is the only caller anywhere that wants the jti, and
+it is now the only caller of `mint_with_jti`. What `mint` keeps are the callers
+that want a string and nothing else: `services/confirm/minter.py`'s
+`WriteTokenMinter`, the device grant's token endpoint in
+`services/confirm/device_auth.py`, and every `mint` call across
+`tests/test_internal_jwt.py`, `tests/test_confirm_service.py` and
+`tests/test_key_split_is_a_property.py`. Widening the method all of those use,
+to serve the one that is not among them, buys a `.token` nobody reads at every
+one of those sites.
+
 One instance per Vault role. The API service constructs the READ minter only;
 the confirm service constructs the WRITE minter only. There is deliberately no
 code path that gives one process both, which is what makes the separation an
@@ -20,6 +33,20 @@ from postern_core.auth.keys import KeySource
 from postern_core.identity import CustomerRef
 
 _LIFETIME = timedelta(seconds=60)
+
+
+@dataclass(frozen=True, slots=True)
+class MintedToken:
+    """A signed token beside the ``jti`` it carries.
+
+    A named pair and not a `tuple[str, str]` on purpose: both fields are
+    strings, so a transposed unpacking would type-check, would sign correctly,
+    and would hand `JtiReplayCache` an entire JWT as a jti. The names make that
+    mistake unwritable.
+    """
+
+    token: str
+    jti: str
 
 
 @dataclass(frozen=True)
@@ -43,6 +70,42 @@ class InternalTokenMinter:
         client_id: str | None = None,
         challenge_id: str | None = None,
     ) -> str:
+        """The signed token, for the callers that want nothing else."""
+        return self.mint_with_jti(
+            subject=subject,
+            audience=audience,
+            scope=scope,
+            consent_id=consent_id,
+            client_id=client_id,
+            challenge_id=challenge_id,
+        ).token
+
+    def mint_with_jti(
+        self,
+        *,
+        subject: CustomerRef,
+        audience: str,
+        scope: str,
+        consent_id: str | None = None,
+        client_id: str | None = None,
+        challenge_id: str | None = None,
+    ) -> MintedToken:
+        """The signed token and its ``jti``, for a caller that needs both.
+
+        The jti exists here as a local for the two statements between drawing
+        it and signing it, and used to be unreachable after that. The one
+        caller that wants it, `ReadTokenMinter` feeding `JtiReplayCache`,
+        recovered it by reimporting the published JWKS and running an RS256
+        verification over a token this method had just produced: measured at
+        42us per backend call against the 910us the signature below costs, to
+        read back a value that was in scope here. Reporting it outward is the
+        whole of this method.
+
+        The jti is still drawn here and never accepted from a caller. An
+        argument would have been additive and would have changed no call site,
+        and it would also have let one caller pass a constant into a claim the
+        minter is supposed to guarantee is unique per token.
+        """
         now = datetime.now(UTC)
         claims: Claims = {
             "iss": self.issuer,
@@ -63,4 +126,7 @@ class InternalTokenMinter:
                 claims[name] = value
 
         key = self.key_source.signing_key()
-        return jwt.encode({"alg": "RS256", "kid": key.kid}, claims, key)
+        token = jwt.encode({"alg": "RS256", "kid": key.kid}, claims, key)
+        # `claims["jti"]` and not a second `uuid4()`: this is the value that
+        # was signed, which is the only value a jti consumer can use.
+        return MintedToken(token=token, jti=str(claims["jti"]))

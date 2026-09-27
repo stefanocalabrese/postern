@@ -171,30 +171,33 @@ class ReadTokenMinter:
         if self._revocation_decision():
             raise RevokedError(f"customer {customer.value} is revoked; no token will be minted")
 
-        token = self._minter.mint(subject=customer, audience=audience, scope=scope)
+        minted = self._minter.mint_with_jti(subject=customer, audience=audience, scope=scope)
 
-        # The jti collision check, after the signature because that is the
-        # only place the jti exists as a value this object can see. Not a
-        # replay check: `JtiReplayCache` carries why, and this ordering is
-        # itself the proof, since a token that has just been signed here has
-        # by definition not been anywhere to be captured from.
+        # The jti collision check, after the signature because the jti belongs
+        # to a token that exists. Not a replay check: `JtiReplayCache` carries
+        # why, and this ordering is itself the proof, since a token that has
+        # just been signed here has by definition not been anywhere to be
+        # captured from.
+        #
+        # WHAT USED TO BE HERE, AND WHY ITS REMOVAL IS THE POINT. Until this
+        # commit these two lines were a `KeySet.import_key_set` over the
+        # published JWKS plus a full RS256 `jwt.decode`, per backend call, to
+        # read back the jti `mint` had drawn three statements earlier. Nothing
+        # consumed the decoded token but the next line, joserfc's `decode`
+        # validates no claim (no `exp`, no `aud`, no `iss`; that is a separate
+        # `JWTClaimsRegistry.validate`), and the whole thing sat inside this
+        # `if`, so a minter built without a cache verified nothing at all. It
+        # was therefore not a self-check on the signing key: the self-check is
+        # `refuse_unverifiable_minter`, which mints one token at startup and
+        # verifies it against the same JWKS, unconditionally, once.
+        #
+        # That matters beyond the 42us it cost per call, measured against the
+        # 910us the signature costs. Decision record 0014 kept this cache
+        # partly because the check was "one dictionary lookup on a path already
+        # paying an RSA verification". The verification was on the path only to
+        # feed the cache, so the argument was circular. The lookup is 0.2us and
+        # now that is the entire cost, which is what 0014 meant.
         if self._jti_cache is not None:
-            # A FULL VERIFYING DECODE, PER BACKEND CALL, TO RECOVER A VALUE
-            # `mint` HELD. `import_key_set` reparses the JWKS and `decode`
-            # runs an RSA verification, on the hot path of every read a
-            # customer makes. The comment here used to justify that with "the
-            # signature is already verified by InternalTokenMinter's caller
-            # (minter_probe)", which describes a startup probe and not this
-            # call, and which argues for skipping the verification rather
-            # than for doing it. Widening `mint` to return its jti would
-            # remove both the decode and the reason to explain it; that is a
-            # signature change this task did not own.
-            from joserfc import jwt as _jwt
-            from joserfc.jwk import KeySet as _KeySet
+            self._jti_cache.add(minted.jti)
 
-            keyset = _KeySet.import_key_set(self._minter.key_source.public_jwks())
-            decoded = _jwt.decode(token, keyset, algorithms=["RS256"])
-            jti: str = decoded.claims["jti"]
-            self._jti_cache.add(jti)
-
-        return token
+        return minted.token

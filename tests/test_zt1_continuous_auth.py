@@ -27,6 +27,8 @@ See ``postern_core.auth.read_minter.ReadTokenMinter`` for the API and
 """
 
 import pytest
+from joserfc import jwt
+from joserfc.jwk import KeySet, KeySetSerialization, RSAKey
 from postern_core.auth.internal_jwt import _LIFETIME, InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
@@ -304,3 +306,92 @@ def test_mint_without_revocation_list_still_uses_jti_cache(source: GeneratedKeyS
 
     # Cache tracks them
     assert cache.size == 2
+
+
+# --- what feeding the cache costs, which was the argument for keeping it ---
+#
+# Decision record 0014 kept this cache partly because "the check costs one
+# dictionary lookup on a path that is already paying an RSA verification".
+# The path was paying that verification only to feed this cache: the decode
+# sat inside `if self._jti_cache is not None`, so a minter built without a
+# cache verified nothing, and `add` itself is the dictionary lookup. Measured
+# on one developer machine over 2000 calls each, at 2048 bits: the RSA
+# signature `mint` performs costs 910us, importing the JWKS plus the verifying
+# decode cost 42us on top of it, and `add` costs 0.2us. The clause was not
+# wrong about the lookup being cheap. It was wrong about what the path pays
+# for anyway, because a signature is not a verification, and the 42us it
+# waved through was 181 times the lookup it was excusing.
+
+
+class _CountingKeySource:
+    """A `KeySource` that records the two halves of the key separately.
+
+    `signing_key` is the mint. `public_jwks` is read for exactly one purpose
+    anywhere in this repository, verifying a token, so counting them apart is
+    the observable that separates "this call signed something" from "this call
+    also verified what it just signed".
+    """
+
+    def __init__(self, inner: GeneratedKeySource) -> None:
+        self._inner = inner
+        self.signing_key_calls = 0
+        self.public_jwks_calls = 0
+
+    def signing_key(self) -> RSAKey:
+        self.signing_key_calls += 1
+        return self._inner.signing_key()
+
+    def public_jwks(self) -> KeySetSerialization:
+        self.public_jwks_calls += 1
+        return self._inner.public_jwks()
+
+
+def test_feeding_the_cache_reads_no_public_key_and_verifies_nothing(
+    source: GeneratedKeySource,
+) -> None:
+    """One mint signs once and verifies zero times, cache installed.
+
+    The public half of the key has no business being touched on a path whose
+    job is to sign. `refuse_unverifiable_minter` already mints one token at
+    startup and verifies it against the JWKS the service publishes, which is
+    the self-check this per-call decode was mistaken for.
+    """
+    counting = _CountingKeySource(source)
+    cache = JtiReplayCache(max_age_seconds=_LIFETIME.total_seconds())
+    minter = ReadTokenMinter(
+        InternalTokenMinter(issuer=ISS, key_source=counting),
+        revocation_decision=unchecked_revocation,
+        jti_cache=cache,
+    )
+
+    minter(CUST_A, "accounts.svc")
+
+    assert counting.signing_key_calls == 1
+    assert counting.public_jwks_calls == 0
+    assert cache.size == 1
+
+
+def test_the_cache_records_the_jti_the_token_actually_carries(
+    source: GeneratedKeySource,
+) -> None:
+    """The value reaching `add` is the token's own jti, not a second draw.
+
+    Without this assertion, feeding the cache any fresh unique string would
+    satisfy every other case in this file, size counts included, and the cache
+    would be watching values that never left the process inside a token. The
+    decode that proves the pairing belongs here, once, and not on the path.
+    """
+    cache = JtiReplayCache(max_age_seconds=_LIFETIME.total_seconds())
+    minter = ReadTokenMinter(
+        InternalTokenMinter(issuer=ISS, key_source=source),
+        revocation_decision=unchecked_revocation,
+        jti_cache=cache,
+    )
+
+    token = minter(CUST_A, "accounts.svc")
+
+    signed_jti = jwt.decode(
+        token, KeySet.import_key_set(source.public_jwks()), algorithms=["RS256"]
+    ).claims["jti"]
+    with pytest.raises(ValueError, match="jti replay detected"):
+        cache.add(signed_jti)

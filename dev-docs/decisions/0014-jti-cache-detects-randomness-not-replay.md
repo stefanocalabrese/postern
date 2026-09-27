@@ -116,8 +116,8 @@ held the credit.
 claim that calls it replay protection.**
 
 Keep the class rather than delete it: an RSA-signed token whose `jti` repeats
-is a catastrophic signal, the check costs one dictionary lookup on a path that
-is already paying an RSA verification, and a cheap canary in the wrong place
+is a catastrophic signal, the check costs one dictionary lookup -- 0.2us
+measured -- and a cheap canary in the wrong place
 is still a canary. Delete it and nothing in the read path would notice at all.
 What it may not do is appear on a list of controls under a name that promises
 an attacker was stopped.
@@ -141,7 +141,7 @@ answer.
 **Removing the control.** A control that detects a randomness failure is not
 worthless. It is misfiled, and the fix for misfiling is the filing.
 
-**Widening `InternalTokenMinter.mint` to return its `jti`,** which would delete
+**Widening `InternalTokenMinter.mint` to return its `jti`** (IMPLEMENTED 2026-09-27, see the amendment at the end -- and it needed no signature change), which would delete
 the verifying decode this path pays per call. Correct, and a signature change
 to the minter both services depend on. Noted here so the next person finds the
 reasoning rather than the decode.
@@ -178,3 +178,45 @@ is reported separately.
 | Customer access token (client to MCP server) | `services/api` | Nobody, and it cannot be owned here: the token is multi-use within its 60 seconds. Bounded by TTL, revocation on mint and ZT-5 origin anomaly detection. Zero-trust plan 5.5 |
 | Internal delegation token (MCP server to backend) | Istio gateway, domain services | The operator, in the gateway or the services. Not in this repository, and not derivable from anything in it |
 | Signed device approval | `services/confirm` | This repository, via the single-use `pending -> approved` claim. Built and durable |
+
+---
+
+## Amendment, 27 September 2026: the cost clause above was circular
+
+It read "one dictionary lookup on a path that is already paying an RSA
+verification". The path was paying that verification **only to feed this
+cache**. The `KeySet.import_key_set` plus RS256 `jwt.decode` sat inside
+`if self._jti_cache is not None`, so a minter built without a cache verified
+nothing and shipped its tokens unchecked -- and it was not a self-check on the
+signing key either, because `refuse_unverifiable_minter` already does that
+once at startup and unconditionally. The cache was paying for its own
+justification.
+
+The clause also conflated two operations. This path pays an RSA **signature**
+regardless: 910us, measured over 2000 calls at 2048 bits. It paid the
+**verification** only for the cache: 42us, which is 181 times the 0.2us lookup
+the sentence was excusing.
+
+Resolved by widening the minter rather than by dropping the cache, which makes
+the clause true instead of merely unsupported. `mint_with_jti` returns a
+`MintedToken` carrying the token and the jti; `mint` delegates to it and
+returns `.token`, so its signature and return type did not move and its other
+callers -- `WriteTokenMinter` and the device grant's token endpoint -- were not
+touched. A second method rather than a widened return, because a widened
+return would have added a `.token` nobody reads to every call site in order to
+serve the one that wanted the jti.
+
+Measured effect: the cache's cost per backend call fell from 62.2us to 0.1us,
+and 4.9% came off a ~970us path. The signature is 95% of that path and is the
+work.
+
+`tests/test_zt1_continuous_auth.py` is 13 tests now, not the 11 recorded
+below, and
+`tests/test_zt1_continuous_auth.py::test_feeding_the_cache_reads_no_public_key_and_verifies_nothing`
+is what pins the circularity as a number: one public-key read per backend call
+became zero.
+
+**The decision itself is unchanged.** Keep the cache, build no Redis backend,
+and let nothing call it replay protection. The reason that carries it never
+depended on the cost clause: a control that detects a randomness failure is
+not worthless, it is misfiled, and the fix for misfiling is the filing.
