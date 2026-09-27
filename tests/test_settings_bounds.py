@@ -18,11 +18,34 @@ constructors. `STORE_BOUNDED` is their inventory, and
 them: it parses every module under ``packages`` and ``services`` rather than
 the two methods a reader already knows to look at.
 
+A THIRD SEAM, and it is the one the first two structurally cannot reach.
+Both sweeps above key on what a value is USED as -- wrapped in ``int()``,
+compared against ``"true"`` -- and a consumer can sit any distance from the
+read. Measured on 2026-09-27 against planted shapes: ``raw =
+os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
+numeric rule completely, and it is the way a careless numeric read is most
+likely to be written. So the third rule keys on the one thing every spelling
+shares, the variable's NAME at the read site. The swept tree names 53
+``POSTERN_*`` variables in two disjoint populations: 18 read directly, all of
+them strings, listed in `READ_AS_STRING`; and 35 handed to a reader, which are
+`BOUNDED`'s 30, `STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
+nothing is in neither, and
+`TestEveryEnvironmentReadNamesAnInventoriedVariable` re-derives that from the
+tree on every run rather than trusting these numbers.
+
 WHAT THE INVENTORY BELOW IS FOR. `BOUNDED` is the whole set, one record per
 variable, and every test here is parametrized over it. A new numeric setting
 that is added to a ``from_env`` and not to this tuple fails
 `TestEveryNumericSettingIsInTheInventory`, which walks the two ``from_env``
 methods rather than trusting anyone to remember.
+
+THE SWEEPS HAD NO POSITIVE CONTROL UNTIL 2026-09-27, which mattered more than
+any single gap in them. Every rule here asserts ``offenders == []``, so a
+predicate that detected nothing passed exactly as a clean tree does. Measured:
+with `_reads_the_environment` replaced by ``return False``, both repo-walking
+rules still reported green. `SHAPES` is the fix -- 34 planted spellings, each
+naming the exact set of rules that must report it -- and blinding the same
+predicate now fails 30 of the 30 rows that expect a report.
 
 WHAT IT DELIBERATELY DOES NOT PIN. These are bounds on what is
 REPRESENTABLE, in the sense `services/confirm/settings.py`'s
@@ -36,6 +59,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
 import inspect
 from pathlib import Path
 from typing import Any
@@ -942,11 +966,366 @@ class TestTheDeviceCodeFloorIsOneNumberAndNotTwo:
         assert MIN_SESSION_TTL_SECONDS == MIN_REPRESENTABLE_TTL_SECONDS == 1
 
 
-def _reads_the_environment(node: ast.AST) -> bool:
-    """``os.environ``, ``os.environ.get``, ``os.getenv``, and bare re-exports."""
+# ---------------------------------------------------------------------------
+# The sweep's machinery. One parse of the tree, three rules over it.
+# ---------------------------------------------------------------------------
+
+#: Where the sweep looks.
+#:
+#: ``migrations`` was added on 2026-09-27, and it is a correction rather than a
+#: widening: the two rules above scoped themselves to ``packages`` and
+#: ``services`` on the stated ground that they are "the only code that runs in a
+#: container", and that is not true of `migrations/env.py`, which reads
+#: ``POSTERN_DATABASE_URL`` and runs under ``alembic upgrade`` in exactly the
+#: container the operator checklist describes. ``tools`` and ``stub`` stay out
+#: and the reason is now the honest one: they are developer code an operator
+#: never runs. ``stub/backend.py`` does read two variables, and that is the
+#: local-development stub whose whole purpose is to stand in for a backend.
+SWEPT_ROOTS = ("packages", "services", "migrations")
+
+#: The four attributes of ``os`` that reach the process environment.
+#:
+#: ``environb`` and ``getenvb`` were absent until 2026-09-27, which made
+#: ``int(os.environb[b"POSTERN_X"])`` invisible to the numeric rule. They are
+#: the bytes-keyed mapping over the same environment, so leaving them out was
+#: a hole and not a scope decision.
+_ENV_ACCESSORS = frozenset({"environ", "environb", "getenv", "getenvb"})
+
+#: Every reader that takes a variable's name, and where in the call it takes it.
+#:
+#: ``None`` means keyword-only: `postern_core/config.py`'s `int_arg_or_env`
+#: takes ``passed`` first and everything after it is keyword-only, so its name
+#: can only ever arrive as ``name=``.
+_READER_NAME_POSITION: dict[str, int | None] = {
+    "int_from_env": 0,
+    "float_from_env": 0,
+    "bool_from_env": 0,
+    "int_arg_or_env": None,
+    "_positive_int": 0,
+    "_device_code_ttl": 0,
+}
+
+#: The functions allowed to read a variable whose name they were handed.
+#:
+#: It is the same six names as `_READER_NAME_POSITION` and that is not a
+#: coincidence: a reader is by definition the thing that takes a name, so the
+#: set of functions that may read a name they did not write down is exactly the
+#: set of readers. A seventh would make every variable it reads invisible to
+#: the two inventories below, which is the objection
+#: `postern_core/config.py`'s own docstring raises against "a third validation
+#: style in the tree".
+GENERIC_READERS = frozenset(_READER_NAME_POSITION)
+
+#: Every variable the swept tree reads DIRECTLY, without a bounded reader.
+#:
+#: ALL EIGHTEEN ARE STRINGS, and that is the invariant this list exists to
+#: hold rather than an observation about today's tree. A number belongs in
+#: `BOUNDED` or `STORE_BOUNDED` and is read through `int_from_env` or
+#: `float_from_env`; a flag belongs in `FLAGS` and is read through
+#: `bool_from_env`. Only a value with no bound to state -- a URL, a filesystem
+#: path, a key id, an issuer, an audience, a Redis key prefix -- is read
+#: straight out of the environment, and then its name belongs here.
+#:
+#: WHAT ADDING A NAME HERE COSTS THE AUTHOR, which is the whole mechanism: it
+#: is a line in a diff, in a list whose docstring says flags and numbers do not
+#: belong in it. The rule cannot stop someone writing that line. It can stop
+#: them adding a flag without anyone seeing them do it.
+READ_AS_STRING: frozenset[str] = frozenset(
+    {
+        "POSTERN_APP_ASSERTION_AUDIENCE",
+        "POSTERN_APP_ASSERTION_ISSUER",
+        "POSTERN_APP_ASSERTION_JWKS_URI",
+        "POSTERN_AUDIENCE",
+        "POSTERN_BACKEND_BASE_URL",
+        "POSTERN_DATABASE_URL",
+        "POSTERN_DEVICE_KEYS_PATH",
+        "POSTERN_DEVICE_VERIFICATION_URI",
+        "POSTERN_JWKS_URI",
+        "POSTERN_READ_KEY_KID",
+        "POSTERN_READ_KEY_PEM_PATH",
+        "POSTERN_READ_TOKEN_ISSUER",
+        "POSTERN_REDIS_KEY_PREFIX",
+        "POSTERN_REDIS_URL",
+        "POSTERN_TOKEN_ISSUER",
+        "POSTERN_WRITE_KEY_KID",
+        "POSTERN_WRITE_KEY_PEM_PATH",
+        "POSTERN_WRITE_TOKEN_ISSUER",
+    }
+)
+
+#: The three flags, each read through `postern_core/config.py`'s `bool_from_env`.
+#:
+#: They carry no bound and so no `Bounded` record, which is why they are a bare
+#: set of names: what `bool_from_env` enforces is an ACCEPTING SET, the same one
+#: for every flag, and it is pinned in `tests/test_require_redis_guard.py`
+#: rather than per variable. All three were read by hand until 2026-09-26, and
+#: ``POSTERN_REQUIRE_PEM_KEY=true`` meant "do not require a PEM key".
+FLAGS: frozenset[str] = frozenset(
+    {
+        "POSTERN_REQUIRE_PEM_KEY",
+        "POSTERN_REQUIRE_REDIS",
+        "POSTERN_STRICT_HEADERS",
+    }
+)
+
+#: The names in the two numeric inventories above, for the membership test.
+BOUNDED_NAMES: frozenset[str] = frozenset(bound.name for bound in BOUNDED)
+STORE_BOUNDED_NAMES: frozenset[str] = frozenset(bound.name for bound in STORE_BOUNDED)
+
+
+def _reads_the_environment(node: ast.AST, aliases: frozenset[str] = _ENV_ACCESSORS) -> bool:
+    """``os.environ``, ``os.environ.get``, ``os.getenv``, and bare re-exports.
+
+    ``aliases`` carries what ``from os import environ as E`` bound in the
+    module being parsed, so a rename does not hide a read. It defaults to the
+    plain spellings, which is what a caller with no module in hand can know.
+    """
     if isinstance(node, ast.Attribute):
-        return node.attr in {"environ", "getenv"}
-    return isinstance(node, ast.Name) and node.id in {"environ", "getenv"}
+        return node.attr in _ENV_ACCESSORS
+    return isinstance(node, ast.Name) and node.id in aliases
+
+
+@dataclasses.dataclass(frozen=True)
+class EnvSite:
+    """One place a module reaches the environment, and what it named there.
+
+    ``shape`` is ``"direct"`` for a read straight off the mapping,
+    ``"reader"`` for a name handed to one of `GENERIC_READERS`, and
+    ``"unnamed"`` for everything else that touches the environment -- a bulk
+    copy, a write, or the mapping passed somewhere whole. ``name`` is ``None``
+    when the sweep could not resolve one, which is an offence outside a
+    generic reader and the normal case inside one.
+    """
+
+    where: str
+    shape: str
+    name: str | None
+    enclosing: str | None
+
+
+@functools.cache
+def _parse(source: str) -> ast.Module:
+    """One parse per source text, shared by all three rules."""
+    return ast.parse(source)
+
+
+@functools.cache
+def _swept_modules() -> tuple[tuple[str, str], ...]:
+    """Every shipping module, as ``(path, source)``, read once per session."""
+    repo = Path(__file__).resolve().parent.parent
+    return tuple(
+        (str(path.relative_to(repo)), path.read_text(encoding="utf-8"))
+        for root in SWEPT_ROOTS
+        for path in sorted((repo / root).rglob("*.py"))
+    )
+
+
+def _environment_aliases(tree: ast.Module) -> frozenset[str]:
+    """What this module can call the environment, imports included."""
+    names = set(_ENV_ACCESSORS)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in {"os", "posix", "nt"}:
+            names.update(
+                alias.asname or alias.name for alias in node.names if alias.name in _ENV_ACCESSORS
+            )
+    return frozenset(names)
+
+
+def _module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level ``NAME = "literal"`` bindings, so an indirect read resolves.
+
+    `postern_core/config.py` reads ``os.environ.get(REDIS_URL_ENV)`` and hands
+    ``REQUIRE_REDIS_ENV`` to `bool_from_env`. Both are module constants naming
+    a variable, and a sweep that only understood string literals would call
+    both unresolvable and fail the build on the module that does this right.
+    """
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        value = node.value if isinstance(node, ast.Assign | ast.AnnAssign) else None
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                constants[target.id] = value.value
+    return constants
+
+
+def _enclosing_functions(tree: ast.Module) -> dict[int, str | None]:
+    """The innermost ``def`` around each node, or ``None`` at module level."""
+    holder: dict[int, str | None] = {id(tree): None}
+
+    def visit(node: ast.AST, current: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = current
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                inner = child.name
+            holder[id(child)] = inner
+            visit(child, inner)
+
+    visit(tree, None)
+    return holder
+
+
+def _called_function_name(func: ast.expr) -> str | None:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def env_sites(where: str, source: str) -> tuple[EnvSite, ...]:
+    """Every environment site in one module, classified.
+
+    THE CLASSIFICATION IS EXHAUSTIVE BY CONSTRUCTION, which is the property
+    that makes the promise "a new read cannot hide" true rather than hopeful.
+    Each recognised shape consumes the accessor node it read; every accessor
+    node left unconsumed at the end becomes an ``"unnamed"`` site. So a
+    spelling nobody anticipated is not silently skipped -- it lands in the one
+    bucket the rules refuse outright.
+    """
+    tree = _parse(source)
+    aliases = _environment_aliases(tree)
+    constants = _module_string_constants(tree)
+    enclosing = _enclosing_functions(tree)
+    sites: list[EnvSite] = []
+    consumed: set[int] = set()
+
+    def resolve(node: ast.expr | None) -> str | None:
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                return node.value
+            if isinstance(node.value, bytes):
+                return node.value.decode("utf-8", "replace")
+        if isinstance(node, ast.Name):
+            return constants.get(node.id)
+        return None
+
+    def accessor(node: ast.AST) -> bool:
+        return _reads_the_environment(node, aliases)
+
+    def record(node: ast.expr, shape: str, name: str | None) -> None:
+        sites.append(EnvSite(f"{where}:{node.lineno}", shape, name, enclosing.get(id(node))))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and accessor(node.value):
+            consumed.add(id(node.value))
+            record(node, "direct", resolve(node.slice))
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        first = node.args[0] if node.args else None
+        if accessor(node.func):  # os.getenv("X")
+            consumed.add(id(node.func))
+            record(node, "direct", resolve(first))
+            continue
+        if isinstance(node.func, ast.Attribute) and accessor(node.func.value):
+            consumed.add(id(node.func.value))
+            if node.func.attr == "get":
+                record(node, "direct", resolve(first))
+            else:  # copy, pop, setdefault, update, items, ...
+                record(node, "unnamed", None)
+            continue
+        called = _called_function_name(node.func)
+        if called in _READER_NAME_POSITION:
+            position = _READER_NAME_POSITION[called]
+            argument: ast.expr | None = None
+            if position is not None and len(node.args) > position:
+                argument = node.args[position]
+            for keyword in node.keywords:
+                if keyword.arg == "name":
+                    argument = keyword.value
+            record(node, "reader", resolve(argument))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute | ast.Name):
+            continue
+        if accessor(node) and id(node) not in consumed:
+            record(node, "unnamed", None)
+    return tuple(sites)
+
+
+@functools.cache
+def _all_env_sites() -> tuple[EnvSite, ...]:
+    """Every environment site in the swept tree."""
+    return tuple(site for where, source in _swept_modules() for site in env_sites(where, source))
+
+
+def _numeric_offenders(where: str, source: str) -> list[str]:
+    """``int()`` or ``float()`` wrapped straight around an environment read."""
+    tree = _parse(source)
+    aliases = _environment_aliases(tree)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Name) and node.func.id in {"int", "float"}):
+            continue
+        if any(_reads_the_environment(inner, aliases) for inner in ast.walk(node)):
+            offenders.append(f"{where}:{node.lineno}")
+    return offenders
+
+
+def _boolean_offenders(where: str, source: str) -> list[str]:
+    """An environment read tested against a boolean token, or through ``bool()``."""
+    tree = _parse(source)
+    aliases = _environment_aliases(tree)
+    tokens = BOOL_TRUE | BOOL_FALSE
+    offenders: list[str] = []
+
+    def is_env_read(node: ast.AST) -> bool:
+        return any(_reads_the_environment(inner, aliases) for inner in ast.walk(node))
+
+    def is_boolean_literal(node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value.strip().lower() in tokens
+        if isinstance(node, ast.Tuple | ast.List | ast.Set):
+            return any(is_boolean_literal(element) for element in node.elts)
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "bool" and is_env_read(node):
+                offenders.append(f"{where}:{node.lineno} bool()")
+            continue
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, ast.Eq | ast.NotEq | ast.In | ast.NotIn) for op in node.ops):
+            continue
+        sides = [node.left, *node.comparators]
+        if any(is_env_read(side) for side in sides) and any(
+            is_boolean_literal(side) for side in sides
+        ):
+            offenders.append(f"{where}:{node.lineno} comparison")
+    return offenders
+
+
+def _inventory_offenders(where: str, source: str) -> list[str]:
+    """A variable read under a name no inventory in this file holds."""
+    through_a_reader = BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS
+    offenders: list[str] = []
+    for site in env_sites(where, source):
+        if site.name is None:
+            if site.enclosing not in GENERIC_READERS:
+                offenders.append(f"{site.where} names no variable")
+        elif site.shape == "direct" and site.name not in READ_AS_STRING:
+            offenders.append(f"{site.where} reads {site.name!r} directly")
+        elif site.shape == "reader" and site.name not in through_a_reader:
+            offenders.append(f"{site.where} reads {site.name!r} through a reader")
+    return offenders
+
+
+#: The three rules, in the order `SHAPES` below reports them.
+_RULES = {
+    "numeric": _numeric_offenders,
+    "boolean": _boolean_offenders,
+    "inventory": _inventory_offenders,
+}
 
 
 class TestNoBareNumericEnvironmentReadRemains:
@@ -958,25 +1337,28 @@ class TestNoBareNumericEnvironmentReadRemains:
     are read in a constructor in another package. This walks every module
     that ships instead, so the next one cannot hide by being somewhere new.
 
-    SCOPED TO WHAT SHIPS. ``packages`` and ``services`` are the two
-    ``root_packages`` in ``.importlinter`` and the only code that runs in a
-    container. ``tools`` and ``tests`` are developer code, where an operator
-    sets nothing.
+    SCOPED TO WHAT SHIPS, which is `SWEPT_ROOTS` and no longer the two
+    ``root_packages`` in ``.importlinter``. This docstring justified those two
+    as "the only code that runs in a container" and that claim was wrong:
+    `migrations/env.py` reads ``POSTERN_DATABASE_URL`` and runs under
+    ``alembic upgrade``, in a container, against the operator's real database.
+    ``tools`` and ``stub`` are still out, on the narrower ground that an
+    operator runs neither.
+
+    WHAT THESE TWO RULES CANNOT SEE, and it is the reason a third one exists
+    below: they key on what a value is USED as. A read whose value reaches
+    ``int()`` through a local variable escapes both, and so does any consumer
+    nobody enumerated. `TestEveryEnvironmentReadNamesAnInventoriedVariable`
+    keys on the variable's NAME at the read site instead, and `SHAPES` is the
+    table of which rule sees which spelling.
     """
 
     def test_no_int_or_float_call_wraps_an_environment_read(self) -> None:
-        repo = Path(__file__).resolve().parent.parent
-        offenders: list[str] = []
-        for root in ("packages", "services"):
-            for path in sorted((repo / root).rglob("*.py")):
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-                for node in ast.walk(tree):
-                    if not isinstance(node, ast.Call):
-                        continue
-                    if not (isinstance(node.func, ast.Name) and node.func.id in {"int", "float"}):
-                        continue
-                    if any(_reads_the_environment(inner) for inner in ast.walk(node)):
-                        offenders.append(f"{path.relative_to(repo)}:{node.lineno}")
+        offenders = [
+            offender
+            for where, source in _swept_modules()
+            for offender in _numeric_offenders(where, source)
+        ]
         assert offenders == [], (
             f"{offenders} wrap an environment read in a bare int()/float(). That accepts "
             "an empty string as a crash naming neither the variable nor the module, and "
@@ -1009,55 +1391,34 @@ class TestNoBareNumericEnvironmentReadRemains:
         ordinary string test and not a flag. Keying the rule on the literal
         rather than on the comparison is what separates the two.
 
-        WHAT IS DELIBERATELY NOT CAUGHT: bare truthiness, ``if
-        os.environ.get(X):``. It is indistinguishable at the syntax level from
-        "is this string configured?", which this repository does correctly in
-        five places for ``POSTERN_REDIS_URL`` -- `create_session_store`,
-        `create_revocation_store`, `create_device_code_store`,
-        `create_customer_rate_limit_store` and
-        `postern_core.auth.revoke_cli`. A rule that flagged those would be
+        WHAT THIS RULE STILL DOES NOT CATCH, and it is no longer the whole
+        gap: bare truthiness, ``if os.environ.get(X):``. It is indistinguishable
+        at the syntax level from "is this string configured?", which this
+        repository does correctly in six places for ``POSTERN_REDIS_URL`` --
+        `create_session_store`, `create_revocation_store`,
+        `create_device_code_store`, `create_customer_rate_limit_store`,
+        `postern_core.auth.revoke_cli` and `config.py`'s
+        `enforce_redis_requirement`. A rule that flagged those would be
         switched off within a week, and a check nobody trusts is worse than no
-        check. It is named here so the gap is known rather than assumed
-        covered.
+        check.
+
+        THAT REASONING STILL HOLDS AND THE GAP IS CLOSED ANYWAY, by asking a
+        different question one class down.
+        `TestEveryEnvironmentReadNamesAnInventoriedVariable` never looks at the
+        ``if``: it takes the NAME at the read site and requires it to be in an
+        inventory. All six of those sites read ``POSTERN_REDIS_URL``, which is
+        in `READ_AS_STRING`, so the rule is silent on every one of them and
+        stays silent however they are rewritten -- while ``if
+        os.environ.get("POSTERN_NEW_FLAG"):`` fails, because the name is in no
+        inventory. Two other discriminators were tried first and both failed
+        against those same six sites; that class's docstring records what each
+        one did.
         """
-        repo = Path(__file__).resolve().parent.parent
-        tokens = BOOL_TRUE | BOOL_FALSE
-        offenders: list[str] = []
-
-        def is_env_read(node: ast.AST) -> bool:
-            return any(_reads_the_environment(inner) for inner in ast.walk(node))
-
-        def is_boolean_literal(node: ast.AST) -> bool:
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                return node.value.strip().lower() in tokens
-            if isinstance(node, ast.Tuple | ast.List | ast.Set):
-                return any(is_boolean_literal(element) for element in node.elts)
-            return False
-
-        for root in ("packages", "services"):
-            for path in sorted((repo / root).rglob("*.py")):
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Call):
-                        if (
-                            isinstance(node.func, ast.Name)
-                            and node.func.id == "bool"
-                            and is_env_read(node)
-                        ):
-                            offenders.append(f"{path.relative_to(repo)}:{node.lineno} bool()")
-                        continue
-                    if not isinstance(node, ast.Compare):
-                        continue
-                    if not any(
-                        isinstance(op, ast.Eq | ast.NotEq | ast.In | ast.NotIn) for op in node.ops
-                    ):
-                        continue
-                    sides = [node.left, *node.comparators]
-                    if any(is_env_read(side) for side in sides) and any(
-                        is_boolean_literal(side) for side in sides
-                    ):
-                        offenders.append(f"{path.relative_to(repo)}:{node.lineno} comparison")
-
+        offenders = [
+            offender
+            for where, source in _swept_modules()
+            for offender in _boolean_offenders(where, source)
+        ]
         assert offenders == [], (
             f"{offenders} read a boolean environment variable by hand. Every spelling "
             "other than the one compared against then means off, silently, which on a "
@@ -1065,3 +1426,422 @@ class TestNoBareNumericEnvironmentReadRemains:
             "mean 'do not require a PEM key'. Read it through "
             "postern_core.config.bool_from_env instead."
         )
+
+
+# ---------------------------------------------------------------------------
+# The adversarial table. One row per spelling a careless author might produce.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class Shape:
+    """One spelling of an environment read, and which rule is meant to see it.
+
+    ``caught_by`` is the EXACT set of rules expected to fire, so a row is a
+    two-sided assertion: the named rules must fire and the unnamed ones must
+    not. An empty tuple pins a known gap, and the table is therefore the same
+    list of gaps this file's docstrings claim, in a form that fails when the
+    claim stops being true.
+    """
+
+    label: str
+    source: str
+    caught_by: tuple[str, ...]
+    note: str
+
+
+#: An inventoried name, used wherever a row is about the CONSUMER rules alone.
+#: Reading it says nothing about the name, so only the rule under test fires.
+_KNOWN = "POSTERN_REDIS_URL"
+
+#: A name in no inventory, used wherever a row is about the NAME rule.
+_UNKNOWN = "POSTERN_NEW_FEATURE_FLAG"
+
+SHAPES: tuple[Shape, ...] = (
+    # --- what the two consumer rules were built to catch --------------------
+    Shape(
+        "int() wrapping a read",
+        f'import os\nT = int(os.environ.get("{_KNOWN}", "5"))\n',
+        ("numeric",),
+        "The original defect class. An empty string crashes, zero passes.",
+    ),
+    Shape(
+        "float() wrapping a read",
+        f'import os\nT = float(os.environ.get("{_KNOWN}", "5"))\n',
+        ("numeric",),
+        "Same, plus nan and inf, which no lower bound written as < refuses.",
+    ),
+    Shape(
+        "int() wrapping a subscript",
+        f'import os\nT = int(os.environ["{_KNOWN}"])\n',
+        ("numeric",),
+        "The subscript is a different read and the same defect.",
+    ),
+    Shape(
+        "int() wrapping os.getenv",
+        f'import os\nT = int(os.getenv("{_KNOWN}", "5"))\n',
+        ("numeric",),
+        "getenv is os.environ.get under another name.",
+    ),
+    Shape(
+        'a read == "true"',
+        f'import os\nF = os.environ.get("{_KNOWN}") == "true"\n',
+        ("boolean",),
+        "One spelling means on and the other three silently mean off.",
+    ),
+    Shape(
+        'a read != "0"',
+        f'import os\nF = os.environ.get("{_KNOWN}") != "0"\n',
+        ("boolean",),
+        "The same defect inverted: every misspelling means ON.",
+    ),
+    Shape(
+        'a read in ("1", "true")',
+        f'import os\nF = os.environ.get("{_KNOWN}") in ("1", "true")\n',
+        ("boolean",),
+        "A hand-rolled accepting set, which is what bool_from_env is.",
+    ),
+    Shape(
+        "bool() wrapping a read",
+        f'import os\nF = bool(os.environ.get("{_KNOWN}"))\n',
+        ("boolean",),
+        'The subtlest: bool("0") is True, so every off value reads as on.',
+    ),
+    # --- what only the name rule sees ---------------------------------------
+    Shape(
+        "bare truthiness on a new variable",
+        f'import os\nif os.environ.get("{_UNKNOWN}"):\n    pass\n',
+        ("inventory",),
+        "The shape this file called its last hiding place. Caught by name.",
+    ),
+    Shape(
+        "a truthy default",
+        f'import os\nif os.environ.get("{_UNKNOWN}", "1"):\n    pass\n',
+        ("inventory",),
+        "Worse than bare truthiness: the branch is taken when nothing is set.",
+    ),
+    Shape(
+        "is not None",
+        f'import os\nF = os.environ.get("{_UNKNOWN}") is not None\n',
+        ("inventory",),
+        "A presence flag the boolean rule cannot see: Is is not Eq.",
+    ),
+    Shape(
+        "subscript access",
+        f'import os\nF = os.environ["{_UNKNOWN}"]\n',
+        ("inventory",),
+        "No .get, so nothing about the call shape gives it away.",
+    ),
+    Shape(
+        "a read bound to a local, then int()",
+        f'import os\nraw = os.environ.get("{_UNKNOWN}")\nT = int(raw)\n',
+        ("inventory",),
+        "The most natural careless numeric read, and the consumer rule's "
+        "worst blind spot: int() and the read are in different statements.",
+    ),
+    Shape(
+        "a read bound to a local, then tested",
+        f'import os\nraw = os.environ.get("{_UNKNOWN}")\nif raw:\n    pass\n',
+        ("inventory",),
+        "One assignment is enough to evade every consumer-keyed rule.",
+    ),
+    Shape(
+        "a walrus in an if",
+        f'import os\nif (raw := os.environ.get("{_UNKNOWN}")) is not None:\n    pass\n',
+        ("inventory",),
+        "Binds and tests in one expression; still a named read.",
+    ),
+    Shape(
+        "a read inside a comprehension",
+        f'import os\nF = [v for v in [os.environ.get("{_UNKNOWN}")] if v]\n',
+        ("inventory",),
+        "Position in the syntax tree never mattered to a name-keyed rule.",
+    ),
+    Shape(
+        "a read inside a ternary",
+        f'import os\nF = True if os.environ.get("{_UNKNOWN}") else False\n',
+        ("inventory",),
+        "Same.",
+    ),
+    Shape(
+        "a module-level read at import time",
+        f'import os\nFLAG = os.environ.get("{_UNKNOWN}") == "yes"\n',
+        ("boolean", "inventory"),
+        "Import time is when this is worst -- no from_env runs, so no bound "
+        "applies -- and both rules see it.",
+    ),
+    Shape(
+        "not not, to dodge bool()",
+        f'import os\nF = not not os.environ.get("{_UNKNOWN}")\n',
+        ("inventory",),
+        "Deliberate evasion of the bool() rule, defeated by the name.",
+    ),
+    Shape(
+        "Decimal() instead of int()",
+        f'import os\nfrom decimal import Decimal\nT = Decimal(os.environ.get("{_UNKNOWN}"))\n',
+        ("inventory",),
+        "Any numeric constructor the numeric rule does not enumerate.",
+    ),
+    Shape(
+        "an f-string name",
+        'import os\nPART = "FLAG"\nif os.environ.get(f"POSTERN_{PART}"):\n    pass\n',
+        ("inventory",),
+        "No name to check, and the rule refuses rather than shrugging.",
+    ),
+    Shape(
+        "a concatenated name",
+        'import os\nif os.environ.get("POSTERN_" + "NEW"):\n    pass\n',
+        ("inventory",),
+        "Same: unresolvable outside the six readers is an offence.",
+    ),
+    Shape(
+        "a new generic reader taking a name",
+        "import os\n"
+        "def _flag(name: str) -> bool:\n"
+        "    if os.environ.get(name):\n"
+        "        return True\n"
+        "    return False\n",
+        ("inventory",),
+        "A seventh reader would make every variable it reads invisible, so "
+        "the six are a closed list and a seventh fails.",
+    ),
+    Shape(
+        "dict(os.environ)",
+        f'import os\nE = dict(os.environ)\nF = E.get("{_UNKNOWN}") == "1"\n',
+        ("inventory",),
+        "A bulk copy names nothing, so nothing downstream can be checked.",
+    ),
+    Shape(
+        "os.environ.copy()",
+        f'import os\nE = os.environ.copy()\nT = int(E["{_UNKNOWN}"])\n',
+        ("inventory",),
+        "Same, through the mapping's own method.",
+    ),
+    Shape(
+        "os.environ.setdefault",
+        f'import os\nos.environ.setdefault("{_UNKNOWN}", "1")\n',
+        ("inventory",),
+        "A WRITE to the process environment, which makes a variable look "
+        "configured to every later reader. No shipping module should.",
+    ),
+    Shape(
+        "os.environ passed whole",
+        'import os\nimport subprocess\nsubprocess.run(["true"], env=os.environ, check=True)\n',
+        ("inventory",),
+        "Names nothing. There are none today and a first one owes a reason.",
+    ),
+    Shape(
+        "an aliased import",
+        f'from os import environ as E\nif E.get("{_UNKNOWN}"):\n    pass\n',
+        ("inventory",),
+        "The alias is read off the import, so the rename buys nothing.",
+    ),
+    Shape(
+        "an aliased import wrapped in int()",
+        f'from os import environ as E\nT = int(E["{_UNKNOWN}"])\n',
+        ("numeric", "inventory"),
+        "This shape defeated the numeric rule until the aliases were "
+        "followed; it is the one row where widening was load-bearing.",
+    ),
+    Shape(
+        "os.environb",
+        f'import os\nT = int(os.environb[b"{_UNKNOWN}"])\n',
+        ("numeric", "inventory"),
+        "The bytes mapping is the same environment. The name decodes.",
+    ),
+    # --- the pinned gaps ----------------------------------------------------
+    Shape(
+        "a number smuggled under an inventoried string name",
+        f'import os\nraw = os.environ.get("{_KNOWN}")\nT = int(raw)\n',
+        (),
+        "GAP, ACCEPTED. The name rule passes because the name is inventoried "
+        "and the numeric rule misses the indirection. Closing it needs "
+        "data-flow analysis for one case that requires reusing a URL "
+        "variable as a number.",
+    ),
+    Shape(
+        "bare truthiness on an inventoried string",
+        f'import os\nif os.environ.get("{_KNOWN}"):\n    pass\n',
+        (),
+        "NOT A GAP. This is the shape the six legitimate presence checks use, "
+        "and it is correct for a string whose empty value means unset.",
+    ),
+    Shape(
+        "a read compared against a non-boolean literal",
+        f'import os\nF = os.environ.get("{_KNOWN}") == "production"\n',
+        (),
+        "NOT A GAP. An ordinary string test, which is why the boolean rule "
+        "keys on the literal and not on the comparison.",
+    ),
+    Shape(
+        "getattr(os, 'environ')",
+        f'import os\nE = getattr(os, "environ")\nF = E.get("{_UNKNOWN}")\n',
+        (),
+        "GAP, ACCEPTED. Reflection defeats every syntactic rule and there is "
+        "no careless way to write it. An author doing this is evading, and a "
+        "sweep is not the control for that.",
+    ),
+)
+
+
+class TestTheSweepSeesEveryShapeItClaimsTo:
+    """The sweep's positive controls, which it had none of until now.
+
+    WHY THIS MATTERS MORE THAN IT LOOKS. Every rule in this file asserts
+    ``offenders == []`` against the real tree, and a rule that stopped
+    detecting anything at all would pass exactly the same way a clean tree
+    does. Nothing distinguished "no offence in the tree" from "the predicate
+    is broken" until these rows existed. Each row plants a shape in a source
+    string and names the rules that must report it.
+    """
+
+    def test_the_table_is_the_size_the_docstrings_claim(self) -> None:
+        """The counts the prose above quotes, re-derived rather than recalled.
+
+        A row added without updating those sentences fails here, which is the
+        only thing that keeps a docstring full of numbers honest.
+        """
+        caught_by = [shape.caught_by for shape in SHAPES]
+        assert len(SHAPES) == 34
+        assert caught_by.count(()) == 4
+        assert caught_by.count(("inventory",)) == 19
+        assert sum(1 for rules in caught_by if {"numeric", "boolean"} & set(rules)) == 11
+
+    @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: s.label)
+    def test_the_rules_that_fire_are_exactly_the_ones_the_table_names(self, shape: Shape) -> None:
+        fired = tuple(rule for rule, check in _RULES.items() if check("planted.py", shape.source))
+        assert fired == shape.caught_by, (
+            f"{shape.label!r} was expected to be caught by {shape.caught_by or '(nothing)'} "
+            f"and was caught by {fired or '(nothing)'}. {shape.note}"
+        )
+
+
+class TestEveryEnvironmentReadNamesAnInventoriedVariable:
+    """The name at the read site, which is the one thing every spelling shares.
+
+    WHAT THIS RULE IS FOR. The two sweeps above key on what a value is USED
+    as. That is why `SHAPES` above holds 19 rows they miss and this one catches
+    alone, and the worst of them is not exotic: binding a read to a local
+    and calling ``int()`` on the next line defeats the numeric rule
+    completely, and it is the way a careless author is most likely to write a
+    numeric read. A rule keyed on the CONSUMER can always be evaded by one
+    assignment, because the consumer can be arbitrarily far from the read.
+
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 53 distinct
+    ``POSTERN_*`` variables across the swept roots, in two disjoint
+    populations. 18 are read directly, and all 18 are strings -- a URL, a
+    path, a key id, an issuer, an audience, a key prefix. 35 are handed to a
+    reader as its ``name`` argument, and those are the 30 in `BOUNDED`, the 2
+    in `STORE_BOUNDED` and the 3 in `FLAGS`. Nothing is in both and nothing is
+    in neither, which
+    `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
+    re-derives on every run.
+
+    SO THE DISCRIMINATOR IS THE NAME, held in a list, not the syntax of the
+    read. A new flag spelled ``if os.environ.get("POSTERN_NEW_FLAG"):`` fails
+    because ``POSTERN_NEW_FLAG`` is in no inventory, and the rule never looks
+    at the ``if`` at all. That is what lets it coexist with the six legitimate
+    presence checks on ``POSTERN_REDIS_URL``: they read an inventoried string,
+    so the rule is silent on all six, and it stays silent no matter how they
+    are rewritten.
+
+    TWO OTHER DISCRIMINATORS WERE TRIED AND BOTH FAILED, measured against
+    those same six sites on 2026-09-27.
+
+    - THE SHAPE OF THE NAME. There is no convention to key on. The 18 strings
+      end in seven different words -- ISSUER four times, URI and URL and PATH
+      three each, AUDIENCE and KID twice, PREFIX once -- so a rule keyed on a
+      URL-ish suffix covers 9 of the 18 and would read the other 9, including
+      ``POSTERN_AUDIENCE`` and both key ids, as not-strings. The flags are
+      worse: they share no suffix, and only two of the three share the
+      ``REQUIRE_`` prefix, which ``POSTERN_STRICT_HEADERS`` breaks.
+    - WHETHER THE VALUE IS DISCARDED AFTER THE TEST. It fires on two of the
+      six, `postern_core.auth.revoke_cli`'s ``main`` and
+      `config.py`'s `enforce_redis_requirement`, and both firings are wrong:
+      each is a presence check on ``POSTERN_REDIS_URL`` that needs the answer
+      and not the value. It clears the other four only because they bind the
+      value to a local first, which is one line of rewriting away for
+      anything trying to hide. A 2-in-6 false-positive rate on a rule that a
+      flag evades by assignment is the rule this file's own docstring says
+      gets switched off within a week.
+
+    WHAT IT STILL DOES NOT CATCH, and both are in `SHAPES` as rows expected to
+    fire nothing: a number read under a name already inventoried as a string,
+    and ``getattr(os, "environ")``. The first needs data-flow analysis; the
+    second is reflection, which no syntactic rule reaches.
+
+    THE INVENTORY IS A HUMAN GATE, not a mechanical one. An author who adds
+    ``POSTERN_NEW_FLAG`` to `READ_AS_STRING` gets their bare truthiness back.
+    What the rule buys is that they cannot do it without editing a list whose
+    docstring says only strings belong in it, in a diff a reviewer sees.
+    """
+
+    def test_every_direct_read_names_a_variable_in_the_string_inventory(self) -> None:
+        offenders = [
+            f"{site.where} reads {site.name!r}"
+            for site in _all_env_sites()
+            if site.shape == "direct" and site.name is not None and site.name not in READ_AS_STRING
+        ]
+        assert offenders == [], (
+            f"{offenders} read the environment directly under a name in no inventory. "
+            "A number belongs in BOUNDED or STORE_BOUNDED and is read through "
+            "postern_core.config's int_from_env or float_from_env; a flag belongs in "
+            "FLAGS and is read through bool_from_env; only a string is read directly, "
+            "and then its name belongs in READ_AS_STRING in this file."
+        )
+
+    def test_every_bounded_reader_call_names_a_variable_in_an_inventory(self) -> None:
+        known = BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS
+        offenders = [
+            f"{site.where} reads {site.name!r}"
+            for site in _all_env_sites()
+            if site.shape == "reader" and site.name is not None and site.name not in known
+        ]
+        assert offenders == [], (
+            f"{offenders} are read through a bounded reader but are in none of this "
+            "file's inventories. This is the gap the two Redis TTLs fell through: "
+            "TestEveryNumericSettingIsInTheInventory walks the two from_env methods, "
+            "and a reader called anywhere else was invisible to it."
+        )
+
+    def test_no_module_reaches_the_environment_without_naming_a_variable(self) -> None:
+        offenders = [
+            site.where
+            for site in _all_env_sites()
+            if site.name is None and site.enclosing not in GENERIC_READERS
+        ]
+        assert offenders == [], (
+            f"{offenders} reach the environment without naming a variable this sweep "
+            "can resolve -- a built name, a bulk copy, a write, or a seventh generic "
+            "reader. Every one of those makes a variable invisible to the two rules "
+            f"above. The readers allowed to take a name they were handed are "
+            f"{sorted(GENERIC_READERS)}."
+        )
+
+    def test_the_two_inventories_are_the_whole_tree(self) -> None:
+        """53 variables, 18 read directly and 35 through a reader, disjoint."""
+        direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
+        through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
+        assert direct & through == set(), (
+            f"{sorted(direct & through)} is both read directly and handed to a reader. "
+            "One variable read two ways is two bounds that can disagree."
+        )
+        assert direct == set(READ_AS_STRING)
+        assert through == BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS
+        assert len(direct) == 18
+        assert len(through) == 35
+
+    def test_no_inventoried_string_is_also_a_number_or_a_flag(self) -> None:
+        """The partition is asserted on the inventories too, not only the tree."""
+        bounded = BOUNDED_NAMES | STORE_BOUNDED_NAMES
+        assert READ_AS_STRING & bounded == frozenset()
+        assert READ_AS_STRING & FLAGS == frozenset()
+        assert bounded & FLAGS == frozenset()
+
+    def test_every_flag_is_read_through_bool_from_env_and_nothing_else(self) -> None:
+        """A name in `FLAGS` that some module read directly would be the defect."""
+        for site in _all_env_sites():
+            assert site.name not in FLAGS or site.shape == "reader", (
+                f"{site.where} reads the flag {site.name!r} directly. A flag has four "
+                "spellings for yes and four for no, and only bool_from_env knows them."
+            )
