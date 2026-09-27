@@ -25,10 +25,10 @@ read. Measured on 2026-09-27 against planted shapes: ``raw =
 os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
 numeric rule completely, and it is the way a careless numeric read is most
 likely to be written. So the third rule keys on the one thing every spelling
-shares, the variable's NAME at the read site. The swept tree names 54
+shares, the variable's NAME at the read site. The swept tree names 55
 ``POSTERN_*`` variables in two disjoint populations: 18 read directly, all of
-them strings, listed in `READ_AS_STRING`; and 36 handed to a reader, which are
-`BOUNDED`'s 31, `STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
+them strings, listed in `READ_AS_STRING`; and 37 handed to a reader, which are
+`BOUNDED`'s 32, `STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
 nothing is in neither, and
 `TestEveryEnvironmentReadNamesAnInventoriedVariable` re-derives that from the
 tree on every run rather than trusting these numbers.
@@ -346,6 +346,21 @@ BOUNDED: tuple[Bounded, ...] = (
         5,
         ("-1", "-5"),
         ("0", "5", "50"),
+    ),
+    # THE WRITE PATH'S RESERVE, the counterpart to the read path's and with the
+    # same floor of one. What differs is not the bound but WHICH rows it
+    # serves: `services/confirm/audit.py` routes both COMPLETION writes through
+    # the reserve and deliberately leaves `ApprovalAudit._write_entry_row` on
+    # the pool, so a saturated replica stops before the backend write instead of
+    # being carried past it. That asymmetry is a property of the writer, not of
+    # this number, and `tests/test_audit_reserve.py` is where it is measured.
+    Bounded(
+        "POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE",
+        "database_audit_reserve_size",
+        "confirm",
+        1,
+        ("0", "-1"),
+        ("1", "2", "5"),
     ),
     Bounded(
         "POSTERN_CONFIRM_RATE_LIMIT_DEVICE_AUTHORIZATION",
@@ -1748,11 +1763,11 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
     numeric read. A rule keyed on the CONSUMER can always be evaded by one
     assignment, because the consumer can be arbitrarily far from the read.
 
-    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 54 distinct
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 55 distinct
     ``POSTERN_*`` variables across the swept roots, in two disjoint
     populations. 18 are read directly, and all 18 are strings -- a URL, a
-    path, a key id, an issuer, an audience, a key prefix. 36 are handed to a
-    reader as its ``name`` argument, and those are the 31 in `BOUNDED`, the 2
+    path, a key id, an issuer, an audience, a key prefix. 37 are handed to a
+    reader as its ``name`` argument, and those are the 32 in `BOUNDED`, the 2
     in `STORE_BOUNDED` and the 3 in `FLAGS`. Nothing is in both and nothing is
     in neither, which
     `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
@@ -1840,7 +1855,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
 
     def test_the_two_inventories_are_the_whole_tree(self) -> None:
-        """54 variables, 18 read directly and 36 through a reader, disjoint."""
+        """55 variables, 18 read directly and 37 through a reader, disjoint."""
         direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
         through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
         assert direct & through == set(), (
@@ -1850,7 +1865,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         assert direct == set(READ_AS_STRING)
         assert through == BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS
         assert len(direct) == 18
-        assert len(through) == 36
+        assert len(through) == 37
 
     def test_no_inventoried_string_is_also_a_number_or_a_flag(self) -> None:
         """The partition is asserted on the inventories too, not only the tree."""

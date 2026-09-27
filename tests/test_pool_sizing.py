@@ -117,8 +117,21 @@ def api_ceiling() -> int:
 
 
 def confirm_ceiling() -> int:
+    """Every connection one write-path replica can hold, its reserve included.
+
+    The reserve counts here for the same reason it counts in `api_ceiling`
+    above: it is a second engine against the same server-wide
+    ``max_connections``. What differs between the two services is not the
+    number but which rows the reserve serves -- `services/confirm/audit.py`
+    keeps `ApprovalAudit`'s entry row on the pool on purpose -- and that has no
+    effect on the arithmetic.
+    """
     settings = ConfirmSettings()
-    return settings.database_pool_size + settings.database_max_overflow
+    return (
+        settings.database_pool_size
+        + settings.database_max_overflow
+        + settings.database_audit_reserve_size
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -505,20 +518,22 @@ class TestTheCeilingIsChosenPerServiceAndReachesTheEngine:
         assert ConfirmSettings().database_max_overflow == 5
         assert confirm_ceiling() < api_ceiling()
 
-    def test_the_read_paths_reserve_is_one_connection_and_is_in_the_ceiling(self) -> None:
-        """The third connection number, and the only one the write path lacks.
+    def test_both_paths_reserve_one_connection_and_both_are_in_the_ceiling(self) -> None:
+        """The third connection number, on both services since 2026-09-27.
 
-        `services/confirm` writes the same `audit_log` from the same
-        fail-closed policy and has no reserve, so its ceiling is still
-        ``pool_size + max_overflow``. That is an asymmetry an operator has to
-        know about rather than a claim that the write path does not need one;
-        `docs/user-guide/getting-started.md` says so where the sizing
-        arithmetic is.
+        It was the read path's alone for one commit. `services/confirm` writes
+        the same `audit_log` under the same fail-closed policy, and a lost row
+        there is no record that a payment approval was attempted at all, so it
+        got the same reserve -- serving its two completion writes and, by
+        design, not `ApprovalAudit`'s entry row.
+        `tests/test_audit_reserve.py` holds that argument; what belongs here is
+        only that both reserves are counted.
         """
         assert api_defaults().database_audit_reserve_size == 1
+        assert ConfirmSettings().database_audit_reserve_size == 1
         assert api_ceiling() == 16
-        assert not hasattr(ConfirmSettings(), "database_audit_reserve_size")
-        assert confirm_ceiling() == 10
+        assert confirm_ceiling() == 11
+        assert confirm_ceiling() < api_ceiling()
 
     def test_the_defaults_fit_postgres_own_max_connections_at_a_stated_replica_count(
         self,
@@ -530,11 +545,15 @@ class TestTheCeilingIsChosenPerServiceAndReachesTheEngine:
         `dev-docs/decisions/0013-connection-pool-ceiling.md` is where an
         operator substitutes their own numbers.
 
-        THE NUMBER MOVED ON 2026-09-27, from 80 to 84, and it still fits.
-        `api_ceiling` now counts the read path's audit reserve, so a replica
-        may hold 16 rather than 15 and the worked example leaves 13 of the
-        default 100 rather than 17. The headroom assertion at the bottom is
-        what would have caught the change if it had not fit.
+        THE NUMBER MOVED TWICE ON 2026-09-27, from 80 to 84 and then to 86,
+        and it still fits. Both ceilings now count an audit reserve: the read
+        path holds 16 per replica rather than 15, the write path 11 rather than
+        10, and the worked example leaves 11 of the default 100 where it used
+        to leave 17. The headroom assertion at the bottom is what would have
+        caught either step if it had not fit, and 11 is close enough to its
+        floor of 10 that the next replica of either service does not fit at the
+        Postgres default -- which is the fact worth carrying out of this test
+        rather than the total.
         """
         api_replicas, confirm_replicas = 4, 2
         api, confirm = api_ceiling(), confirm_ceiling()

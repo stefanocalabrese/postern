@@ -12,6 +12,116 @@ beside `append` because the two are one decision from the caller's side, and
 because naming it after the audit path is the cheapest thing that stops a
 second caller from quietly turning a reserve into a pool.
 
+===========================================================================
+WHAT HAPPENS WHEN POSTGRES IS UNREACHABLE, AND WHY THERE IS NO SPOOL HERE
+===========================================================================
+
+Decided 27 September 2026. If you are here to add a local spool, a queue, or
+a second store so the record survives an outage, this is the argument you are
+overturning; it is not an oversight.
+
+THE RESERVE ANSWERS SATURATION AND NOTHING ELSE. A second set of connections
+to an unreachable database is a second way to fail to connect. So the
+question below is not about pools at all: it is whether the FACT of an
+approval or a denial can survive Postgres being down, by any mechanism.
+
+WHAT AN OPERATOR CAN RECONSTRUCT AFTERWARDS, which is the thing any decision
+here is trading, and it splits cleanly in two.
+
+  RECONSTRUCTABLE, AND IT IS THE HALF THAT MATTERS MOST: nothing happened.
+  Both entry rows are committed BEFORE the operator's backend is reached and
+  both fail closed, so a store that cannot take a row cannot be passed. For
+  the duration of a total outage, no `tools/call` reaches a backend read
+  endpoint, no approval reaches a backend write endpoint, no money moves, no
+  read token is returned by `POST /token` (the mint is fail-closed on its
+  row), and no device pairing survives -- `services/confirm/device_auth.py`'s
+  `_withdraw_pairing` revokes a pairing whose row could not be written. The
+  regulator-facing question "did customer data leave, or did money move,
+  while the table was blind" is therefore answerable without the table: it
+  did not, and the operator's own backend access logs corroborate it by being
+  empty. That is a property of the fail-closed construction, not of a record.
+
+  EACH CLAUSE OF THAT IS ALREADY MEASURED, which is why this decision cites
+  rather than asserts:
+  `tests/test_asgi_app.py::test_a_tool_call_fails_closed_when_the_audit_database_is_unreachable`
+  for the read path,
+  `tests/test_write_audit.py::test_a_failed_entry_write_stops_the_backend_write`
+  for the approval (it counts BACKEND CALLS, not status codes),
+  `tests/test_pairing_audit.py::test_a_token_that_cannot_be_audited_is_never_returned`
+  for the mint, and
+  `tests/test_audit_reserve.py::TestATotalOutageIsAcceptedAndBounded` for the
+  claim this section exists to keep honest -- that a configured reserve
+  changes none of it.
+
+  NOT RECONSTRUCTABLE: the attempts. Who tried, under which token and which
+  OAuth client, against which tool, with what arguments, and whether they
+  were refused for want of consent or because the store was down. An attacker
+  probing during an outage leaves no row. That is a loss of SECURITY
+  MONITORING, not of the money trail, and it is the whole cost of this
+  decision. Say it that way rather than "the audit trail has a gap", which
+  overstates it in one direction and understates the monitoring loss in the
+  other.
+
+  Two residues on top, both named rather than hidden. A device code created
+  by `POST /device_authorization` during the outage persists in that store,
+  which is Redis or process memory and not Postgres -- it is unusable,
+  because approving it needs a row, but it is state that outlived the blind
+  window. And if `_withdraw_pairing` cannot reach the device-code store
+  either, an approved code is left with no row behind it; that is the one
+  shape this design cannot close, and it is the only ERROR line in the tree
+  that names an identifier the row would have carried.
+
+THE LOG IS NOT THE RECORD OF RECORD, and three specific things are why.
+  * CONTENT. The lines carry a tool name and an exception type. They do not
+    carry `customer_ref`, `call_id`, `client_id`, the arguments, the duration
+    or the refusal reason. So "show me every call this token made" is
+    unanswerable from logs however perfectly they are shipped -- the fields
+    are not in them.
+  * DURABILITY. Nothing in this repository configures a log handler, a
+    formatter, a destination or a retention period; `audit_log` has no
+    retention job, no partitioning and no `DELETE` anywhere, so the table's
+    horizon is forever and the log's is whatever the platform happens to do.
+  * INTEGRITY. Migration `f1860c110112` makes `audit_log` refuse `UPDATE`,
+    `DELETE` and `TRUNCATE` inside the database. A log file has no
+    equivalent, and the operator duty in CLAUDE.md that would make one
+    possible -- shipping off-host before the container dies -- is not
+    discharged here.
+  The log is a DETECTION signal and is treated as one: it is how an operator
+  learns the window happened. It is not evidence of what happened in it.
+
+A LOCAL SPOOL IS REFUSED, and it collects every objection
+`dev-docs/decisions/0006-audit-write-failure.md` already made, plus two of its
+own.
+  * It is that record's "no queue" verbatim. A spool changes the table's
+    guarantee from "this row exists before the caller is told the call
+    happened" to "this row will probably exist eventually", which is the
+    weaker property 0006 refused, with a per-replica failure mode the queue
+    it considered did not have: the spool dies with the container.
+  * It is also that record's "no fallback store". Two places a
+    regulator-facing record lives answers "show me every call" with "check
+    both and reconcile".
+  * REPLAY CANNOT BE MADE SAFE BY THIS SCHEMA. `audit_log.call_id` is
+    `String(36)`, nullable, with no unique constraint and no index
+    (`postern_core.store.models`), so nothing dedupes a row a replay inserts
+    twice -- and the append-only triggers mean a duplicate on a
+    regulator-facing table cannot be removed afterwards by anyone.
+  * IT DEMANDS INFRASTRUCTURE THIS PROJECT TELLS OPERATORS TO FORBID. A disk
+    spool needs a writable filesystem, and asserting
+    `readonlyRootFilesystem = true` on the ECS task definitions is one of the
+    operator duties CLAUDE.md lists.
+  * AND IT WOULD HAVE TO FAIL CLOSED ITSELF, or it reintroduces exactly the
+    silent gap it was built to close. A fail-closed spool makes a full disk
+    into a full outage: the dependency moves, it does not go away.
+
+SO: ACCEPTED AND BOUNDED. The record does not survive a total outage, the
+outage is bounded and loud rather than silent and unbounded (which is 0006's
+own bargain), the money trail survives by construction because nothing can be
+touched without a row, and what is lost is the ability to see who was
+knocking while the door was shut. If that loss ever becomes unacceptable, the
+next move is not a spool: it is the tiered policy 0006 already recommends and
+did not build, or making `audit_log`'s own availability the operator's problem
+to solve with replication -- both of which keep one record in one place.
+
 WHY THE BOUNDS LIVE HERE. Both services write this table and both need the
 same ceilings on what reaches it, and `.importlinter` forbids
 `services.api` and `services.confirm` importing each other in either

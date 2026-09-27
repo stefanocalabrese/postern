@@ -90,6 +90,14 @@ class Database:
         `Database` constructed outside a composition root behaves as it always
         has.
 
+        NOT EVERY AUDIT WRITE ROUTES THROUGH IT, which matters for sizing
+        because it bounds the demand. `services/api` sends both of a call's
+        rows; `services/confirm` sends its completion rows and keeps
+        `ApprovalAudit`'s entry row on the pool, because that row is the last
+        statement before a backend WRITE endpoint and the transition after the
+        money moves is not an audit write at all. That service's own settings
+        module carries the argument.
+
         WHY A FALLBACK AND NOT A SECOND POOL, since
         `dev-docs/decisions/0013-connection-pool-ceiling.md` rejected the
         second pool and its arithmetic still holds. That record's objection
@@ -148,10 +156,10 @@ class Database:
         ``pool_size=0`` and at ``max_overflow=-1`` an engine held 25
         connections at once against a ceiling that read as one. The third's
         zero is not an off switch of that kind but a plain absence, which is
-        why it is the DEFAULT here and still floored at one in the read
-        path's ``from_env``: a direct caller wants no second engine, and a
-        deployment that turned the reserve off would be choosing to lose the
-        row `tests/test_audit_reserve.py` exists to prove it keeps.
+        why it is the DEFAULT here and still floored at one in BOTH services'
+        ``from_env``: a direct caller wants no second engine, and a deployment
+        that turned the reserve off would be choosing to lose the row
+        `tests/test_audit_reserve.py` exists to prove it keeps.
 
         Passing the values in the URL query string instead of `connect_args`
         does not work and was tried: SQLAlchemy hands asyncpg the string and

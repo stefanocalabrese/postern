@@ -164,6 +164,7 @@ from postern_core.store.models import (
     OUTCOME_RETURNED,
 )
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
 logger = logging.getLogger(__name__)
@@ -547,7 +548,37 @@ class ApprovalAudit:
     async def _write_entry_row(self) -> None:
         """The entry write itself, split out only so ``record`` can wrap it in
         one ``try`` without burying the row's field-by-field reasoning inside
-        an exception handler."""
+        an exception handler.
+
+        THE ONE AUDIT WRITE IN THIS REPOSITORY THAT DOES **NOT** USE THE
+        RESERVE, and the omission is the decision rather than an oversight.
+        ``postern_core.store.audit``'s ``append_with_reserve`` gives a refused
+        checkout a second, reserved connection, and both completion writes
+        below use it. This one keeps the pool's answer.
+
+        WHY. This write is the last statement before a backend WRITE endpoint
+        is reached, and the ``approved -> executed`` transition that follows
+        the money moving runs on ``_approve``'s own session -- the application
+        pool, not an audit write, and nothing a reserve may cover without
+        becoming a second pool. Routing this row to the reserve would carry a
+        request across the money boundary on a connection that cannot carry it
+        to the end: the backend accepts the write, the transition is then
+        refused by the very pool the reserve was standing in for, and the
+        challenge is stranded in ``approved`` with the money gone. Refusing
+        here instead stops the request BEFORE the money moves, which is what
+        ``BackendRequestHook``'s contract already says this raise is for, and
+        the refusal is then recorded by ``_completion`` on the reserve.
+
+        It is also why the read path's equivalent DOES use the reserve and is
+        not inconsistent with this: ``services/api`` has no application-pool
+        checkout after its touch -- its completion row is an audit write -- so
+        covering its entry row carries the request to completion, where
+        covering this one would not.
+
+        NO LATENCY BEFORE MONEY MOVES, as a consequence rather than as an aim:
+        this path gains no second wait, so the interval between the claim and
+        the outbound write is exactly what it was.
+        """
         async with self._db.sessionmaker() as session:
             await audit.append(
                 session,
@@ -613,7 +644,22 @@ class ApprovalAudit:
         await self._completion(OUTCOME_RAISED, detail)
 
     async def _completion(self, outcome: str, detail: str | None) -> None:
-        async with self._db.sessionmaker() as session:
+        """THROUGH ``append_with_reserve`` SINCE 2026-09-27.
+
+        This is the row that says what happened to an approval, and a pool at
+        its ceiling used to lose it in both of the states where it is worth
+        most: the refusal of an approval this service never attempted, and --
+        worse -- the case the backend ACCEPTED the write and the
+        ``approved -> executed`` transition was then refused by the same
+        exhausted pool, which is the money-moved-and-unrecorded state
+        ``dev-docs/decisions/0013-connection-pool-ceiling.md`` already names as
+        this service's reason to keep headroom.
+
+        Nothing about the row changes: same columns, same instant, same
+        duration, and a failure to write it still fails the request.
+        """
+
+        async def row(session: AsyncSession) -> None:
             await audit.append(
                 session,
                 at=self._at,
@@ -656,6 +702,8 @@ class ApprovalAudit:
                 client_id=self._client_id,
                 risk_signals=None,
             )
+
+        await audit.append_with_reserve(self._db, row)
 
 
 def _arguments(challenge_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -1275,7 +1323,27 @@ class PairingAudit:
         await self._write(OUTCOME_RAISED, detail)
 
     async def _write(self, outcome: str, detail: str | None) -> None:
-        async with self._db.sessionmaker() as session:
+        """THROUGH ``append_with_reserve`` SINCE 2026-09-27, and this writer has
+        only completion rows, so there is no entry-row exception to make.
+
+        Neither endpoint reaches a backend -- the class docstring's "ONE ROW,
+        NOT THE READ PATH'S TWO" is the argument -- so nothing here can be
+        carried across a money boundary the way ``ApprovalAudit``'s entry row
+        could. Every row this writer produces is the record of a conclusion
+        already reached, which is exactly what a reserve is for.
+
+        THE VOLUME IS THE REASON IT MATTERS AT ``POST /token``. That row is
+        fail-closed on a mint: it is awaited before the token is returned, so a
+        saturated pool used to mean no credential issued AND no record of the
+        refusal. At ``POST /approve`` the failure was louder and worse in a
+        different way -- ``services/confirm/device_auth.py``'s
+        ``_withdraw_pairing`` revokes a pairing whose row could not be written,
+        so a customer who had already compared their pairing code had the
+        pairing taken away and had to start from a fresh QR. With the row
+        written, neither happens.
+        """
+
+        async def row(session: AsyncSession) -> None:
             await audit.append(
                 session,
                 at=self._at,
@@ -1314,6 +1382,8 @@ class PairingAudit:
                 # statement.
                 risk_signals=None,
             )
+
+        await audit.append_with_reserve(self._db, row)
 
     def _arguments(self) -> dict[str, Any]:
         """What this pairing attempt was, bounded the way both services bound it.

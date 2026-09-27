@@ -395,3 +395,25 @@ One new operator-visible signal: a WARNING from `postern_core.store.audit` when
 a row is written on the reserve, which means this replica hit its pool ceiling
 on a path that no longer fails because of it. That is the line to alert on to
 learn a deployment is one connection short.
+
+---
+
+## Second amendment, 27 September 2026: the write path, and the question this record never asked
+
+`services/confirm` has the reserve now. It is not the retry this record
+refused, for the reason the first amendment gives: it fires on
+`sqlalchemy.exc.TimeoutError` alone.
+
+`ApprovalAudit._write_entry_row` is deliberately excluded from it, and that
+exclusion is THIS RECORD'S OWN POLICY WORKING rather than an exception to it.
+A row that cannot be written still stops the money: the entry row's refusal
+reaches `BackendRequestHook`'s contract, the backend is never touched, and the
+challenge stays `pending`. Record 0013's second amendment carries why routing
+it to the reserve would be worse -- it would carry a request across the money
+boundary on a connection that cannot carry it to the end.
+
+AND THE NEIGHBOURING QUESTION, which this record accepts by implication and
+never states: whether the RECORD survives when Postgres is unreachable, as
+against whether the request fails. It does not, and record 0016 is where that
+is argued and accepted rather than left for someone to discover and try to fix
+with a spool.

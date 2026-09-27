@@ -290,3 +290,66 @@ common shape, and the only one a connection could have been reserved for.
 
 `services/confirm` is owed the same and does not have it. Same fail-closed
 policy, same one-`Database` shape, no reserve. Scoped out deliberately.
+
+---
+
+## Second amendment, 27 September 2026: the write path, and the one row that stays on the pool
+
+`services/confirm` took the same reserve one commit after `services/api`, with
+one exclusion that is the design rather than an omission.
+
+WHICH ROWS. `ConfirmSettings.database_audit_reserve_size` (default 1, floored
+at 1, `POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE`, its own prefix so one env
+file cannot move both services at once) serves `ApprovalAudit._completion` and
+`PairingAudit._write`. It does NOT serve `ApprovalAudit._write_entry_row`,
+which is now the only audit write in the repository that stays on the
+application pool.
+
+WHY. `services/confirm/callback.py` claims the challenge and commits, writes
+the entry row, reaches the backend, then runs `approved -> executed` on its own
+session -- a fresh checkout on the application pool, and not an audit write, so
+no reserve may cover it without becoming a second pool. Routing the entry row
+to the reserve would carry a request ACROSS THE MONEY BOUNDARY on a connection
+that cannot carry it to the end: the backend accepts the write, the transition
+is refused by the very pool the reserve was standing in for, and the challenge
+is stranded in `approved` with the money gone. Routinely, because saturation
+persists across those milliseconds.
+
+Keeping the pool's refusal stops the request before money moves, which is what
+`BackendRequestHook`'s contract is for, and the refusal is then recorded by
+`_completion` on the reserve. It also means NO LATENCY IS ADDED ANYWHERE BEFORE
+MONEY MOVES -- not a bounded addition, none, by construction.
+
+The read path is not inconsistent: `services/api` has no application-pool
+checkout after its touch, so covering its entry row carries the request to
+completion.
+
+WHERE THE RESERVE IS WORTH MOST HERE is the worst case rather than the common
+one: the row recording that the backend ACCEPTED the write and the `executed`
+transition was then refused by the same exhausted pool. That is the
+money-moved-and-unrecorded state this record already names as the reason this
+service keeps headroom.
+
+ONE RESERVED CONNECTION SERVES TWO SEQUENTIAL WRITES, because an
+`AsyncSession` returns its connection at COMMIT -- the same fact this record
+rests its four-checkouts-one-at-a-time finding on. What bounds the reserve is
+concurrent writes, not writes.
+
+`PairingAudit` volume: one row per recorded `POST /approve`, one per
+`POST /token`, none per poll, so two per completed pairing. At `/token` the row
+is fail-closed on a mint, so a saturated replica previously issued no
+credential and recorded nothing about refusing. At `/approve` a failed row
+triggers `_withdraw_pairing`, so a customer who had already compared their
+pairing code lost it and needed a fresh QR. Neither happens now.
+
+THE NUMBERS. `services/confirm` is 5 + 5 + 1 = 11. `4 x 16 + 2 x 11 = 86`,
+plus 3 reserved = 89 of 100, leaving 11. What fits at the Postgres default:
+3+2, 3+3, 4+2 and 5+1. What does not: 4+3 (97), 5+2 (102), 6+3 (129). This
+shape is one replica of either service away from not fitting -- and it was
+before the reserves too, at 17 spare. The lever is `max_connections` or
+`pool_size`, not the one connection that records the refusal.
+
+Guarded by an existing test rather than only a new one: routing the entry row
+through the reserve fails
+`tests/test_pool_sizing.py::TestAnApprovalNeverHoldsTwoPooledConnectionsAtOnce::test_a_successful_approval_completes_through_a_pool_of_one`,
+because the approval's four application-pool checkouts become three.

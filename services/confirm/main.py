@@ -329,6 +329,15 @@ def create_confirm_app(
         # less and what raising it looks like.
         pool_size=settings.database_pool_size,
         max_overflow=settings.database_max_overflow,
+        # THE RESERVE, narrower here than on the read path. It serves the two
+        # COMPLETION writes in `services/confirm/audit.py` and deliberately not
+        # `ApprovalAudit`'s entry row, which keeps the pool's refusal so that a
+        # saturated replica stops before the backend write instead of being
+        # carried past it on a connection that cannot see the
+        # `approved -> executed` transition through.
+        # `services/confirm/settings.py` carries the argument and
+        # `tests/test_audit_reserve.py` measures both halves.
+        audit_reserve_size=settings.database_audit_reserve_size,
     )
 
     # --- Assemble routes ---

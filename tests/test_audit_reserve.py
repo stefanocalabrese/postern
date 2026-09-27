@@ -65,13 +65,16 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import patch
 
 import httpx2
 import pytest
 import sqlalchemy.exc as sa_exc
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from fastmcp.server.http import StarletteWithLifespan
+from postern_core.domain.verification import VerificationTier
 from postern_core.store import audit
+from postern_core.store import challenges as challenge_store
 from postern_core.store.engine import Database
 from postern_core.store.models import (
     REFUSAL_CONSENT_STORE_UNAVAILABLE,
@@ -81,14 +84,20 @@ from postern_core.store.models import (
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.pool import NullPool, QueuePool
+from starlette.applications import Starlette
 from starlette.types import Message, Scope
 
 from services.api.main import create_app
 from services.api.settings import Settings
+from services.confirm.audit import ApprovalAudit, PairingAudit
+from services.confirm.execute import BackendWriteClient
+from services.confirm.main import create_confirm_app
+from services.confirm.settings import ConfirmSettings
 from tests.fixtures import backend_responses as fx
 from tests.fixtures.append_only_bypass import (
     delete_audit_rows_by_bypassing_the_append_only_triggers,
 )
+from tests.fixtures.device_keys import approval_body, device_key, enrolled_store
 
 ISSUER = "https://postern-reserve.invalid"
 AUDIENCE = "postern"
@@ -227,6 +236,12 @@ def queue_pool(engine: AsyncEngine) -> QueuePool:
     pool = engine.pool
     assert isinstance(pool, QueuePool)
     return pool
+
+
+def app_database(app: Starlette) -> Database:
+    """The `Database` a composed app built, typed rather than left as `Any`."""
+    database: Database = app.state.postern_database
+    return database
 
 
 @asynccontextmanager
@@ -765,3 +780,385 @@ class TestWhenTheReserveRunsOutToo:
 
             assert response.json()["result"]["isError"] is True
             assert await rows_for(database, customer) == []
+
+
+# ---------------------------------------------------------------------------
+# THE WRITE PATH. Same reserve, one deliberate difference, and the difference
+# is the money.
+# ---------------------------------------------------------------------------
+
+CONFIRM_ISSUER = "https://app.test.invalid"
+CONFIRM_AUDIENCE = "postern-confirm"
+
+#: Every challenge this file creates, deleted by prefix at teardown -- the same
+#: contract `tests/test_pool_sizing.py` and `tests/test_approval_integration.py`
+#: use against their own.
+CHALLENGE_PREFIX = "chal_reserve_"
+
+DEVICE_PRIVATE, DEVICE_PUBLIC = device_key("reserve-phone")
+
+
+def _confirm_settings(pg_url: str, **overrides: Any) -> ConfirmSettings:
+    fields: dict[str, Any] = {
+        "backend_base_url": "https://backend.test",
+        "database_url": pg_url,
+        "database_pool_size": 1,
+        "database_max_overflow": 0,
+        "database_pool_timeout_seconds": POOL_TIMEOUT,
+    }
+    fields.update(overrides)
+    return ConfirmSettings(**fields)
+
+
+def _confirm_app(settings: ConfirmSettings, key_pair: RSAKeyPair, customer: str) -> Starlette:
+    verifier = JWTVerifier(
+        public_key=key_pair.public_key, issuer=CONFIRM_ISSUER, audience=CONFIRM_AUDIENCE
+    )
+    return create_confirm_app(
+        settings,
+        assertion_verifier=verifier,
+        device_key_store=enrolled_store(customer, DEVICE_PUBLIC),
+    )
+
+
+def confirm_bearer(key_pair: RSAKeyPair, customer: str) -> dict[str, str]:
+    token = key_pair.create_token(
+        subject=customer, issuer=CONFIRM_ISSUER, audience=CONFIRM_AUDIENCE
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def post_approval(
+    app: Starlette, challenge_id: str, body: dict[str, Any], headers: dict[str, str]
+) -> httpx2.Response:
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as client:
+        return await client.post(f"/challenges/{challenge_id}/approve", json=body, headers=headers)
+
+
+@asynccontextmanager
+async def pending_challenge(
+    database: Database, challenge_id: str, customer: str
+) -> AsyncIterator[None]:
+    """One `pending` challenge, and every row it causes taken away again."""
+    async with database.sessionmaker() as session:
+        await challenge_store.create_challenge(
+            session,
+            challenge_id=challenge_id,
+            customer_ref=customer,
+            tool_name="payments.create_payment",
+            payload={"amount": "EUR 340.00"},
+            tier=VerificationTier.APP_APPROVAL,
+        )
+        await session.commit()
+    try:
+        yield
+    finally:
+        async with database.sessionmaker() as session:
+            await session.execute(
+                text("DELETE FROM challenges WHERE challenge_id LIKE :p"),
+                {"p": f"{CHALLENGE_PREFIX}%"},
+            )
+            await delete_audit_rows_by_bypassing_the_append_only_triggers(
+                session, AuditEntry.customer_ref == customer
+            )
+            await session.commit()
+
+
+async def challenge_status(database: Database, challenge_id: str) -> str | None:
+    async with database.sessionmaker() as session:
+        record = await challenge_store.get_challenge(session, challenge_id)
+        return None if record is None else str(record.status)
+
+
+class TestTheWritePathRecordsTheApprovalItRefused:
+    """The more serious half of the same gap.
+
+    A lost row on the read path is an unrecorded denial of a balance query. A
+    lost row here is no record that a payment approval was attempted at all,
+    against the one endpoint in this repository from which a backend WRITE
+    endpoint is reached.
+    """
+
+    async def test_without_a_reserve_a_saturated_approval_writes_no_row(
+        self, pg_url: str, database: Database, key_pair: RSAKeyPair
+    ) -> None:
+        """Today's behaviour on the write path, measured.
+
+        The handler's own lookup is refused by the ceiling, so it raises before
+        any backend exists; the completion row that would record the refusal is
+        refused by the same ceiling. The challenge stays `pending`, which is
+        the one good part and is unchanged below.
+        """
+        customer = "cust_wreserveoff"
+        challenge_id = f"{CHALLENGE_PREFIX}off"
+        settings = _confirm_settings(pg_url, database_audit_reserve_size=0)
+        async with pending_challenge(database, challenge_id, customer):
+            app = _confirm_app(settings, key_pair, customer)
+            body = await approval_body(database, challenge_id, DEVICE_PRIVATE)
+            async with saturated(app_database(app).engine):
+                with pytest.raises(sa_exc.TimeoutError):
+                    await post_approval(app, challenge_id, body, confirm_bearer(key_pair, customer))
+
+            assert await rows_for(database, customer) == [], (
+                "a row exists, so this test is no longer measuring the gap"
+            )
+            assert await challenge_status(database, challenge_id) == "pending"
+            await app_database(app).close()
+
+    async def test_the_refused_approval_reaches_the_audit_table_through_the_reserve(
+        self, pg_url: str, database: Database, key_pair: RSAKeyPair
+    ) -> None:
+        """The row, and everything else identical.
+
+        The request still fails, the challenge is still `pending` and therefore
+        still approvable once the pressure clears, and the money still has not
+        moved. What is new is a row saying a named customer's approval of a
+        named challenge was refused, and why.
+        """
+        customer = "cust_wreserveon"
+        challenge_id = f"{CHALLENGE_PREFIX}on"
+        settings = _confirm_settings(pg_url, database_audit_reserve_size=1)
+        async with pending_challenge(database, challenge_id, customer):
+            app = _confirm_app(settings, key_pair, customer)
+            body = await approval_body(database, challenge_id, DEVICE_PRIVATE)
+            async with saturated(app_database(app).engine):
+                with pytest.raises(sa_exc.TimeoutError):
+                    await post_approval(app, challenge_id, body, confirm_bearer(key_pair, customer))
+
+            rows = await rows_for(database, customer)
+            assert len(rows) == 1, [(r.outcome, r.detail) for r in rows]
+            assert rows[0].outcome == "raised"
+            assert rows[0].detail == "TimeoutError"
+            assert rows[0].customer_ref == customer
+            assert rows[0].arguments["challenge_id"] == challenge_id
+            # Unchanged, and the point: the reserve records the refusal, it
+            # does not turn it into an approval.
+            assert await challenge_status(database, challenge_id) == "pending"
+            await app_database(app).close()
+
+    async def test_one_reserved_connection_serves_request_after_request(
+        self, pg_url: str, database: Database, key_pair: RSAKeyPair
+    ) -> None:
+        """The two-row question, answered on the quantity that actually varies.
+
+        A single reserved connection is not a single row: an `AsyncSession`
+        returns its connection at COMMIT, so each audit write hands it back
+        before the next one asks. What bounds the reserve is concurrent writes,
+        not writes. Two approvals refused one after another under one held pool
+        therefore produce two rows with two `call_id`s on one connection.
+        """
+        customer = "cust_wreserveseq"
+        settings = _confirm_settings(pg_url, database_audit_reserve_size=1)
+        async with pending_challenge(database, f"{CHALLENGE_PREFIX}seq1", customer):
+            app = _confirm_app(settings, key_pair, customer)
+            reserve = app_database(app).audit_reserve
+            assert reserve is not None
+            body = await approval_body(database, f"{CHALLENGE_PREFIX}seq1", DEVICE_PRIVATE)
+            async with saturated(app_database(app).engine):
+                for _ in range(2):
+                    with pytest.raises(sa_exc.TimeoutError):
+                        await post_approval(
+                            app,
+                            f"{CHALLENGE_PREFIX}seq1",
+                            body,
+                            confirm_bearer(key_pair, customer),
+                        )
+
+            rows = await rows_for(database, customer)
+            assert len(rows) == 2
+            assert rows[0].call_id != rows[1].call_id
+            assert queue_pool(reserve).size() == 1
+            await app_database(app).close()
+
+    async def test_create_confirm_app_wires_the_reserve_from_settings(
+        self, pg_url: str, key_pair: RSAKeyPair
+    ) -> None:
+        app = _confirm_app(
+            _confirm_settings(pg_url, database_audit_reserve_size=2), key_pair, "cust_wreservecfg"
+        )
+        reserve = app_database(app).audit_reserve
+        assert reserve is not None
+        assert queue_pool(reserve).size() == 2
+        await app_database(app).close()
+
+
+class TestTheEntryRowIsDeliberatelyNotOnTheReserve:
+    """The one place the write path does NOT copy the read path.
+
+    `ApprovalAudit`'s entry row is the last statement before a backend WRITE
+    endpoint is reached, and the `approved -> executed` transition that follows
+    the money moving is NOT an audit write, so no reserve can cover it without
+    becoming a second pool. Putting the entry row on the reserve would carry a
+    request across the money boundary on a connection that cannot carry it to
+    the end: the write succeeds, the transition is then refused by the pool the
+    reserve was standing in for, and the challenge is stranded in `approved`
+    with the money gone.
+
+    So the entry row keeps the pool's answer. When the pool is full the backend
+    is not reached, no money moves, and the completion row records the refusal
+    -- on the reserve, because recording it is what the reserve is for. The
+    read path has no post-touch application-pool checkout, which is why
+    covering its entry row carries the request to completion and covering this
+    one would not.
+    """
+
+    async def test_the_entry_row_takes_the_pools_refusal_and_the_completion_row_does_not(
+        self, pg_url: str, database: Database
+    ) -> None:
+        customer = "cust_wreserveasym"
+        db = Database(
+            pg_url,
+            audit_reserve_size=1,
+            pool_timeout_seconds=POOL_TIMEOUT,
+            pool_size=1,
+            max_overflow=0,
+        )
+        record = ApprovalAudit(
+            db=db,
+            call_id="00000000-0000-4000-8000-00000000abcd",
+            at=datetime.now(UTC),
+            started=0.0,
+            subject=customer,
+            claims={},
+            challenge_id=f"{CHALLENGE_PREFIX}asym",
+            body={},
+        )
+        try:
+            async with saturated(db.engine):
+                # The entry row is refused, which is what stops the backend
+                # write. No reserve fallback, on purpose.
+                with pytest.raises(sa_exc.TimeoutError):
+                    await record.record()
+                assert await rows_for(database, customer) == []
+
+                # The completion row, on the same object and the same held
+                # pool, lands.
+                await record.raised("TimeoutError")
+
+            rows = await rows_for(database, customer)
+            assert [r.outcome for r in rows] == ["raised"]
+        finally:
+            async with database.sessionmaker() as session:
+                await delete_audit_rows_by_bypassing_the_append_only_triggers(
+                    session, AuditEntry.customer_ref == customer
+                )
+                await session.commit()
+            await db.close()
+
+    async def test_a_pairing_row_reaches_the_table_through_the_reserve(
+        self, pg_url: str, database: Database
+    ) -> None:
+        """The third write site, and the one with the highest call volume.
+
+        `PairingAudit` writes one row per recorded `POST /approve` and per
+        `POST /token` and none per poll, so two rows per completed pairing.
+        Both are the only record that a customer authorised a client and that a
+        credential was issued to it, and both are refused by a saturated pool
+        today -- at `/token` the mint is fail-closed on the row, so a
+        saturated replica issues no credentials and records nothing about
+        having refused to.
+        """
+        customer = "cust_wreservepair"
+        db = Database(
+            pg_url,
+            audit_reserve_size=1,
+            pool_timeout_seconds=POOL_TIMEOUT,
+            pool_size=1,
+            max_overflow=0,
+        )
+        pairing = PairingAudit(
+            db=db,
+            call_id="00000000-0000-4000-8000-00000000beef",
+            at=datetime.now(UTC),
+            started=0.0,
+            subject=customer,
+            claims={},
+            client_ip_value=None,
+        )
+        try:
+            async with saturated(db.engine):
+                await pairing.approved()
+            rows = await rows_for(database, customer)
+            assert [r.outcome for r in rows] == ["returned"]
+        finally:
+            async with database.sessionmaker() as session:
+                await delete_audit_rows_by_bypassing_the_append_only_triggers(
+                    session, AuditEntry.customer_ref == customer
+                )
+                await session.commit()
+            await db.close()
+
+
+class TestATotalOutageIsAcceptedAndBounded:
+    """The claim this file's docstring makes in bold, measured rather than
+    asserted: a reserve writes no row against a store that is DOWN.
+
+    A second set of connections to an unreachable database is a second way to
+    fail to connect, so nothing here is a gap the reserve was supposed to
+    close. `postern_core.store.audit`'s module docstring carries the decision
+    that follows -- no spool, no queue, no second store -- and what an operator
+    can and cannot reconstruct afterwards. These two tests are the premise it
+    rests on: with the store unreachable, nothing is recorded AND nothing is
+    reached, on both paths.
+
+    The second half is the one worth measuring. "No row" alone would be a gap;
+    "no row and no touch" is a bounded outage, and the difference is the whole
+    argument.
+    """
+
+    async def test_the_read_path_records_nothing_and_touches_nothing(
+        self, key_pair: RSAKeyPair
+    ) -> None:
+        reached: list[str] = []
+
+        def counting(request: httpx2.Request) -> httpx2.Response:
+            reached.append(str(request.url.path))
+            return _backend(request)
+
+        settings = _settings(_UNREACHABLE, database_audit_reserve_size=1)
+        verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
+        app = create_app(settings, transport=httpx2.MockTransport(counting), auth_override=verifier)
+        assert app.state.postern_database.audit_reserve is not None, (
+            "the reserve must be configured, or this measures the wrong thing"
+        )
+        async with _drive_lifespan(app):
+            response = await _call(app, token_for(key_pair, "cust_outage01"), GATED_TOOL)
+
+        assert response.json()["result"]["isError"] is True
+        assert reached == [], "the backend was reached with nothing recorded first"
+
+    async def test_the_write_path_records_nothing_and_moves_no_money(
+        self, key_pair: RSAKeyPair
+    ) -> None:
+        """The challenge lookup is the first thing to fail, so the approval
+        never reaches the point of minting a write token, let alone sending
+        one. `tests/test_write_audit.py` covers the narrower case where the
+        store fails only at the entry row."""
+        customer = "cust_outage02"
+        minted: list[str] = []
+        app = _confirm_app(
+            _confirm_settings(_UNREACHABLE, database_audit_reserve_size=1), key_pair, customer
+        )
+        assert app_database(app).audit_reserve is not None
+
+        # A write token is minted one statement before the entry row, so a
+        # mint that never happens is the sharpest available proof that the
+        # outbound request was never even prepared.
+        original = BackendWriteClient.execute
+
+        async def spy(self: Any, **kwargs: Any) -> Any:  # pragma: no cover - never called
+            minted.append(str(kwargs.get("challenge_id")))
+            return await original(self, **kwargs)
+
+        with patch.object(BackendWriteClient, "execute", spy):
+            with pytest.raises((OSError, sa_exc.SQLAlchemyError)):
+                await post_approval(
+                    app,
+                    f"{CHALLENGE_PREFIX}outage",
+                    {"signature": "a" * 86},
+                    confirm_bearer(key_pair, customer),
+                )
+
+        assert minted == [], "the backend write client was reached with nothing recorded"
+        await app_database(app).close()

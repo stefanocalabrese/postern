@@ -228,6 +228,39 @@ class ConfirmSettings:
     # arithmetic to redo before raising it.
     database_pool_size: int = 5
     database_max_overflow: int = 5
+    # THE RESERVE, and on this service it is narrower than on the read path by
+    # one deliberate omission. `postern_core.store.engine`'s `Database` builds
+    # a second engine of this many connections and no overflow;
+    # `postern_core.store.audit`'s `append_with_reserve` reaches it only when
+    # the pool above raises `sqlalchemy.exc.TimeoutError`.
+    #
+    # WHAT IT RECORDS HERE. `services/confirm/audit.py`'s COMPLETION writes --
+    # `ApprovalAudit._completion` and `PairingAudit._write` -- and not
+    # `ApprovalAudit._write_entry_row`. That asymmetry is the whole design and
+    # `tests/test_audit_reserve.py`'s
+    # `TestTheEntryRowIsDeliberatelyNotOnTheReserve` carries the argument: the
+    # entry row is the last statement before a backend WRITE endpoint is
+    # reached, and the `approved -> executed` transition that follows the money
+    # moving is not an audit write, so no reserve can cover it. Putting the
+    # entry row on the reserve would carry a request across the money boundary
+    # on a connection that cannot carry it to the end -- the write succeeds and
+    # the transition is then refused by the very pool the reserve was standing
+    # in for, stranding the challenge in `approved` with the money gone. So the
+    # entry row keeps the pool's answer, the backend is not reached, and the
+    # refusal is what the reserve records.
+    #
+    # WHAT THAT BUYS, and it is the worst case rather than the common one: a
+    # `raised` row for every approval a saturated replica refuses, and a row
+    # for the case the money DID move and the transition then failed, which is
+    # the one state `dev-docs/decisions/0013-connection-pool-ceiling.md`
+    # already names as this service's reason to keep headroom. Before the
+    # reserve that row was lost exactly when it mattered most.
+    #
+    # It is a CEILING, not a standing cost: `QueuePool` opens on demand and
+    # this engine is only ever asked after a refused checkout, so an
+    # unsaturated replica holds none of it. Budget it anyway -- the moment one
+    # replica needs it is the moment they all do.
+    database_audit_reserve_size: int = 1
     # Inbound app assertion (C-01, C-02). All three required; see the module
     # docstring for why there is no audience default and why this service,
     # unlike `services/api`, has no no-auth path at all.
@@ -502,6 +535,32 @@ class ConfirmSettings:
                     "open above pool_size and close again on return. Zero is a legitimate "
                     "setting and means no burst; -1 is the off switch, and an engine set to "
                     "it held 25 connections at once against a ceiling that read as one."
+                ),
+            ),
+            # A FLOOR OF ONE, matching the read path's: there is no value that
+            # turns the reserve off. Reaching zero from the environment would
+            # mean a deployment choosing to lose the row for every approval a
+            # saturated replica refuses -- including the one that records money
+            # having moved with the executed transition refused, which is the
+            # single row in this table an investigator most needs. An operator
+            # short of connections raises max_connections or lowers
+            # POSTERN_CONFIRM_DATABASE_POOL_SIZE; both leave the record intact.
+            #
+            # ITS OWN NAME, with the POSTERN_CONFIRM_ prefix the ceiling pair
+            # above carries and for the identical reason: one env file read by
+            # both containers must not let an operator move the read path's
+            # reserve and this one together without meaning to.
+            database_audit_reserve_size=int_from_env(
+                "POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE",
+                1,
+                minimum=1,
+                because=(
+                    "It is the connections held back so an approval's completion row can "
+                    "still be written when this service's pool is at its ceiling, and it "
+                    "adds to the replicas x ceiling total that has to clear the database's "
+                    "max_connections. There is no value that turns it off: at zero a "
+                    "saturated replica refuses approvals and records nothing about having "
+                    "refused them."
                 ),
             ),
             app_assertion_jwks_uri=os.environ.get("POSTERN_APP_ASSERTION_JWKS_URI") or None,

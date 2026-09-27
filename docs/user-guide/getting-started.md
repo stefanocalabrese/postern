@@ -114,6 +114,7 @@ The table below lists every variable, grouped by service.
 | `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds). **Zero or greater**; zero sheds rather than queueing when the pool is saturated |
 | `POSTERN_CONFIRM_DATABASE_POOL_SIZE` | No | `5` | Connections this replica keeps open, separate from the API service's `POSTERN_DATABASE_POOL_SIZE`. **At least 1** |
 | `POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW` | No | `5` | Burst above `POSTERN_CONFIRM_DATABASE_POOL_SIZE`. **Zero or greater**. Lower than the API service's 10 because one approval is one person tapping a phone, and both services draw on one `max_connections` |
+| `POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE` | No | `1` | Connections held back so an approval's **completion** row can still be written when the pool above is at its ceiling. **At least 1** — no value turns it off. Serves `ApprovalAudit`'s completion row and every `PairingAudit` row, and deliberately **not** the entry row: see the sizing section below |
 
 The three `POSTERN_APP_ASSERTION_*` variables are the only **required** settings on
 either service. `create_confirm_app()` raises `ValueError` and the process does not
@@ -129,14 +130,15 @@ requirement, not something a gate here will catch.
 
 ### Sizing the connection pools
 
-The five pool variables above are the one set of numbers this repository cannot
+The six pool variables above are the one set of numbers this repository cannot
 pick for you, because the constraint involves your replica count and your
 database's limit and neither is visible from here:
 
 ```
   api_replicas     x (POSTERN_DATABASE_POOL_SIZE + POSTERN_DATABASE_MAX_OVERFLOW
                       + POSTERN_DATABASE_AUDIT_RESERVE_SIZE)
-+ confirm_replicas x (POSTERN_CONFIRM_DATABASE_POOL_SIZE + POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW)
++ confirm_replicas x (POSTERN_CONFIRM_DATABASE_POOL_SIZE + POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW
+                      + POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE)
 + migrations, psql, monitoring, backups
 <= max_connections - superuser_reserved_connections
 ```
@@ -148,22 +150,47 @@ limit. On an unmodified PostgreSQL 17 those two server settings are 100 and 3
 Going over is not a slowdown, it is a refusal at connect:
 `asyncpg.exceptions.TooManyConnectionsError: sorry, too many clients already`.
 
-At the defaults, four API replicas and two confirm replicas hold
-`4x16 + 2x10 = 84` connections, which leaves 13 of the default 100 once the 3
-reserved slots are taken. Six and three would need 126 and does not fit.
+At the defaults a replica of `services/api` may hold `5 + 10 + 1 = 16`
+connections and a replica of `services/confirm` `5 + 5 + 1 = 11`. Four API
+replicas and two confirm replicas hold `4x16 + 2x11 = 86`, which leaves 11 of
+the default 100 once the 3 reserved slots are taken.
 
-**The audit reserve is in the API term and has no counterpart on the write
-path.** `services/api` holds `5 + 10` pooled connections plus 1 reserved, so 16
-per replica; `services/confirm` holds `5 + 5` and no reserve, so 10. The
+**What still fits at `max_connections = 100`**, with the 3 reserved slots taken
+and counting nothing for migrations, psql or monitoring:
+
+| API replicas | confirm replicas | held | spare of 97 |
+|---|---|---|---|
+| 3 | 2 | 70 | 27 |
+| 3 | 3 | 81 | 16 |
+| 4 | 2 | 86 | 11 |
+| 5 | 1 | 91 | 6 |
+| 4 | 3 | 97 | **0 — does not fit** |
+| 5 | 2 | 102 | **does not fit** |
+| 6 | 3 | 129 | **does not fit** |
+
+`4 x api + 2 x confirm` is the shape the repository's own test asserts, and at
+the Postgres default it is one replica of either service away from not fitting.
+If you need a fifth API replica, raise `max_connections` (the usual first move
+on a managed instance), lower `POSTERN_DATABASE_POOL_SIZE`, or put a
+transaction-mode pooler in front. Do not reach for the reserve: it is one
+connection and it is the only thing that records the refusal.
+
+**Both reserves are in the sum, and they do not serve the same rows.** The
 reserve is the connection an audit row is written on when the pool is full —
-without it, a pool at its ceiling denies the call *and* loses the row that says
-why, because the consent lookup and the audit write draw on the same pool.
-`services/confirm` writes the same table under the same fail-closed policy and
-does not have one yet; until it does, a saturated write-path replica still
-loses its approval rows. Count the reserve as a ceiling rather than a standing
-cost — a replica opens it only once its pool has actually refused a checkout —
-but budget it, because the moment one replica needs it is the moment they all
-do.
+without it, a pool at its ceiling fails the request *and* loses the row that
+says why, because the application work and the audit write draw on the same
+pool. On `services/api` the reserve serves both of a call's rows. On
+`services/confirm` it serves the **completion** row of an approval and every
+pairing row, and deliberately **not** the entry row that precedes the backend
+write: that row keeps the pool's refusal, so a saturated replica stops *before*
+money moves rather than being carried past it on a connection that cannot see
+the `approved -> executed` transition through. The practical consequence is the
+one to plan around — while a confirm replica is saturated, approvals are
+refused and recorded, not performed.
+
+Count a reserve as a ceiling rather than a standing cost: a replica opens it
+only once its pool has actually refused a checkout. Budget it anyway, because
+the moment one replica needs it is the moment they all do.
 
 A pool holds one connection per in-flight *request*, not per request's worth of
 work: a tool call costs two to seven checkouts one after another, and an
