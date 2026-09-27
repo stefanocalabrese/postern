@@ -1,7 +1,16 @@
-"""Appending to the audit log, and the width bounds its values are written
-under.
+"""Appending to the audit log, the width bounds its values are written under,
+and which connection the append gets.
 
 Append-only by construction: this module exposes no update and no delete.
+
+TWO FUNCTIONS, AND THE SECOND IS ABOUT CONNECTIONS RATHER THAN COLUMNS.
+`append` writes the row on a session its caller hands over.
+`append_with_reserve` decides WHICH session that is: the application pool's,
+or -- when that pool is at its ceiling and nothing else -- the reserve
+`postern_core.store.engine`'s `Database` holds for exactly this. It lives
+beside `append` because the two are one decision from the caller's side, and
+because naming it after the audit path is the cheapest thing that stops a
+second caller from quietly turning a reserve into a pool.
 
 WHY THE BOUNDS LIVE HERE. Both services write this table and both need the
 same ceilings on what reaches it, and `.importlinter` forbids
@@ -52,12 +61,29 @@ write-path tree is under 300 bytes against an 8,192-byte bound.
 """
 
 import json
+import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
+import sqlalchemy.exc as sa_exc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry
+
+logger = logging.getLogger(__name__)
+
+#: One audit write, given a session to run on.
+#:
+#: A callable rather than `append`'s own fifteen keyword arguments, and the
+#: reason is mypy. `append` requires every one of them with no default, on
+#: purpose and with a paragraph each saying why; a wrapper that forwarded
+#: ``**row: Any`` would accept a caller that omitted any of them and would
+#: undo, at one call site, the guarantee the whole signature exists for.
+#: Handing the write itself over keeps the type checking where the row is
+#: built.
+AuditWrite = Callable[[AsyncSession], Awaitable[None]]
 
 # The marker a clamped value carries, so the VALUE announces its own
 # alteration -- the way a masked value already announces itself by containing
@@ -534,3 +560,81 @@ async def append(
         )
     )
     await session.commit()
+
+
+async def append_with_reserve(db: Database, write: AuditWrite) -> None:
+    """Run `write` on the pool, and on the reserve when the pool refuses.
+
+    THE ONE CONDITION THAT EARNS A SECOND ATTEMPT is
+    `sqlalchemy.exc.TimeoutError`. It is `QueuePool` saying that
+    ``pool_size + max_overflow`` connections are checked out and none came
+    back within ``pool_timeout``; it says nothing about the database, which
+    may be answering every one of those connections in milliseconds. That is
+    the only failure a second set of connections can answer, and it is the
+    failure that cost the row: under
+    `dev-docs/decisions/0006-audit-write-failure.md` the write fails the call,
+    and `services/api/consent.py`'s check denies when its own lookup raises,
+    so saturation produced both halves of the failure and put neither in the
+    table.
+
+    EVERY OTHER FAILURE PROPAGATES UNTOUCHED, and the omission is the
+    decision. A refused connect, a `command_timeout`, a schema error, a bug in
+    this repository -- a second attempt against a second pool to the SAME
+    database reaches the same answer, having first paid another
+    ``connect_timeout``. That is the "slower hard outage" decision 0006 named
+    when it refused a retry, and this is not an exception to that refusal: the
+    reserve is not a second chance at a failed write, it is a connection for a
+    write that never got one. `tests/test_audit_reserve.py`'s
+    `TestOnlyAPoolCeilingReachesTheReserve` walks the classes that are left
+    alone, with a positive control beside them so a predicate that matched
+    nothing could not pass as a correct one.
+
+    `completed` IS THE DUPLICATE-ROW GUARD, and it is cheap because the thing
+    it guards against is rare rather than impossible. A pooled checkout raises
+    before any statement is sent -- measured against postgres:17-alpine on
+    2026-09-27, an INSERT through a saturated pool left zero rows behind -- so
+    the ordinary path cannot double-write. What this closes is a
+    `TimeoutError` arriving from anywhere AFTER `write` returned, a session
+    exit included, where running the write again would put a second row on a
+    regulator-facing table. Two lines, and the property stops depending on
+    which line of `sqlalchemy/pool/impl.py` raises.
+
+    WARNING AND NOT ERROR, matching the outcomes: the row is written and the
+    call is unaffected, so this is degradation rather than failure. It is
+    still the only signal that the application pool hit its ceiling on a path
+    that no longer fails because of it, which makes it the line an operator
+    alerts on to learn they are one pool short.
+
+    Nothing about the ROW changes here -- not its columns, not when it is
+    written, not whether a failure to write it still fails the call. Only
+    whether the write can get a connection.
+    """
+    completed = False
+    try:
+        async with db.sessionmaker() as session:
+            await write(session)
+            completed = True
+    except sa_exc.TimeoutError as saturated:
+        reserve = db.audit_reserve_sessionmaker
+        if completed or reserve is None:
+            raise
+        logger.warning(
+            "the connection pool is at its ceiling; writing this audit row on the "
+            "reserve connection instead: %s",
+            saturated,
+        )
+        try:
+            async with reserve() as session:
+                await write(session)
+        except Exception as refused:
+            # THE RESERVE'S FAILURE IS WHAT PROPAGATES, with the pool's as its
+            # `__cause__`. Both halves are needed and neither alone is the
+            # story: the pool's exception says saturation, the reserve's says
+            # the row could not be placed anyway, and an operator who sees
+            # only the first would go looking for a ceiling to raise while
+            # the second names what actually happened. Explicit `from` rather
+            # than the implicit `__context__` this would get for free, for the
+            # reason decision 0006 gives where it does the same thing on the
+            # middleware's raised path: a chain that is deliberate reads as
+            # deliberate.
+            raise refused from saturated

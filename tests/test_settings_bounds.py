@@ -25,10 +25,10 @@ read. Measured on 2026-09-27 against planted shapes: ``raw =
 os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
 numeric rule completely, and it is the way a careless numeric read is most
 likely to be written. So the third rule keys on the one thing every spelling
-shares, the variable's NAME at the read site. The swept tree names 53
+shares, the variable's NAME at the read site. The swept tree names 54
 ``POSTERN_*`` variables in two disjoint populations: 18 read directly, all of
-them strings, listed in `READ_AS_STRING`; and 35 handed to a reader, which are
-`BOUNDED`'s 30, `STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
+them strings, listed in `READ_AS_STRING`; and 36 handed to a reader, which are
+`BOUNDED`'s 31, `STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
 nothing is in neither, and
 `TestEveryEnvironmentReadNamesAnInventoriedVariable` re-derives that from the
 tree on every run rather than trusting these numbers.
@@ -204,6 +204,27 @@ BOUNDED: tuple[Bounded, ...] = (
         10,
         ("-1", "-5"),
         ("0", "10", "50"),
+    ),
+    # THE THIRD CONNECTION NUMBER, and the only one with no counterpart on the
+    # write path: `services/confirm` shares the shape but not this setting,
+    # and `docs/user-guide/getting-started.md` records that as owed rather
+    # than as a difference of design.
+    #
+    # ITS FLOOR IS ONE AND ITS ZERO IS NOT AN OFF SWITCH OF THE OTHER KIND.
+    # `pool_size=0` and `max_overflow=-1` above are refused because SQLAlchemy
+    # reads them as "unlimited"; zero here is a plain absence -- no second
+    # engine -- which is `Database`'s own default and what every direct
+    # construction in this repository gets. It is floored at one anyway,
+    # because reaching it from the environment means a deployment choosing to
+    # lose the audit row for every call a saturated pool refuses, which is the
+    # silence the reserve exists to end.
+    Bounded(
+        "POSTERN_DATABASE_AUDIT_RESERVE_SIZE",
+        "database_audit_reserve_size",
+        "api",
+        1,
+        ("0", "-1"),
+        ("1", "2", "5"),
     ),
     Bounded(
         "POSTERN_MAX_BODY_BYTES",
@@ -1727,11 +1748,11 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
     numeric read. A rule keyed on the CONSUMER can always be evaded by one
     assignment, because the consumer can be arbitrarily far from the read.
 
-    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 53 distinct
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 54 distinct
     ``POSTERN_*`` variables across the swept roots, in two disjoint
     populations. 18 are read directly, and all 18 are strings -- a URL, a
-    path, a key id, an issuer, an audience, a key prefix. 35 are handed to a
-    reader as its ``name`` argument, and those are the 30 in `BOUNDED`, the 2
+    path, a key id, an issuer, an audience, a key prefix. 36 are handed to a
+    reader as its ``name`` argument, and those are the 31 in `BOUNDED`, the 2
     in `STORE_BOUNDED` and the 3 in `FLAGS`. Nothing is in both and nothing is
     in neither, which
     `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
@@ -1819,7 +1840,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
 
     def test_the_two_inventories_are_the_whole_tree(self) -> None:
-        """53 variables, 18 read directly and 35 through a reader, disjoint."""
+        """54 variables, 18 read directly and 36 through a reader, disjoint."""
         direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
         through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
         assert direct & through == set(), (
@@ -1829,7 +1850,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         assert direct == set(READ_AS_STRING)
         assert through == BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS
         assert len(direct) == 18
-        assert len(through) == 35
+        assert len(through) == 36
 
     def test_no_inventoried_string_is_also_a_number_or_a_flag(self) -> None:
         """The partition is asserted on the inventories too, not only the tree."""

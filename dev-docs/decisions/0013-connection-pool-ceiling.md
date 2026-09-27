@@ -232,3 +232,61 @@ how much of the ceiling is standing cost against the server's limit.
   arithmetic, because the services' pools then connect to the pooler rather
   than to Postgres. Neither was evaluated here and no claim about either is
   made.
+
+---
+
+## Amendment, 27 September 2026: the rejected option, narrowed
+
+The options section rejected **a separate engine or pool for audit writes** on
+two grounds. Both stand as written, and both are properties of a pool that
+SERVES TRAFFIC. A reserve reached by fallback is neither, and is what shipped
+today.
+
+`Database` takes `audit_reserve_size` (read path default 1, floored at 1 in
+`from_env`, `Database`'s own default 0) and builds a second engine of that many
+connections with `max_overflow=0` fixed in code. `postern_core.store.audit`'s
+`append_with_reserve` is its only reader and reaches it from one branch,
+`except sqlalchemy.exc.TimeoutError`. The audit write uses the application pool
+first, every time.
+
+THE ARITHMETIC GROUND. "Each keeps its own `pool_size` open whether or not the
+other is busy" is true of two busy pools and false of a pool nothing has asked.
+`QueuePool` opens on demand: measured against `postgres:17-alpine`,
+`checkedin()` is 0 before first use and 1 after. A reserve asked only after a
+refused checkout costs a ceiling, not a connection.
+
+THE SYMPTOM GROUND. "Two different symptoms depending on which pool ran out"
+requires two independently reachable pools. Under a fallback the reserve is
+unreachable until the application pool has raised, so an exhausted reserve is
+always the second half of a pair and arrives as that exception's `__cause__` --
+one traceback, both halves. With both full, the operator sees exactly what they
+saw before.
+
+Also priced rather than assumed: SQLAlchemy 2.0.52 cannot express reserved
+capacity inside one pool. `QueuePool.__init__` takes `creator, pool_size,
+max_overflow, timeout, use_lifo` and nothing else, and a search of
+`sqlalchemy/pool/` for reservation or priority returns nothing. The only
+in-one-pool approximation is an application-side semaphore in front of every
+non-audit checkout, which reserves a slot rather than a connection and leaks
+the moment a checkout path forgets to pass through it.
+
+THE NUMBERS MOVE. `services/api` is 5 + 10 + 1 = 16 per replica.
+`services/confirm` is unchanged at 10 and has NO reserve, so a saturated
+write-path replica still loses its approval rows. The worked example becomes
+4 x 16 + 2 x 10 = 84, plus 3 reserved = 87 of 100, leaving 13. Six and three is
+126 and still does not fit. `api_ceiling()` in `tests/test_pool_sizing.py`
+includes the reserve, so raising the default has to face the arithmetic.
+
+WHAT IT BUYS, MEASURED. With every connection of a `pool_size=1,
+max_overflow=0` pool held against a live Postgres, a real `tools/call` through
+`create_app` is denied and writes zero rows at `audit_reserve_size=0` and
+exactly one row at 1, while still failing closed. `start_session`, which no
+consent check gates, writes both its rows and reaches the backend.
+
+WHAT IT DOES NOT BUY: nothing against a store that is down. A second pool to an
+unreachable Postgres is a second way to fail to connect. The shape this closes
+is saturation of the ceiling against a store that is answering -- which is the
+common shape, and the only one a connection could have been reserved for.
+
+`services/confirm` is owed the same and does not have it. Same fail-closed
+policy, same one-`Database` shape, no reserve. Scoped out deliberately.

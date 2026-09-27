@@ -371,3 +371,27 @@ holds and now has a wider reach: a store that is merely slow fails calls, and
 with the entry write it fails them *before* the backend is reached rather
 than after. That is this record's own bargain moved earlier in the call, not
 a new trade-off.
+
+---
+
+## Amendment, 27 September 2026: the reserve is not the retry this record refused
+
+`postern_core.store.audit`'s `append_with_reserve` makes a second attempt at an
+audit write, and that is not the retry refused above. This record refused a
+second attempt against the same unavailable store, on the ground that it
+"turns a hard outage into a slower hard outage".
+
+The reserve fires on `sqlalchemy.exc.TimeoutError` ONLY -- the pool saying its
+connections are all checked out and none came back, which says nothing about
+the database. A refused connect, a `command_timeout`, a schema error and a
+plain bug all propagate untouched, precisely so that no failure already lost
+pays a second `connect_timeout`.
+
+Nothing about the rows changed: not their columns, not when they are written,
+not that a failure to write one still fails the call. Only whether the write
+can get a connection.
+
+One new operator-visible signal: a WARNING from `postern_core.store.audit` when
+a row is written on the reserve, which means this replica hit its pool ceiling
+on a path that no longer fails because of it. That is the line to alert on to
+learn a deployment is one connection short.

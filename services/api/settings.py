@@ -120,6 +120,38 @@ class Settings:
     # operation, not fifteen tool calls in flight.
     database_pool_size: int = 5
     database_max_overflow: int = 10
+    # THE RESERVE, and it is the one connection this replica holds back rather
+    # than the throughput it serves with. `postern_core.store.engine`'s
+    # `Database` builds a second engine of this many connections and no
+    # overflow, and `postern_core.store.audit`'s `append_with_reserve` reaches
+    # it from exactly one branch: the application pool above raising
+    # `sqlalchemy.exc.TimeoutError` because every one of its connections is
+    # checked out.
+    #
+    # WHY IT EXISTS. `create_app` hands one `Database` to the consent lookup
+    # and to `AuditMiddleware`, so a pool at its ceiling refuses both. The
+    # consent check then denies (`services/api/consent.py`) and the audit
+    # write then fails the call (decision 0006), and the row saying WHY --
+    # `refusal_reason = 'consent_store_unavailable'`, the value that work
+    # added for exactly this incident -- never reached the table, because
+    # writing it needed the connection that was missing. The operator got log
+    # lines and an empty table. `tests/test_audit_reserve.py` measures both
+    # halves: no row without this, the row with it, and the call still failing
+    # either way.
+    #
+    # ONE, not more, and the number is about availability rather than rate.
+    # An audit row is one INSERT and one commit on an indexed append-only
+    # table, single-digit milliseconds, so one connection clears hundreds of
+    # them a second; what the reserve has to be is PRESENT, not fast. Raising
+    # it buys queueing room for a longer saturation event and costs one
+    # connection per replica against the operator's `max_connections`, which
+    # is the arithmetic `Database.__init__` carries.
+    #
+    # It is a CEILING and not a standing cost: `QueuePool` opens on demand, so
+    # a replica that never saturates never opens the connection at all
+    # (measured, and pinned by `tests/test_audit_reserve.py`'s
+    # `TestTheReserveCostsNothingUntilItIsNeeded`).
+    database_audit_reserve_size: int = 1
     # Task 12: `HeaderBodyValidation.max_body_bytes` is opt-in and unset by
     # default (Task 5) because nothing in that task's scope could pick a
     # number on a deployment's behalf. This deployment's tool surface is
@@ -378,6 +410,29 @@ class Settings:
                     "open above pool_size and close again on return. Zero is a legitimate "
                     "setting and means no burst; -1 is the off switch, and an engine set to "
                     "it held 25 connections at once against a ceiling that read as one."
+                ),
+            ),
+            # A FLOOR OF ONE, so there is no value that turns the reserve off.
+            # Zero is what `Database`'s own default is and what every direct
+            # construction outside this composition root gets, but reaching it
+            # from the environment would mean a deployment choosing to lose the
+            # audit row for every call a saturated pool refuses -- the exact
+            # silence this setting exists to end, and a silence nothing would
+            # then report. An operator short of connections raises
+            # `max_connections` or lowers POSTERN_DATABASE_POOL_SIZE, both of
+            # which leave the record intact. Same posture as the rate limits in
+            # `services/confirm/settings.py`: the control is configurable in
+            # size and not in existence.
+            database_audit_reserve_size=int_from_env(
+                "POSTERN_DATABASE_AUDIT_RESERVE_SIZE",
+                1,
+                minimum=1,
+                because=(
+                    "It is the connections held back so an audit row can still be written "
+                    "when the application pool is at its ceiling, and it adds to the "
+                    "replicas x ceiling total that has to clear the database's "
+                    "max_connections. There is no value that turns it off: at zero a "
+                    "saturated pool denies the call and records nothing about why."
                 ),
             ),
             # A FLOOR OF ONE BYTE, stated as what it is rather than dressed up.

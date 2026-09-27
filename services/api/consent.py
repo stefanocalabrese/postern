@@ -55,6 +55,81 @@ internal `tools/list` pass happens to cost -- and a client re-issues a
 dropped call anyway, so the retry still exists one layer out, where it holds
 no connection for five seconds.
 
+AND THE MEMORY STOPS AT THE REQUEST BOUNDARY. THERE IS NO CIRCUIT BREAKER,
+and there is not going to be one. Decided 27 September 2026, after the
+question was asked properly for the second time, because one probe per
+request still scales with request rate and a sustained outage under load
+still loads the pool at one attempt per call.
+
+WHAT A BREAKER WOULD ACTUALLY SAVE, per outage shape, since the answer is
+not the same in all three and only one of them is interesting.
+
+  * REFUSED CONNECTION (Postgres down, nothing listening). A probe costs a
+    `ConnectionRefusedError` in about 0.0s and holds a pool slot for that
+    long. There is nothing to cut.
+  * SATURATION (the pool at its ceiling, the store answering normally). A
+    probe costs one refused checkout at `pool_timeout`. A breaker here is
+    not a saving but a defect: saturation is per-instant and clears as
+    requests finish, so a breaker opened by one refused checkout denies calls
+    the store was about to serve, and it denies them for its whole cooldown.
+  * SILENT IN BOTH DIRECTIONS (a blackholing firewall rule, a security group
+    closed under an incident, a failed-over primary whose old address still
+    accepts). A probe holds a pool slot for the full
+    `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS`, so at 2.0s and a ceiling of
+    15 the pool is saturated by connect attempts alone from about 7.5
+    requests per second up -- arithmetic from those two numbers, not a load
+    measurement, and nothing here has one. This is the one shape where a
+    breaker would cut real load.
+
+ONE SHAPE IS NOT ENOUGH, FOR THREE REASONS, and the third is the one that
+settles it.
+
+  * It would MAKE THE SECOND SHAPE WORSE while helping the third, and the
+    second is the one every deployment meets first. The two arrive wearing one
+    exception, so nothing here can tune for the case it helps:
+    `docs/verification/2026-09-17-query-stall-deadline.md` measured a request
+    against a silent store holding its pooled connection past a 60-second cap,
+    and a pool whose connections are all held that way refuses a checkout with
+    the same `sqlalchemy.exc.TimeoutError` a merely busy one does. Whichever
+    way that exception is read, it is read wrong half the time.
+  * The third shape already has a bound that is not this one.
+    `services/api/asgi/request_deadline.py`'s `RequestDeadline` caps the
+    whole HTTP request, and the operator's lever on the per-probe cost is
+    `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` itself -- lowering it cuts
+    exactly the pool-slot holding time a breaker would cut, and it does so
+    by attempting rather than by remembering.
+  * IT WOULD WRITE A FALSE ROW, PERMANENTLY. `refusal_reason` is a claim
+    about the operator's infrastructure on a regulator-facing table, and
+    `REFUSAL_CONSENT_STORE_UNAVAILABLE` says the store could not be reached.
+    A breaker files that from a cached observation instead of from an
+    attempt, so every call denied in the window between the store recovering
+    and the cooldown expiring carries a statement that was true a minute ago
+    and is false on the row. This module's per-request memory is defended,
+    two paragraphs down, on the ground that within one request the verdict
+    for a (customer, tool) pair CANNOT change; across requests it plainly
+    can, which is the same stale-filing problem `_clear_refusal` was deleted
+    to remove -- except that nothing can withdraw it, because migration
+    `f1860c110112` makes `audit_log` refuse `UPDATE` and `DELETE` inside the
+    database. A per-request memory can be wrong about nothing; a
+    process-wide one is wrong about every request that never probed.
+
+WHAT IT WOULD HAVE COST TO BUILD, priced rather than waved at, because "not
+worth it" is only an answer if the alternative was costed. A half-open policy
+needs a cooldown duration nobody has evidence for; an admission rule saying
+WHICH request pays the probe, which under MCP `2026-07-28` cannot be a
+background task on one instance because protocol-level sessions are gone and
+any request can land on any replica; a close threshold (one success, or n);
+and a decision about shared state -- per replica means R replicas hold R
+different opinions about one database, and shared means Redis, which makes a
+Redis outage into a consent outage. What the customer sees in the window the
+whole design turns on: every consent-gated tool absent from `tools/list` and
+`Unknown tool` on call, against a store that is answering, for up to the
+cooldown, with a permanent audit row blaming infrastructure that was fine.
+
+The denial is unchanged either way. This is a decision about how the denial
+is REACHED: by asking the store, every request, or by remembering that it
+once said no.
+
 WHY NOTHING NEEDS WITHDRAWING, which is the second thing remembering a
 failure bought and the reason a function was deleted rather than added. A
 `_clear_refusal` stood on `check`'s allow path from 26 to 27 September 2026,

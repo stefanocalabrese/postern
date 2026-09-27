@@ -38,8 +38,10 @@ class Database:
         pool_timeout_seconds: float = 1.0,
         pool_size: int = 5,
         max_overflow: int = 10,
+        audit_reserve_size: int = 0,
     ) -> None:
-        """Three deadlines and one ceiling, defaulting to the production values.
+        """Three deadlines, one ceiling and one reserve, defaulting to the
+        production values.
 
         `connect_timeout_seconds` becomes asyncpg's `connect(timeout=)`: the
         TCP connect, the TLS handshake and the startup/authentication
@@ -78,10 +80,42 @@ class Database:
         `dev-docs/decisions/0013-connection-pool-ceiling.md` carries the
         derivation.
 
+        `audit_reserve_size` is a SECOND engine, of that many connections and
+        no overflow, which exists so that one statement can still find a
+        connection when the pool above is at its ceiling.
+        `postern_core.store.audit`'s `append_with_reserve` is its only reader
+        and reaches it from one branch: `except sqlalchemy.exc.TimeoutError`,
+        which is the pool saying N connections are checked out and none came
+        back. Zero, the default, builds no second engine at all, so every
+        `Database` constructed outside a composition root behaves as it always
+        has.
+
+        WHY A FALLBACK AND NOT A SECOND POOL, since
+        `dev-docs/decisions/0013-connection-pool-ceiling.md` rejected the
+        second pool and its arithmetic still holds. That record's objection
+        was that two pools each keep their own `pool_size` open at the same
+        request concurrency, and it is right about two pools serving traffic.
+        This one serves none: the audit write uses the pool above FIRST, every
+        time, so the reserve is asked for a connection only after a checkout
+        has already been refused. `QueuePool` opens on demand, measured
+        against postgres:17-alpine on 2026-09-27 -- `checkedin()` is 0 before
+        first use and 1 after -- so a reserve that is never reached costs a
+        ceiling and not a connection. The record's other objection was that
+        two pools make "the store is full" produce two symptoms depending on
+        which ran out; under a fallback there is no which, because an
+        exhausted reserve is reachable only through an exhausted pool and
+        arrives as that exception's `__cause__`.
+        `tests/test_audit_reserve.py` measures both halves.
+
+        NOT null_pool. `NullPool` opens a connection per checkout and queues
+        for nothing, so it raises no `sqlalchemy.exc.TimeoutError` and there
+        is no ceiling for a reserve to be a reserve against; the branch below
+        builds none, and `tests/conftest.py`'s whole suite runs there.
+
         THE CONSTRAINT THIS FILE CANNOT SEE, and the reason these are
         configurable rather than constants:
 
-            replicas x (pool_size + max_overflow)
+            replicas x (pool_size + max_overflow + audit_reserve_size)
                 <= max_connections - superuser_reserved - everything else
 
         Both services connect to the same database, so both sides of that sum
@@ -106,13 +140,18 @@ class Database:
         nested them fails instead of merely halving the concurrency at which
         this service stops.
 
-        NEITHER VALUE IS BOUNDED HERE, matching the three deadlines above:
-        the floor lives in each service's ``from_env``, where the refusal can
-        name the environment variable an operator would have to edit. Both
-        have a value that reads as "small" and means "unlimited", measured
-        against postgres:17-alpine on 2026-09-26: at ``pool_size=0`` and at
-        ``max_overflow=-1`` an engine held 25 connections at once against a
-        ceiling that read as one.
+        NONE OF THE THREE IS BOUNDED HERE, matching the three deadlines
+        above: the floor lives in each service's ``from_env``, where the
+        refusal can name the environment variable an operator would have to
+        edit. Two of them have a value that reads as "small" and means
+        "unlimited", measured against postgres:17-alpine on 2026-09-26: at
+        ``pool_size=0`` and at ``max_overflow=-1`` an engine held 25
+        connections at once against a ceiling that read as one. The third's
+        zero is not an off switch of that kind but a plain absence, which is
+        why it is the DEFAULT here and still floored at one in the read
+        path's ``from_env``: a direct caller wants no second engine, and a
+        deployment that turned the reserve off would be choosing to lose the
+        row `tests/test_audit_reserve.py` exists to prove it keeps.
 
         Passing the values in the URL query string instead of `connect_args`
         does not work and was tried: SQLAlchemy hands asyncpg the string and
@@ -221,9 +260,60 @@ class Database:
         self.sessionmaker: async_sessionmaker[AsyncSession] = async_sessionmaker(
             self.engine, expire_on_commit=False
         )
+        # THE RESERVE. Same URL, same three deadlines, same `pool_pre_ping`:
+        # it is the identical path to the identical database, and the only
+        # thing it does not share is the queue whose exhaustion is the reason
+        # to reach it.
+        #
+        # `max_overflow=0`, fixed here and not configurable, which is the one
+        # value in this constructor an operator cannot move. Overflow exists
+        # to absorb a burst by opening connections above the ceiling, and the
+        # condition this engine is reached in -- the application pool refusing
+        # every checkout -- is precisely when every request in flight becomes
+        # such a burst. An overflow here would let the fallback open
+        # connections without a bound during a saturation event, against the
+        # same `max_connections` the pool it is standing in for has already
+        # run out of room under. `audit_reserve_size` is therefore the whole
+        # ceiling, and a deployment that wants more headroom raises that.
+        #
+        # Built eagerly and connected lazily, the same property
+        # `services/api/main.py` relies on for the pool above: nothing here
+        # opens a socket, so a reserve on a process that never saturates costs
+        # one Python object.
+        self.audit_reserve: AsyncEngine | None = (
+            None
+            if null_pool or audit_reserve_size <= 0
+            else create_async_engine(
+                url,
+                pool_pre_ping=True,
+                pool_timeout=pool_timeout_seconds,
+                pool_size=audit_reserve_size,
+                max_overflow=0,
+                connect_args={
+                    "timeout": connect_timeout_seconds,
+                    "command_timeout": command_timeout_seconds,
+                },
+            )
+        )
+        self.audit_reserve_sessionmaker: async_sessionmaker[AsyncSession] | None = (
+            None
+            if self.audit_reserve is None
+            else async_sessionmaker(self.audit_reserve, expire_on_commit=False)
+        )
 
     async def close(self) -> None:
+        """Both engines, and the reserve second.
+
+        Order is not load-bearing and is stated so nobody has to wonder:
+        neither dispose touches the other's connections. What matters is that
+        the reserve is disposed AT ALL -- it is a second set of sockets on the
+        same database, and a composition root that closed only `engine` would
+        leak `audit_reserve_size` connections per replica on every restart
+        against the one `max_connections` this whole file is budgeting.
+        """
         await self.engine.dispose()
+        if self.audit_reserve is not None:
+            await self.audit_reserve.dispose()
 
     async def __aenter__(self) -> "Database":
         return self

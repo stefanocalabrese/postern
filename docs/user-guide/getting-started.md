@@ -69,10 +69,11 @@ The table below lists every variable, grouped by service.
 | `POSTERN_DATABASE_POOL_TIMEOUT_SECONDS` | No | `1.0` | Database pool timeout (seconds). **Zero or greater**; zero sheds rather than queueing when the pool is saturated |
 | `POSTERN_DATABASE_POOL_SIZE` | No | `5` | Connections this replica keeps open. **At least 1**; zero is SQLAlchemy's spelling of "unlimited", not of "small" |
 | `POSTERN_DATABASE_MAX_OVERFLOW` | No | `10` | Connections this replica may open above `POSTERN_DATABASE_POOL_SIZE` and close again on return. **Zero or greater**; zero means no burst, and `-1` is the off switch |
+| `POSTERN_DATABASE_AUDIT_RESERVE_SIZE` | No | `1` | Connections held back so an audit row can still be written when the pool above is at its ceiling. **At least 1** — there is no value that turns it off. Opened only once the pool has actually refused a checkout, so an unsaturated replica holds none of them |
 | `POSTERN_MAX_BODY_BYTES` | No | `1048576` (1 MiB) | Maximum request body size in bytes. **At least 1**; at zero every request carrying a body is refused 413 |
 | `POSTERN_REQUEST_DEADLINE_SECONDS` | No | `101.0` | Wall-clock bound on the whole HTTP request (see [Audit System](components/audit.md)). **Greater than 0**, and finite: there is no off switch, raise the number instead |
 | `POSTERN_REQUIRE_PEM_KEY` | No | - | Set to `"1"` to refuse startup with an ephemeral read key |
-| `POSTERN_REQUIRE_REDIS` | No | - | Set to exactly `"1"` to refuse startup without `POSTERN_REDIS_URL`. Enforced by **both** services since 26 September 2026; `services/api` alone before that. No other spelling arms it — `true` and `yes` are silently ignored |
+| `POSTERN_REQUIRE_REDIS` | No | - | Refuses startup without `POSTERN_REDIS_URL`. Enforced by **both** services since 26 September 2026; `services/api` alone before that. `1`, `true`, `yes` and `on` arm it, case and surrounding whitespace ignored; `0`, `false`, `no`, `off`, empty and unset leave it off. Anything else refuses to start rather than guessing — this line said until 27 September 2026 that only `"1"` worked and that `true` was silently ignored, which was the defect `bool_from_env` fixed |
 | `POSTERN_REDIS_URL` | No | - | Redis connection string (for sessions, device codes, revocation lists, per-customer approval counters). Unset, each is per-replica: a revocation cuts one replica, a spent device code stays redeemable on the others, and R replicas admit R times the per-customer ceilings below. Point **both** services at the same instance — nothing checks that they agree |
 | `POSTERN_REDIS_SESSION_TTL` | No | `1800` (30 min) | How long a risk context accumulates its ZT-5 budget, on the Redis session store. **At least 1**; at zero every load answers `None`, so every call starts from an empty budget |
 
@@ -128,12 +129,13 @@ requirement, not something a gate here will catch.
 
 ### Sizing the connection pools
 
-The four pool variables above are the one set of numbers this repository cannot
+The five pool variables above are the one set of numbers this repository cannot
 pick for you, because the constraint involves your replica count and your
 database's limit and neither is visible from here:
 
 ```
-  api_replicas     x (POSTERN_DATABASE_POOL_SIZE + POSTERN_DATABASE_MAX_OVERFLOW)
+  api_replicas     x (POSTERN_DATABASE_POOL_SIZE + POSTERN_DATABASE_MAX_OVERFLOW
+                      + POSTERN_DATABASE_AUDIT_RESERVE_SIZE)
 + confirm_replicas x (POSTERN_CONFIRM_DATABASE_POOL_SIZE + POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW)
 + migrations, psql, monitoring, backups
 <= max_connections - superuser_reserved_connections
@@ -147,8 +149,21 @@ Going over is not a slowdown, it is a refusal at connect:
 `asyncpg.exceptions.TooManyConnectionsError: sorry, too many clients already`.
 
 At the defaults, four API replicas and two confirm replicas hold
-`4x15 + 2x10 = 80` connections, which leaves 17 of the default 100 once the 3
-reserved slots are taken. Six and three would need 120 and does not fit.
+`4x16 + 2x10 = 84` connections, which leaves 13 of the default 100 once the 3
+reserved slots are taken. Six and three would need 126 and does not fit.
+
+**The audit reserve is in the API term and has no counterpart on the write
+path.** `services/api` holds `5 + 10` pooled connections plus 1 reserved, so 16
+per replica; `services/confirm` holds `5 + 5` and no reserve, so 10. The
+reserve is the connection an audit row is written on when the pool is full —
+without it, a pool at its ceiling denies the call *and* loses the row that says
+why, because the consent lookup and the audit write draw on the same pool.
+`services/confirm` writes the same table under the same fail-closed policy and
+does not have one yet; until it does, a saturated write-path replica still
+loses its approval rows. Count the reserve as a ceiling rather than a standing
+cost — a replica opens it only once its pool has actually refused a checkout —
+but budget it, because the moment one replica needs it is the moment they all
+do.
 
 A pool holds one connection per in-flight *request*, not per request's worth of
 work: a tool call costs two to seven checkouts one after another, and an

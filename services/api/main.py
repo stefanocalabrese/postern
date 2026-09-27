@@ -347,6 +347,23 @@ def create_app(
         # the operator's behalf.
         pool_size=settings.database_pool_size,
         max_overflow=settings.database_max_overflow,
+        # THE RESERVE, and the reason it is on THIS `Database` rather than a
+        # second object passed alongside it. The two readers of the reserve
+        # are the two audit writes, and both reach the store through the object
+        # this line builds: `AuditMiddleware(db)` below for the completion row,
+        # and the `_PendingEntry` that middleware pre-binds for the entry row.
+        # A second `Database` would have to be threaded through both, plus
+        # `record_data_touch`'s `ContextVar` hop, and closed on shutdown
+        # separately; holding it here keeps "one `Database` per process" true
+        # and makes `db.close()` dispose both engines.
+        #
+        # Why the audit path needs one at all: this function hands the SAME
+        # `Database` to the consent lookup (`consent_db` below) and to the
+        # audit middleware, so a pool at its ceiling refuses both, and the row
+        # recording the refusal needed the connection that was missing.
+        # `services/api/settings.py` carries why the default is 1 and why the
+        # environment cannot set it to 0.
+        audit_reserve_size=settings.database_audit_reserve_size,
     )
 
     # Consent is enforced against `AuthContext.token`, which only exists when

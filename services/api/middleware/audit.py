@@ -116,6 +116,7 @@ from postern_core.store.models import (
     OUTCOME_RETURNED,
 )
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api import consent
 
@@ -621,8 +622,21 @@ class _PendingEntry:
     async def _write_entry_row(self) -> None:
         """The write itself, split out only so `record` above can wrap it in
         one `try` without burying the row's own field-by-field reasoning
-        inside an exception handler."""
-        async with self.db.sessionmaker() as session:
+        inside an exception handler.
+
+        THROUGH `append_with_reserve` SINCE 2026-09-27, which changes which
+        connection this gets and nothing else about it. A pool at its ceiling
+        used to fail this write, and failing this write stops the backend
+        request -- so a saturated replica turned every ungated call into a
+        failure with no row explaining it. `postern_core.store.audit`'s
+        `append_with_reserve` carries which single exception earns the
+        reserve and why every other one does not. The `written = True` below
+        stays exactly where it was, inside the session block and on the line
+        after the commit, because the callable this passes over IS the body of
+        that block.
+        """
+
+        async def row(session: AsyncSession) -> None:
             await audit.append(
                 session,
                 at=self.at,
@@ -716,6 +730,8 @@ class _PendingEntry:
             # the class docstring for the duplicate row the other placement
             # produces.
             self.written = True
+
+        await audit.append_with_reserve(self.db, row)
 
 
 # Set by `AuditMiddleware.on_call_tool` and read by `record_data_touch`,
@@ -1230,7 +1246,22 @@ class AuditMiddleware(Middleware):
         # `on_call_tool` always have a real value to supply.
         risk_signals: list[dict[str, Any]] | None,
     ) -> None:
-        async with self.db.sessionmaker() as session:
+        """THROUGH `append_with_reserve` SINCE 2026-09-27, for the row this
+        repository had recorded three times as its largest remaining gap.
+
+        Both reasons `services/api/consent.py` files for an unreachable store
+        arrive on THIS write, on the raised branch of `on_call_tool`, and a
+        pool at its ceiling refuses the consent lookup and this write
+        together -- so the two values existed in the code and reached
+        `audit_log` only for calls whose audit write happened to get a
+        connection. During saturation that is none of them.
+
+        The row is unchanged: same columns, same values, same instant, and
+        still fail-closed if it cannot be written at all. Only the connection
+        is new.
+        """
+
+        async def row(session: AsyncSession) -> None:
             await audit.append(
                 session,
                 at=at,
@@ -1257,3 +1288,5 @@ class AuditMiddleware(Middleware):
                 client_id=client_id,
                 risk_signals=risk_signals,
             )
+
+        await audit.append_with_reserve(self.db, row)

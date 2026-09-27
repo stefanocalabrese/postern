@@ -92,8 +92,28 @@ def api_defaults() -> Settings:
 
 
 def api_ceiling() -> int:
+    """Every connection one read-path replica can hold, the reserve included.
+
+    THE RESERVE IS IN THE SUM, and that is the point of computing it here
+    rather than writing 15. `postern_core.store.engine`'s `Database` holds a
+    second engine of `database_audit_reserve_size` connections so that an
+    audit row can still be written when the pool is at its ceiling
+    (`tests/test_audit_reserve.py`), and those connections come out of the
+    same server-wide `max_connections` as the pool's. Leaving them out would
+    make the arithmetic below quietly optimistic by one per replica.
+
+    It is a CEILING and not a standing cost -- `QueuePool` opens on demand and
+    the reserve is reached only after a refused checkout -- but a budget
+    against `max_connections` has to be written against what a replica MAY
+    hold, because the moment the reserve is needed is the moment every replica
+    needs it at once.
+    """
     settings = api_defaults()
-    return settings.database_pool_size + settings.database_max_overflow
+    return (
+        settings.database_pool_size
+        + settings.database_max_overflow
+        + settings.database_audit_reserve_size
+    )
 
 
 def confirm_ceiling() -> int:
@@ -485,6 +505,21 @@ class TestTheCeilingIsChosenPerServiceAndReachesTheEngine:
         assert ConfirmSettings().database_max_overflow == 5
         assert confirm_ceiling() < api_ceiling()
 
+    def test_the_read_paths_reserve_is_one_connection_and_is_in_the_ceiling(self) -> None:
+        """The third connection number, and the only one the write path lacks.
+
+        `services/confirm` writes the same `audit_log` from the same
+        fail-closed policy and has no reserve, so its ceiling is still
+        ``pool_size + max_overflow``. That is an asymmetry an operator has to
+        know about rather than a claim that the write path does not need one;
+        `docs/user-guide/getting-started.md` says so where the sizing
+        arithmetic is.
+        """
+        assert api_defaults().database_audit_reserve_size == 1
+        assert api_ceiling() == 16
+        assert not hasattr(ConfirmSettings(), "database_audit_reserve_size")
+        assert confirm_ceiling() == 10
+
     def test_the_defaults_fit_postgres_own_max_connections_at_a_stated_replica_count(
         self,
     ) -> None:
@@ -494,6 +529,12 @@ class TestTheCeilingIsChosenPerServiceAndReachesTheEngine:
         a promise about anybody's cluster;
         `dev-docs/decisions/0013-connection-pool-ceiling.md` is where an
         operator substitutes their own numbers.
+
+        THE NUMBER MOVED ON 2026-09-27, from 80 to 84, and it still fits.
+        `api_ceiling` now counts the read path's audit reserve, so a replica
+        may hold 16 rather than 15 and the worked example leaves 13 of the
+        default 100 rather than 17. The headroom assertion at the bottom is
+        what would have caught the change if it had not fit.
         """
         api_replicas, confirm_replicas = 4, 2
         api, confirm = api_ceiling(), confirm_ceiling()
