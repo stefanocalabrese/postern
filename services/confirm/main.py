@@ -68,6 +68,7 @@ from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource, warn_ephemeral_signing_key
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement
+from postern_core.env_inventory import enforce_known_environment
 from postern_core.store.engine import Database
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -218,6 +219,16 @@ def create_confirm_app(
             verify an approval signature, unreachable by construction rather
             than by remembering to configure one.
     """
+    # FIRST, AND AHEAD OF THE AUTHENTICATION GUARD, which is a deliberate
+    # exception to the ordering the next comment states. That order exists so
+    # an operator missing both authentication and Redis hears about
+    # authentication, and it is about two guards that read VALUES. This one
+    # reads NAMES, and when it fires it is the explanation for whatever the
+    # others are about to say: a typo in POSTERN_APP_ASSERTION_JWKS_URI makes
+    # the assertion guard report an incomplete configuration, which sends the
+    # operator to check a line they already wrote correctly. It costs one pass
+    # over os.environ and builds nothing.
+    enforce_known_environment(service="confirm")
     settings = settings or ConfirmSettings.from_env()
     verifier = assertion_verifier or _assertion_verifier(settings)
     # AFTER the assertion guard, so an operator missing both is told about

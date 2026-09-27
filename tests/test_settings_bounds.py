@@ -25,13 +25,22 @@ read. Measured on 2026-09-27 against planted shapes: ``raw =
 os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
 numeric rule completely, and it is the way a careless numeric read is most
 likely to be written. So the third rule keys on the one thing every spelling
-shares, the variable's NAME at the read site. The swept tree names 55
-``POSTERN_*`` variables in two disjoint populations: 18 read directly, all of
-them strings, listed in `READ_AS_STRING`; and 37 handed to a reader, which are
-`BOUNDED`'s 32, `STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
-nothing is in neither, and
-`TestEveryEnvironmentReadNamesAnInventoriedVariable` re-derives that from the
-tree on every run rather than trusting these numbers.
+shares, the variable's NAME at the read site. The swept tree names 56
+``POSTERN_*`` variables in two disjoint populations: 19 read directly, all of
+them strings, and 37 handed to a reader, which are `BOUNDED`'s 32,
+`STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both, nothing is in neither,
+and `TestEveryEnvironmentReadNamesAnInventoriedVariable` re-derives that from
+the tree on every run rather than trusting these numbers.
+
+WHERE THE NAMES THEMSELVES NOW LIVE, since 2026-09-27: not here.
+`postern_core/env_inventory.py`'s `INVENTORY` is the one copy, because a
+startup guard in both composition roots needs it and cannot import from
+``tests``. `READ_AS_STRING` and `FLAGS` below are projections of that table,
+and `test_the_two_inventories_are_the_whole_tree` asserts the tree's names and
+the table's names are the SAME SET -- which fails in both directions, so a
+variable declared there and read nowhere is caught as well as one read here and
+declared nowhere. The first would make the runtime guard accept a name that
+arms nothing, which is the defect that guard exists for.
 
 WHAT THE INVENTORY BELOW IS FOR. `BOUNDED` is the whole set, one record per
 variable, and every test here is parametrized over it. A new numeric setting
@@ -43,7 +52,7 @@ THE SWEEPS HAD NO POSITIVE CONTROL UNTIL 2026-09-27, which mattered more than
 any single gap in them. Every rule here asserts ``offenders == []``, so a
 predicate that detected nothing passed exactly as a clean tree does. Measured:
 with `_reads_the_environment` replaced by ``return False``, both repo-walking
-rules still reported green. `SHAPES` is the fix -- 34 planted spellings, each
+rules still reported green. `SHAPES` is the fix -- 36 planted spellings, each
 naming the exact set of rules that must report it -- and blinding the same
 predicate now fails 30 of the 30 rows that expect a report.
 
@@ -75,6 +84,7 @@ from postern_core.config import (
     float_from_env,
     int_from_env,
 )
+from postern_core.env_inventory import INVENTORY, KNOWN_ENV, names_read_by
 from postern_core.risk.session import DEFAULT_SESSION_TTL_SECONDS, MIN_SESSION_TTL_SECONDS
 from postern_core.store.audit import MAX_ARGUMENTS_BYTES
 
@@ -1041,68 +1051,94 @@ _READER_NAME_POSITION: dict[str, int | None] = {
     "_device_code_ttl": 0,
 }
 
-#: The functions allowed to read a variable whose name they were handed.
+#: The exact functions allowed to read a variable whose name they were handed.
 #:
-#: It is the same six names as `_READER_NAME_POSITION` and that is not a
+#: It is the same six functions as `_READER_NAME_POSITION` and that is not a
 #: coincidence: a reader is by definition the thing that takes a name, so the
 #: set of functions that may read a name they did not write down is exactly the
 #: set of readers. A seventh would make every variable it reads invisible to
 #: the two inventories below, which is the objection
 #: `postern_core/config.py`'s own docstring raises against "a third validation
 #: style in the tree".
-GENERIC_READERS = frozenset(_READER_NAME_POSITION)
+#:
+#: KEYED ON MODULE AND FUNCTION, NOT ON THE NAME ALONE. `_READER_NAME_POSITION`
+#: above is deliberately still name-keyed, because a CALL to ``int_from_env``
+#: from any module really is a call to the one reader. Being the callee is the
+#: opposite: it is a licence, and a licence held by a word rather than by a
+#: place is held by anything that spells itself the same way.
+GENERIC_READERS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("packages/postern-core/src/postern_core/config.py", "int_from_env"),
+        ("packages/postern-core/src/postern_core/config.py", "float_from_env"),
+        ("packages/postern-core/src/postern_core/config.py", "bool_from_env"),
+        ("packages/postern-core/src/postern_core/config.py", "int_arg_or_env"),
+        ("services/confirm/settings.py", "_positive_int"),
+        ("services/confirm/settings.py", "_device_code_ttl"),
+    }
+)
+
+#: The one function allowed to reach the environment without naming a variable.
+#:
+#: Enumerating what an operator set is the only job in this repository that
+#: cannot be done through a name, because the names are what it is looking for.
+#: `postern_core/env_inventory.py`'s `classify_environment` is therefore a bulk
+#: read by necessity, and `SHAPES` below lists a bulk read as an offence --
+#: correctly, since one makes every variable downstream invisible to the two
+#: name rules. So it is declared here rather than exempted by a special case,
+#: and the list is one entry long: a second function enumerating the environment
+#: would be a second place deciding what an unknown variable means, and there is
+#: one such decision.
+ENVIRONMENT_ENUMERATORS: frozenset[tuple[str, str]] = frozenset(
+    {("packages/postern-core/src/postern_core/env_inventory.py", "classify_environment")}
+)
+
+#: Every place licensed to touch the environment without naming a variable.
+LICENSED_SITES = GENERIC_READERS | ENVIRONMENT_ENUMERATORS
+
+
+def _is_licensed(site: EnvSite) -> bool:
+    """Whether this site may reach the environment without naming a variable.
+
+    ONE PREDICATE, TWO CALLERS, and it was two copies for an afternoon.
+    `_inventory_offenders` applies it and so does the repo-wide test, which
+    re-implements the walk for the sake of a better message. Two copies meant a
+    mutation could revert one of them to name-keying and no test would notice,
+    because the distinction only shows up when a duplicate function name exists
+    in the tree -- which is exactly the case the licence is protecting against.
+    """
+    return (site.module, site.enclosing) in LICENSED_SITES
+
 
 #: Every variable the swept tree reads DIRECTLY, without a bounded reader.
 #:
-#: ALL EIGHTEEN ARE STRINGS, and that is the invariant this list exists to
-#: hold rather than an observation about today's tree. A number belongs in
-#: `BOUNDED` or `STORE_BOUNDED` and is read through `int_from_env` or
-#: `float_from_env`; a flag belongs in `FLAGS` and is read through
-#: `bool_from_env`. Only a value with no bound to state -- a URL, a filesystem
-#: path, a key id, an issuer, an audience, a Redis key prefix -- is read
-#: straight out of the environment, and then its name belongs here.
+#: DERIVED, NOT LISTED, SINCE 2026-09-27. This file spelled out all eighteen
+#: names it then knew about
+#: names until `postern_core/env_inventory.py` had to exist: a runtime guard
+#: cannot import from ``tests``, so the list moved into production code, and the
+#: choice was then whether this file keeps a second copy. It does not. Every set
+#: below is a projection of `INVENTORY`, so the repository holds ONE copy of the
+#: name list, and what keeps that copy honest is the sweep further down, which
+#: re-derives the same names from the syntax tree of every shipping module.
 #:
-#: WHAT ADDING A NAME HERE COSTS THE AUTHOR, which is the whole mechanism: it
-#: is a line in a diff, in a list whose docstring says flags and numbers do not
-#: belong in it. The rule cannot stop someone writing that line. It can stop
-#: them adding a flag without anyone seeing them do it.
+#: WHAT THE INVARIANT STILL IS. All nineteen are strings, and that is a rule
+#: rather than an observation: a number belongs in `BOUNDED` or `STORE_BOUNDED`
+#: and is read through `int_from_env` or `float_from_env`; a flag belongs in
+#: `FLAGS` and is read through `bool_from_env`. Only a value with no bound to
+#: state -- a URL, a filesystem path, a key id, an issuer, an audience, a Redis
+#: key prefix, and this guard's own comma-separated declaration list -- is read
+#: straight out of the environment, and then its row carries ``kind="string"``.
 READ_AS_STRING: frozenset[str] = frozenset(
-    {
-        "POSTERN_APP_ASSERTION_AUDIENCE",
-        "POSTERN_APP_ASSERTION_ISSUER",
-        "POSTERN_APP_ASSERTION_JWKS_URI",
-        "POSTERN_AUDIENCE",
-        "POSTERN_BACKEND_BASE_URL",
-        "POSTERN_DATABASE_URL",
-        "POSTERN_DEVICE_KEYS_PATH",
-        "POSTERN_DEVICE_VERIFICATION_URI",
-        "POSTERN_JWKS_URI",
-        "POSTERN_READ_KEY_KID",
-        "POSTERN_READ_KEY_PEM_PATH",
-        "POSTERN_READ_TOKEN_ISSUER",
-        "POSTERN_REDIS_KEY_PREFIX",
-        "POSTERN_REDIS_URL",
-        "POSTERN_TOKEN_ISSUER",
-        "POSTERN_WRITE_KEY_KID",
-        "POSTERN_WRITE_KEY_PEM_PATH",
-        "POSTERN_WRITE_TOKEN_ISSUER",
-    }
+    entry.name for entry in INVENTORY if entry.kind == "string"
 )
 
 #: The three flags, each read through `postern_core/config.py`'s `bool_from_env`.
 #:
-#: They carry no bound and so no `Bounded` record, which is why they are a bare
-#: set of names: what `bool_from_env` enforces is an ACCEPTING SET, the same one
-#: for every flag, and it is pinned in `tests/test_require_redis_guard.py`
-#: rather than per variable. All three were read by hand until 2026-09-26, and
-#: ``POSTERN_REQUIRE_PEM_KEY=true`` meant "do not require a PEM key".
-FLAGS: frozenset[str] = frozenset(
-    {
-        "POSTERN_REQUIRE_PEM_KEY",
-        "POSTERN_REQUIRE_REDIS",
-        "POSTERN_STRICT_HEADERS",
-    }
-)
+#: They carry no bound and so no `Bounded` record: what `bool_from_env` enforces
+#: is an ACCEPTING SET, the same one for every flag, pinned in
+#: `tests/test_require_redis_guard.py` rather than per variable. All three were
+#: read by hand until 2026-09-26, and ``POSTERN_REQUIRE_PEM_KEY=true`` meant
+#: "do not require a PEM key".
+FLAGS: frozenset[str] = frozenset(entry.name for entry in INVENTORY if entry.kind == "flag")
 
 #: The names in the two numeric inventories above, for the membership test.
 BOUNDED_NAMES: frozenset[str] = frozenset(bound.name for bound in BOUNDED)
@@ -1131,9 +1167,17 @@ class EnvSite:
     copy, a write, or the mapping passed somewhere whole. ``name`` is ``None``
     when the sweep could not resolve one, which is an offence outside a
     generic reader and the normal case inside one.
+
+    ``module`` AND ``enclosing`` TOGETHER, NOT ``enclosing`` ALONE, and that
+    pair is what the two allowlists below are keyed on. Until 2026-09-27 the
+    exemptions were matched on the function's NAME, so a second function called
+    ``classify_environment`` or ``int_from_env``, in any module in the tree,
+    inherited the exemption of the one that had earned it -- measured, by
+    planting one. An allowlist has to name a place.
     """
 
     where: str
+    module: str
     shape: str
     name: str | None
     enclosing: str | None
@@ -1246,7 +1290,7 @@ def env_sites(where: str, source: str) -> tuple[EnvSite, ...]:
         return _reads_the_environment(node, aliases)
 
     def record(node: ast.expr, shape: str, name: str | None) -> None:
-        sites.append(EnvSite(f"{where}:{node.lineno}", shape, name, enclosing.get(id(node))))
+        sites.append(EnvSite(f"{where}:{node.lineno}", where, shape, name, enclosing.get(id(node))))
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and accessor(node.value):
@@ -1347,7 +1391,7 @@ def _inventory_offenders(where: str, source: str) -> list[str]:
     offenders: list[str] = []
     for site in env_sites(where, source):
         if site.name is None:
-            if site.enclosing not in GENERIC_READERS:
+            if not _is_licensed(site):
                 offenders.append(f"{site.where} names no variable")
         elif site.shape == "direct" and site.name not in READ_AS_STRING:
             offenders.append(f"{site.where} reads {site.name!r} directly")
@@ -1642,6 +1686,24 @@ SHAPES: tuple[Shape, ...] = (
         "the six are a closed list and a seventh fails.",
     ),
     Shape(
+        "a function spelled like a licensed reader",
+        "import os\ndef int_from_env(name: str) -> int:\n    return int(os.environ.get(name, 0))\n",
+        ("numeric", "inventory"),
+        "The licence belongs to a PLACE, not a word. Until 2026-09-27 both "
+        "allowlists were keyed on the function name alone, so any module could "
+        "take an exemption by spelling itself the same way -- measured by "
+        "planting one, which passed.",
+    ),
+    Shape(
+        "a second function spelled classify_environment",
+        "import os\n"
+        "def classify_environment(service: str) -> dict[str, str]:\n"
+        "    return dict(os.environ)\n",
+        ("inventory",),
+        "The same hole in the enumerator licence, which is the one this file "
+        "granted itself, and the reason both are keyed on module and function.",
+    ),
+    Shape(
         "dict(os.environ)",
         f'import os\nE = dict(os.environ)\nF = E.get("{_UNKNOWN}") == "1"\n',
         ("inventory",),
@@ -1738,10 +1800,10 @@ class TestTheSweepSeesEveryShapeItClaimsTo:
         only thing that keeps a docstring full of numbers honest.
         """
         caught_by = [shape.caught_by for shape in SHAPES]
-        assert len(SHAPES) == 34
+        assert len(SHAPES) == 36
         assert caught_by.count(()) == 4
-        assert caught_by.count(("inventory",)) == 19
-        assert sum(1 for rules in caught_by if {"numeric", "boolean"} & set(rules)) == 11
+        assert caught_by.count(("inventory",)) == 20
+        assert sum(1 for rules in caught_by if {"numeric", "boolean"} & set(rules)) == 12
 
     @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: s.label)
     def test_the_rules_that_fire_are_exactly_the_ones_the_table_names(self, shape: Shape) -> None:
@@ -1756,20 +1818,20 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
     """The name at the read site, which is the one thing every spelling shares.
 
     WHAT THIS RULE IS FOR. The two sweeps above key on what a value is USED
-    as. That is why `SHAPES` above holds 19 rows they miss and this one catches
+    as. That is why `SHAPES` above holds 20 rows they miss and this one catches
     alone, and the worst of them is not exotic: binding a read to a local
     and calling ``int()`` on the next line defeats the numeric rule
     completely, and it is the way a careless author is most likely to write a
     numeric read. A rule keyed on the CONSUMER can always be evaded by one
     assignment, because the consumer can be arbitrarily far from the read.
 
-    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 55 distinct
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 56 distinct
     ``POSTERN_*`` variables across the swept roots, in two disjoint
-    populations. 18 are read directly, and all 18 are strings -- a URL, a
-    path, a key id, an issuer, an audience, a key prefix. 37 are handed to a
-    reader as its ``name`` argument, and those are the 32 in `BOUNDED`, the 2
-    in `STORE_BOUNDED` and the 3 in `FLAGS`. Nothing is in both and nothing is
-    in neither, which
+    populations. 19 are read directly, and all 19 are strings -- a URL, a
+    path, a key id, an issuer, an audience, a key prefix, and one
+    comma-separated list of names. 37 are handed to a reader as its ``name``
+    argument, and those are the 32 in `BOUNDED`, the 2 in `STORE_BOUNDED` and
+    the 3 in `FLAGS`. Nothing is in both and nothing is in neither, which
     `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
     re-derives on every run.
 
@@ -1842,20 +1904,18 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
 
     def test_no_module_reaches_the_environment_without_naming_a_variable(self) -> None:
         offenders = [
-            site.where
-            for site in _all_env_sites()
-            if site.name is None and site.enclosing not in GENERIC_READERS
+            site.where for site in _all_env_sites() if site.name is None and not _is_licensed(site)
         ]
         assert offenders == [], (
             f"{offenders} reach the environment without naming a variable this sweep "
             "can resolve -- a built name, a bulk copy, a write, or a seventh generic "
             "reader. Every one of those makes a variable invisible to the two rules "
             f"above. The readers allowed to take a name they were handed are "
-            f"{sorted(GENERIC_READERS)}."
+            f"{sorted(LICENSED_SITES)}."
         )
 
     def test_the_two_inventories_are_the_whole_tree(self) -> None:
-        """55 variables, 18 read directly and 37 through a reader, disjoint."""
+        """56 variables, 19 read directly and 37 through a reader, disjoint."""
         direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
         through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
         assert direct & through == set(), (
@@ -1864,8 +1924,80 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
         assert direct == set(READ_AS_STRING)
         assert through == BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS
-        assert len(direct) == 18
-        assert len(through) == 37
+        # THE ANTI-DRIFT ASSERTION, and the reason this file no longer keeps its
+        # own copy of the names. Set equality fails in both directions: a name
+        # the tree reads that `INVENTORY` does not declare would leave the
+        # runtime guard refusing a variable an operator is right to set, and a
+        # name `INVENTORY` declares that nothing reads would leave the guard
+        # accepting one that arms nothing -- the defect it exists for,
+        # reintroduced inside the control itself.
+        assert direct | through == set(KNOWN_ENV)
+        assert len(KNOWN_ENV) == 56
+
+    def test_the_counts_the_docstrings_quote(self) -> None:
+        """Every number the prose in this file states, re-derived.
+
+        The prose is dense with counts and a count that goes stale reads as
+        confidently as one that is right. A variable added anywhere fails here,
+        which is the line that sends the author to the sentences.
+        """
+        assert len(KNOWN_ENV) == 56
+        assert len(READ_AS_STRING) == 19
+        assert len(FLAGS) == 3
+        assert len(BOUNDED_NAMES) == 32
+        assert len(STORE_BOUNDED_NAMES) == 2
+        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS) == 37
+        assert len(names_read_by("api")) == 30
+        assert len(names_read_by("confirm")) == 40
+
+    def test_each_rows_services_are_the_roots_that_actually_read_it(self) -> None:
+        """`INVENTORY`'s ``services`` column, re-derived from the syntax tree.
+
+        This is the half of the runtime inventory an AST sweep can check that
+        no unit test can: which DEPLOYABLE reads a variable. The rule is the
+        module path -- a read under ``services/api`` is the read path's, one
+        under ``services/confirm`` is the write path's, and one under
+        ``packages`` or ``migrations`` counts for both, because both import that
+        library and both run those migrations.
+
+        THAT LAST CLAUSE IS GENEROUS ON PURPOSE AND THE DIRECTION MATTERS.
+        ``POSTERN_REDIS_SESSION_TTL`` is read by `postern_core.risk.session`'s
+        ``RedisSessionStore``, which only `services/api` builds, so this records
+        it as read by both and the write path reads nothing. The error is always
+        toward calling a variable READ, so it can cost a report that was owed
+        and can never produce a refusal that was not.
+        """
+        reading_roots: dict[str, set[str]] = {}
+        for where, source in _swept_modules():
+            for site in env_sites(where, source):
+                if not site.name:
+                    continue
+                if where.startswith("services/api/"):
+                    root = "api"
+                elif where.startswith("services/confirm/"):
+                    root = "confirm"
+                else:
+                    root = "both"
+                reading_roots.setdefault(site.name, set()).add(root)
+
+        wrong: list[str] = []
+        for entry in INVENTORY:
+            roots = reading_roots[entry.name]
+            expected = {"api", "confirm"} if "both" in roots else roots
+            if set(entry.services) != expected:
+                wrong.append(f"{entry.name}: declared {entry.services}, read by {sorted(expected)}")
+        assert wrong == [], (
+            f"{wrong}. The services column drives which variables each composition root "
+            "reports as unread, so a wrong row either hides a safety switch that arms "
+            "nothing on this service or warns about one that works."
+        )
+
+    def test_every_service_reads_a_name_the_other_one_does_not(self) -> None:
+        """Or population 2 would be empty and the whole distinction moot."""
+        api, confirm = names_read_by("api"), names_read_by("confirm")
+        assert api - confirm
+        assert confirm - api
+        assert api | confirm == KNOWN_ENV
 
     def test_no_inventoried_string_is_also_a_number_or_a_flag(self) -> None:
         """The partition is asserted on the inventories too, not only the tree."""

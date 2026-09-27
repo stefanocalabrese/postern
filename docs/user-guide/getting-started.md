@@ -45,6 +45,44 @@ make fmt        # format all Python files in packages, services, tests
 Both services read configuration from environment variables prefixed with `POSTERN_`.
 The table below lists every variable, grouped by service.
 
+### A `POSTERN_` variable nothing reads stops the service from starting
+
+Both services check the whole `POSTERN_` namespace at startup, before reading any
+value, and refuse to start on a name that neither service reads:
+
+```
+1 POSTERN_ variable(s) are set that no code in this deployment reads:
+  POSTERN_REQUIRE_REDDIS Did you mean POSTERN_REQUIRE_REDIS?
+```
+
+This exists because a misspelt name is not detectable any other way. Every check on
+a value — the bounds below, the four accepted spellings of a flag — needs the name to
+be read first, and nothing reads `POSTERN_REQUIRE_REDDIS`, so the value behind it
+never reaches a check and the variable is indistinguishable from one you never set.
+You would have armed nothing and been told nothing. Three of these variables are
+safety switches (`POSTERN_REQUIRE_REDIS`, `POSTERN_REQUIRE_PEM_KEY`,
+`POSTERN_STRICT_HEADERS`), and a switch that silently fails to arm is worse than one
+that does not exist.
+
+Names are compared exactly, so `postern_require_redis` and `POSTERN_REQUIRE_REDIS `
+(trailing space) are each a different variable from `POSTERN_REQUIRE_REDIS` and each
+refused, with the name you meant in the message.
+
+**A variable the *other* service reads is not refused.** Running one environment file
+against both deployables is normal — `POSTERN_CONFIRM_RATE_LIMIT_TOKEN` in the API
+service's environment configures nothing there and is logged, not fatal. Check the
+log line when the variable is a switch: `POSTERN_REQUIRE_PEM_KEY` and
+`POSTERN_STRICT_HEADERS` are read by the API service **only**, so setting either on
+the confirm service arms nothing.
+
+**If your deployment sets a `POSTERN_` variable for something else** — a sidecar, your
+own tooling, a version you have not deployed yet — name it in
+`POSTERN_ALLOWED_UNREAD_ENV` and the service starts. It takes exact names, comma
+separated, and no wildcards: a `POSTERN_SIDECAR_*` pattern would hide a typo inside
+that family, which is what this check is for. Misspelling `POSTERN_ALLOWED_UNREAD_ENV`
+itself cannot switch the check off — the misspelling is an unread `POSTERN_` name, so
+the service refuses and names this variable as the one you meant.
+
 ### API Service (`services/api/settings.py`)
 
 | Variable | Required | Default | Description |
@@ -115,6 +153,12 @@ The table below lists every variable, grouped by service.
 | `POSTERN_CONFIRM_DATABASE_POOL_SIZE` | No | `5` | Connections this replica keeps open, separate from the API service's `POSTERN_DATABASE_POOL_SIZE`. **At least 1** |
 | `POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW` | No | `5` | Burst above `POSTERN_CONFIRM_DATABASE_POOL_SIZE`. **Zero or greater**. Lower than the API service's 10 because one approval is one person tapping a phone, and both services draw on one `max_connections` |
 | `POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE` | No | `1` | Connections held back so an approval's **completion** row can still be written when the pool above is at its ceiling. **At least 1** — no value turns it off. Serves `ApprovalAudit`'s completion row and every `PairingAudit` row, and deliberately **not** the entry row: see the sizing section below |
+
+### Both services
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `POSTERN_ALLOWED_UNREAD_ENV` | No | - | `POSTERN_` variable names this deployment sets that Postern does not read, comma separated, exact names, no wildcards. Without it, any such name refuses startup — see the section above |
 
 The three `POSTERN_APP_ASSERTION_*` variables are the only **required** settings on
 either service. `create_confirm_app()` raises `ValueError` and the process does not

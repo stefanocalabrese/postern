@@ -66,6 +66,7 @@ from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
 from postern_core.auth.revocation import create_revocation_store, decision_scope
 from postern_core.config import bool_from_env, enforce_redis_requirement
+from postern_core.env_inventory import enforce_known_environment
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
@@ -224,6 +225,16 @@ def create_app(
     external dependencies because there is no live customer token, real
     operator backend or real identity provider to call against in CI.
     """
+    # FIRST, BEFORE ANY VALUE IS READ. `Settings.from_env` below validates the
+    # value behind every name it asks for and cannot see a name nobody asks
+    # for, so a misspelt variable reaches it as an unset one and takes a
+    # default in silence. This refuses on the name instead, and it runs first
+    # because when it fires its message explains the failures the guards below
+    # would otherwise report: an operator who typed POSTERN_JWKS_UR is told
+    # about the typo rather than about a service running in no-auth mode.
+    # `postern_core/env_inventory.py` carries the three populations, why only
+    # the third refuses, and why the escape hatch cannot be the hole.
+    enforce_known_environment(service="api")
     settings = settings or Settings.from_env()
 
     # Plan 3 Task 2: one minter, built over the READ key only. `BackendClient`
