@@ -7,8 +7,11 @@ the check does when that line raises instead of returning a decision:
 `dev-docs/decisions/0006-audit-write-failure.md` made that call deliberately for
 audit writes and wrote the cost down, but consent never had the equivalent.
 These tests pinned the answer measured on 2026-09-17, so it was a fact in
-the repository before anyone changed it, and the three whose names still
-carry "currently" assert what IS rather than what should be.
+the repository before anyone changed it. Three of them carried "currently" in
+their names to mark that they asserted what IS rather than what should be;
+the word came out on 27 September 2026, once the policy was chosen
+deliberately -- fail closed, and say so distinguishably. Their assertions did
+not move with the word.
 
 ONE OF THEM WAS REWRITTEN ON 26 SEPTEMBER 2026, which is what the file said
 would happen when the policy was chosen deliberately. capo ruled that
@@ -477,7 +480,7 @@ async def test_control_a_healthy_consent_check_lists_and_runs_the_consented_tool
     assert backend.paths == ["/accounts"], "the control must actually reach the backend"
 
 
-async def test_a_raising_consent_check_currently_hides_every_consent_gated_tool(
+async def test_a_raising_consent_check_hides_every_consent_gated_tool(
     pg_url: str,
     key_pair: RSAKeyPair,
     database: Database,
@@ -501,7 +504,7 @@ async def test_a_raising_consent_check_currently_hides_every_consent_gated_tool(
         await dead.close()
 
 
-async def test_a_raising_consent_check_currently_denies_the_call_and_never_runs_the_tool(
+async def test_a_raising_consent_check_denies_the_call_and_never_runs_the_tool(
     pg_url: str,
     key_pair: RSAKeyPair,
     database: Database,
@@ -902,7 +905,7 @@ async def test_a_hung_store_now_costs_one_connect_timeout_per_call_not_five(
     assert backend.paths == [], "a hung store must not let the tool body run"
 
 
-async def test_a_blackholed_consent_store_currently_denies_only_after_the_driver_timeout(
+async def test_a_blackholed_consent_store_denies_only_after_one_driver_timeout(
     pg_url: str,
     key_pair: RSAKeyPair,
     database: Database,
