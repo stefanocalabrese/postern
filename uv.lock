@@ -10,6 +10,8 @@ resolution-markers = [
 [manifest]
 members = [
     "postern",
+    "postern-cards",
+    "postern-cards-write",
     "postern-core",
 ]
 
@@ -1520,6 +1522,8 @@ dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "fastmcp" },
+    { name = "postern-cards" },
+    { name = "postern-cards-write" },
     { name = "postern-core", extra = ["redis"] },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "structlog" },
@@ -1545,6 +1549,8 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.20,<2" },
     { name = "asyncpg", specifier = ">=0.31" },
     { name = "fastmcp", specifier = ">=4.0.3,<5" },
+    { name = "postern-cards", editable = "packages/postern-cards" },
+    { name = "postern-cards-write", editable = "packages/postern-cards-write" },
     { name = "postern-core", extras = ["redis"], editable = "packages/postern-core" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.52,<3" },
     { name = "structlog", specifier = ">=25.1" },
@@ -1564,6 +1570,28 @@ dev = [
     { name = "types-docker", specifier = ">=7.2.0.20260827" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20260906" },
 ]
+
+[[package]]
+name = "postern-cards"
+version = "0.1.0"
+source = { editable = "packages/postern-cards" }
+dependencies = [
+    { name = "postern-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "postern-core", editable = "packages/postern-core" }]
+
+[[package]]
+name = "postern-cards-write"
+version = "0.1.0"
+source = { editable = "packages/postern-cards-write" }
+dependencies = [
+    { name = "postern-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "postern-core", editable = "packages/postern-core" }]
 
 [[package]]
 name = "postern-core"

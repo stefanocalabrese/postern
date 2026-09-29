@@ -1,4 +1,4 @@
-.PHONY: ci lint fmt fmt-check type imports lock citations citations-baseline test migrations
+.PHONY: ci lint fmt fmt-check type imports lock citations citations-baseline test migrations tool-surface
 
 ci: lint fmt-check type imports lock citations test
 
@@ -75,3 +75,17 @@ test:
 # free Postgres service container, dispatched manually.
 migrations:
 	POSTERN_DATABASE_URL=$${POSTERN_DATABASE_URL:-postgresql+asyncpg://postern:postern@localhost:5432/postern} uv run alembic check
+
+# Regenerates `tool-surface.json`, the checked-in record of every registered
+# tool and every backend write route. NOT a `ci` dependency, and that is the
+# point: `tests/test_tool_surface_golden.py` runs inside `test` and FAILS when
+# the file disagrees with the assembled server, so a module that changes the
+# surface breaks the build until someone regenerates the file and commits the
+# diff. A target that rewrote it as part of `ci` would make the gate agree with
+# whatever just happened, which is the opposite of a gate.
+#
+# Reach for it after adding, removing or re-declaring a module -- including one
+# installed from outside this repository, since that is exactly the change
+# `git diff` on this tree would otherwise not show.
+tool-surface:
+	uv run python tools/write_tool_surface.py

@@ -2,6 +2,8 @@
 root_packages =
     services
     postern_core
+    postern_cards
+    postern_cards_write
 
 # The api/confirm pair is forbidden in both directions, not just one, because
 # the two services are separately deployed with different Vault key material:
@@ -40,3 +42,67 @@ source_modules =
     postern_core.facade
 forbidden_modules =
     postern_core.store
+
+# THE THREE CONTRACTS BELOW ARE THE MODULE SEAM'S HALF OF THE KEY SPLIT, added
+# 2026-09-29. A module that adds a write operation has two halves loading into
+# two different processes, and the read process holds a READ signing key. If a
+# module's write half can reach `services.api`, the split stops being an
+# infrastructure property and becomes a code-review promise, which is exactly
+# what CLAUDE.md says it must not be.
+#
+# WHAT THESE CAN AND CANNOT SEE. import-linter graphs the root packages listed
+# above, so the first two cover this repository's own cards module by name and
+# the third covers ANY module, in this tree or outside it, because the one thing
+# a write half must import in order to declare an operation at all is
+# `postern_core.modules.write`. An out-of-repo distribution is in nobody's
+# graph, which is why
+# `postern_core.modules.read._refuse_write_half_in_the_read_path` watches for
+# that same import appearing in `sys.modules` at load time -- measured in a
+# subprocess by `tests/test_module_seam_write_half.py`, because a graph cannot
+# see a wheel nobody listed here.
+
+[importlinter:contract:api-not-module-write-half]
+name = The API service must not import any module write half
+type = forbidden
+source_modules =
+    services.api
+forbidden_modules =
+    postern_core.modules.write
+    postern_cards_write
+
+# The read protocol knows the write group's NAME -- `postern_core.modules.groups`
+# holds both strings and no types, for exactly this reason -- so that
+# `refuse_distributions_declaring_both_halves` can compare the two groups'
+# distributions without the read path importing the write half's types. Without
+# this contract that separation is one convenience import away from collapsing,
+# and it would take the contract above with it: every reader of
+# `postern_core.modules.read` would then reach the write protocol transitively.
+[importlinter:contract:read-protocol-not-write-protocol]
+name = The read module protocol must not import the write module protocol
+type = forbidden
+source_modules =
+    postern_core.modules.read
+forbidden_modules =
+    postern_core.modules.write
+
+# A module's two halves must not import one another either. The read half runs
+# in the process with the READ key; a read half that imported its own write half
+# would put the write routing in the read image through its own dependency
+# rather than through `services.api`, which the first contract would not see.
+[importlinter:contract:module-halves-do-not-meet]
+name = A module read half and write half must not import one another
+type = forbidden
+source_modules =
+    postern_cards
+forbidden_modules =
+    postern_cards_write
+
+[importlinter:contract:module-write-half-not-read-half]
+name = A module write half must not import its read half or either service
+type = forbidden
+source_modules =
+    postern_cards_write
+forbidden_modules =
+    postern_cards
+    services.api
+    services.confirm

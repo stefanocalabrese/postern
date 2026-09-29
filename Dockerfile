@@ -51,7 +51,14 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58 AS builder
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
+# Every workspace member's `pyproject.toml`, and not just the library's: the
+# root project depends on all three through `[tool.uv.sources] workspace = true`,
+# and `[tool.uv.workspace] members = ["packages/*"]` globs the directory. A
+# member whose manifest is absent from this layer is a member uv cannot resolve,
+# so the sync below fails rather than quietly omitting it.
 COPY packages/postern-core/pyproject.toml packages/postern-core/
+COPY packages/postern-cards/pyproject.toml packages/postern-cards/
+COPY packages/postern-cards-write/pyproject.toml packages/postern-cards-write/
 # `--frozen` refuses to update `uv.lock`: the build fails instead of silently
 # drifting from the committed lockfile. `--no-install-project` alone still
 # tries to build the `postern-core` workspace member from source (measured:
@@ -125,6 +132,18 @@ USER 1000:1000
 FROM runtime AS api
 COPY --from=serving-venv /app/.venv /app/.venv
 COPY --from=builder /app/services/api /app/services/api
+# The cards MODULE's read half, and not its write half. This is the image-level
+# expression of the module seam's share of the key split, and it works because
+# `uv sync` installs a workspace member editable: the venv holds a
+# `postern_cards_write.pth` pointing at a source directory this image does not
+# copy, so `import postern_cards_write` raises `ModuleNotFoundError` here. A
+# single distribution declaring both entry-point groups would defeat that --
+# `site-packages` is copied whole -- which is why
+# `postern_core.modules.read.refuse_distributions_declaring_both_halves` refuses
+# one. `tests/test_module_halves_in_images.py` holds every module pair in
+# `packages/` to this rule, derived from the tree rather than listed, so the next
+# module pair is covered without editing that file.
+COPY --from=builder /app/packages/postern-cards/src /app/packages/postern-cards/src
 CMD ["uvicorn", "services.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 # The write path, and only the write path. The read service's tool handlers,
@@ -132,6 +151,10 @@ CMD ["uvicorn", "services.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
 FROM runtime AS confirm
 COPY --from=serving-venv /app/.venv /app/.venv
 COPY --from=builder /app/services/confirm /app/services/confirm
+# The cards module's write half, and not its read half. What this container holds
+# of the cards module is three routes -- audience, path, method, tier -- and no
+# tool, no handler and no MCP surface.
+COPY --from=builder /app/packages/postern-cards-write/src /app/packages/postern-cards-write/src
 CMD ["uvicorn", "services.confirm.main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 # The migration runner: the whole venv, the scripts, and no service. It serves

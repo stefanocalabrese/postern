@@ -85,13 +85,22 @@ for details on each control and what is still pending.
 
 ## Architecture
 
-Two deployables share one library:
+Two deployables share one library, and tool families are modules:
 
 ```
-packages/postern-core/     shared library: domain types, façade, identity, masking
-services/api/              read path — MCP tools, OAuth endpoints, consent checks
-services/confirm/          write path — approval callback, payment execution, device auth
+packages/postern-core/        shared library: domain types, façade, identity, masking
+packages/postern-cards/       a module's read half: the cards.list tool
+packages/postern-cards-write/ a module's write half: three card write routes
+services/api/                 read path — MCP tools, OAuth endpoints, consent checks
+services/confirm/             write path — approval callback, payment execution, device auth
 ```
+
+A module is an installed distribution declaring a Python entry point, discovered at
+import time. `services/api` imports no tool family by name. The read and write halves
+ship as two distributions because the read container holds a READ signing key and must
+not carry backend write routing. `tool-surface.json` records every registered tool and
+every write route, so a module addition is a reviewable diff. See
+[Writing a Module](docs/user-guide/writing-a-module.md).
 
 A compromised tool handler cannot mint a token the payments service will accept, because
 it does not hold the key. That is an infrastructure property, not a code-review promise.
@@ -132,6 +141,7 @@ Structured documentation with setup instructions, component manuals, and glossar
 - [**Session Store**](docs/user-guide/components/session-store.md) — In-memory and Redis backends
 - [**Masking**](docs/user-guide/components/masking.md) — PAN/IBAN redaction layers
 - [**Audit System**](docs/user-guide/components/audit.md) — Two-row pattern, fail-closed writes
+- [**Writing a Module**](docs/user-guide/writing-a-module.md) — Adding tools through entry points
 - [**Glossary**](docs/user-guide/glossary.md) — Key terms and concepts
 
 ## Running the gates

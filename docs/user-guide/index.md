@@ -11,9 +11,15 @@ verification, and fail-closed auditing.
 
 ```
 packages/postern-core/     shared library: domain types, façade, identity, masking
+packages/postern-cards/       a module's read half: the cards.list tool
+packages/postern-cards-write/ a module's write half: three card write routes
 services/api/              read path: MCP tools, OAuth endpoints, consent checks
 services/confirm/          write path: approval callback, payment execution, device auth
 ```
+
+Tool families are modules, discovered from installed distributions through Python
+entry points rather than imported by name. See
+[Writing a Module](writing-a-module.md).
 
 A compromised tool handler cannot mint a token the payments service will accept, because
 it does not hold the key. That is an infrastructure property, not a code-review promise.
@@ -29,6 +35,7 @@ it does not hold the key. That is an infrastructure property, not a code-review 
 | [Session Store](components/session-store.md) | In-memory and Redis backends, ContextVar pattern |
 | [Masking](components/masking.md) | PAN/IBAN redaction layers, FreeText type, scan budgets |
 | [Audit System](components/audit.md) | Two-row pattern, fail-closed writes, CHECK constraints |
+| [Writing a Module](writing-a-module.md) | Adding tools through entry points: the two halves, what the host gives you, and what a module can break |
 | [Glossary](glossary.md) | Key terms and concepts across the platform |
 
 ## Architecture at a Glance

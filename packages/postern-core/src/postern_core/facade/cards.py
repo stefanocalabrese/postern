@@ -43,7 +43,10 @@ Typed against `BackendReader` (Task 4's minimal `Protocol`), matching Task
 8's correction for `facade/accounts.py`: `services/api/server.py` only ever
 holds a `BackendReader | None`, so a parameter typed `BackendClient` here
 would make `mypy --strict` reject the call site in
-`services/api/tools/cards.py`.
+`packages/postern-cards/src/postern_cards/__init__.py`, which is where
+`cards.list` lives since the cards family moved onto the module seam: a module
+receives a `postern_core.modules.read.ReadContext` whose `backend` is typed
+`BackendReader` for the same reason.
 
 Handoff §6.5 prefers the backend returning pre-masked values so this server
 never holds a full PAN and stays out of PCI DSS scope -- open question

@@ -1,0 +1,17 @@
+[project]
+name = "postern-cards"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "postern-core",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.13"]
+build-backend = "uv_build"
+
+# The seam. `services/api/server.py` imports nothing from this distribution;
+# `postern_core.modules.read.load_read_modules` resolves this line at import
+# time, out of the distributions present in the image.
+[project.entry-points."postern.read_modules"]
+cards = "postern_cards:MODULE"

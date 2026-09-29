@@ -1,0 +1,17 @@
+[project]
+name = "postern-cards-write"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "postern-core",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.13"]
+build-backend = "uv_build"
+
+# The write half's own group, declared by its own distribution. A single
+# distribution declaring both groups is refused by
+# `postern_core.modules.read.refuse_distributions_declaring_both_halves`.
+[project.entry-points."postern.write_modules"]
+cards = "postern_cards_write:MODULE"

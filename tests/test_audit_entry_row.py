@@ -678,7 +678,10 @@ async def test_the_ungated_tool_writes_an_entry_row_and_its_refusal_reason_is_nu
     (`services/api/tools/bootstrap.py`'s `start_session`; the other four
     carry `auth=check` on `services/api/tools/accounts.py`'s `accounts_list`
     and `accounts_get_balance`, `services/api/tools/transactions.py`'s
-    `transactions_list` and `services/api/tools/cards.py`'s `cards_list`),
+    `transactions_list` and, since the cards family moved onto the module
+    seam, `packages/postern-cards/src/postern_cards/__init__.py`'s
+    `cards_list` -- which the host wraps rather than the module declaring
+    `auth=` itself),
     and it reaches the operator's backend anyway, through
     `accounts_facade.list_accounts`. So it is the one
     ungated tool that writes an entry row -- and `services/api/middleware/audit.py` names

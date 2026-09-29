@@ -61,15 +61,10 @@ and nothing reads it back.
 
 from typing import Literal
 
-from fastmcp import FastMCP
-from mcp.types import ToolAnnotations
 from postern_core.domain.models import ConsentSummary, SessionInfo
 from postern_core.facade import accounts as accounts_facade
-from postern_core.facade.protocol import BackendReader
-from postern_core.identity import CustomerResolver
+from postern_core.modules.read import ReadContext, ReadModule, ReadTool, ToolHandler
 from postern_core.risk.session import get_current_session
-
-_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 _Domain = Literal["accounts", "transactions", "cards", "payments"]
 
@@ -86,12 +81,7 @@ _DOMAINS: tuple[_Domain, ...] = ("accounts", "transactions", "cards", "payments"
 _READABLE = {"accounts", "transactions", "cards"}
 
 
-def register(
-    mcp: FastMCP,
-    resolver: CustomerResolver,
-    backend: BackendReader,
-) -> None:
-    @mcp.tool(name="start_session", annotations=_READ)
+def _build_start_session(context: ReadContext) -> ToolHandler:
     async def start_session() -> SessionInfo:
         """Start here. Returns the customer's accounts, what this session may
         do, and how confirmations work. Call this before any other banking
@@ -105,7 +95,7 @@ def register(
         the server recognises this session from the access token on every
         call, not from anything in the arguments.
         """
-        customer = resolver()
+        customer = context.resolver()
 
         # ZT-5: the risk middleware has already loaded (or created) this
         # identity's context and pushed it onto the contextvar, for this call
@@ -116,7 +106,7 @@ def register(
         session_handle_value = ctx.session_id if ctx is not None and ctx.session_id else ""
 
         return SessionInfo(
-            accounts=await accounts_facade.list_accounts(backend, customer),
+            accounts=await accounts_facade.list_accounts(context.backend, customer),
             consents=[
                 ConsentSummary(domain=domain, granted=domain in _READABLE, expires_at=None)
                 for domain in _DOMAINS
@@ -125,3 +115,33 @@ def register(
             confirmation_note=_CONFIRMATION_NOTE,
             session_handle=session_handle_value,
         )
+
+    return start_session
+
+
+#: `start_session` is the one tool declaring ``consent_domain=None``, and the
+#: only one entitled to. It discloses the customer's accounts and which domains
+#: are consented, which is the answer a caller needs BEFORE it can know whether
+#: any consent-gated tool will work; gating it on a consent row would make the
+#: tool that reports consent state unreachable in exactly the case an operator
+#: most wants it readable. It carries no ``auth=`` on the host's registration
+#: for the same reason, which `services/api/middleware/audit.py` and
+#: `tests/test_audit_entry_row.py` both record as the one exception among the
+#: five shipped tools.
+#:
+#: WHAT THIS TOOL DOES NOT YET KNOW ABOUT MODULES, recorded rather than fixed:
+#: `_DOMAINS` and `_READABLE` below are literals, so a module adding a fifth
+#: domain registers its tools, is consent-gated on that domain, and is absent
+#: from this tool's `consents` list. Deriving the list from the registered
+#: module set would change what all five shipped tools return, which is outside
+#: what the seam was asked to do.
+MODULE = ReadModule(
+    name="bootstrap",
+    tools=(
+        ReadTool(
+            name="start_session",
+            consent_domain=None,
+            build=_build_start_session,
+        ),
+    ),
+)

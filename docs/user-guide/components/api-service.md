@@ -12,8 +12,9 @@ that is executed server-side through the confirm service.
 ```
 packages/postern-core/src/postern_core/facade/     HTTP client to operator backend
 services/api/main.py                                Composition root (create_app)
-services/api/server.py                              FastMCP server builder
-services/api/tools/                                 MCP tool handlers (accounts, transactions, cards)
+services/api/server.py                              FastMCP server builder, module registration loop
+services/api/tools/                                 built-in read modules (start_session, accounts, transactions)
+packages/postern-cards/                             the cards module's read half, found by entry point
 services/api/asgi/request_deadline.py               Outermost ASGI middleware, request deadline
 services/api/asgi/header_validation.py              MCP Streamable HTTP header/body validation
 services/api/consent.py                             Per-tool consent authorization

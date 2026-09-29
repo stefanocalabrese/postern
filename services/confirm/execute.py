@@ -3,6 +3,20 @@
 Tool-to-endpoint mapping and the HTTP client that executes approved
 challenges against backend write endpoints.
 
+THE MAPPING IS NO LONGER A LITERAL. `TOOL_REGISTRY` used to be a hand-edited
+dict of six entries, which made "add a write operation" mean "fork this
+repository". It is built now, by `build_write_operations`, from the three built-in
+operations below plus every `postern_core.modules.write.WriteModule` an installed
+distribution declares. The three card operations moved to the
+`postern_cards_write` distribution; the merged registry still has the same six
+keys and byte-identical tuples, which `tests/test_execute.py` pins.
+
+THIS MODULE IS THE IMPORT `services.api` MUST NEVER MAKE, transitively included:
+it imports `postern_core.modules.write`, and `.importlinter`'s
+``api-not-module-write-half`` contract forbids the read path from reaching either.
+`tests/test_module_seam_write_half.py` measures the same refusal at runtime,
+where an entry point resolves and a graph cannot see.
+
 Execution belongs to the server, never the agent (handoff §6.2). This
 module lives in ``services/confirm`` and holds the write key, so it can
 mint internal JWTs with ``challenge_id`` claims (§7.2).
@@ -19,6 +33,7 @@ from typing import Any, Protocol
 
 import httpx2
 from postern_core.domain.masking import scrub_text
+from postern_core.domain.verification import VerificationTier
 
 # The same Protocol `BackendClient` uses for the same job, imported rather
 # than redeclared so the read and write paths cannot drift into two
@@ -26,6 +41,7 @@ from postern_core.domain.masking import scrub_text
 # are `postern_core.facade -> postern_core.store` and `services.api <->
 # services.confirm`, and this is neither.
 from postern_core.facade.client import BackendRequestHook
+from postern_core.modules.write import WriteOperation, WriteSeamViolation, load_write_modules
 
 from services.confirm.minter import WRITE_SCOPES, WriteTokenMinter
 
@@ -59,21 +75,113 @@ class _MinterProtocol(Protocol):
 # Tool-to-endpoint registry.
 # ---------------------------------------------------------------------------
 
-# Maps tool_name → (audience, path_template, method).
-# The path template is a format string that receives the payload fields.
-# The payload dict from the challenge is passed as kwargs to .format().
+# WHAT CHANGED WHEN THE MODULE SEAM LANDED, and what deliberately did not.
+#
+# `TOOL_REGISTRY` was a literal dict of six entries edited by hand, which made
+# "add a write operation" mean "edit this file", i.e. fork the repository. It is
+# now BUILT, from two sources merged by `build_write_operations`: the built-in
+# operations below, and every `postern_core.modules.write.WriteModule` an
+# installed distribution declares through the ``postern.write_modules`` entry
+# point. `postern_cards_write` is the first of those, and the three card
+# operations that used to sit in this dict now live there.
+#
+# WHAT DID NOT CHANGE IS THE SHAPE. The merged registry is still
+# ``dict[str, tuple[audience, path_template, method]]`` with the same six keys
+# and byte-identical tuples, because `resolve_endpoint` below reads it and
+# `tests/test_execute.py` pins every entry. That is what makes this a move
+# rather than a rewrite: the six entries are proven unchanged by tests written
+# against the literal.
+#
+# THE TIER IS DECLARED ON THE OPERATION AND NOTHING HERE READS IT. CLAUDE.md is
+# explicit that the verification tier belongs on the tool definition and must
+# never be derived from the HTTP verb, so a `WriteOperation` carries one; this
+# module needs only the triple, and `WriteOperation.as_registry_entry` is what
+# narrows it. The tier reaches ``tool-surface.json``, so raising or lowering one
+# is a reviewable diff, and it is what a future `create_challenge` producer will
+# read when it decides which tier a challenge row is created at. No code path
+# consumes it today, because no production caller creates a challenge at all.
 
+#: The write operations this repository ships without a distribution of its own.
+#:
+#: Three remain, and the reason is scope rather than principle: `cards` was the
+#: family moved onto the seam, and moving payments, accounts and standing orders
+#: as well would have cost three more distribution pairs to prove a mechanism
+#: one pair already proves. Each is a candidate to move unchanged -- they are
+#: already `WriteOperation`s, so the move is a packaging change.
+#:
+#: ``payments.create_payment`` is the one tier-2 operation. `postern_core.domain.verification`
+#: is where that comes from: tier 2 covers payments, new payees, high value and
+#: limit increases, and tier 1 is the default for everything else a write does.
+BUILTIN_WRITE_OPERATIONS: tuple[WriteOperation, ...] = (
+    WriteOperation(
+        tool_name="payments.create_payment",
+        audience="payments.svc",
+        path_template="/payments",
+        method="POST",
+        tier=VerificationTier.APP_IDENTITY_VERIFICATION,
+    ),
+    WriteOperation(
+        tool_name="accounts.rename",
+        audience="accounts.svc",
+        path_template="/accounts/{account_id}/rename",
+        method="PATCH",
+        tier=VerificationTier.APP_APPROVAL,
+    ),
+    WriteOperation(
+        tool_name="standing_orders.cancel",
+        audience="payments.svc",
+        path_template="/standing-orders/{order_id}/cancel",
+        method="POST",
+        tier=VerificationTier.APP_APPROVAL,
+    ),
+)
+
+
+def build_write_operations() -> dict[str, WriteOperation]:
+    """Every write operation this process routes, built-in and installed.
+
+    Raises:
+        WriteSeamViolation: if an installed module routes a tool name a
+            built-in already routes. Last-wins would mean a module could
+            silently redirect ``payments.create_payment`` at its own backend
+            audience and path, which is the single worst thing this seam could
+            be made to do. `postern_core.modules.write.load_write_modules`
+            already refuses two modules colliding with each other; this is the
+            collision it cannot see.
+    """
+    operations = {operation.tool_name: operation for operation in BUILTIN_WRITE_OPERATIONS}
+    for module in load_write_modules():
+        for operation in module.operations:
+            if operation.tool_name in operations:
+                raise WriteSeamViolation(
+                    f"module {module.name!r} routes write operation "
+                    f"{operation.tool_name!r}, which this repository already routes as "
+                    "a built-in. A module cannot redirect a shipped write operation: "
+                    "the audience, path and method decide which backend endpoint an "
+                    "approved operation reaches."
+                )
+            operations[operation.tool_name] = operation
+    return operations
+
+
+#: Every write operation, keyed by tool name, tier included.
+#:
+#: Read by the ``tool-surface.json`` gate, which is what makes a module's write
+#: routing diffable between deploys.
+WRITE_OPERATIONS: dict[str, WriteOperation] = build_write_operations()
+
+
+#: Maps tool_name → (audience, path_template, method).
+#:
+#: The path template is a format string that receives the payload fields. The
+#: payload dict from the challenge is passed as kwargs to ``.format()``.
+#:
+#: NARROWED FROM `WRITE_OPERATIONS` rather than built by a second pass over the
+#: entry points, so the two cannot disagree about what is installed: one scan,
+#: one snapshot, at import. `resolve_endpoint` below has never needed the tier,
+#: and `WriteOperation.as_registry_entry` is what drops it.
 TOOL_REGISTRY: dict[str, tuple[str, str, str]] = {
-    # Payments — tier-1 and tier-2 operations.
-    "payments.create_payment": ("payments.svc", "/payments", "POST"),
-    # Cards — tier-1 operations.
-    "cards.freeze_card": ("cards.svc", "/cards/{card_id}/freeze", "POST"),
-    "cards.unfreeze_card": ("cards.svc", "/cards/{card_id}/unfreeze", "POST"),
-    "cards.set_label": ("cards.svc", "/cards/{card_id}/label", "PATCH"),
-    # Accounts — tier-1 operations.
-    "accounts.rename": ("accounts.svc", "/accounts/{account_id}/rename", "PATCH"),
-    # Standing orders — tier-1 operations.
-    "standing_orders.cancel": ("payments.svc", "/standing-orders/{order_id}/cancel", "POST"),
+    name: operation.as_registry_entry() for name, operation in WRITE_OPERATIONS.items()
 }
 
 

@@ -1,0 +1,108 @@
+{
+  "read_tools": [
+    {
+      "module": "accounts",
+      "name": "accounts.get_balance",
+      "consent_domain": "accounts",
+      "read_only_hint": true,
+      "open_world_hint": false,
+      "parameters": [
+        "account_ref"
+      ],
+      "required": [
+        "account_ref"
+      ]
+    },
+    {
+      "module": "accounts",
+      "name": "accounts.list",
+      "consent_domain": "accounts",
+      "read_only_hint": true,
+      "open_world_hint": false,
+      "parameters": [],
+      "required": []
+    },
+    {
+      "module": "bootstrap",
+      "name": "start_session",
+      "consent_domain": null,
+      "read_only_hint": true,
+      "open_world_hint": false,
+      "parameters": [],
+      "required": []
+    },
+    {
+      "module": "cards",
+      "name": "cards.list",
+      "consent_domain": "cards",
+      "read_only_hint": true,
+      "open_world_hint": false,
+      "parameters": [],
+      "required": []
+    },
+    {
+      "module": "transactions",
+      "name": "transactions.list",
+      "consent_domain": "transactions",
+      "read_only_hint": true,
+      "open_world_hint": false,
+      "parameters": [
+        "account_ref",
+        "days"
+      ],
+      "required": [
+        "account_ref"
+      ]
+    }
+  ],
+  "write_operations": [
+    {
+      "module": "(built-in)",
+      "tool_name": "accounts.rename",
+      "audience": "accounts.svc",
+      "path_template": "/accounts/{account_id}/rename",
+      "method": "PATCH",
+      "tier": 1
+    },
+    {
+      "module": "(built-in)",
+      "tool_name": "payments.create_payment",
+      "audience": "payments.svc",
+      "path_template": "/payments",
+      "method": "POST",
+      "tier": 2
+    },
+    {
+      "module": "(built-in)",
+      "tool_name": "standing_orders.cancel",
+      "audience": "payments.svc",
+      "path_template": "/standing-orders/{order_id}/cancel",
+      "method": "POST",
+      "tier": 1
+    },
+    {
+      "module": "cards",
+      "tool_name": "cards.freeze_card",
+      "audience": "cards.svc",
+      "path_template": "/cards/{card_id}/freeze",
+      "method": "POST",
+      "tier": 1
+    },
+    {
+      "module": "cards",
+      "tool_name": "cards.set_label",
+      "audience": "cards.svc",
+      "path_template": "/cards/{card_id}/label",
+      "method": "PATCH",
+      "tier": 1
+    },
+    {
+      "module": "cards",
+      "tool_name": "cards.unfreeze_card",
+      "audience": "cards.svc",
+      "path_template": "/cards/{card_id}/unfreeze",
+      "method": "POST",
+      "tier": 1
+    }
+  ]
+}

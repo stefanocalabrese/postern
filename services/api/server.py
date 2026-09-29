@@ -1,5 +1,29 @@
 """MCP server assembly.
 
+EVERY TOOL ARRIVES THROUGH THE MODULE SEAM, and this file names no tool family.
+`build_server` registers whatever `services/api/tools/__init__.py`'s
+`BUILTIN_READ_MODULES` and `postern_core.modules.read.load_read_modules` hand it,
+by one loop, with no second path -- a built-in registered by hand could use a
+FastMCP feature a module cannot express, and the seam would be second-class from
+the first time someone reached for one. The cards family lives in the
+`postern_cards` distribution and reaches this module only through an entry point.
+
+Three properties the loop is responsible for, each of which would be a quiet
+regression rather than a loud one:
+
+- ONE CONSENT CHECK PER DOMAIN, not per tool. `services/api/consent.py`'s module
+  docstring measures five evaluations for one real call and counts the two
+  accounts tools as sharing one closure; the `checks` dict below is what keeps
+  that measurement describing this code.
+- NO ``auth=`` AT ALL for a tool declaring no consent domain, which is a
+  different thing from a check that returns True.
+  `services/api/middleware/audit.py` distinguishes the two, and `start_session`
+  is the one tool entitled to it.
+- A DUPLICATE TOOL NAME REFUSES. FastMCP's registry is a dict keyed on the name,
+  so a module declaring `accounts.list` would silently replace the shipped tool.
+  `refuse_duplicate_tool_names` runs on the combined list, which is the call
+  `load_read_modules`' own check cannot make.
+
 The customer resolver is injected (design decision D3) so that:
   - there is exactly one place that answers "which customer is this?", and
   - tools are testable without an auth round trip, which FastMCP's in-process
@@ -11,20 +35,27 @@ The customer resolver is injected (design decision D3) so that:
 backend itself, only passes it through to tools registered in later tasks.
 """
 
+from collections.abc import Awaitable, Callable, Sequence
+
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthContext, AuthProvider
 from fastmcp.server.auth.providers.jwt import JWTVerifier
+from mcp.types import ToolAnnotations
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef, CustomerResolver
+from postern_core.modules.read import (
+    ReadContext,
+    ReadModule,
+    ReadTool,
+    load_read_modules,
+    refuse_duplicate_tool_names,
+)
 from postern_core.store.engine import Database
 from pydantic import ValidationError
 
 from services.api.consent import consent_for
 from services.api.settings import Settings
-from services.api.tools import accounts as accounts_tools
-from services.api.tools import bootstrap as bootstrap_tools
-from services.api.tools import cards as cards_tools
-from services.api.tools import transactions as transactions_tools
+from services.api.tools import BUILTIN_READ_MODULES
 
 SERVER_INSTRUCTIONS = """\
 Postern exposes read access to the customer's own bank accounts, cards and
@@ -74,6 +105,37 @@ async def _no_consent_required(ctx: AuthContext) -> bool:
     return True
 
 
+def _annotations(tool: ReadTool) -> ToolAnnotations:
+    """Build the MCP annotations from a module's declared hints.
+
+    CONSTRUCTED HERE AND NOT IN THE MODULE, so that `mcp.types.ToolAnnotations`
+    -- whose import path CLAUDE.md records as a trap, since it is not
+    re-exported by fastmcp -- is named in exactly one place in the tree that a
+    FastMCP major would have to be reconciled with. A module declares two
+    booleans.
+    """
+    return ToolAnnotations(read_only_hint=tool.read_only, open_world_hint=tool.open_world)
+
+
+def _read_modules(
+    explicit: Sequence[ReadModule] | None,
+) -> tuple[ReadModule, ...]:
+    """The built-ins plus whatever is installed, or an explicit test set.
+
+    `refuse_duplicate_tool_names` runs on the COMBINED list, which is the call
+    `postern_core.modules.read.load_read_modules`' own duplicate check
+    structurally cannot make: it sees only what it discovered, so a module
+    shadowing `accounts.list` would pass there and silently replace a shipped
+    tool here -- FastMCP's registry is a dict keyed on the name, and the second
+    registration wins with no warning.
+    """
+    modules = (
+        tuple(explicit) if explicit is not None else BUILTIN_READ_MODULES + load_read_modules()
+    )
+    refuse_duplicate_tool_names(modules)
+    return modules
+
+
 def build_server(
     settings: Settings,
     resolver: CustomerResolver,
@@ -81,6 +143,7 @@ def build_server(
     *,
     db: Database | None = None,
     auth_override: AuthProvider | None = None,
+    read_modules: Sequence[ReadModule] | None = None,
 ) -> FastMCP:
     has_jwks_uri = settings.customer_jwks_uri is not None
     has_issuer = settings.customer_token_issuer is not None
@@ -118,13 +181,36 @@ def build_server(
         cache_ttl=settings.cache_ttl_seconds,
     )
     if backend is not None:
-        bootstrap_tools.register(server, resolver, backend)
-        accounts_check = consent_for("accounts", db) if db is not None else _no_consent_required
-        transactions_check = (
-            consent_for("transactions", db) if db is not None else _no_consent_required
-        )
-        cards_check = consent_for("cards", db) if db is not None else _no_consent_required
-        accounts_tools.register(server, resolver, backend, accounts_check)
-        transactions_tools.register(server, resolver, backend, transactions_check)
-        cards_tools.register(server, resolver, backend, cards_check)
+        context = ReadContext(resolver=resolver, backend=backend)
+        # ONE CHECK OBJECT PER DOMAIN, not per tool, and `services/api/consent.py`'s
+        # module docstring is what makes that load-bearing rather than tidy: it
+        # measures five evaluations of the check for one real `accounts.get_balance`
+        # call, four of them from the internal `tools/list` pass, and counts
+        # `accounts.list` and `accounts.get_balance` as sharing one
+        # `consent_for("accounts", db)` closure while remaining two `Tool`
+        # objects. A closure per tool would still hit the request-scoped cache,
+        # but that measurement would stop describing this code.
+        checks: dict[str, Callable[[AuthContext], Awaitable[bool]]] = {}
+        for module in _read_modules(read_modules):
+            for tool in module.tools:
+                handler = tool.build(context)
+                if tool.consent_domain is None:
+                    # No `auth=` at all, which is a different thing from a check
+                    # that returns True: `services/api/middleware/audit.py` and
+                    # `tests/test_audit_entry_row.py` both distinguish the two,
+                    # and `start_session` is the one tool entitled to it.
+                    server.tool(handler, name=tool.name, annotations=_annotations(tool))
+                    continue
+                if tool.consent_domain not in checks:
+                    checks[tool.consent_domain] = (
+                        consent_for(tool.consent_domain, db)
+                        if db is not None
+                        else _no_consent_required
+                    )
+                server.tool(
+                    handler,
+                    name=tool.name,
+                    annotations=_annotations(tool),
+                    auth=checks[tool.consent_domain],
+                )
     return server
