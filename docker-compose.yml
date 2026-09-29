@@ -59,6 +59,27 @@ services:
     command: uv run uvicorn stub.backend:app --host 0.0.0.0 --port 8081
     ports: ["8081:8081"]
 
+  # The migration runner, and the reason it is a service here rather than a
+  # step in the images: since the serving images stopped carrying `alembic`
+  # and the revision scripts, nothing in this stack applied the schema.
+  # `docker compose up` left an empty database and every tool call 500ed on
+  # the consent lookup -- measured on 28 September 2026, before this existed.
+  #
+  # `restart: "no"` and `service_completed_successfully` below are what make
+  # it a task rather than a daemon: it runs `alembic upgrade head`, exits 0,
+  # and the two services start behind it. A non-zero exit stops the stack,
+  # which is the same direction the deploy workflow takes.
+  migrate:
+    build:
+      context: .
+      target: migrate
+    restart: "no"
+    environment:
+      POSTERN_DATABASE_URL: postgresql+asyncpg://postern:postern@db:5432/postern
+    depends_on:
+      db:
+        condition: service_healthy
+
   api:
     build:
       context: .
@@ -76,6 +97,8 @@ services:
         condition: service_started
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   # Plan 3 Task 6: the write path, brought up alongside `api` to verify the
   # read/write key split against a running stack rather than only in-process.
@@ -137,3 +160,14 @@ services:
       POSTERN_APP_ASSERTION_ISSUER: "https://postern-local-dev.invalid"
       POSTERN_APP_ASSERTION_AUDIENCE: "postern-confirm"
       POSTERN_DEVICE_KEYS_PATH: /etc/postern/device-keys.json
+      # UNSET UNTIL 29 SEPTEMBER 2026, which meant this service resolved
+      # `Database`'s own default, `localhost:5432`, inside its own container.
+      # The engine is lazy so it started fine and failed on first use: every
+      # approval, every `audit_log` row, every challenge lookup. The comment
+      # above this block still said "no database" from when that was true.
+      POSTERN_DATABASE_URL: postgresql+asyncpg://postern:postern@db:5432/postern
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
