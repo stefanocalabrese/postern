@@ -73,8 +73,15 @@ test:
 # packages/postern-core/src/postern_core/store/models.py against such a
 # database. The same check also runs in `.github/workflows/ci.yml` against a
 # free Postgres service container, dispatched manually.
+# The fallback URL names postern_owner and not postern, and that is not
+# cosmetic: since the role split (operator checklist item 11) the compose stack
+# migrates as the owner, so the schema this target checks drift against belongs
+# to that role. A default naming the superuser would still PASS `alembic check`,
+# which only reads -- and would be the line somebody copies when they mean to
+# run `alembic upgrade` by hand, creating tables owned by a superuser and
+# silently undoing the split.
 migrations:
-	POSTERN_DATABASE_URL=$${POSTERN_DATABASE_URL:-postgresql+asyncpg://postern:postern@localhost:5432/postern} uv run alembic check
+	POSTERN_DATABASE_URL=$${POSTERN_DATABASE_URL:-postgresql+asyncpg://postern_owner:postern_owner@localhost:5432/postern} uv run alembic check
 
 # Regenerates `tool-surface.json`, the checked-in record of every registered
 # tool and every backend write route. NOT a `ci` dependency, and that is the

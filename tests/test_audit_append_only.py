@@ -19,17 +19,42 @@ session_replication_role` both delete rows the trigger refused a moment
 earlier. If either of those ever starts failing, the control got STRONGER
 and this file should be read before it is "fixed".
 
-THE NON-OWNER ROLE IS THE POINT OF THE OTHER HALF. Every environment this
-repo ships with connects as one role that is simultaneously the table owner,
-the role migrations run as, and a superuser (`tests/conftest.py::pg_url`'s
-testcontainers user, `docker-compose.yml`'s `POSTGRES_USER: postern`). For
-that role the control is a trigger away from being off. `CLAUDE.md`'s
-operator checklist item 11 asks operators to run the application as a role
-that owns nothing, and the honest question about a checklist item is whether
-anyone has ever checked what it buys. `appender` below is that role, created
-inside the test container and connected to over TCP, and the four tests that
-use it are what item 11 is worth: INSERT and SELECT work, UPDATE, DELETE and
-TRUNCATE are refused, and neither bypass is in reach.
+THREE ROLES NOW, WHERE THERE USED TO BE ONE, and the whole file has been
+re-pointed onto them. Until 2026-09-29 every environment this repo shipped
+connected as a single role that was simultaneously the table owner, the role
+migrations ran as, and a superuser, so "the owner erases the record" and "a
+superuser erases the record" were one sentence measured twice. `sql/01-roles.sql`
+and `sql/02-grants.sql` split it, `tests/conftest.py`'s `pg_url` applies both
+and runs the migrations as the owner, and the three roles are now distinct
+things with distinct costs:
+
+    database / `clean`   the container's bootstrap SUPERUSER. Still what the
+                         rest of this suite connects as, and still refused
+                         UPDATE, DELETE and TRUNCATE by the triggers -- which
+                         is migration f1860c110112's central claim, since a
+                         superuser bypasses the ACL half entirely.
+    `owner`              postern_owner. Owns every table, is NOT a superuser.
+    `appender`           postern_app. Owns nothing, is not a superuser, and
+                         holds exactly what `sql/02-grants.sql` grants.
+
+WHAT THE SPLIT COST THE OWNER, measured here rather than predicted:
+migration `f1860c110112`'s `REVOKE UPDATE, DELETE, TRUNCATE ... FROM
+CURRENT_USER` was decorative while CURRENT_USER was a superuser, and now
+binds. So the owner bypass is THREE statements, not the two item 11 was
+written around -- a `GRANT` back to itself, the `DISABLE TRIGGER`, then the
+`DELETE`. That migration's docstring predicted exactly this ("the
+one-statement speed bump against a non-superuser owner") and
+`test_the_owner_erases_the_record_by_disabling_the_trigger` is where it stops
+being a prediction.
+
+THE APPLICATION ROLE IS THE POINT OF THE OTHER HALF. `CLAUDE.md`'s operator
+checklist item 11 asks operators to run the application as a role that owns
+nothing, and the honest question about a checklist item is whether anyone has
+ever checked what it buys. The four tests that use `appender` are that answer:
+INSERT and SELECT work, UPDATE, DELETE and TRUNCATE are refused AT THE ACL
+CHECK rather than by the trigger, and neither bypass is in reach.
+`tests/test_application_role.py` is the other half of the answer -- that the
+same role can still serve the whole application.
 
 WHY THE SEEDED ROW IS NOT INCIDENTAL. A `FOR EACH ROW` trigger fires per
 row, so `DELETE FROM audit_log WHERE id = -1` raises nothing and reports
@@ -50,7 +75,7 @@ import pytest_asyncio
 from postern_core.store import audit
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry
-from sqlalchemy import func, make_url, select, text
+from sqlalchemy import select, text
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import DBAPIError
 
@@ -66,18 +91,6 @@ from tests.fixtures.append_only_bypass import (
 CUSTOMER = "cust_appendonly"
 
 CALL_ID = "append-only-probe"
-
-#: The non-owner, non-superuser login role operator checklist item 11
-#: describes. Created inside the disposable test container and never dropped:
-#: the container is torn down with the session, and a `DROP ROLE` would have
-#: to `REASSIGN OWNED` first for no benefit here.
-APPENDER_ROLE = "postern_appender_probe"
-
-#: Not a credential: a literal for a role that exists only inside a
-#: throwaway container bound to a random port on the loopback interface, and
-#: whose entire privilege set is INSERT and SELECT on one table. `S105` fires
-#: on the name, which has to keep saying what the value is.
-APPENDER_PASSWORD = "appender-probe"  # noqa: S105
 
 #: SQLSTATE `insufficient_privilege`. Both halves of the control answer with
 #: it -- the trigger because migration `f1860c110112` raises `USING ERRCODE`,
@@ -117,50 +130,34 @@ async def _wipe(db: Database) -> None:
         await s.commit()
 
 
-@pytest_asyncio.fixture(scope="session")
-async def appender_url(database: Database, pg_url: str) -> str:
-    """A login role that owns nothing, is not a superuser, and may only append.
+@pytest.fixture
+def appender(app_db: Database) -> Database:
+    """The application role -- `postern_app`, as the shipped SQL creates it.
 
-    This is operator checklist item 11 built in miniature: `SELECT, INSERT`
-    on `audit_log`, `USAGE` on its sequence, and nothing else. The sequence
-    is resolved through `pg_get_serial_sequence` rather than spelled
-    `audit_log_id_seq`, so a future migration that rebuilds the column does
-    not leave this fixture granting on a name that no longer exists -- it
-    would fail loudly here instead.
-
-    Created through the owner connection, which in this container is also a
-    superuser, because creating a role requires a privilege the role being
-    created must not have.
+    RE-POINTED ON 2026-09-29, and the re-point is the whole of what changed
+    about this fixture. It used to `CREATE ROLE postern_appender_probe` here
+    and grant to it inline, which measured a role this file invented: item 11
+    could have stayed a paragraph nobody had built, and these four tests would
+    still have passed. It now takes `tests/conftest.py`'s `app_db`, whose role
+    is created by `sql/01-roles.sql` and granted by `sql/02-grants.sql` -- the
+    two files `docker-compose.yml` mounts and runs, and the two an operator
+    runs. What passes here and what `docker compose up` applies can no longer
+    disagree.
     """
-    async with database.sessionmaker() as s:
-        await s.execute(text(f"DROP ROLE IF EXISTS {APPENDER_ROLE}"))
-        await s.execute(text(f"CREATE ROLE {APPENDER_ROLE} LOGIN PASSWORD '{APPENDER_PASSWORD}'"))
-        url = make_url(pg_url)
-        await s.execute(text(f'GRANT CONNECT ON DATABASE "{url.database}" TO {APPENDER_ROLE}'))
-        await s.execute(text(f"GRANT USAGE ON SCHEMA public TO {APPENDER_ROLE}"))
-        await s.execute(text(f"GRANT SELECT, INSERT ON audit_log TO {APPENDER_ROLE}"))
-        sequence = (
-            await s.execute(select(func.pg_get_serial_sequence("audit_log", "id")))
-        ).scalar_one()
-        assert sequence is not None, "audit_log.id has no sequence to grant on"
-        await s.execute(text(f"GRANT USAGE ON SEQUENCE {sequence} TO {APPENDER_ROLE}"))
-        await s.commit()
-    # `render_as_string(hide_password=False)`, never `str(url)`: `URL.__str__`
-    # renders the password as `***`, so the obvious spelling produces a URL
-    # that connects as this role with the literal password "***" and fails
-    # authentication -- measured here before this line was written.
-    return (
-        make_url(pg_url)
-        .set(username=APPENDER_ROLE, password=APPENDER_PASSWORD)
-        .render_as_string(hide_password=False)
-    )
+    return app_db
 
 
-@pytest_asyncio.fixture
-async def appender(appender_url: str) -> AsyncIterator[Database]:
-    db = Database(appender_url, null_pool=True)
-    yield db
-    await db.close()
+@pytest.fixture
+def owner(owner_db: Database) -> Database:
+    """`postern_owner`: owns every table, and is NOT a superuser.
+
+    The distinction this fixture exists to draw. Until the split there was one
+    role wearing three hats, so "the owner erases the record" and "a superuser
+    erases the record" were the same sentence measured twice. They are now two
+    roles and two different costs, which the two bypass tests below measure
+    separately.
+    """
+    return owner_db
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +238,18 @@ def _sqlstate(error: DBAPIError) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# The role this repo actually runs as -- owner AND superuser.
+# The SUPERUSER -- the one role no privilege system binds, refused anyway.
 # ---------------------------------------------------------------------------
 
 
-async def test_the_current_role_cannot_update_a_row_that_exists(clean: Database) -> None:
+async def test_the_superuser_cannot_update_a_row_that_exists(clean: Database) -> None:
     """The control test from the other direction: before migration
-    f1860c110112 this statement reported `UPDATE 1`."""
+    f1860c110112 this statement reported `UPDATE 1`.
+
+    RE-POINTED IN NAME ONLY on 2026-09-29. `clean` was "the current role"
+    when one role did everything; it is the container's bootstrap superuser
+    now, and this test is where the trigger half of the control earns its
+    existence, because a `REVOKE` cannot touch this role at all."""
     await _seed(clean)
     error = await _refused(
         clean, "UPDATE audit_log SET outcome = 'tampered' WHERE customer_ref = :customer"
@@ -258,7 +260,7 @@ async def test_the_current_role_cannot_update_a_row_that_exists(clean: Database)
     assert [row.outcome for row in await _rows(clean)] == ["returned"]
 
 
-async def test_the_current_role_cannot_delete_a_row_that_exists(clean: Database) -> None:
+async def test_the_superuser_cannot_delete_a_row_that_exists(clean: Database) -> None:
     await _seed(clean)
     error = await _refused(clean, "DELETE FROM audit_log WHERE customer_ref = :customer")
     assert "DELETE is not permitted" in str(error)
@@ -266,7 +268,7 @@ async def test_the_current_role_cannot_delete_a_row_that_exists(clean: Database)
     assert len(await _rows(clean)) == 1
 
 
-async def test_the_current_role_cannot_truncate_the_table(clean: Database) -> None:
+async def test_the_superuser_cannot_truncate_the_table(clean: Database) -> None:
     """A `FOR EACH ROW` trigger does not fire on TRUNCATE at all, so without
     the separate statement trigger this one word would empty the table."""
     await _seed(clean)
@@ -329,17 +331,26 @@ async def test_the_appender_role_can_append_and_read(clean: Database, appender: 
 async def test_the_appender_role_is_refused_every_erasing_statement(
     clean: Database, appender: Database, statement: str
 ) -> None:
-    """Refused by the `REVOKE` half, BEFORE the trigger is consulted.
+    """Refused at the ACL check, BEFORE the trigger is consulted.
 
-    The message is `permission denied for table audit_log`, not the trigger's
-    own text: this role was never granted the privilege, so Postgres stops
-    the statement at the ACL check. That is the difference item 11 buys --
-    for this role the control is not a trigger that could be disabled, it is
-    a privilege that was never held.
+    The message is `permission denied for table audit_log`, which is
+    PostgreSQL's ACL refusal, and it is asserted here ALONGSIDE the absence of
+    the trigger's own text. Both directions are needed and only together do
+    they say anything: the trigger raises `audit_log is append-only: UPDATE is
+    not permitted`, so a message carrying neither phrase would mean the
+    statement failed for some third reason, and a message carrying the
+    trigger's phrase would mean this role holds the privilege and was stopped
+    by the thing an owner can switch off.
+
+    That is the whole difference item 11 buys. For this role the control is
+    not a trigger that could be disabled, it is a privilege that was never
+    held -- and the statement never reaches the trigger to find out.
     """
     await _seed(clean)
     error = await _refused(appender, statement)
     assert "permission denied for table audit_log" in str(error)
+    assert "append-only" not in str(error), "the trigger answered, so the ACL did not"
+    assert "is not permitted" not in str(error)
     assert _sqlstate(error) == INSUFFICIENT_PRIVILEGE
     assert len(await _rows(clean)) == 1
 
@@ -381,29 +392,72 @@ async def test_the_appender_role_cannot_reach_either_bypass(
 # ---------------------------------------------------------------------------
 
 
-async def test_the_owner_erases_the_record_by_disabling_the_trigger(clean: Database) -> None:
-    """BYPASS ONE, and the reason the docstrings do not say "append-only".
+async def test_the_owner_is_refused_at_the_acl_before_it_re_grants_to_itself(
+    clean: Database, owner: Database
+) -> None:
+    """The first of the owner's three statements, and what it costs an attacker.
 
-    Table ownership is enough. Two statements, no superuser needed, and the
-    only residue is a gap in the `id` sequence that reads the same as a
-    rolled-back INSERT. This is why `CLAUDE.md`'s item 11 asks operators to
-    run the application as a role that owns nothing: against an owner, this
-    migration buys one extra statement and an audit-log entry in whatever
-    watches DDL, which in this repo is nothing.
+    NEW MEASUREMENT, and it exists because the split changed the answer.
+    Migration `f1860c110112` runs `REVOKE UPDATE, DELETE, TRUNCATE ON
+    audit_log FROM CURRENT_USER`, and its docstring calls that REVOKE
+    "decorative" against a superuser owner -- correctly, because a superuser
+    bypasses the ACL. CURRENT_USER at migration time is now `postern_owner`,
+    which is not a superuser, so the REVOKE binds and this is the refusal it
+    produces. It is worth exactly one statement: the owner grants the
+    privilege back to itself in the next breath, which
+    `test_the_owner_erases_the_record_by_disabling_the_trigger` then does.
     """
     await _seed(clean)
-    async with clean.sessionmaker() as s:
+    error = await _refused(owner, "DELETE FROM audit_log WHERE customer_ref = :customer")
+    assert "permission denied for table audit_log" in str(error)
+    assert _sqlstate(error) == INSUFFICIENT_PRIVILEGE
+    assert len(await _rows(clean)) == 1
+
+
+async def test_the_owner_erases_the_record_by_disabling_the_trigger(
+    clean: Database, owner: Database
+) -> None:
+    """BYPASS ONE, and the reason the docstrings do not say "append-only".
+
+    RE-POINTED ON 2026-09-29 FROM THE SUPERUSER TO `postern_owner`, which is
+    the point of the re-point: this used to run as a role that was the owner
+    AND a superuser, so it could not distinguish which of the two properties
+    did the work. It is now a role holding only ownership, and ownership is
+    still enough.
+
+    THREE STATEMENTS, NOT TWO, which is the one number the split moved. The
+    `GRANT ... TO CURRENT_USER` at the top is new and is not ceremony: without
+    it the DELETE is refused at the ACL by migration `f1860c110112`'s REVOKE,
+    which the previous superuser owner bypassed without noticing. So the price
+    of this bypass went from two statements to three, and the residue is
+    unchanged -- a gap in the `id` sequence that reads the same as a
+    rolled-back INSERT, plus whatever watches DDL, which in this repo is
+    nothing.
+
+    This is why `CLAUDE.md`'s item 11 asks operators to keep the application
+    off this role: three statements is not a wall, it is a receipt.
+    """
+    await _seed(clean)
+    async with owner.sessionmaker() as s:
+        await s.execute(text("GRANT DELETE ON audit_log TO CURRENT_USER"))
         await s.execute(text("ALTER TABLE audit_log DISABLE TRIGGER audit_log_append_only_row"))
         await s.execute(
             text("DELETE FROM audit_log WHERE customer_ref = :customer"), {"customer": CUSTOMER}
         )
         await s.execute(text("ALTER TABLE audit_log ENABLE TRIGGER audit_log_append_only_row"))
+        await s.execute(text("REVOKE DELETE ON audit_log FROM CURRENT_USER"))
         await s.commit()
     assert await _rows(clean) == []
-    # Re-armed, in this session and for every later test in the suite.
+    # Re-armed, in this session and for every later test in the suite. Asserted
+    # against BOTH halves: the trigger answers the superuser, and the ACL
+    # answers the owner again, so a teardown that forgot either statement
+    # fails here rather than silently leaving the control off for the rest of
+    # the run.
     await _seed(clean)
     error = await _refused(clean, "DELETE FROM audit_log WHERE customer_ref = :customer")
     assert "DELETE is not permitted" in str(error)
+    owner_error = await _refused(owner, "DELETE FROM audit_log WHERE customer_ref = :customer")
+    assert "permission denied for table audit_log" in str(owner_error)
 
 
 async def test_a_superuser_erases_the_record_by_setting_session_replication_role(
@@ -420,6 +474,12 @@ async def test_a_superuser_erases_the_record_by_setting_session_replication_role
     create and a superuser drops it, and the same role can reach the table's
     files regardless. Operator checklist item 11 is the whole mitigation --
     the application must not connect as this kind of role.
+
+    DELIBERATELY NOT RE-POINTED. Every other test in this file moved onto one
+    of the two new roles on 2026-09-29; this one stays on `clean` because
+    `clean` is the superuser and a superuser is precisely what it measures.
+    `test_the_appender_role_cannot_reach_either_bypass` is the other side of
+    it: the application role is refused this exact statement.
     """
     await _seed(clean)
     async with clean.sessionmaker() as s:

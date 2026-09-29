@@ -42,6 +42,54 @@ services:
       timeout: 3s
       retries: 15
 
+  # OPERATOR CHECKLIST ITEM 11, applied here rather than described. Until
+  # 29 September 2026 every container in this file connected as `postern`, the
+  # bootstrap SUPERUSER, which is also the owner of every table `migrate`
+  # creates. Against that role `audit_log`'s append-only triggers are two
+  # statements from being off -- measured, not argued, in
+  # `tests/test_audit_append_only.py`, which performs both bypasses.
+  #
+  # There are now three roles in this stack and the services hold the weakest:
+  #
+  #   postern         superuser. Creates the other two and nothing else.
+  #   postern_owner   owns every table, runs `alembic upgrade head`. No service.
+  #   postern_app     owns nothing, not a superuser, holds exactly
+  #                   `sql/02-grants.sql`. `api` and `confirm` connect as this.
+  #
+  # THREE ONE-SHOT SERVICES BECAUSE THERE ARE THREE PRIVILEGE LEVELS, and the
+  # order between them is not cosmetic: a role must exist before it can own a
+  # table, a table must exist before anything can be granted on it. `depends_on`
+  # with `service_completed_successfully` is what serialises them, the same
+  # shape `migrate` already used.
+  #
+  # `postgres:17-alpine` rather than the repo's own images because `psql` is
+  # what runs a `.sql` file, and neither serving image carries it. That is a
+  # feature: the two scripts are SQL an operator runs with the client they
+  # already have, not Python this repository has to ship.
+  db-roles:
+    image: postgres:17-alpine
+    restart: "no"
+    volumes:
+      - ./sql:/sql:ro
+    environment:
+      PGPASSWORD: postern
+    # The passwords are set HERE and not in `sql/01-roles.sql`, which creates
+    # both roles able to log in and unable to authenticate. A credential in a
+    # repository is a credential in every clone of it; these two are throwaway
+    # local-development values sitting beside the throwaway superuser password
+    # three lines up in this same file, and a deployment sets its own from a
+    # secrets manager instead.
+    command: >
+      sh -ec '
+      psql -v ON_ERROR_STOP=1 -h db -U postern -d postern -f /sql/01-roles.sql;
+      psql -v ON_ERROR_STOP=1 -h db -U postern -d postern
+      -c "ALTER ROLE postern_owner PASSWORD '"'"'postern_owner'"'"'"
+      -c "ALTER ROLE postern_app PASSWORD '"'"'postern_app'"'"'";
+      '
+    depends_on:
+      db:
+        condition: service_healthy
+
   backend-stub:
     image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
     working_dir: /app
@@ -75,10 +123,34 @@ services:
       target: migrate
     restart: "no"
     environment:
-      POSTERN_DATABASE_URL: postgresql+asyncpg://postern:postern@db:5432/postern
+      # THE OWNER, and this is the line that makes the split real. The tables
+      # `alembic upgrade head` creates are owned by whoever runs it, so this
+      # value decides which role can reach `audit_log`'s triggers. It is the
+      # only container in this file that holds it.
+      POSTERN_DATABASE_URL: postgresql+asyncpg://postern_owner:postern_owner@db:5432/postern
     depends_on:
       db:
         condition: service_healthy
+      db-roles:
+        condition: service_completed_successfully
+
+  # The grants, as `postern_owner`, after the migrations. Re-run on every
+  # `docker compose up` because that is what a deployment does after every
+  # release: a migration that adds a table leaves it reachable by nobody until
+  # this runs again, and the REVOKE pair at the top of the file makes re-running
+  # restore the intended set rather than merely add to it.
+  db-grants:
+    image: postgres:17-alpine
+    restart: "no"
+    volumes:
+      - ./sql:/sql:ro
+    environment:
+      PGPASSWORD: postern_owner
+    command: >
+      psql -v ON_ERROR_STOP=1 -h db -U postern_owner -d postern -f /sql/02-grants.sql
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
   api:
     build:
@@ -86,7 +158,11 @@ services:
       target: api
     environment:
       POSTERN_BACKEND_BASE_URL: http://backend-stub:8081
-      POSTERN_DATABASE_URL: postgresql+asyncpg://postern:postern@db:5432/postern
+      # The application role: owns nothing, is not a superuser, and cannot
+      # UPDATE, DELETE or TRUNCATE `audit_log` -- refused at the ACL check,
+      # before the trigger is consulted. An RCE in this container inherits
+      # exactly this.
+      POSTERN_DATABASE_URL: postgresql+asyncpg://postern_app:postern_app@db:5432/postern
       POSTERN_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
       POSTERN_TOKEN_ISSUER: "https://postern-local-dev.invalid"
       POSTERN_AUDIENCE: "postern"
@@ -97,7 +173,7 @@ services:
         condition: service_started
       db:
         condition: service_healthy
-      migrate:
+      db-grants:
         condition: service_completed_successfully
 
   # Plan 3 Task 6: the write path, brought up alongside `api` to verify the
@@ -165,9 +241,13 @@ services:
       # The engine is lazy so it started fine and failed on first use: every
       # approval, every `audit_log` row, every challenge lookup. The comment
       # above this block still said "no database" from when that was true.
-      POSTERN_DATABASE_URL: postgresql+asyncpg://postern:postern@db:5432/postern
+      #
+      # The application role, for the same reason `api` above holds it. This
+      # service is the one that writes the approval rows, so it is the one
+      # whose compromise the split is actually bought against.
+      POSTERN_DATABASE_URL: postgresql+asyncpg://postern_app:postern_app@db:5432/postern
     depends_on:
       db:
         condition: service_healthy
-      migrate:
+      db-grants:
         condition: service_completed_successfully
