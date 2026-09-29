@@ -50,17 +50,15 @@ read a customer from otherwise.
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import httpx2
 from fastmcp.server.auth import AuthProvider
 from fastmcp.server.http import StarletteWithLifespan
 from postern_core.auth.internal_jwt import _LIFETIME, InternalTokenMinter
 from postern_core.auth.keys import (
-    FileKeySource,
     GeneratedKeySource,
     KeySource,
-    warn_ephemeral_signing_key,
+    choose_key_source,
 )
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
@@ -90,43 +88,64 @@ _STARTUP_PROBE = CustomerRef(value="cust_startupprobe")
 
 
 def _read_key_source(settings: Settings) -> KeySource:
-    """The READ signing key, from a PEM when a deployment names one.
+    """The READ signing key: inside Vault, from a PEM, or generated here.
+
+    THREE BRANCHES, ONE DECISION, AND IT IS NOT MADE HERE. The if/else this
+    function used to be moved into
+    `postern_core.auth.keys.choose_key_source` on 29 September 2026, because
+    the same decision is made three times in this repository -- this key, the
+    WRITE key in `services/confirm/minter.py`, and the device grant's READ key
+    in `services/confirm/main.py` -- and `.importlinter` forbids the two
+    services sharing anything directly. What is left here is the argument
+    list, which is this process's half of the read/write split: a READ kid, a
+    READ PEM variable, and the name of a READ transit key. There is no
+    spelling of this call that names a write key.
+
+    VAULT FIRST when ``POSTERN_VAULT_ADDR`` is set, and then the private key
+    is not in this process at all: `postern_core.auth.vault` carries what that
+    buys, what it costs per call, and why a Vault plus a PEM is refused rather
+    than ordered.
 
     A set `read_key_pem_path` is the Vault Agent shape: the sidecar renders
     the private key to a file and this process reads it once at startup, so
     `FileKeySource`'s public-key rejection fires before uvicorn serves rather
-    than at the first customer request. Unset means generate 2048 bits in
-    process, which `Settings.for_testing()` and the local docker-compose
+    than at the first customer request. Neither set means generate 2048 bits
+    in process, which `Settings.for_testing()` and the local docker-compose
     stack both want: nothing verifies these tokens locally (the backend stub
-    reads `sub` out of the payload without checking the signature, by
-    design), so a generated key needs no secret on disk and no key rotation.
+    reads `sub` out of the payload without checking the signature, by design),
+    so a generated key needs no secret on disk and no key rotation.
 
     A process restart throws a generated key away, which is exactly why a
-    deployment must set the path: the JWKS Task 3 publishes would otherwise
-    change under every verifier on every restart. That sentence has been in
-    this docstring since Plan 3 Task 2 and the code said nothing at runtime;
-    since 2026-09-18 the generated branch warns, unconditionally and without
-    refusing. `warn_ephemeral_signing_key` carries why it is neither gated
-    nor fatal, and `docs/verification/2026-09-18-multi-replica-jwks.md`
-    measures what the discarded key costs a caller.
+    deployment must set one of the other two: the JWKS Task 3 publishes would
+    otherwise change under every verifier on every restart.
+    `warn_ephemeral_signing_key` carries why that is neither gated nor fatal,
+    and `docs/verification/2026-09-18-multi-replica-jwks.md` measures what the
+    discarded key costs a caller.
 
     Production deployments MUST set ``POSTERN_REQUIRE_PEM_KEY=1`` to refuse
-    startup with an ephemeral key. Without it, a restart changes the JWKS
-    and every verifier rejects all tokens until they re-fetch.
+    startup with an ephemeral key. Without it, a restart changes the JWKS and
+    every verifier rejects all tokens until they re-fetch.
     """
-    if settings.read_key_pem_path is not None:
-        return FileKeySource(Path(settings.read_key_pem_path), kid=settings.read_key_kid)
-    # Warn AFTER the key exists, not on `read_key_pem_path is None` read a
-    # second time from settings: the lesson of `d203606` is that a control
-    # keyed on configuration shape drifts away from what the process actually
-    # built. This fires only on the object below having been constructed.
-    source = GeneratedKeySource(kid=settings.read_key_kid)
-    warn_ephemeral_signing_key(
-        role="READ", kid=settings.read_key_kid, pem_env_var="POSTERN_READ_KEY_PEM_PATH"
+    source = choose_key_source(
+        role="READ",
+        kid=settings.read_key_kid,
+        vault=settings.vault,
+        vault_key_name=settings.vault_read_key_name,
+        pem_path=settings.read_key_pem_path,
+        pem_env_var="POSTERN_READ_KEY_PEM_PATH",
     )
     # Audit finding (2026-09-21): refuse to start with ephemeral key when
     # the operator has explicitly required a persisted PEM. Without this,
     # a restart changes the JWKS and every verifier rejects all tokens.
+    #
+    # KEYED ON THE OBJECT THAT WAS BUILT, not on `read_key_pem_path is None`
+    # read a second time from settings. That is the lesson `d203606` left --
+    # a control keyed on configuration shape drifts away from what the
+    # process actually built -- and since 29 September 2026 it is also the
+    # difference between right and wrong: a Vault-backed deployment sets no
+    # PEM path, so the settings-shaped test would have refused to start the
+    # one configuration in which there is no ephemeral key and no private key
+    # in the process at all.
     #
     # READ THROUGH `bool_from_env` SINCE 2026-09-26, AND THAT CHANGED WHAT
     # SOME DEPLOYMENTS DO. It was `== "1"`, so `POSTERN_REQUIRE_PEM_KEY=true`
@@ -137,7 +156,7 @@ def _read_key_source(settings: Settings) -> KeySource:
     # that did nothing, which is why this one was worth converting rather
     # than documenting. `true`, `yes` and `on` now arm it; an unreadable
     # value refuses to start instead of defaulting to off.
-    if bool_from_env(
+    if isinstance(source, GeneratedKeySource) and bool_from_env(
         "POSTERN_REQUIRE_PEM_KEY",
         False,
         because=(
@@ -147,8 +166,9 @@ def _read_key_source(settings: Settings) -> KeySource:
         ),
     ):
         raise RuntimeError(
-            "POSTERN_REQUIRE_PEM_KEY is set but POSTERN_READ_KEY_PEM_PATH is not. "
-            "A persisted PEM key is required for production: a restart with an "
+            "POSTERN_REQUIRE_PEM_KEY is set but this process generated an ephemeral "
+            "signing key: neither POSTERN_READ_KEY_PEM_PATH nor POSTERN_VAULT_ADDR is "
+            "set. A persisted key is required for production: a restart with an "
             "ephemeral key changes the JWKS and invalidates all existing tokens."
         )
     return source
@@ -172,10 +192,10 @@ def _backend_timeout(settings: Settings) -> httpx2.Timeout:
 
 
 def _close_resources_after_fastmcp_shutdown(
-    app: StarletteWithLifespan, backend: BackendClient, db: Database
+    app: StarletteWithLifespan, backend: BackendClient, db: Database, key_source: KeySource
 ) -> None:
-    """Wires `backend.aclose()` and (Task 6) `db.close()` into the app's own
-    ASGI lifespan.
+    """Wires `backend.aclose()`, (Task 6) `db.close()` and (2026-09-29)
+    `key_source.close()` into the app's own ASGI lifespan.
 
     `FastMCP.http_app()` returns a `StarletteWithLifespan` whose lifespan
     starts and stops FastMCP's session manager (`fastmcp/server/http.py`).
@@ -201,6 +221,17 @@ def _close_resources_after_fastmcp_shutdown(
             yield
         await backend.aclose()
         await db.close()
+        # The third resource, and the only synchronous one: a Vault-backed
+        # `KeySource` holds an `httpx2.Client` connection pool, and the two
+        # local ones hold nothing and no-op. Called through the Protocol
+        # rather than behind an `isinstance`, for the reason
+        # `postern_core.auth.keys.KeySource.close` gives -- a composition root
+        # that has to ask which implementation it built is the first thing to
+        # break "nothing above the seam knows".
+        #
+        # LAST, after the backend client, because a token minted for an
+        # in-flight request is useless once that request cannot be sent.
+        key_source.close()
 
     app.router.lifespan_context = lifespan
 
@@ -546,7 +577,7 @@ def create_app(
     # route serves it, and it is the only handle on that key outside the
     # `BackendClient` the minter is buried in.
     app.state.postern_read_key_source = read_key_source
-    _close_resources_after_fastmcp_shutdown(app, backend, db)
+    _close_resources_after_fastmcp_shutdown(app, backend, db, read_key_source)
     # Plan 3 Task 3: the public half of that same key, appended to the router
     # of the object this function returns rather than served from a parent
     # Starlette app mounting this one.

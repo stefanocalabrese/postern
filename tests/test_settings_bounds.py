@@ -248,9 +248,9 @@ BOUNDED: tuple[Bounded, ...] = (
         "POSTERN_REQUEST_DEADLINE_SECONDS",
         "request_deadline_seconds",
         "api",
-        101.0,
+        105.0,
         ("0", "0.0", "-1", "nan", "inf"),
-        ("0.001", "101.0", "600"),
+        ("0.001", "105.0", "600"),
     ),
     # --- services/confirm --------------------------------------------------
     Bounded(
@@ -507,6 +507,16 @@ class TestEveryNumericSettingIsInTheInventory:
             "POSTERN_APP_ASSERTION_ISSUER",
             "POSTERN_APP_ASSERTION_AUDIENCE",
             "POSTERN_DEVICE_KEYS_PATH",
+            # The two transit key names, read in each service's own `from_env`
+            # and nowhere else. They are strings with no bound to state: a
+            # transit key either exists under that name or the first read of it
+            # answers 404, which is a refusal from Vault and not one this
+            # process can usefully anticipate. `POSTERN_VAULT_ADDR` and the
+            # other five in the family are absent from this set because
+            # `from_env` does not read them -- `postern_core.auth.vault`'s
+            # `vault_from_env` does, once, for both services.
+            "POSTERN_VAULT_READ_KEY_NAME",
+            "POSTERN_VAULT_WRITE_KEY_NAME",
         }
         source = inspect.getsource(cls.from_env.__func__)  # type: ignore[attr-defined]
         tree = ast.parse(inspect.cleandoc(source))
@@ -848,6 +858,156 @@ STORE_BOUNDED: tuple[StoreBounded, ...] = (
 STORE_IDS = [b.name for b in STORE_BOUNDED]
 
 
+@dataclasses.dataclass(frozen=True)
+class VaultBounded:
+    """One environment variable `postern_core.auth.vault.vault_from_env` reads.
+
+    A THIRD INVENTORY AND NOT A ROW IN EITHER OF THE OTHER TWO, for the reason
+    `StoreBounded` is separate from `Bounded`: the seam is different. These two
+    are behind neither a settings ``from_env`` (so
+    `TestEveryNumericSettingIsInTheInventory`'s walk of those two methods
+    cannot see them) nor a store constructor. They are read in one function in
+    the shared library, which both services call, so a single parse covers
+    both deployables -- and that is precisely the shape the two Redis TTLs had
+    when they went unbounded for a day.
+    """
+
+    name: str
+    attribute: str
+    default: float
+    refuses: tuple[str, ...]
+    accepts: tuple[str, ...]
+
+    def read(self) -> float:
+        """Parse the environment as both services do, and return this field.
+
+        The class's own fixture sets ``POSTERN_VAULT_ADDR``, because
+        `vault_from_env` returns ``None`` without it -- the no-Vault path --
+        and then there is no value to bound. The address is never connected to.
+        """
+        from postern_core.auth.vault import vault_from_env
+
+        settings = vault_from_env()
+        assert settings is not None
+        value = getattr(settings, self.attribute)
+        assert isinstance(value, float)
+        return value
+
+
+VAULT_BOUNDED: tuple[VaultBounded, ...] = (
+    VaultBounded(
+        name="POSTERN_VAULT_TIMEOUT_SECONDS",
+        attribute="timeout_seconds",
+        default=1.0,
+        # Zero is refused where the two POOL timeouts accept it, and the
+        # asymmetry is the one `services/api/settings.py`'s module docstring
+        # measured: this value reaches connect, read and write as well as pool,
+        # and httpx2 at connect=0 answers every request ConnectTimeout. A
+        # process that cannot sign mints nothing and reaches no backend.
+        refuses=("0", "0.0", "-1", "nan", "inf", "abc"),
+        accepts=("0.25", "1.0", "5", "30"),
+    ),
+    VaultBounded(
+        name="POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS",
+        attribute="public_key_ttl_seconds",
+        default=300.0,
+        refuses=("0", "0.0", "-1", "nan", "inf", "abc"),
+        accepts=("1", "60", "300.0", "86400"),
+    ),
+)
+
+VAULT_IDS = [b.name for b in VAULT_BOUNDED]
+
+
+@pytest.fixture(autouse=True)
+def _clean_vault_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("POSTERN_VAULT_ADDR", raising=False)
+    for bound in VAULT_BOUNDED:
+        monkeypatch.delenv(bound.name, raising=False)
+
+
+class TestTheVaultVariablesAreBoundedToo:
+    """The same properties, at the third seam."""
+
+    @pytest.fixture(autouse=True)
+    def _an_address_so_there_is_a_vault(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("POSTERN_VAULT_ADDR", "http://vault.invalid:8200")
+
+    def test_no_vault_address_means_no_vault_and_nothing_to_bound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The documented path, asserted first. This repository is a framework
+        and an operator without a Vault must still be able to run it, so an
+        unset ``POSTERN_VAULT_ADDR`` is not a degraded mode but the absence of
+        one."""
+        from postern_core.auth.vault import vault_from_env
+
+        monkeypatch.delenv("POSTERN_VAULT_ADDR")
+        assert vault_from_env() is None
+
+    def test_an_empty_address_is_unset_and_not_a_vault_at_the_empty_string(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``docker-compose.yml``'s convention for "off" is the empty string,
+        and every other optional string field in this repository collapses it
+        to ``None``. One that did not would build a `VaultTransitKeySource`
+        against ``base_url=""``."""
+        from postern_core.auth.vault import vault_from_env
+
+        monkeypatch.setenv("POSTERN_VAULT_ADDR", "")
+        assert vault_from_env() is None
+
+    @pytest.mark.parametrize("bound", VAULT_BOUNDED, ids=VAULT_IDS)
+    def test_an_unset_or_empty_variable_gives_the_documented_default(
+        self, bound: VaultBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert bound.read() == bound.default
+        monkeypatch.setenv(bound.name, "")
+        assert bound.read() == bound.default
+
+    @pytest.mark.parametrize("bound", VAULT_BOUNDED, ids=VAULT_IDS)
+    def test_each_refused_value_names_the_variable(
+        self, bound: VaultBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for raw in bound.refuses:
+            monkeypatch.setenv(bound.name, raw)
+            with pytest.raises(ValueError, match=bound.name):
+                bound.read()
+
+    @pytest.mark.parametrize("bound", VAULT_BOUNDED, ids=VAULT_IDS)
+    def test_each_accepted_value_parses_to_itself(
+        self, bound: VaultBounded, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for raw in bound.accepts:
+            monkeypatch.setenv(bound.name, raw)
+            assert bound.read() == float(raw)
+
+    def test_the_mount_and_the_credential_default_the_way_the_family_says(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The four strings in the family, which carry no bound and so no row
+        above. The credential pair is deliberately left ``None`` here:
+        `VaultTransitKeySource`'s constructor is the one place that refuses
+        neither-or-both, and a second copy of that refusal would be a second
+        thing to keep in step."""
+        from postern_core.auth.vault import vault_from_env
+
+        monkeypatch.setenv("POSTERN_VAULT_ADDR", "http://vault.invalid:8200")
+        settings = vault_from_env()
+        assert settings is not None
+        assert settings.mount == "transit"
+        assert settings.token is None
+        assert settings.token_path is None
+
+        monkeypatch.setenv("POSTERN_VAULT_TRANSIT_MOUNT", "postern-transit")
+        sink = "/run/secrets/vault-token"  # noqa: S105 -- a path, not a credential
+        monkeypatch.setenv("POSTERN_VAULT_TOKEN_PATH", sink)
+        rebuilt = vault_from_env()
+        assert rebuilt is not None
+        assert rebuilt.mount == "postern-transit"
+        assert rebuilt.token_path == sink
+
+
 @pytest.fixture(autouse=True)
 def _clean_store_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for bound in STORE_BOUNDED:
@@ -1173,9 +1333,10 @@ READ_AS_STRING: frozenset[str] = frozenset(
 #: "do not require a PEM key".
 FLAGS: frozenset[str] = frozenset(entry.name for entry in INVENTORY if entry.kind == "flag")
 
-#: The names in the two numeric inventories above, for the membership test.
+#: The names in the three numeric inventories above, for the membership test.
 BOUNDED_NAMES: frozenset[str] = frozenset(bound.name for bound in BOUNDED)
 STORE_BOUNDED_NAMES: frozenset[str] = frozenset(bound.name for bound in STORE_BOUNDED)
+VAULT_BOUNDED_NAMES: frozenset[str] = frozenset(bound.name for bound in VAULT_BOUNDED)
 
 
 def _reads_the_environment(node: ast.AST, aliases: frozenset[str] = _ENV_ACCESSORS) -> bool:
@@ -1922,7 +2083,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
 
     def test_every_bounded_reader_call_names_a_variable_in_an_inventory(self) -> None:
-        known = BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS
+        known = BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS
         offenders = [
             f"{site.where} reads {site.name!r}"
             for site in _all_env_sites()
@@ -1948,7 +2109,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
 
     def test_the_two_inventories_are_the_whole_tree(self) -> None:
-        """57 variables, 20 read directly and 37 through a reader, disjoint."""
+        """65 variables, 26 read directly and 39 through a reader, disjoint."""
         direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
         through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
         assert direct & through == set(), (
@@ -1956,7 +2117,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
             "One variable read two ways is two bounds that can disagree."
         )
         assert direct == set(READ_AS_STRING)
-        assert through == BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS
+        assert through == BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS
         # THE ANTI-DRIFT ASSERTION, and the reason this file no longer keeps its
         # own copy of the names. Set equality fails in both directions: a name
         # the tree reads that `INVENTORY` does not declare would leave the
@@ -1965,7 +2126,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         # accepting one that arms nothing -- the defect it exists for,
         # reintroduced inside the control itself.
         assert direct | through == set(KNOWN_ENV)
-        assert len(KNOWN_ENV) == 57
+        assert len(KNOWN_ENV) == 65
 
     def test_the_counts_the_docstrings_quote(self) -> None:
         """Every number the prose in this file states, re-derived.
@@ -1974,14 +2135,15 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         confidently as one that is right. A variable added anywhere fails here,
         which is the line that sends the author to the sentences.
         """
-        assert len(KNOWN_ENV) == 57
-        assert len(READ_AS_STRING) == 20
+        assert len(KNOWN_ENV) == 65
+        assert len(READ_AS_STRING) == 26
         assert len(FLAGS) == 3
         assert len(BOUNDED_NAMES) == 32
         assert len(STORE_BOUNDED_NAMES) == 2
-        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | FLAGS) == 37
-        assert len(names_read_by("api")) == 31
-        assert len(names_read_by("confirm")) == 41
+        assert len(VAULT_BOUNDED_NAMES) == 2
+        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 39
+        assert len(names_read_by("api")) == 38
+        assert len(names_read_by("confirm")) == 49
         assert len(names_read_by("migrations")) == 3
 
     def test_each_rows_services_are_the_roots_that_actually_read_it(self) -> None:

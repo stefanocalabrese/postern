@@ -148,6 +148,49 @@ class TestRequirePemKey:
         with pytest.raises(ValueError):
             create_app(settings)
 
+    def test_a_vault_backed_deployment_satisfies_the_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The flag is named PEM and what it means is "not an ephemeral key".
+
+        Added 29 September 2026 with Vault transit signing, and it is the half
+        of that change most likely to be broken by a plausible edit. The guard
+        used to read ``settings.read_key_pem_path is None`` -- a SETTINGS
+        SHAPE -- and a Vault-backed deployment sets no PEM path, so that
+        spelling would refuse to start the one configuration in which there is
+        no ephemeral key and no private key in the process at all. It now asks
+        what was BUILT: `GeneratedKeySource` or not.
+
+        `_read_key_source` rather than `create_app`, because
+        `VaultTransitKeySource`'s constructor fetches nothing but
+        `create_app`'s startup probe does, and this assertion is about the
+        flag and not about a reachable Vault.
+        `tests/test_vault_live.py::TestTheCompositionRoots` drives the whole
+        root against a real one.
+        """
+        from postern_core.auth.vault import VaultSettings, VaultTransitKeySource
+
+        from services.api.main import _read_key_source
+
+        monkeypatch.setenv("POSTERN_REQUIRE_PEM_KEY", "true")
+        vault = VaultSettings(
+            address="http://vault.invalid:8200",
+            token="hvs.notarealtoken",  # noqa: S106 -- a literal, never sent
+            token_path=None,
+            mount="transit",
+            timeout_seconds=1.0,
+            public_key_ttl_seconds=300.0,
+        )
+        source = _read_key_source(Settings(backend_base_url=BACKEND, vault=vault))
+        assert isinstance(source, VaultTransitKeySource)
+        source.close()
+
+        # The control: the same flag, the same settings minus the Vault, still
+        # refuses. Without this the assertion above passes for a flag that
+        # never fires at all.
+        with pytest.raises(RuntimeError, match="POSTERN_VAULT_ADDR"):
+            _read_key_source(Settings(backend_base_url=BACKEND))
+
 
 # ---------------------------------------------------------------------------
 # POSTERN_STRICT_HEADERS, through Settings.from_env.

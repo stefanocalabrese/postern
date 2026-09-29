@@ -13,15 +13,8 @@ for the write audiences the payment and card write paths will use; nothing
 in this service derives a scope from it yet; Plan 5/6 is expected to.
 """
 
-from pathlib import Path
-
 from postern_core.auth.internal_jwt import InternalTokenMinter
-from postern_core.auth.keys import (
-    FileKeySource,
-    GeneratedKeySource,
-    KeySource,
-    warn_ephemeral_signing_key,
-)
+from postern_core.auth.keys import KeySource, choose_key_source
 from postern_core.identity import CustomerRef
 
 from services.confirm.settings import ConfirmSettings
@@ -56,29 +49,37 @@ class WriteTokenMinter:
 
 
 def _write_key_source(settings: ConfirmSettings) -> KeySource:
-    """The WRITE signing key, from a PEM when a deployment names one.
+    """The WRITE signing key: inside Vault, from a PEM, or generated here.
 
-    Mirrors `services.api.main._read_key_source`: a set `write_key_pem_path`
-    is the Vault Agent shape, unset means generate 2048 bits in process,
-    which `ConfirmSettings.for_testing()` and the local docker-compose stack
-    both want. Since 2026-09-18 it mirrors the warning too. This is the half
-    with more at stake, since this key is what will sign write tokens for
-    `payments.svc` and `cards.svc` (`WRITE_SCOPES` above).
+    Mirrors `services.api.main._read_key_source` and, since 29 September 2026,
+    shares its body: both call `postern_core.auth.keys.choose_key_source` and
+    differ only in the arguments, which is the whole of the split expressed as
+    a call. This one names a WRITE kid, the WRITE PEM variable and the WRITE
+    transit key; that one names three read values and cannot name these.
+
+    This is the half with more at stake, since this key is what will sign
+    write tokens for `payments.svc` and `cards.svc` (`WRITE_SCOPES` above),
+    and it is therefore the half Vault is most worth for. Under
+    ``POSTERN_VAULT_ADDR`` the material that signs a payment token exists only
+    inside Vault, and this process holds a token whose policy permits
+    ``update`` on one transit path.
+
+    `ConfirmSettings.for_testing()` and the local docker-compose stack leave
+    both unset and get a generated key, with the same warning.
     `docs/verification/2026-09-18-multi-replica-jwks.md` measured two live
     `confirm` replicas publishing different 2048-bit moduli under the one
     `kid` `write-1`; it minted no write token, which that record's own
     unverified list states, so the divergence is measured on this side and
     the `bad_signature: ` cost of it only on the read side.
     """
-    if settings.write_key_pem_path is not None:
-        return FileKeySource(Path(settings.write_key_pem_path), kid=settings.write_key_kid)
-    # Same ordering as `_read_key_source`: the key first, the warning second,
-    # so the warning reports something built rather than something configured.
-    source = GeneratedKeySource(kid=settings.write_key_kid)
-    warn_ephemeral_signing_key(
-        role="WRITE", kid=settings.write_key_kid, pem_env_var="POSTERN_WRITE_KEY_PEM_PATH"
+    return choose_key_source(
+        role="WRITE",
+        kid=settings.write_key_kid,
+        vault=settings.vault,
+        vault_key_name=settings.vault_write_key_name,
+        pem_path=settings.write_key_pem_path,
+        pem_env_var="POSTERN_WRITE_KEY_PEM_PATH",
     )
-    return source
 
 
 def build_write_minter(settings: ConfirmSettings) -> tuple[WriteTokenMinter, KeySource]:

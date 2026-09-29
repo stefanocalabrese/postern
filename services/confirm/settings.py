@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from postern_core.auth.device_codes import (
     MIN_DEVICE_CODE_TTL_SECONDS as _MIN_DEVICE_CODE_TTL_SECONDS,
 )
+from postern_core.auth.vault import VaultSettings, vault_from_env
 from postern_core.config import float_from_env, int_from_env
 
 #: The scope string ``POST /device_authorization`` substitutes when the caller
@@ -189,6 +190,19 @@ class ConfirmSettings:
     write_key_pem_path: str | None = None
     write_key_kid: str = "write-1"
     write_token_issuer: str = "https://mcp-write.internal"  # noqa: S105
+    # VAULT TRANSIT. `vault` is the same six values `services/api/settings.py`
+    # reads, from the same `vault_from_env`, because there is one Vault. The
+    # two KEY NAMES are read here and not there, and this is the service that
+    # has both -- the device grant exception this file's module docstring
+    # already records. What keeps the split real under Vault is not this
+    # dataclass: it is the policy on the Vault token each SERVICE holds. The
+    # api service's token has `update` on `transit/sign/<read key>` and
+    # nothing on the write key, so a compromised read process cannot sign a
+    # payment token even knowing its name -- measured against Vault 1.20.4 in
+    # `tests/test_vault_live.py`.
+    vault: VaultSettings | None = None
+    vault_write_key_name: str = "postern-write"
+    vault_read_key_name: str = "postern-read"
     # Device authorization (§7.3): where the user goes to approve pairing.
     device_verification_uri: str = "https://auth.postern.internal/verify"
     # Floored at `MIN_DEVICE_CODE_TTL_SECONDS` when it comes from the
@@ -426,6 +440,9 @@ class ConfirmSettings:
         return cls(
             write_key_pem_path=os.environ.get("POSTERN_WRITE_KEY_PEM_PATH") or None,
             write_key_kid=os.environ.get("POSTERN_WRITE_KEY_KID", "write-1"),
+            vault=vault_from_env(),
+            vault_write_key_name=os.environ.get("POSTERN_VAULT_WRITE_KEY_NAME", "postern-write"),
+            vault_read_key_name=os.environ.get("POSTERN_VAULT_READ_KEY_NAME", "postern-read"),
             write_token_issuer=os.environ.get(
                 "POSTERN_WRITE_TOKEN_ISSUER", "https://mcp-write.internal"
             ),

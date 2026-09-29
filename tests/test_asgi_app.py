@@ -257,9 +257,20 @@ def test_create_app_fails_clearly_on_incomplete_environment(
 async def test_lifespan_runs_fastmcps_own_startup_then_closes_the_backend_client_after_its_shutdown(
     monkeypatch: pytest.MonkeyPatch, pg_url: str
 ) -> None:
-    """Three hooks must all run, in order: FastMCP's own session-manager
+    """Four hooks must all run, in order: FastMCP's own session-manager
     lifespan, then (Task 6) both `BackendClient.aclose()` and
-    `Database.close()`, only after FastMCP's shutdown has finished.
+    `Database.close()` and (2026-09-29) `KeySource.close()`, only after
+    FastMCP's shutdown has finished.
+
+    THE KEY SOURCE IS THE THIRD RESOURCE and it is spied on here rather than
+    asserted on its own, because under `GeneratedKeySource` -- which is what
+    this test builds -- `close()` is a documented no-op and an assertion about
+    its effect would have nothing to observe. Under
+    `postern_core.auth.vault.VaultTransitKeySource` it releases an
+    `httpx2.Client` connection pool, so what has to hold is that the call
+    HAPPENS, exactly once, after FastMCP's shutdown. Measured by mutation:
+    replacing the call with `pass` left this file green until this spy
+    existed.
 
     Since Task 6, `AuditMiddleware` is installed unconditionally and writes a
     real row after every call, so this test needs a real, reachable database
@@ -272,10 +283,13 @@ async def test_lifespan_runs_fastmcps_own_startup_then_closes_the_backend_client
     app = create_app(settings, resolver=_resolver, transport=httpx2.MockTransport(_handler))
     backend = app.state.backend_client
     db = app.state.postern_database
+    key_source = app.state.postern_read_key_source
     backend_close_calls: list[None] = []
     db_close_calls: list[None] = []
+    key_source_close_calls: list[None] = []
     original_backend_aclose = backend.aclose
     original_db_close = db.close
+    original_key_source_close = key_source.close
 
     async def spy_backend_aclose() -> None:
         backend_close_calls.append(None)
@@ -285,8 +299,13 @@ async def test_lifespan_runs_fastmcps_own_startup_then_closes_the_backend_client
         db_close_calls.append(None)
         await original_db_close()
 
+    def spy_key_source_close() -> None:
+        key_source_close_calls.append(None)
+        original_key_source_close()
+
     monkeypatch.setattr(backend, "aclose", spy_backend_aclose)
     monkeypatch.setattr(db, "close", spy_db_close)
+    monkeypatch.setattr(key_source, "close", spy_key_source_close)
 
     async with _drive_lifespan(app):
         # Proof FastMCP's own lifespan ran: without it, the session manager
@@ -313,9 +332,11 @@ async def test_lifespan_runs_fastmcps_own_startup_then_closes_the_backend_client
         assert body["result"]["isError"] is False
         assert backend_close_calls == []  # not yet -- the app is still running
         assert db_close_calls == []  # not yet -- the app is still running
+        assert key_source_close_calls == []  # not yet -- tokens are still minted
 
     assert backend_close_calls == [None]  # closed exactly once, after shutdown
     assert db_close_calls == [None]  # closed exactly once, after shutdown
+    assert key_source_close_calls == [None]  # closed exactly once, after shutdown
     assert backend._client.is_closed
 
 

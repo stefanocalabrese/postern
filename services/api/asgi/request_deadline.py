@@ -88,7 +88,7 @@ not:
     statement about a call that happened rather than silence about one.
 
   - **It does not make the service responsive.** See the deadline value in
-    `services/api/settings.py`: 101.0 seconds is longer than any consumer AI
+    `services/api/settings.py`: 105.0 seconds is longer than any consumer AI
     client will wait. This control exists to return the WORKER, not to give
     the caller a timely answer.
 

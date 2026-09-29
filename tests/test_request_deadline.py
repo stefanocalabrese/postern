@@ -104,7 +104,7 @@ from tests.test_store_query_stall_deadline import (
 )
 
 # The deadline the integration tests configure. Far below `Settings`'
-# production 101.0s so the gate stays quick; the production number is derived
+# production 105.0s so the gate stays quick; the production number is derived
 # in `services/api/settings.py` and is not a measurement.
 DEADLINE = 1.5
 
@@ -652,13 +652,16 @@ async def _nowhere(message: Message) -> None:
 def test_settings_carries_the_derived_default_and_reads_the_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """101.0 is not a preference and not a round number: it is the sum
+    """105.0 is not a preference and not a round number: it is the sum
     `services/api/settings.py` derives from the per-phase budgets already in
     this repository. A test pinning the literal is what makes a later change
-    to it deliberate.
+    to it deliberate -- and it did exactly that on 29 September 2026, when the
+    backend term grew from 10.0 to 14.0 because every internal token is now
+    signed by a Vault round trip taken inside `BackendClient.get_json`, under
+    its own four-phase budget.
 
     Both routes to the value are pinned, and the second is the one that
-    matters: production reads `from_env`, which carries its own `"101.0"`
+    matters: production reads `from_env`, which carries its own `105.0`
     string literal in an `os.environ.get` default. Pinning only the dataclass
     field would let those two drift, with the gate green and every deployment
     on the stale number. Same shape as
@@ -666,11 +669,11 @@ def test_settings_carries_the_derived_default_and_reads_the_environment(
     stated_six_second_worst_case`, which pins the store budgets through
     `from_env` with the variables explicitly unset.
     """
-    assert Settings.for_testing().request_deadline_seconds == 101.0
+    assert Settings.for_testing().request_deadline_seconds == 105.0
 
     monkeypatch.setenv("POSTERN_BACKEND_BASE_URL", "https://backend.test")
     monkeypatch.delenv("POSTERN_REQUEST_DEADLINE_SECONDS", raising=False)
-    assert Settings.from_env().request_deadline_seconds == 101.0
+    assert Settings.from_env().request_deadline_seconds == 105.0
 
     monkeypatch.setenv("POSTERN_REQUEST_DEADLINE_SECONDS", "12.5")
     assert Settings.from_env().request_deadline_seconds == 12.5

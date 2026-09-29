@@ -1,7 +1,19 @@
 """Minting the token for one internal hop (handoff §7.2).
 
-Pure: a key plus claims in, a signed string out, no I/O. Vault lives behind
-`KeySource` and never appears here.
+Claims in, a signed string out. Vault lives behind `KeySource` and never
+appears here.
+
+THIS FUNCTION IS NO LONGER PURE, AND THE LINE THAT SAID IT WAS IS GONE. It
+read "a key plus claims in, a signed string out, no I/O" until 29 September
+2026, which was true of the two local key sources and stopped being true the
+moment `postern_core.auth.vault.VaultTransitKeySource` existed: under it,
+`mint` performs a synchronous HTTP round trip to Vault, measured at 1.8ms over
+loopback against 0.9ms for the in-process signature it replaces. Nothing about
+the shape of this module changed -- it still knows nothing about where the
+signature happens -- but a caller reading "no I/O" and concluding that `mint`
+cannot block, cannot time out and cannot raise a network error would be wrong
+on all three. It can raise `VaultTransitError`, and it does so rather than
+returning an unsigned token, which is the direction this path has to fail in.
 
 TWO METHODS, ONE BODY. `mint` returns the token. `mint_with_jti` returns the
 token and the ``jti`` that was signed into it, for the one caller that needs
@@ -26,7 +38,6 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from joserfc import jwt
 from joserfc.jwt import Claims
 
 from postern_core.auth.keys import KeySource
@@ -125,8 +136,16 @@ class InternalTokenMinter:
             if value is not None:
                 claims[name] = value
 
-        key = self.key_source.signing_key()
-        token = jwt.encode({"alg": "RS256", "kid": key.kid}, claims, key)
+        # THE ONE LINE THAT MADE VAULT POSSIBLE. This was
+        # ``key = self.key_source.signing_key()`` followed by ``jwt.encode(...,
+        # key)``, which required the seam to hand this function a private key
+        # and therefore required the key to be in this process. `KeySource.sign`
+        # returns the token instead, so where the signature happens is the
+        # implementation's business: in process for `GeneratedKeySource` and
+        # `FileKeySource`, inside Vault for
+        # `postern_core.auth.vault.VaultTransitKeySource`. Nothing else in this
+        # function changed, and nothing above it did.
+        token = self.key_source.sign(claims)
         # `claims["jti"]` and not a second `uuid4()`: this is the value that
         # was signed, which is the only value a jti consumer can use.
         return MintedToken(token=token, jti=str(claims["jti"]))

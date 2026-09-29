@@ -65,7 +65,7 @@ from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.auth.device_codes import create_device_code_store
 from postern_core.auth.device_keys import DeviceKeyStoreBase, FileDeviceKeyStore
 from postern_core.auth.internal_jwt import InternalTokenMinter
-from postern_core.auth.keys import GeneratedKeySource, warn_ephemeral_signing_key
+from postern_core.auth.keys import choose_key_source
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement
 from postern_core.env_inventory import enforce_known_environment
@@ -275,21 +275,23 @@ def create_confirm_app(
     _write_minter, write_key_source = build_write_minter(settings)
 
     # --- Read key / minter (device grant exception) ---
-    from postern_core.auth.keys import FileKeySource
-
-    if settings.read_key_pem_path is not None:
-        from pathlib import Path
-
-        read_key_source: FileKeySource | GeneratedKeySource = FileKeySource(
-            Path(settings.read_key_pem_path), kid=settings.read_key_kid
-        )
-    else:
-        read_key_source = GeneratedKeySource(kid=settings.read_key_kid)
-        warn_ephemeral_signing_key(
-            role="READ (device grant)",
-            kid=settings.read_key_kid,
-            pem_env_var="POSTERN_READ_KEY_PEM_PATH",
-        )
+    #
+    # THE ONE PROCESS IN THIS REPOSITORY THAT HOLDS TWO KEYS, and it is a
+    # recorded exception rather than a leak: the device grant mints the
+    # browser's read token in the same atomic step as the write one, so this
+    # service needs both. `services/confirm/settings.py`'s module docstring is
+    # where that is argued. Note what it is NOT: two calls to the same
+    # one-key-in, one-source-out function, which is all
+    # `choose_key_source` can do. There is still no object anywhere that
+    # hands a process both.
+    read_key_source = choose_key_source(
+        role="READ (device grant)",
+        kid=settings.read_key_kid,
+        vault=settings.vault,
+        vault_key_name=settings.vault_read_key_name,
+        pem_path=settings.read_key_pem_path,
+        pem_env_var="POSTERN_READ_KEY_PEM_PATH",
+    )
     read_minter = InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
 
     # --- Device code store ---

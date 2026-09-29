@@ -45,7 +45,7 @@ def refuse_unverifiable_minter(
        `tests/test_asgi_app.py` each configure a real `read_key_pem_path`, and
        `tests/test_key_sources.py` builds `FileKeySource` directly. An earlier
        draft of this line said EVERY test, which is false and sent a reviewer
-       looking for a coverage hole that does not exist -- see "BOTH KEY
+       looking for a coverage hole that does not exist -- see "ALL THREE KEY
        BRANCHES" below.) This hazard is
        reachable by no configuration: no `Settings` field, no environment
        variable and no `create_app` parameter selects a minter, and every
@@ -83,21 +83,29 @@ def refuse_unverifiable_minter(
     holds two. Every process here publishes exactly one key, so if
     `InternalTokenMinter` ever stopped putting `kid` in the JOSE header this
     probe would keep passing while a real verifier resolving against a
-    multi-key set failed. The kid is set today from `key.kid` in
-    `InternalTokenMinter.mint`, and
+    multi-key set failed. The kid is set by the KEY SOURCE since 29 September
+    2026 -- `InternalTokenMinter.mint` hands claims to `KeySource.sign` and
+    never sees a JOSE header -- and
     `tests/test_internal_jwt.py::test_the_header_names_the_signing_kid` is
-    where that contract is pinned; this function is not a second guard on it.
+    still where that contract is pinned; this function is not a second guard
+    on it. The Vault source publishes more than one key as soon as a rotation
+    happens, so on that branch the kid-less case this cannot see becomes one a
+    real verifier reports as `InvalidKeyIdError` rather than accepting.
 
-    BOTH KEY BRANCHES REACH THIS CHECK IN CI, which is worth stating here
+    ALL THREE KEY BRANCHES REACH THIS CHECK IN CI, which is worth stating here
     because the file is small and the evidence for it is not local to it. The
     body below has no branch on where the key came from, and both
-    `GeneratedKeySource` and `FileKeySource` derive `signing_key()` and
+    `GeneratedKeySource` and `FileKeySource` derive `sign()` and
     `public_jwks()` from a single `self._key`, with `create_app` handing that
     one object to both the minter and the JWKS route, so choosing a branch
     cannot produce the mismatch this probe looks for: producing it takes an
     edit to `create_app`, which `tests/test_startup_minter_probe.py` models by
-    patching the minter. The PEM branch is nonetheless exercised through here
-    on every run. Measured, by replacing this function's body with an
+    patching the minter. THE THIRD BRANCH,
+    `postern_core.auth.vault.VaultTransitKeySource`, reaches the same place by
+    a different route: its `sign` and its `public_jwks` both resolve the key
+    version from ONE cached read, so the version that signed and the version
+    published cannot disagree either. The PEM branch is nonetheless exercised
+    through here on every run. Measured, by replacing this function's body with an
     unconditional refusal:
     `tests/test_asgi_app.py::test_a_configured_pem_path_signs_instead_of_a_generated_key`
     (which configures a non-default kid, `read-file`, so a kid divergence in
@@ -110,14 +118,19 @@ def refuse_unverifiable_minter(
     developer machine, a mean of 0.96ms over 20 runs, against 70.7ms for the
     `GeneratedKeySource` construction already on that path in the same
     measurement -- one RSA signature and one verification, no I/O, nothing
-    that can block. Later is the part worth writing down: `KeySource` is the
-    seam Vault lands behind, and if a Vault-backed implementation ever makes
-    minting a REMOTE signing call, this line converts "Vault unreachable, the
-    first tool call fails" into "Vault unreachable, the container never
-    becomes ready" -- a crash loop instead of a degraded pod. That is a
-    defensible trade for a process whose whole job is minting those tokens,
-    but it is a trade, and whoever lands remote signing should decide it on
-    purpose rather than discover it in a rollout.
+    that can block. Later arrived on 29 September 2026, and this
+    paragraph predicted it: `postern_core.auth.vault.VaultTransitKeySource`
+    makes minting a REMOTE signing call, so under it this line costs two Vault
+    round trips at startup -- one to sign the probe token, one to read the key
+    set it is verified against -- and converts "Vault unreachable, the first
+    tool call fails" into "Vault unreachable, the container never becomes
+    ready", a crash loop instead of a degraded pod. THE TRADE IS TAKEN,
+    deliberately, and it is the better of the two: a pod that passes its
+    readiness probe and then 500s every tool call takes traffic away from
+    replicas that work, while one that never becomes ready leaves the previous
+    task set serving. The measurement is
+    `tests/test_vault_live.py::TestTheCompositionRoots::test_the_api_refuses_to_start_when_vault_is_unreachable`,
+    and there is no flag that turns it off.
 
     Measured against joserfc 1.7.5, all four rejections are `JoseError`
     subclasses, which is why that one `except` is enough: the stub's literal

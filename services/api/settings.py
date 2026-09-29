@@ -27,6 +27,7 @@ bound refuses what is UNREPRESENTABLE, not what is unwise.
 import os
 from dataclasses import dataclass
 
+from postern_core.auth.vault import VaultSettings, vault_from_env
 from postern_core.config import bool_from_env, float_from_env, int_from_env
 
 
@@ -44,6 +45,20 @@ class Settings:
     # `kid` the JWKS publishes, since a verifier selects the key by it.
     read_key_pem_path: str | None = None
     read_key_kid: str = "read-1"
+    # VAULT TRANSIT, the third branch and the only one under which the private
+    # key is not in this process at all. `vault` is `None` unless
+    # POSTERN_VAULT_ADDR is set, which keeps the PEM and generated branches
+    # behaving exactly as they did before it existed -- an operator without a
+    # Vault must still be able to run this, and `docker compose` must come up
+    # without one. `postern_core.auth.keys.choose_key_source` is where the
+    # three branches meet and where a Vault plus a PEM is refused.
+    #
+    # `vault_read_key_name` is read HERE and not in `vault_from_env` alongside
+    # the other six variables, because which transit key a process may name is
+    # the read/write split itself. There is no field on this dataclass, and no
+    # field on `postern_core.auth.vault.VaultSettings`, that names a write key.
+    vault: VaultSettings | None = None
+    vault_read_key_name: str = "postern-read"
     # S105 fires on the name containing "token", not on the value: this is
     # the `iss` claim every read token carries, a URL a verifier compares
     # against, and it is published in the JWKS discovery path.
@@ -172,7 +187,7 @@ class Settings:
     # two separate paths. That is a cap, not a bound: whether either request
     # ever returns was not determined.
     #
-    # 101.0 is derived, not chosen, and every term is a number already in this
+    # 105.0 is derived, not chosen, and every term is a number already in this
     # repository. Per DATABASE OPERATION, from `Database.__init__`'s own
     # arithmetic (`postern_core/store/engine.py`): 1.0 pool + 2.0 connect +
     # 3.0 statement = 6.0s when the checkout opens a connection, and 1.0 +
@@ -190,7 +205,24 @@ class Settings:
     # `_get_tool` and the entry row is written from the façade below it. The
     # ceiling is therefore the arrangement where the first four evaluations
     # burn 13.0s each and the fifth still succeeds:
-    # 5x13.0 + 13.0 + 10.0 + 13.0 = 101.0s.
+    # 5x13.0 + 13.0 + 14.0 + 13.0 = 105.0s.
+    #
+    # THE BACKEND TERM IS 14.0 AND NOT 10.0 SINCE 29 SEPTEMBER 2026, and the
+    # 4.0 of it is Vault. `postern_core.auth.vault.VaultTransitKeySource` signs
+    # every internal token with an HTTP round trip taken inside
+    # `BackendClient.get_json`, before the backend request, under a per-phase
+    # budget of ``POSTERN_VAULT_TIMEOUT_SECONDS`` (1.0 by default) applied to
+    # connect, read, write and pool independently -- so 4 x 1.0 in the worst
+    # case, exactly the arithmetic the four backend phases above already carry.
+    # That surcharge is written into the default for EVERY deployment and not
+    # only the Vault-backed ones, which is conservative in the safe direction:
+    # this is a cap on a path that has escaped its own deadlines, so a
+    # non-Vault deployment carrying four unusable seconds loses nothing, while
+    # a derived-per-configuration default would make one number mean two things.
+    # An operator who RAISES ``POSTERN_VAULT_TIMEOUT_SECONDS`` owes this line
+    # four times the increase; nothing here can do that for them, because
+    # lowering this value below its terms is also a legitimate deliberate
+    # choice and a cross-field refusal would refuse it.
     #
     # WHAT THAT SUM BOUNDS is a reachable store and a reachable backend,
     # which is the qualifier `postern_core/store/engine.py` already carries
@@ -207,7 +239,7 @@ class Settings:
     # quietly rounded down. It is longer than any consumer AI client will
     # wait, so in practice the client gives up first; what this deadline
     # returns is the WORKER, not a timely answer. Two more honest readings of
-    # it: the realistic success ceiling is 13.0 + 13.0 + 10.0 + 13.0 = 49.0s
+    # it: the realistic success ceiling is 13.0 + 13.0 + 14.0 + 13.0 = 53.0s
     # and the realistic denial ceiling (every lookup raising, the backend
     # never reached) is 5x13.0 + 13.0 = 78.0s -- unchanged by the entry
     # write, because a refused call never reaches the backend and so never
@@ -229,7 +261,7 @@ class Settings:
     # `POSTERN_REQUEST_DEADLINE_SECONDS=0` reached for as an off switch fails
     # at startup instead of 504-ing every request. There is no off switch;
     # raise the number instead.
-    request_deadline_seconds: float = 101.0
+    request_deadline_seconds: float = 105.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -266,6 +298,8 @@ class Settings:
             # `FileKeySource` a `Path("")` to read a key from.
             read_key_pem_path=os.environ.get("POSTERN_READ_KEY_PEM_PATH") or None,
             read_key_kid=os.environ.get("POSTERN_READ_KEY_KID", "read-1"),
+            vault=vault_from_env(),
+            vault_read_key_name=os.environ.get("POSTERN_VAULT_READ_KEY_NAME", "postern-read"),
             read_token_issuer=os.environ.get(
                 "POSTERN_READ_TOKEN_ISSUER", "https://mcp-read.internal"
             ),
@@ -455,7 +489,7 @@ class Settings:
             ),
             request_deadline_seconds=float_from_env(
                 "POSTERN_REQUEST_DEADLINE_SECONDS",
-                101.0,
+                105.0,
                 minimum=0,
                 exclusive=True,
                 because=(

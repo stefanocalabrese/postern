@@ -210,8 +210,10 @@ EVERYWHERE = ("api", "confirm", "migrations")
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 57 rows: 20
-#: strings (18 settings plus this guard's own two lists), 34 numbers, 3 flags.
+#: against it by `tests/test_settings_bounds.py` on every run. 65 rows since
+#: 2026-09-29: 26 strings (24 settings plus this guard's own two lists), 36
+#: numbers, 3 flags. The eight that arrived on that date are the
+#: ``POSTERN_VAULT_*`` family, below the device-code block.
 INVENTORY: tuple[EnvVar, ...] = (
     EnvVar(ALLOWED_UNREAD_ENV, "string", EVERYWHERE),
     EnvVar(REQUIRED_ENV, "string", EVERYWHERE),
@@ -267,6 +269,24 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_TOKEN_ISSUER", "string", ("api",)),
     EnvVar("POSTERN_TRUSTED_PROXY_HOPS", "number", ("api",)),
     EnvVar("POSTERN_USER_CODE_MAX_ATTEMPTS", "number", ("confirm",)),
+    # THE VAULT FAMILY, added 2026-09-29 with transit signing. Six are about
+    # the Vault and are read once, in `postern_core.auth.vault.vault_from_env`,
+    # so both services get identical parsing and both are recorded as reading
+    # them. The two KEY NAMES are read in each service's own `from_env`, and
+    # their attribution here is the read/write split written down: the write
+    # key's name is read by `confirm` and by nothing else, so setting
+    # POSTERN_VAULT_WRITE_KEY_NAME on the read path is reported as a variable
+    # that service does not read -- which is the correct answer, because a
+    # process that cannot name the write key also holds no policy to sign with
+    # it.
+    EnvVar("POSTERN_VAULT_ADDR", "string", BOTH),
+    EnvVar("POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS", "number", BOTH),
+    EnvVar("POSTERN_VAULT_READ_KEY_NAME", "string", BOTH),
+    EnvVar("POSTERN_VAULT_TIMEOUT_SECONDS", "number", BOTH),
+    EnvVar("POSTERN_VAULT_TOKEN", "string", BOTH),
+    EnvVar("POSTERN_VAULT_TOKEN_PATH", "string", BOTH),
+    EnvVar("POSTERN_VAULT_TRANSIT_MOUNT", "string", BOTH),
+    EnvVar("POSTERN_VAULT_WRITE_KEY_NAME", "string", ("confirm",)),
     EnvVar("POSTERN_WRITE_KEY_KID", "string", ("confirm",)),
     EnvVar("POSTERN_WRITE_KEY_PEM_PATH", "string", ("confirm",)),
     EnvVar("POSTERN_WRITE_TOKEN_ISSUER", "string", ("confirm",)),

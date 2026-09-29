@@ -69,7 +69,7 @@ Request → [Deadline] → [HeaderValidation] → FastMCP server
 Bounds the **entire HTTP request** from first byte to last. Prevents worker leaks when
 both the database and backend are silent (no timeout fires on a path that returns nothing).
 
-- Default: `101.0` seconds (`POSTERN_REQUEST_DEADLINE_SECONDS`)
+- Default: `105.0` seconds (`POSTERN_REQUEST_DEADLINE_SECONDS`)
 - Derived from: DB operation ceiling (13.0s) × 4 + backend request (10.0s) + consent
   lookups (5 × 13.0s). Realistic success ceiling: ~49.0s; realistic denial ceiling: ~78.0s
 - Zero and negative values are refused at startup (no off switch)
@@ -192,9 +192,11 @@ Timeouts are configured in [`services/api/settings.py`](../../../services/api/se
 | DB command | 3.0s | Single statement execution (SELECT or INSERT) |
 | DB pool | 1.0s | Connection pool acquisition |
 
-The request deadline (101.0s) is derived from the sum of all possible operations per call:
-DB ceiling (13.0s) × 4 + backend request (10.0s) = ~62.0s, with headroom for consent
-lookups that raise (up to 5 evaluations × 13.0s).
+The request deadline (105.0s) is derived from the sum of all possible operations per call:
+DB ceiling (13.0s) × 4 + backend request (14.0s) = ~66.0s, with headroom for consent
+lookups that raise (up to 5 evaluations × 13.0s). The backend request term is 14.0s and
+not 10.0s because minting the internal token is a Vault round trip under its own
+four-phase budget (4 × `POSTERN_VAULT_TIMEOUT_SECONDS`, 1.0s by default).
 
 ## Source References
 

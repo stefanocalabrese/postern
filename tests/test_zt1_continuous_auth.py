@@ -28,7 +28,8 @@ See ``postern_core.auth.read_minter.ReadTokenMinter`` for the API and
 
 import pytest
 from joserfc import jwt
-from joserfc.jwk import KeySet, KeySetSerialization, RSAKey
+from joserfc.jwk import KeySet, KeySetSerialization
+from joserfc.jwt import Claims
 from postern_core.auth.internal_jwt import _LIFETIME, InternalTokenMinter
 from postern_core.auth.keys import GeneratedKeySource
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
@@ -326,24 +327,35 @@ def test_mint_without_revocation_list_still_uses_jti_cache(source: GeneratedKeyS
 class _CountingKeySource:
     """A `KeySource` that records the two halves of the key separately.
 
-    `signing_key` is the mint. `public_jwks` is read for exactly one purpose
-    anywhere in this repository, verifying a token, so counting them apart is
-    the observable that separates "this call signed something" from "this call
+    `sign` is the mint. `public_jwks` is read for exactly one purpose anywhere
+    in this repository, verifying a token, so counting them apart is the
+    observable that separates "this call signed something" from "this call
     also verified what it just signed".
+
+    IT COUNTS `sign` AND NOT `signing_key` SINCE 29 SEPTEMBER 2026, because
+    that is when `KeySource` stopped handing a private key out at all
+    (`postern_core.auth.keys`' module docstring carries why). The assertion is
+    unchanged in meaning and stronger in reach: under
+    `postern_core.auth.vault.VaultTransitKeySource` one `sign` is one Vault
+    round trip, so a second one would be a second network call on the hot
+    path, where before it was a second RSA signature.
     """
 
     def __init__(self, inner: GeneratedKeySource) -> None:
         self._inner = inner
-        self.signing_key_calls = 0
+        self.sign_calls = 0
         self.public_jwks_calls = 0
 
-    def signing_key(self) -> RSAKey:
-        self.signing_key_calls += 1
-        return self._inner.signing_key()
+    def sign(self, claims: Claims) -> str:
+        self.sign_calls += 1
+        return self._inner.sign(claims)
 
     def public_jwks(self) -> KeySetSerialization:
         self.public_jwks_calls += 1
         return self._inner.public_jwks()
+
+    def close(self) -> None:
+        """Nothing is open; the inner source holds the key."""
 
 
 def test_feeding_the_cache_reads_no_public_key_and_verifies_nothing(
@@ -366,7 +378,7 @@ def test_feeding_the_cache_reads_no_public_key_and_verifies_nothing(
 
     minter(CUST_A, "accounts.svc")
 
-    assert counting.signing_key_calls == 1
+    assert counting.sign_calls == 1
     assert counting.public_jwks_calls == 0
     assert cache.size == 1
 
