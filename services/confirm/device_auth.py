@@ -978,10 +978,14 @@ async def approve_callback(request: Request) -> JSONResponse:
         # what the database did and not what the pairing did. Same shape as
         # `services/confirm/callback.py`'s raised branch.
         #
-        # Nothing was approved on any path that raises: the only write in
-        # `_pair` is `approve_scanned`, a compare-and-set that either commits
-        # and returns or raises having written nothing, and nothing after a
-        # successful one can raise. There is nothing to withdraw here.
+        # A RAISE MAY FOLLOW A COMMITTED APPROVAL. The only write in `_pair`
+        # is `approve_scanned`, and on Redis its `pipe.execute()` can raise a
+        # timeout or a connection error after the server ran `EXEC`, leaving
+        # the code approved behind a row that says refused. `_pair` therefore
+        # withdraws the pairing before that exception reaches this branch, so
+        # the ambiguous case fails closed and the customer re-pairs. Nothing
+        # after a successful `approve_scanned` can raise, and nothing before
+        # it wrote anything, so there is nothing left to withdraw here.
         try:
             await audit.refused(type(exc).__name__)
         except Exception as audit_exc:
@@ -1174,7 +1178,20 @@ async def _pair(
     # the code expires.
     audit.names(device_code=existing.device_code, paired_client_id=existing.client_id)
 
-    if await store.approve_scanned(existing.device_code, customer.value):
+    try:
+        approved = await store.approve_scanned(existing.device_code, customer.value)
+    except Exception:
+        # AN EXCEPTION HERE DOES NOT MEAN NOTHING WAS WRITTEN. On Redis the
+        # reply to `EXEC` can be lost to a timeout or a dropped connection
+        # after the server committed, so the code may be approved. Withdraw it
+        # before the exception propagates: `approve_callback` records the
+        # exception's type as a refusal, and a refusal row over a standing
+        # approval is the fail-open shape. `_withdraw_pairing` swallows its own
+        # failure, so the exception re-raised is still the store's.
+        await _withdraw_pairing(store, existing.device_code)
+        raise
+
+    if approved:
         # THE STORE WRITE COMES FIRST AND THE ROW FOLLOWS, which is the
         # opposite of the read path's entry row and is chosen for a measurable
         # reason rather than by analogy. Writing the row first would make every
@@ -1208,12 +1225,14 @@ async def _approve_refusal_detail(
     never approve anything.
 
     A ROW THAT PASSES ALL FOUR is scanned by this customer, unexpired and
-    unapproved, which is exactly what ``approve_scanned`` approves. Neither
-    backend can refuse such a row: in memory nothing can run between the two
-    reads' decisions, and on Redis a transaction beaten on every try raises
-    ``DeviceCodeStoreContended`` rather than answering ``False``. So that
-    shape raises here too, and ``approve_callback`` records the exception's
-    type, which is the true statement.
+    unapproved, which is what ``approve_scanned`` approves -- so at the moment
+    it refused, the row was NOT scanned by this customer. On Redis the refusal
+    and this read are two round trips, and the same customer's ``POST /scan``
+    can commit between them. That shape is recorded as ``DETAIL_NOT_SCANNED``,
+    the state the compare-and-set saw, and answered with the same
+    ``invalid_grant`` as every other refusal. Raising here would turn a race
+    the caller can trigger into a 500, which is a second response shape and
+    so an oracle.
     """
     row = await store.get_device_code(device_code_value)
     if row is None or row.is_expired:
@@ -1224,7 +1243,7 @@ async def _approve_refusal_detail(
         return DETAIL_SCANNED_BY_OTHER
     if row.approved:
         return DETAIL_ALREADY_APPROVED
-    raise RuntimeError("approve_scanned refused a code this customer scanned and has not approved")
+    return DETAIL_NOT_SCANNED
 
 
 # ---------------------------------------------------------------------------

@@ -530,6 +530,41 @@ async def test_a_row_gone_between_the_lookup_and_the_refusal_is_user_code_not_fo
     assert row.arguments["device_code_handle"] == handle_of(code.device_code)
 
 
+async def test_a_scan_racing_a_refused_approval_is_still_the_identical_refusal(
+    app: Starlette,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The re-read finds a row ``approve_scanned`` would have approved.
+
+    On Redis the refused compare-and-set and the re-read are two round trips,
+    so the same customer's ``POST /scan`` can commit between them. The re-read
+    then shows a row scanned by this customer, unexpired and unapproved. That
+    is still a refusal, and it must answer the one ``invalid_grant`` body
+    rather than a 500. Forced here by an ``approve_scanned`` that refuses a
+    row the store already holds in exactly that shape.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+
+    async def refuse(device_code: str, customer_ref: str) -> bool:
+        return False
+
+    monkeypatch.setattr(store, "approve_scanned", refuse)
+
+    unknown = await approve(app, {"user_code": "ZZZ-ZZZ"}, bearer(key_pair))
+    await _wipe(clean)
+    resp = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+
+    assert resp.status_code == 400
+    assert resp.json() == unknown.json()
+    row = await one_row(clean)
+    assert row.detail == DETAIL_NOT_SCANNED
+    stored = await unwrap(store, code.device_code)
+    assert stored.approved is False
+
+
 async def test_every_refusal_about_a_pairing_answers_one_identical_body(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
@@ -725,6 +760,43 @@ async def test_a_pairing_that_cannot_be_audited_does_not_stand(
         "the pairing survived an audit write it could not make; "
         "POST /token would mint a read token no row accounts for"
     )
+
+
+async def test_an_approval_whose_store_write_fails_ambiguously_is_withdrawn(
+    app: Starlette,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store error after the server may have committed the approval.
+
+    On Redis ``pipe.execute()`` can raise a timeout after ``EXEC`` ran, so an
+    exception out of ``approve_scanned`` does not mean nothing was written.
+    Forced here by an ``approve_scanned`` that approves and then raises. The
+    response is the 500 it always was, and the pairing is revoked so the
+    browser cannot be handed a read token the row says was refused.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+    real_approve = store.approve_scanned
+
+    async def approve_then_time_out(device_code: str, customer_ref: str) -> bool:
+        assert await real_approve(device_code, customer_ref) is True
+        raise TimeoutError("reply lost after EXEC")
+
+    monkeypatch.setattr(store, "approve_scanned", approve_then_time_out)
+
+    resp = await approve(
+        app,
+        {"user_code": code.user_code_display},
+        bearer(key_pair),
+        as_a_server_would=True,
+    )
+
+    assert resp.status_code == 500
+    assert await store.get_device_code(code.device_code) is None
+    row = await one_row(clean)
+    assert row.detail == "TimeoutError"
 
 
 # ---------------------------------------------------------------------------
