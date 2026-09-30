@@ -21,7 +21,10 @@
 //     Age is counted from freshAt, the last pending 200, plus the wait before
 //     the next poll: when that sum passes QR_STALE_AFTER_MS on a 429 or a
 //     failure, both come off the page with a message saying why. The next
-//     pending 200 puts both back and restores the pending text.
+//     pending 200 puts both back and restores the pending text. Once scanned
+//     there is no token to take down, so a 429 or a failure leaves the compare
+//     instruction alone and only reschedules; failures still count toward
+//     MAX_FAILURES.
 //   - Any answer but 200, 404 and 429, a network error, a body that does not
 //     parse, and a fetch still unanswered after FETCH_TIMEOUT_MS are all
 //     failures. MAX_FAILURES in a row stop polling and ask for a reload. Only
@@ -126,6 +129,11 @@
   }
 
   function takeDown(text) {
+    // Scanned: no token is on the page, so there is nothing to take down, and
+    // the compare instruction is what the user needs in front of them.
+    if (qrNode === null) {
+      return;
+    }
     degraded = true;
     hideToken();
     say(text);

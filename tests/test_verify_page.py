@@ -567,3 +567,21 @@ async def test_the_stylesheet_is_served_as_css(app: Starlette) -> None:
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/css")
     assert resp.headers["x-content-type-options"] == "nosniff"
+
+
+async def test_the_script_keeps_the_compare_instruction_after_a_scan(
+    app: Starlette,
+) -> None:
+    script = (await get(app, "/verify.js")).text
+
+    # Once scanned, showScanned nulls qrNode, and freshAt is never refreshed
+    # again, so isStale() is true forever. Without a guard, a 429 or a failure
+    # would replace the compare instruction with a retry message.
+    body = script.split("function takeDown(text) {", 1)[1].split("\n  }\n", 1)[0]
+
+    guard = "if (qrNode === null) {\n      return;\n    }"
+    assert guard in body, (
+        "takeDown must return before touching the instruction when no token is on the page"
+    )
+    assert body.index(guard) < body.index("degraded = true;")
+    assert body.index(guard) < body.index("say(text)")
