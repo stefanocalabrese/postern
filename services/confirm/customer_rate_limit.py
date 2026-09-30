@@ -112,6 +112,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_CUSTOMER_LIMITS: dict[str, Limit] = {
     "/approve": Limit(requests=10, window_seconds=RATE_LIMIT_WINDOW_SECONDS),
     "/challenges/approve": Limit(requests=10, window_seconds=RATE_LIMIT_WINDOW_SECONDS),
+    # The scan that precedes every pairing approval: one per pairing, the
+    # same human sequence as ``/approve``'s derivation above, so the same 10.
+    "/scan": Limit(requests=10, window_seconds=RATE_LIMIT_WINDOW_SECONDS),
 }
 
 #: What an authenticated path with no entry of its own gets.
@@ -465,8 +468,9 @@ def customer_limits_from_settings(
     *,
     approve: int,
     challenge_approve: int,
+    scan: int,
 ) -> dict[str, Limit]:
-    """Build the per-path limit map from two per-minute request counts.
+    """Build the per-path limit map from three per-minute request counts.
 
     Here rather than in `services/confirm/main.py` so the composition root
     stays assembly, and here rather than in `services/confirm/settings.py` so
@@ -477,6 +481,7 @@ def customer_limits_from_settings(
     return {
         "/approve": Limit(approve, RATE_LIMIT_WINDOW_SECONDS),
         "/challenges/approve": Limit(challenge_approve, RATE_LIMIT_WINDOW_SECONDS),
+        "/scan": Limit(scan, RATE_LIMIT_WINDOW_SECONDS),
     }
 
 

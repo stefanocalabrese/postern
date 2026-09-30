@@ -428,6 +428,64 @@ BOUNDED: tuple[Bounded, ...] = (
         ("0", "-1"),
         ("1",),
     ),
+    # The QR page's five public routes and ``POST /scan``, through the same
+    # `_positive_int`, and the per-customer ceiling on ``/scan``.
+    Bounded(
+        "POSTERN_CONFIRM_RATE_LIMIT_SCAN",
+        "rate_limit_scan",
+        "confirm",
+        60,
+        ("0", "-1"),
+        ("1",),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_RATE_LIMIT_VERIFY",
+        "rate_limit_verify",
+        "confirm",
+        60,
+        ("0", "-1"),
+        ("1",),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_RATE_LIMIT_VERIFY_QR",
+        "rate_limit_verify_qr",
+        "confirm",
+        300,
+        ("0", "-1"),
+        ("1",),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_RATE_LIMIT_VERIFY_STATE",
+        "rate_limit_verify_state",
+        "confirm",
+        300,
+        ("0", "-1"),
+        ("1",),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_RATE_LIMIT_VERIFY_JS",
+        "rate_limit_verify_js",
+        "confirm",
+        60,
+        ("0", "-1"),
+        ("1",),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS",
+        "rate_limit_verify_css",
+        "confirm",
+        60,
+        ("0", "-1"),
+        ("1",),
+    ),
+    Bounded(
+        "POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN",
+        "customer_rate_limit_scan",
+        "confirm",
+        10,
+        ("0", "-1"),
+        ("1",),
+    ),
 )
 
 IDS = [f"{b.service}:{b.name}" for b in BOUNDED]
@@ -2109,7 +2167,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
 
     def test_the_two_inventories_are_the_whole_tree(self) -> None:
-        """66 variables, 27 read directly and 39 through a reader, disjoint."""
+        """73 variables, 27 read directly and 46 through a reader, disjoint."""
         direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
         through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
         assert direct & through == set(), (
@@ -2126,7 +2184,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         # accepting one that arms nothing -- the defect it exists for,
         # reintroduced inside the control itself.
         assert direct | through == set(KNOWN_ENV)
-        assert len(KNOWN_ENV) == 66
+        assert len(KNOWN_ENV) == 73
 
     def test_the_counts_the_docstrings_quote(self) -> None:
         """Every number the prose in this file states, re-derived.
@@ -2135,15 +2193,15 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         confidently as one that is right. A variable added anywhere fails here,
         which is the line that sends the author to the sentences.
         """
-        assert len(KNOWN_ENV) == 66
+        assert len(KNOWN_ENV) == 73
         assert len(READ_AS_STRING) == 27
         assert len(FLAGS) == 3
-        assert len(BOUNDED_NAMES) == 32
+        assert len(BOUNDED_NAMES) == 39
         assert len(STORE_BOUNDED_NAMES) == 2
         assert len(VAULT_BOUNDED_NAMES) == 2
-        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 39
+        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 46
         assert len(names_read_by("api")) == 38
-        assert len(names_read_by("confirm")) == 50
+        assert len(names_read_by("confirm")) == 57
         assert len(names_read_by("migrations")) == 3
 
     def test_each_rows_services_are_the_roots_that_actually_read_it(self) -> None:

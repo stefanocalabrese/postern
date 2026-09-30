@@ -781,7 +781,7 @@ class TestTheShippedCeilings:
         -- so about seven a minute. Ten admits both with margin and refuses
         the sixty the address ceiling would have allowed.
         """
-        for route in ("/approve", "/challenges/approve"):
+        for route in ("/approve", "/challenges/approve", "/scan"):
             assert DEFAULT_CUSTOMER_LIMITS[route] == Limit(10, RATE_LIMIT_WINDOW_SECONDS)
         assert FALLBACK_CUSTOMER_LIMIT == Limit(10, RATE_LIMIT_WINDOW_SECONDS)
 
@@ -791,6 +791,7 @@ class TestTheShippedCeilings:
             customer_limits_from_settings(
                 approve=settings.customer_rate_limit_approve,
                 challenge_approve=settings.customer_rate_limit_challenge_approve,
+                scan=settings.customer_rate_limit_scan,
             )
             == DEFAULT_CUSTOMER_LIMITS
         )

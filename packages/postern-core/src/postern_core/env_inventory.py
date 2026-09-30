@@ -210,11 +210,11 @@ EVERYWHERE = ("api", "confirm", "migrations")
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 66 rows since
-#: 2026-09-30: 27 strings (25 settings plus this guard's own two lists), 36
+#: against it by `tests/test_settings_bounds.py` on every run. 73 rows since
+#: 2026-09-30: 27 strings (25 settings plus this guard's own two lists), 43
 #: numbers, 3 flags. The eight ``POSTERN_VAULT_*`` rows below the device-code
-#: block arrived on 2026-09-29; ``POSTERN_DEVICE_APP_LINK_URI`` arrived on
-#: 2026-09-30 with the QR page.
+#: block arrived on 2026-09-29; ``POSTERN_DEVICE_APP_LINK_URI`` and the seven
+#: QR-page rate limits arrived on 2026-09-30.
 INVENTORY: tuple[EnvVar, ...] = (
     EnvVar(ALLOWED_UNREAD_ENV, "string", EVERYWHERE),
     EnvVar(REQUIRED_ENV, "string", EVERYWHERE),
@@ -230,6 +230,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_CACHE_TTL_SECONDS", "number", ("api",)),
     EnvVar("POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_APPROVE", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_CHALLENGE_APPROVE", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_DATABASE_POOL_SIZE", "number", ("confirm",)),
@@ -238,7 +239,13 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_DEFAULT", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_DEVICE_AUTHORIZATION", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_RATE_LIMIT_SCAN", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_TOKEN", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_RATE_LIMIT_VERIFY", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_JS", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_QR", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_STATE", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_TRUSTED_PROXY_HOPS", "number", ("confirm",)),
     EnvVar("POSTERN_DATABASE_AUDIT_RESERVE_SIZE", "number", ("api",)),
     EnvVar("POSTERN_DATABASE_COMMAND_TIMEOUT_SECONDS", "number", BOTH),

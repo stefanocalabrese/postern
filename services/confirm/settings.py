@@ -467,6 +467,21 @@ class ConfirmSettings:
     # want it set for their own reasons already.
     customer_rate_limit_approve: int = 10
     customer_rate_limit_challenge_approve: int = 10
+    # THE QR PAGE AND ``POST /scan``, added 2026-09-30: six more per-address
+    # counts and one more per-customer count, each reproducing its entry in
+    # `services/confirm/rate_limit.py`'s ``DEFAULT_LIMITS`` or
+    # `services/confirm/customer_rate_limit.py`'s ``DEFAULT_CUSTOMER_LIMITS``
+    # exactly, where the working behind each number lives. The five public
+    # routes are the browser's, so the carrier-grade NAT reasoning above
+    # applies to them; ``/scan`` is the app's, so the app-backend reasoning
+    # applies to it.
+    rate_limit_scan: int = 60
+    rate_limit_verify: int = 60
+    rate_limit_verify_qr: int = 300
+    rate_limit_verify_state: int = 300
+    rate_limit_verify_js: int = 60
+    rate_limit_verify_css: int = 60
+    customer_rate_limit_scan: int = 10
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -746,6 +761,13 @@ class ConfirmSettings:
             customer_rate_limit_challenge_approve=_positive_int(
                 "POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_CHALLENGE_APPROVE", 10
             ),
+            rate_limit_scan=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_SCAN", 60),
+            rate_limit_verify=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_VERIFY", 60),
+            rate_limit_verify_qr=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_QR", 300),
+            rate_limit_verify_state=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_STATE", 300),
+            rate_limit_verify_js=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_JS", 60),
+            rate_limit_verify_css=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS", 60),
+            customer_rate_limit_scan=_positive_int("POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN", 10),
         )
 
     @classmethod

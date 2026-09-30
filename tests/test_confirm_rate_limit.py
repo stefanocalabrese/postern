@@ -1032,8 +1032,30 @@ class TestTheSlowDownInteraction:
 
 class TestTheConfiguredLimits:
     def test_every_public_path_carries_a_limit(self) -> None:
-        for path in ("/device_authorization", "/token", "/approve", "/challenges/approve"):
+        for path in (
+            "/device_authorization",
+            "/token",
+            "/approve",
+            "/challenges/approve",
+            "/scan",
+            "/verify",
+            "/verify/qr.svg",
+            "/verify/state",
+            "/verify.js",
+            "/verify.css",
+        ):
             assert path in DEFAULT_LIMITS
+
+    def test_the_qr_page_limits_are_the_specs(self) -> None:
+        """Section 8 of ``dev-docs/qr-page-spec.md``: the image and the state
+        are polled every two seconds, 30 a minute per tab, so 300 is ten tabs
+        behind one address; everything else is loaded once per page."""
+        assert DEFAULT_LIMITS["/verify"] == Limit(60, RATE_LIMIT_WINDOW_SECONDS)
+        assert DEFAULT_LIMITS["/verify/qr.svg"] == Limit(300, RATE_LIMIT_WINDOW_SECONDS)
+        assert DEFAULT_LIMITS["/verify/state"] == Limit(300, RATE_LIMIT_WINDOW_SECONDS)
+        assert DEFAULT_LIMITS["/verify.js"] == Limit(60, RATE_LIMIT_WINDOW_SECONDS)
+        assert DEFAULT_LIMITS["/verify.css"] == Limit(60, RATE_LIMIT_WINDOW_SECONDS)
+        assert DEFAULT_LIMITS["/scan"] == Limit(60, RATE_LIMIT_WINDOW_SECONDS)
 
     def test_the_token_budget_clears_rfc_8628_polling(self) -> None:
         """At the 5-second default interval one pairing polls 12 times a
@@ -1071,6 +1093,12 @@ class TestTheLimitsAreSettableWithoutACodeChange:
         ("POSTERN_CONFIRM_RATE_LIMIT_APPROVE", "rate_limit_approve"),
         ("POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE", "rate_limit_challenge_approve"),
         ("POSTERN_CONFIRM_RATE_LIMIT_DEFAULT", "rate_limit_default"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_SCAN", "rate_limit_scan"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_VERIFY", "rate_limit_verify"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_QR", "rate_limit_verify_qr"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_STATE", "rate_limit_verify_state"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_JS", "rate_limit_verify_js"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS", "rate_limit_verify_css"),
     ]
 
     @pytest.mark.parametrize(("name", "field"), NAMES)
@@ -1122,6 +1150,12 @@ class TestTheLimitsAreSettableWithoutACodeChange:
                 token=settings.rate_limit_token,
                 approve=settings.rate_limit_approve,
                 challenge_approve=settings.rate_limit_challenge_approve,
+                scan=settings.rate_limit_scan,
+                verify=settings.rate_limit_verify,
+                verify_qr=settings.rate_limit_verify_qr,
+                verify_state=settings.rate_limit_verify_state,
+                verify_js=settings.rate_limit_verify_js,
+                verify_css=settings.rate_limit_verify_css,
             )
             == DEFAULT_LIMITS
         )

@@ -151,6 +151,14 @@ class Limit:
 #: ``/challenges/{id}/approve`` -- 60/min. The same party, and the most
 #:     expensive request this service serves: a JWKS fetch, an assertion
 #:     verification, an Ed25519 device signature check and a database write.
+#: ``/scan`` -- 60/min. The operator's app, once per pairing, like
+#:     ``/approve``; its per-customer ceiling is the one that means something.
+#: ``/verify`` -- 60/min. A page load, plus the 12 a minute the noscript
+#:     refresh adds for a browser with no script.
+#: ``/verify/qr.svg`` and ``/verify/state`` -- 300/min each. The page's
+#:     script polls both every two seconds, 30 a minute per open tab, so 300
+#:     is ten tabs behind one address.
+#: ``/verify.js`` and ``/verify.css`` -- 60/min each. Loaded once per page.
 #:
 #: WHY ALL OF THESE ARE GENEROUS, said plainly because it is the honest
 #: weakness of per-address limiting on a consumer bank's public endpoint:
@@ -160,7 +168,7 @@ class Limit:
 #: that trade. These are set on the side that does not break customers.
 #:
 #: EVERY ONE OF THESE IS OVERRIDABLE, per `services/confirm/settings.py`'s
-#: five ``rate_limit_*`` fields, and that setting carries the sentence that
+#: eleven ``rate_limit_*`` fields, and that setting carries the sentence that
 #: says which way to set them. The knob exists for one case in particular: if
 #: the operator's banking app backend calls the two authenticated paths on the
 #: phone's behalf, every approval in the bank arrives from a handful of egress
@@ -171,6 +179,12 @@ DEFAULT_LIMITS: dict[str, Limit] = {
     "/token": Limit(requests=300, window_seconds=60),
     "/approve": Limit(requests=60, window_seconds=60),
     "/challenges/approve": Limit(requests=60, window_seconds=60),
+    "/scan": Limit(requests=60, window_seconds=60),
+    "/verify": Limit(requests=60, window_seconds=60),
+    "/verify/qr.svg": Limit(requests=300, window_seconds=60),
+    "/verify/state": Limit(requests=300, window_seconds=60),
+    "/verify.js": Limit(requests=60, window_seconds=60),
+    "/verify.css": Limit(requests=60, window_seconds=60),
 }
 
 #: What an unlisted path gets. See "WHY DEFAULT-DENY ON PATHS" above.
@@ -192,8 +206,14 @@ def limits_from_settings(
     token: int,
     approve: int,
     challenge_approve: int,
+    scan: int,
+    verify: int,
+    verify_qr: int,
+    verify_state: int,
+    verify_js: int,
+    verify_css: int,
 ) -> dict[str, Limit]:
-    """Build the per-path limit map from four per-minute request counts.
+    """Build the per-path limit map from ten per-minute request counts.
 
     Here rather than in `services/confirm/main.py` so the composition root
     stays assembly, and here rather than in `services/confirm/settings.py` so
@@ -205,6 +225,12 @@ def limits_from_settings(
         "/token": Limit(token, RATE_LIMIT_WINDOW_SECONDS),
         "/approve": Limit(approve, RATE_LIMIT_WINDOW_SECONDS),
         "/challenges/approve": Limit(challenge_approve, RATE_LIMIT_WINDOW_SECONDS),
+        "/scan": Limit(scan, RATE_LIMIT_WINDOW_SECONDS),
+        "/verify": Limit(verify, RATE_LIMIT_WINDOW_SECONDS),
+        "/verify/qr.svg": Limit(verify_qr, RATE_LIMIT_WINDOW_SECONDS),
+        "/verify/state": Limit(verify_state, RATE_LIMIT_WINDOW_SECONDS),
+        "/verify.js": Limit(verify_js, RATE_LIMIT_WINDOW_SECONDS),
+        "/verify.css": Limit(verify_css, RATE_LIMIT_WINDOW_SECONDS),
     }
 
 
@@ -292,7 +318,7 @@ class Buckets:
 def route_key(path: str) -> str:
     """The `DEFAULT_LIMITS` key a request path counts against.
 
-    Exact for the three fixed paths. ``/challenges/{challenge_id}/approve``
+    Exact for every fixed path. ``/challenges/{challenge_id}/approve``
     collapses to one key, because the challenge id is caller-supplied and
     per-id counters would let a caller mint a fresh budget by inventing an
     id -- the same reason `services/confirm/device_auth.py` refuses to key
