@@ -1407,11 +1407,21 @@ class PairingAudit:
         if paired_client_id is not None:
             self._paired_client_id = scrub_text(paired_client_id)
 
-    async def approved(self) -> None:
-        """Record that this pairing was granted."""
-        await self._write(OUTCOME_RETURNED, None)
+    async def approved(self, *, risk_signals: list[dict[str, Any]] | None = None) -> None:
+        """Record that this pairing was granted.
 
-    async def approved_again(self, detail: str = DETAIL_ALREADY_APPROVED) -> None:
+        ``risk_signals`` is passed by ``POST /scan`` alone, for a first scan:
+        the one serialized ``PAIRING_NETWORK`` signal. Every other caller
+        leaves it ``None`` and the column NULL.
+        """
+        await self._write(OUTCOME_RETURNED, None, risk_signals)
+
+    async def approved_again(
+        self,
+        detail: str = DETAIL_ALREADY_APPROVED,
+        *,
+        risk_signals: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Record a repeat that is answered with the first request's 200.
 
         ``returned``, because the request is answered with the same 200 the
@@ -1421,8 +1431,13 @@ class PairingAudit:
         repeat on either route; ``POST /scan`` passes
         ``DETAIL_ALREADY_SCANNED`` for a repeat before approving. Each
         literal's comment carries the reasoning.
+
+        ``risk_signals`` is passed by ``POST /scan`` for the
+        ``DETAIL_ALREADY_SCANNED`` repeat, whose row compares the creator with
+        that repeat's own address; without it those rows would silently lose
+        the signal. The ``DETAIL_ALREADY_APPROVED`` repeat passes none.
         """
-        await self._write(OUTCOME_RETURNED, detail)
+        await self._write(OUTCOME_RETURNED, detail, risk_signals)
 
     # No caller since 2026-09-30; the pending session-token change uses it again.
     async def minted(self) -> None:
@@ -1457,7 +1472,12 @@ class PairingAudit:
         """
         await self._write(OUTCOME_RAISED, detail)
 
-    async def _write(self, outcome: str, detail: str | None) -> None:
+    async def _write(
+        self,
+        outcome: str,
+        detail: str | None,
+        risk_signals: list[dict[str, Any]] | None = None,
+    ) -> None:
         """THROUGH ``append_with_reserve`` SINCE 2026-09-27, and this writer has
         only completion rows, so there is no entry-row exception to make.
 
@@ -1510,12 +1530,16 @@ class PairingAudit:
                 refusal_reason=None,
                 call_id=self._call_id,
                 client_id=self._client_id,
-                # NULL, not ``[]``: ``[]`` means a risk session ran and no
-                # signal fired. ``RiskEngine`` and ``IpAnomalyDetector`` are
-                # wired into ``services/api``'s tool middleware and nothing in
-                # this service establishes a session, so NULL is the true
-                # statement.
-                risk_signals=None,
+                # NULL on every row but a successful scan, and never ``[]``:
+                # ``[]`` means a risk session ran and no signal fired.
+                # ``RiskEngine`` and ``IpAnomalyDetector`` are wired into
+                # ``services/api``'s tool middleware and nothing in this
+                # service establishes a session, so NULL is still the true
+                # statement everywhere else. A successful ``POST /scan`` row
+                # carries exactly one signal, ``PAIRING_NETWORK``, and no
+                # session: the comparison of where the pairing was created
+                # with where it was scanned.
+                risk_signals=risk_signals,
             )
 
         await audit.append_with_reserve(self._db, row)
