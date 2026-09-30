@@ -1018,15 +1018,16 @@ DETAIL_DEVICE_CODE_SPENT = "device_code_spent"
 #: request: at ``POST /approve`` when the code is already approved, and at
 #: ``POST /scan`` through ``ScanClaim.APPROVED_MINE``.
 #:
-#: TWO OUTCOMES SINCE 2026-09-30, one per route. At ``POST /scan`` it is still
-#: a refusal (``outcome='raised'``). At ``POST /approve`` it is the one
+#: ``RETURNED`` ON BOTH ROUTES SINCE 2026-09-30. On each it is the one
 #: ``detail`` a ``returned`` row carries: the approver's retry, typically
-#: after a lost 200, is answered with that same 200, because the approval it
-#: asks for stands and only the customer who scanned and approved the code can
-#: reach this answer. ``returned`` because the request succeeded; a non-NULL
-#: ``detail`` because a first approval (NULL) must stay countable apart from
-#: its repeats, and ``WHERE outcome = 'returned' AND detail IS NULL`` is still
-#: exactly one row per pairing granted. The repeat writes nothing to the store.
+#: after a lost 200, is answered with the 200 the first request got (on
+#: ``POST /scan`` the stored pairing's context, reached only with a genuine
+#: in-window rotation token), because the approval it follows stands and only
+#: the customer who scanned and approved the code can reach this answer.
+#: ``returned`` because the request succeeded; a non-NULL ``detail`` so this
+#: repeat is never counted with the NULL rows of a first approval or a scan.
+#: It writes nothing to the store. On ``POST /approve`` it can still be a refusal
+#: (``outcome='raised'``), for a code approved for another customer.
 #:
 #: REWRITTEN ON 2026-09-30, because the rationale it carried stopped being
 #: possible. It used to be a caller holding an assertion of their own swapping

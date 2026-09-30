@@ -315,20 +315,84 @@ async def test_an_expired_code_is_invalid_grant(
     assert (await one_row(clean)).detail == DETAIL_USER_CODE_NOT_FOUND
 
 
-async def test_a_code_this_customer_already_approved_is_invalid_grant(
+async def _scanned_and_approved(app: Starlette, key_pair: RSAKeyPair) -> tuple[DeviceCode, Any]:
+    """A pairing ALICE scanned and approved through the real endpoints, with
+    the first scan's response body."""
+    code = await start(app)
+    first = await scan(app, key_pair, ALICE, code)
+    assert first.status_code == 200, first.text
+    approved = await post(
+        app,
+        "/approve",
+        json_body={"user_code": code.user_code_display},
+        headers=bearer(key_pair, ALICE),
+    )
+    assert approved.status_code == 200, approved.text
+    return code, first.json()
+
+
+async def test_the_approvers_repeat_scan_answers_the_first_scans_body(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """``approved_mine``: nothing new to show, so nothing distinct to say."""
-    code = await start(app)
-    assert (await scan(app, key_pair, ALICE, code)).status_code == 200
-    assert await device_store_of(app).approve_scanned(code.device_code, ALICE) is True
+    """``approved_mine`` with a genuine in-window token: the approver's retry,
+    normally after a lost 200, gets the first scan's body back, recorded as
+    ``returned`` with ``already_approved`` and nothing written to the store."""
+    code, first_body = await _scanned_and_approved(app, key_pair)
+    before = await device_store_of(app).get_device_code(code.device_code)
     await _wipe(clean)
 
     resp = await scan(app, key_pair, ALICE, code)
 
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == first_body
+    row = await one_row(clean)
+    assert row.outcome == OUTCOME_RETURNED
+    assert row.detail == DETAIL_ALREADY_APPROVED
+    assert row.tool_name == SCAN_TOOL_NAME
+    assert row.arguments["device_code_handle"] == device_code_handle(code.device_code)
+    assert await device_store_of(app).get_device_code(code.device_code) == before
+
+
+async def test_the_approvers_repeat_scan_with_a_stale_token_is_qr_stale(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """The rotation token is checked first, so the 200 needs an in-window one."""
+    code, _ = await _scanned_and_approved(app, key_pair)
+    before = await device_store_of(app).get_device_code(code.device_code)
+    await _wipe(clean)
+
+    resp = await scan(app, key_pair, ALICE, code, qr=qr_for(code, slot_offset=-6))
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "qr_stale"
+    assert (await one_row(clean)).detail == DETAIL_QR_STALE
+    assert await device_store_of(app).get_device_code(code.device_code) == before
+
+
+async def test_the_approvers_repeat_scan_with_a_forged_token_is_invalid_grant(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    code, _ = await _scanned_and_approved(app, key_pair)
+    await _wipe(clean)
+
+    resp = await scan(app, key_pair, ALICE, code, qr=forged(code))
+
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_grant"
-    assert (await one_row(clean)).detail == DETAIL_ALREADY_APPROVED
+    assert (await one_row(clean)).detail == DETAIL_QR_INVALID
+
+
+async def test_another_customers_scan_of_an_approved_code_is_still_scan_conflict(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    code, _ = await _scanned_and_approved(app, key_pair)
+    await _wipe(clean)
+
+    resp = await scan(app, key_pair, BOB, code)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "scan_conflict"
+    assert (await one_row(clean)).detail == DETAIL_SCAN_CONFLICT
 
 
 @pytest.mark.parametrize("shape", ["forged mac", "future slot", "malformed"])
@@ -355,15 +419,15 @@ async def test_a_token_that_does_not_verify_is_invalid_grant_and_claims_nothing(
     assert stored is not None and stored.scanned_by == ""
 
 
-async def test_unknown_expired_approved_and_forged_answer_one_identical_body(
+async def test_unknown_expired_and_forged_answer_one_identical_body(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """The existence oracle closed: four causes, one body, four details."""
+    """The existence oracle closed: three causes, one body, three details.
+
+    An approved code left this set on 30 September 2026: its approver's
+    repeat now answers 200, and anyone else's scan is ``scan_conflict``."""
     expired = await start(app)
     overwrite_in_memory(app, replace(expired, expires_at=datetime.now(UTC) - timedelta(seconds=1)))
-    approved = await start(app)
-    assert (await scan(app, key_pair, ALICE, approved)).status_code == 200
-    await device_store_of(app).approve_scanned(approved.device_code, ALICE)
     live = await start(app)
     await _wipe(clean)
 
@@ -375,7 +439,6 @@ async def test_unknown_expired_approved_and_forged_answer_one_identical_body(
             headers=bearer(key_pair, ALICE),
         ),
         await scan(app, key_pair, ALICE, expired),
-        await scan(app, key_pair, ALICE, approved),
         await scan(app, key_pair, ALICE, live, qr=forged(live)),
     ]
 
@@ -384,7 +447,6 @@ async def test_unknown_expired_approved_and_forged_answer_one_identical_body(
     assert [r.detail for r in await rows(clean)] == [
         DETAIL_USER_CODE_NOT_FOUND,
         DETAIL_USER_CODE_NOT_FOUND,
-        DETAIL_ALREADY_APPROVED,
         DETAIL_QR_INVALID,
     ]
 

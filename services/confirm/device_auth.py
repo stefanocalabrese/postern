@@ -1424,6 +1424,13 @@ async def _answer_refused_approval(
     commits between the refused compare-and-set and this read is an approval
     that stands, and reporting it as one is true.
 
+    THE ONE RESIDUAL: this read can land just before a concurrent withdrawal
+    or conflict recall deletes the row, and the repeat then answers 200 and
+    writes ``returned`` with ``already_approved`` for a pairing that no
+    longer stands. The window is two store round trips wide and it grants
+    nothing: nothing is written to the store, and ``POST /token`` issues
+    nothing for a revoked code.
+
     A ROW THAT PASSES ALL FOUR is scanned by this customer, unexpired and
     unapproved, which is what ``approve_scanned`` approves -- so at the moment
     it refused, the row was NOT scanned by this customer. On Redis the refusal
@@ -1536,6 +1543,9 @@ class _Scanned:
     #: A ``claim_scan`` that raises never reaches this field: ``_scan``
     #: withdraws that claim itself before the exception propagates.
     claimed_device_code: str | None = None
+    #: The approver's repeat scan of a pairing it already approved, answered
+    #: with the first scan's 200 and recorded by ``PairingAudit.approved_again``.
+    repeated: bool = False
 
 
 async def scan_callback(request: Request) -> JSONResponse:
@@ -1549,10 +1559,12 @@ async def scan_callback(request: Request) -> JSONResponse:
         qr: The rotation token from the same link, ``<slot>.<mac>``.
 
     Response (200): the stored pairing's context; see ``_scan_context_response``.
+        The same body, since 2026-09-30, for the approving customer's repeat
+        scan of a code it already approved, with a current rotation token.
     Response (400): ``invalid_request`` for a malformed body; ``qr_stale``;
         ``scan_conflict``; and the one ``invalid_grant`` body of
-        ``_unpairable_response`` for an unknown or expired code, an approved
-        one, and a malformed, forged or future rotation token.
+        ``_unpairable_response`` for an unknown or expired code and a
+        malformed, forged or future rotation token.
     Response (401): no verified assertion.
     Response (403): ``invalid_subject`` or ``access_revoked`` (ZT-7).
 
@@ -1615,7 +1627,9 @@ async def scan_callback(request: Request) -> JSONResponse:
         return outcome.response
 
     try:
-        if outcome.detail is None:
+        if outcome.repeated:
+            await audit.approved_again()
+        elif outcome.detail is None:
             await audit.approved()
         else:
             await audit.refused(outcome.detail)
@@ -1651,6 +1665,21 @@ async def _scan(
     ``qr_stale`` and revokes nothing, because only a caller inside the token
     window -- one who could have been standing at the screen -- reaches
     ``claim_scan`` at all.
+
+    ``APPROVED_MINE`` ANSWERS 200, SINCE 2026-09-30, for the reason
+    ``_answer_refused_approval`` gives on ``POST /approve``: it is the
+    approver retrying, normally after a lost response, and the identical
+    ``invalid_grant`` left the app unable to tell "your approval stands" from
+    "refused". The body is the first scan's, built from the stored row by
+    ``_scan_context_response``; ``PairingAudit.approved_again`` records it,
+    so ``outcome='returned' AND detail IS NULL`` never counts it; and the
+    store is not written. Only a genuine in-window rotation token reaches it,
+    because the MAC check above runs first. The same residual as there: the
+    row can be deleted by a concurrent withdrawal or conflict recall after
+    ``claim_scan`` answered, and the repeat then answers 200 and writes
+    ``returned`` with ``already_approved`` for a pairing that no longer
+    stands. The window is small and it grants nothing: nothing is written to
+    the store, and ``POST /token`` issues nothing for a revoked code.
     """
     try:
         customer = CustomerRef(value=subject)
@@ -1726,7 +1755,7 @@ async def _scan(
     if claim is ScanClaim.ALREADY_MINE:
         return _Scanned(_scan_context_response(code))
     if claim is ScanClaim.APPROVED_MINE:
-        return _Scanned(_unpairable_response(), DETAIL_ALREADY_APPROVED)
+        return _Scanned(_scan_context_response(code), repeated=True)
     if claim is ScanClaim.CONFLICT_REVOKED or claim is ScanClaim.CONFLICT_EXCHANGED:
         # A LOG LINE AS WELL AS THE ROW, because this is the event an operator
         # may want to alert on at the edge. The handle, never the code.

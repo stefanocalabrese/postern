@@ -158,7 +158,7 @@ Content-Type: application/json
 | Status | `error` | When | What the app shows |
 |---|---|---|---|
 | 400 | `invalid_request` | Body is not JSON, not an object, or `user_code`/`qr` missing, empty or not strings. | An app bug. A generic failure message; report it. |
-| 400 | `invalid_grant` | One identical body (`"this pairing cannot be completed"`) for: an unknown or expired code, a code this customer already approved, a malformed or forged `qr`, a `qr` for a different pairing, or a slot more than one ahead of the server's clock. | "This code can no longer be used. Start again from your AI client." The server deliberately does not say which case it was. |
+| 400 | `invalid_grant` | One identical body (`"this pairing cannot be completed"`) for: an unknown or expired code, a malformed or forged `qr`, a `qr` for a different pairing, or a slot more than one ahead of the server's clock. | "This code can no longer be used. Start again from your AI client." The server deliberately does not say which case it was. |
 | 400 | `qr_stale` | A genuine token for this pairing, older than the window. | "The code on your screen has changed. Scan it again." The QR is still on the page if nobody has scanned it yet. |
 | 400 | `scan_conflict` | Another customer's app scanned this pairing first. The server has now cancelled the pairing, including one already approved, because `/token` issues nothing and so spends no code. A code spent by an earlier build is the one case where nothing is cancelled. | "This pairing was cancelled because another device scanned the same code. Start again from your AI client, and do not share your screen while pairing." Both cases give the same body. |
 | 401 | `invalid_token` | No valid assertion (section 3). | Refresh the assertion once and retry; if it fails again, a generic failure. |
@@ -171,6 +171,8 @@ Content-Type: application/json
 | 500 | none: `text/plain`, `Internal Server Error` | The revocation store could not answer, the audit row could not be written, or the device-code store failed. No exception handler is registered, so this is Starlette's default body. | "Something went wrong. Start again from your AI client." See section 7 on why a retry rarely helps. |
 
 **Repeating a successful scan.** A second `/scan` by the same customer with a token still inside its window returns the same 200 body and changes nothing. After the window, the same request answers `qr_stale`, even though the pairing is still claimed by this customer. Once scanned, the page removes the QR, so there is no fresh token to fetch. An app that loses the `/scan` response and cannot retry inside the window has no way back to the confirmation context; the recovery is a new pairing from the AI client. The spec (`dev-docs/qr-page-spec.md`, "Out of scope") records this as deliberate.
+
+**Repeating a scan after approving.** Since 30 September 2026, a `/scan` by the customer who already scanned and approved the pairing, with a token still inside its window and before `expires_at`, returns the same 200 body as the first scan, built from the stored pairing, and changes nothing on the server (recorded as `returned` with `detail` `already_approved`). Before that date it answered `invalid_grant`. The token is checked first, so outside the window the answer is still `qr_stale`, and a forged or malformed token is still `invalid_grant`. Another customer's scan of an approved code is still `scan_conflict`.
 
 **Order of checks,** so the app team can reason about which failure it will see first: per-address rate limit, body size, assertion, per-customer rate limit, `sub` format, revocation, body shape, pairing lookup, rotation token, then the first-scan claim.
 
@@ -280,14 +282,14 @@ Both endpoints write one `audit_log` row per recorded call through `services/con
 | `tool_name` | `device_grant.scan` or `device_grant.approve` |
 | `customer_ref` | The assertion's `sub` (NULL with a reason when it is not a customer reference) |
 | `client_id` | The assertion's `client_id` claim, else `azp`, else NULL |
-| `outcome`, `detail` | `returned` with NULL detail on success; `returned` with `already_approved` for the approver's repeated `/approve`; `raised` with a detail on refusal |
+| `outcome`, `detail` | `returned` with NULL detail on success; `returned` with `already_approved` for the approver's repeated `/approve` or `/scan`; `raised` with a detail on refusal |
 | `at`, `duration_ms` | Arrival time and handling time |
 | `arguments.route` | `/scan` or `/approve` |
 | `arguments.device_code_handle` | 16 hex characters of SHA-256 of the pairing's device code, never the code |
 | `arguments.client_ip` | The caller's address, when one can be attributed |
 | `arguments.paired_client_id` | The AI client's self-declared `client_id` |
 
-Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale`, `already_approved`, `scan_conflict`. On `/approve`: `invalid_subject`, `revoked`, `user_code_not_found`, `not_scanned`, `scanned_by_other`, and `already_approved` for a code approved for another customer. An exception is recorded under its class name.
+Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale`, `scan_conflict`. On `/approve`: `invalid_subject`, `revoked`, `user_code_not_found`, `not_scanned`, `scanned_by_other`, and `already_approved` for a code approved for another customer. An exception is recorded under its class name.
 
 **Not recorded, on purpose:** the `user_code`, the `qr` token, the scopes, and any request the server refused before reaching a pairing. A malformed body (400 `invalid_request`) leaves no row and no log line. A 401, 413, 429 or 503 leaves a log line and no row.
 
