@@ -11,11 +11,17 @@ from __future__ import annotations
 
 import base64
 import re
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from postern_core.auth.device_codes import DeviceCode, InMemoryDeviceCodeStore
+from postern_core.auth import device_codes
+from postern_core.auth.device_codes import (
+    DeviceCode,
+    DeviceCodeStoreContended,
+    InMemoryDeviceCodeStore,
+)
 
 from services.confirm.qr_token import QrVerdict, token_for, verify_token
 
@@ -150,3 +156,113 @@ class TestSerialization:
         assert code.scanned_at is None
         forged = token_for(code.qr_secret, code.user_code, 5)
         assert verify_token(code.qr_secret, code.user_code, forged, 5) is QrVerdict.INVALID
+
+
+# ---------------------------------------------------------------------------
+# The two secondary lookups.
+# ---------------------------------------------------------------------------
+
+
+class TestTheSecondaryLookups:
+    async def test_both_lookups_find_the_code(self) -> None:
+        store = InMemoryDeviceCodeStore()
+        code = await _create(store)
+
+        assert await store.get_by_display_handle(code.display_handle) == code
+        assert await store.get_by_user_code(code.user_code) == code
+
+    async def test_an_unknown_or_empty_value_finds_nothing(self) -> None:
+        store = InMemoryDeviceCodeStore()
+        await _create(store)
+
+        assert await store.get_by_display_handle("no-such-handle") is None
+        assert await store.get_by_display_handle("") is None
+        assert await store.get_by_user_code("") is None
+
+    async def test_an_expired_code_is_found_by_neither(self) -> None:
+        """Unlike ``get_device_code``, which must still return it so that
+        ``POST /token`` can answer RFC 8628's ``expired_token``."""
+        store = InMemoryDeviceCodeStore()
+        code = await _create(store)
+        past = datetime.now(UTC) - timedelta(seconds=1)
+        store._codes[code.device_code] = replace(code, expires_at=past)
+
+        assert await store.get_by_display_handle(code.display_handle) is None
+        assert await store.get_by_user_code(code.user_code) is None
+        assert await store.get_device_code(code.device_code) is not None
+
+    async def test_an_entry_pointing_at_another_code_is_not_trusted(self) -> None:
+        store = InMemoryDeviceCodeStore()
+        first = await _create(store)
+        second = await _create(store)
+        store._by_user_code[first.user_code] = second.device_code
+        store._by_handle[first.display_handle] = second.device_code
+
+        assert await store.get_by_user_code(first.user_code) is None
+        assert await store.get_by_display_handle(first.display_handle) is None
+
+    async def test_a_revoke_clears_both_entries(self) -> None:
+        store = InMemoryDeviceCodeStore()
+        code = await _create(store)
+
+        await store.revoke_device_code(code.device_code)
+
+        assert code.user_code not in store._by_user_code
+        assert code.display_handle not in store._by_handle
+        assert await store.get_by_user_code(code.user_code) is None
+
+    async def test_a_consumed_code_still_resolves_by_both(self) -> None:
+        """``POST /scan`` must still find an exchanged row, to answer
+        ``conflict_exchanged`` rather than ``gone``."""
+        store = InMemoryDeviceCodeStore()
+        code = await _create(store)
+
+        assert await store.consume_device_code(code.device_code) is True
+
+        by_code = await store.get_by_user_code(code.user_code)
+        assert by_code is not None and by_code.exchanged_at is not None
+        assert await store.get_by_display_handle(code.display_handle) is not None
+
+    async def test_the_expiry_sweep_clears_both_entries(self) -> None:
+        store = InMemoryDeviceCodeStore()
+        due = await _create(store, expires_in=0)
+
+        await _create(store)
+
+        assert due.device_code not in store._codes
+        assert due.user_code not in store._by_user_code
+        assert due.display_handle not in store._by_handle
+
+    async def test_a_colliding_user_code_is_regenerated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = InMemoryDeviceCodeStore()
+        first = await _create(store)
+        spellings = iter([first.user_code, "XYZ789"])
+        monkeypatch.setattr(device_codes, "_generate_user_code", lambda: next(spellings))
+
+        second = await _create(store)
+
+        assert second.user_code == "XYZ789"
+        assert await store.get_by_user_code(first.user_code) == first
+
+    async def test_a_colliding_handle_is_regenerated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        store = InMemoryDeviceCodeStore()
+        first = await _create(store)
+        spellings = iter([first.display_handle, "fresh-handle-0000000000"])
+        monkeypatch.setattr(device_codes, "_generate_display_handle", lambda: next(spellings))
+
+        second = await _create(store)
+
+        assert second.display_handle == "fresh-handle-0000000000"
+        assert await store.get_by_display_handle(first.display_handle) == first
+
+    async def test_a_generator_that_only_collides_is_refused_not_looped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = InMemoryDeviceCodeStore()
+        first = await _create(store)
+        monkeypatch.setattr(device_codes, "_generate_user_code", lambda: first.user_code)
+
+        with pytest.raises(DeviceCodeStoreContended):
+            await _create(store)

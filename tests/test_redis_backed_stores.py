@@ -71,9 +71,11 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 import redis.exceptions
+from postern_core.auth import device_codes
 from postern_core.auth.device_codes import (
     MIN_DEVICE_CODE_TTL_SECONDS,
     DeviceCode,
+    DeviceCodeStoreContended,
     DeviceCodeStoreFull,
     RedisDeviceCodeStore,
     create_device_code_store,
@@ -709,6 +711,102 @@ async def test_the_pairing_fields_cross_to_a_second_connection(stores: RedisStor
     assert seen.creator_ip == "203.0.113.9"
     assert seen.scanned_by == ""
     assert seen.scanned_at is None
+
+
+async def test_both_secondary_lookups_resolve_on_a_second_connection(
+    stores: RedisStores,
+) -> None:
+    writer = stores.device_codes()
+    reader = stores.device_codes()
+    code = await _create(writer)
+
+    assert await reader.get_by_display_handle(code.display_handle) == code
+    assert await reader.get_by_user_code(code.user_code) == code
+    assert await reader.get_by_user_code("") is None
+    assert await reader.get_by_display_handle("") is None
+
+
+async def test_the_secondary_keys_carry_the_codes_lifetime(stores: RedisStores) -> None:
+    """``SET NX EX`` in one command, so a secondary key without a TTL cannot
+    exist even if the connection drops mid-create."""
+    store = stores.device_codes()
+    code = await _create(store, expires_in=120)
+
+    for key in (store._user_code_key(code.user_code), store._handle_key(code.display_handle)):
+        assert 118 <= await store._redis.ttl(key) <= 120, key
+        assert await store._redis.get(key) == code.device_code
+
+
+async def test_a_secondary_key_naming_another_code_is_not_trusted(stores: RedisStores) -> None:
+    store = stores.device_codes()
+    code = await _create(store)
+    await store._redis.set(store._user_code_key("ZZZ999"), code.device_code, ex=60)
+    await store._redis.set(store._handle_key("forged-handle"), code.device_code, ex=60)
+
+    assert await store.get_by_user_code("ZZZ999") is None
+    assert await store.get_by_display_handle("forged-handle") is None
+
+
+async def test_an_expired_primary_is_not_found_through_a_secondary_key(
+    stores: RedisStores,
+) -> None:
+    """The secondary key can outlive the primary's own ``expires_at`` by up to
+    a second under ``_set_code``'s truncation, so the lookup re-checks it."""
+    store = stores.device_codes()
+    code = await _create(store)
+    stale = dataclasses.replace(code, expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    await store._redis.set(store._key(code.device_code), stale.to_json(), keepttl=True)
+
+    assert await store.get_by_user_code(code.user_code) is None
+    assert await store.get_by_display_handle(code.display_handle) is None
+
+
+async def test_a_revoke_deletes_both_secondary_keys(stores: RedisStores) -> None:
+    store = stores.device_codes()
+    code = await _create(store)
+
+    await store.revoke_device_code(code.device_code)
+
+    assert await store._redis.exists(store._user_code_key(code.user_code)) == 0
+    assert await store._redis.exists(store._handle_key(code.display_handle)) == 0
+
+
+async def test_a_consumed_code_still_resolves_by_both_keys(stores: RedisStores) -> None:
+    store = stores.device_codes()
+    code = await _create(store)
+
+    assert await store.consume_device_code(code.device_code) is True
+
+    found = await store.get_by_user_code(code.user_code)
+    assert found is not None and found.exchanged_at is not None
+    assert await store.get_by_display_handle(code.display_handle) is not None
+
+
+async def test_a_taken_user_code_key_is_regenerated_not_overwritten(
+    stores: RedisStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = stores.device_codes()
+    await store._redis.set(store._user_code_key("ABC234"), "someone-else", ex=600)
+    spellings = iter(["ABC234", "DEF567"])
+    monkeypatch.setattr(device_codes, "_generate_user_code", lambda: next(spellings))
+
+    code = await _create(store)
+
+    assert code.user_code == "DEF567"
+    assert await store._redis.get(store._user_code_key("ABC234")) == "someone-else"
+    assert await store._redis.get(store._user_code_key("DEF567")) == code.device_code
+
+
+async def test_a_generator_that_only_collides_raises_rather_than_looping(
+    stores: RedisStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = stores.device_codes()
+    await store._redis.set(store._user_code_key("ABC234"), "someone-else", ex=600)
+    monkeypatch.setattr(device_codes, "_generate_user_code", lambda: "ABC234")
+
+    with pytest.raises(DeviceCodeStoreContended):
+        await _create(store)
+    assert await store._redis.zcard(store._index_key()) == 0, "nothing half-created was indexed"
 
 
 # ---------------------------------------------------------------------------

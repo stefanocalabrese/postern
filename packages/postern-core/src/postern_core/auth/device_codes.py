@@ -63,6 +63,7 @@ import json as _json
 import os
 import secrets
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from datetime import UTC as _UTC
@@ -196,6 +197,31 @@ class DeviceCodeStoreFull(RuntimeError):
         super().__init__(f"device code store holds {held} codes, at its cap of {cap}")
         self.held = held
         self.cap = cap
+
+
+class DeviceCodeStoreContended(RuntimeError):
+    """A store operation that could not settle after a bounded number of tries.
+
+    Two sources, both of which refuse rather than loop. A secondary key --
+    the ``user_code`` or the display handle -- whose freshly generated value
+    was already taken on every one of ``_SECONDARY_KEY_ATTEMPTS`` tries, which
+    at 32**6 pairing codes against a 10,000-code cap means something is wrong
+    with the generator rather than unlucky. And a compare-and-set whose
+    ``WATCH`` was beaten on every one of ``_CLAIM_ATTEMPTS`` tries.
+
+    RAISED RATHER THAN ANSWERED ``False``, where ``consume_device_code``
+    answers ``False``. Its caller maps ``False`` onto a response that is true
+    whichever way the race went; ``claim_scan`` and ``approve_scanned`` have
+    callers that would have to invent a reason, and the handlers record an
+    exception's type name in ``audit_log.detail`` already, which is the true
+    statement: the store could not decide.
+    """
+
+
+#: How many freshly generated values a secondary key gets before
+#: `DeviceCodeStoreContended`. Five is generous: a collision needs a live
+#: pairing already holding the same six-character code or 128-bit handle.
+_SECONDARY_KEY_ATTEMPTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +395,28 @@ class DeviceCodeStoreBase(ABC):
         """Look up a device code by its opaque value, or ``None``."""
 
     @abstractmethod
+    async def get_by_display_handle(self, display_handle: str) -> DeviceCode | None:
+        """The live code this display handle keys, or ``None``.
+
+        UNLIKE ``get_device_code``, EXPIRY-FILTERED: the page and the state
+        endpoint answer an expired pairing exactly as an unknown one, and
+        ``POST /scan`` answers both ``invalid_grant``. The lookup re-reads the
+        primary and re-checks that its handle matches and that it has not
+        expired, because on Redis the secondary key's TTL can outlive the
+        primary's by up to a second under the truncation ``_set_code``
+        records.
+        """
+
+    @abstractmethod
+    async def get_by_user_code(self, user_code: str) -> DeviceCode | None:
+        """The live code this stored-form pairing code keys, or ``None``.
+
+        ``user_code`` is the six-character stored form; callers normalise
+        first. Expiry-filtered and re-checked for the same reasons as
+        ``get_by_display_handle``.
+        """
+
+    @abstractmethod
     async def approve_device_code(self, device_code: str) -> bool:
         """Mark a device code as approved. Returns True if found and updated."""
 
@@ -400,7 +448,13 @@ class DeviceCodeStoreBase(ABC):
 
     @abstractmethod
     async def revoke_device_code(self, device_code: str) -> None:
-        """Remove a device code (e.g. on explicit cancellation)."""
+        """Remove a device code and both of its secondary lookups.
+
+        The only operation that deletes the secondaries early. Consuming a
+        code leaves them, so ``POST /scan`` can still find an exchanged row
+        and answer ``conflict_exchanged``; otherwise they expire with the
+        primary.
+        """
 
     @abstractmethod
     async def update_device_code(self, device_code: str, code: DeviceCode) -> None:
@@ -449,6 +503,37 @@ def _generate_qr_secret() -> bytes:
     return secrets.token_bytes(QR_SECRET_BYTES)
 
 
+def _live_match(code: DeviceCode | None, attribute: str, presented: str) -> DeviceCode | None:
+    """``code`` if it is live and its ``attribute`` is exactly ``presented``.
+
+    The re-check both backends run on a secondary lookup. A secondary entry is
+    a pointer, and the primary row is the authority: an empty value, an
+    expired row, or a row whose own field no longer names what the pointer was
+    looked up by all answer ``None``.
+    """
+    if code is None or not presented or code.is_expired:
+        return None
+    if getattr(code, attribute) != presented:
+        return None
+    return code
+
+
+def _unused(generate: Callable[[], str], taken: dict[str, str], what: str) -> str:
+    """A freshly generated value ``taken`` does not hold, or refuse.
+
+    ``generate`` is passed at each call rather than bound at import, so a test
+    can replace ``_generate_user_code`` or ``_generate_display_handle`` on the
+    module and force a collision.
+    """
+    for _ in range(_SECONDARY_KEY_ATTEMPTS):
+        value = generate()
+        if value not in taken:
+            return value
+    raise DeviceCodeStoreContended(
+        f"{_SECONDARY_KEY_ATTEMPTS} generated {what} values were all already in use"
+    )
+
+
 class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
     """In-memory store mapping ``device_code`` → ``DeviceCode``.
 
@@ -482,6 +567,27 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         #: Min-heap of ``(expiry timestamp, device_code)``. See `_drop_expired`.
         self._expiry: list[tuple[float, str]] = []
         self._max_codes = max_codes
+        #: Display handle to device code, and stored-form pairing code to
+        #: device code. Cleared by `_forget` wherever a code leaves `_codes`.
+        self._by_handle: dict[str, str] = {}
+        self._by_user_code: dict[str, str] = {}
+
+    def _forget(self, device_code: str) -> DeviceCode | None:
+        """Remove a code and its two secondary entries, without yielding.
+
+        Synchronous on purpose: `claim_scan` calls it inside its read-then-write
+        and must not suspend there. Each secondary entry is removed only if it
+        still points at this code, so a value a later code reused is left
+        alone.
+        """
+        code = self._codes.pop(device_code, None)
+        if code is None:
+            return None
+        if self._by_handle.get(code.display_handle) == device_code:
+            del self._by_handle[code.display_handle]
+        if self._by_user_code.get(code.user_code) == device_code:
+            del self._by_user_code[code.user_code]
+        return code
 
     def _drop_expired(self) -> int:
         """Remove every code whose expiry has passed, and say how many.
@@ -502,7 +608,7 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
             existing = self._codes.get(device_code)
             if existing is None or existing.expires_at.timestamp() > expires_ts:
                 continue
-            del self._codes[device_code]
+            self._forget(device_code)
             dropped += 1
         if dropped:
             logger.info("device code store: swept %d expired codes", dropped)
@@ -523,12 +629,15 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         Raises:
             DeviceCodeStoreFull: if the store still holds ``max_codes`` after
                 expired codes have been swept.
+            DeviceCodeStoreContended: if every generated pairing code or
+                display handle collided with a live one.
         """
         self._drop_expired()
         if len(self._codes) >= self._max_codes:
             raise DeviceCodeStoreFull(len(self._codes), self._max_codes)
         device_code = _generate_device_code()
-        user_code = _generate_user_code()
+        user_code = _unused(_generate_user_code, self._by_user_code, "user_code")
+        display_handle = _unused(_generate_display_handle, self._by_handle, "display handle")
         expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
         code = DeviceCode(
             device_code=device_code,
@@ -538,11 +647,13 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
             interval=interval,
             client_id=client_id,
             scopes=scopes,
-            display_handle=_generate_display_handle(),
+            display_handle=display_handle,
             qr_secret=_generate_qr_secret(),
             creator_ip=creator_ip,
         )
         self._codes[device_code] = code
+        self._by_user_code[user_code] = device_code
+        self._by_handle[display_handle] = device_code
         heapq.heappush(self._expiry, (expires_at.timestamp(), device_code))
         return code
 
@@ -558,6 +669,18 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         not a second authority on what is valid.
         """
         return self._codes.get(device_code)
+
+    async def get_by_display_handle(self, display_handle: str) -> DeviceCode | None:
+        """The live code this display handle keys, or ``None``."""
+        device_code = self._by_handle.get(display_handle)
+        code = self._codes.get(device_code) if device_code is not None else None
+        return _live_match(code, "display_handle", display_handle)
+
+    async def get_by_user_code(self, user_code: str) -> DeviceCode | None:
+        """The live code this stored-form pairing code keys, or ``None``."""
+        device_code = self._by_user_code.get(user_code)
+        code = self._codes.get(device_code) if device_code is not None else None
+        return _live_match(code, "user_code", user_code)
 
     async def approve_device_code(self, device_code: str) -> bool:
         """Mark a device code as approved. Returns True if found and updated."""
@@ -590,8 +713,8 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         return True
 
     async def revoke_device_code(self, device_code: str) -> None:
-        """Remove a device code."""
-        self._codes.pop(device_code, None)
+        """Remove a device code and both of its secondary entries."""
+        self._forget(device_code)
 
     async def update_device_code(self, device_code: str, code: DeviceCode) -> None:
         """Replace a device code with an updated version."""
@@ -734,6 +857,51 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         """
         return f"{self._prefix}device:index"
 
+    def _handle_key(self, display_handle: str) -> str:
+        """The secondary key a display handle is looked up by.
+
+        A device code is ``secrets.token_urlsafe`` output and never contains
+        a colon, so ``device:handle:...`` and ``device:user_code:...`` cannot
+        collide with ``_key``'s ``device:<device_code>``.
+        """
+        return f"{self._prefix}device:handle:{display_handle}"
+
+    def _user_code_key(self, user_code: str) -> str:
+        """The secondary key a stored-form pairing code is looked up by."""
+        return f"{self._prefix}device:user_code:{user_code}"
+
+    def _secondary_keys(self, code: DeviceCode) -> list[str]:
+        """Both secondary keys a stored code owns. A record written before
+        display handles existed owns only the second."""
+        keys = [self._user_code_key(code.user_code)]
+        if code.display_handle:
+            keys.append(self._handle_key(code.display_handle))
+        return keys
+
+    async def _claim_secondary(
+        self,
+        key_for: Callable[[str], str],
+        generate: Callable[[], str],
+        device_code: str,
+        ttl_seconds: int,
+        what: str,
+    ) -> str:
+        """Claim a fresh secondary key with ``SET NX EX``, or refuse.
+
+        ``NX`` IS THE UNIQUENESS CHECK, and there is no other. Reading the key
+        and then setting it would let two replicas both find it free and both
+        write, and the second writer's pointer would silently re-home the
+        first pairing's ``user_code``. ``EX`` in the same command means a key
+        without a TTL cannot exist even if the connection drops mid-create.
+        """
+        for _ in range(_SECONDARY_KEY_ATTEMPTS):
+            value = generate()
+            if await self._redis.set(key_for(value), device_code, nx=True, ex=ttl_seconds):
+                return value
+        raise DeviceCodeStoreContended(
+            f"{_SECONDARY_KEY_ATTEMPTS} generated {what} values were all already in use"
+        )
+
     async def create_device_code(
         self,
         *,
@@ -749,6 +917,15 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         Raises:
             DeviceCodeStoreFull: if the index still holds ``max_codes`` after
                 due members have been dropped.
+            DeviceCodeStoreContended: if every generated pairing code or
+                display handle was already a live secondary key.
+
+        THE SECONDARY KEYS ARE CLAIMED BEFORE THE PRIMARY IS WRITTEN, so a
+        collision is resolved by regenerating the value rather than by
+        rewriting a stored row. Their TTL is the requested lifetime in whole
+        seconds; the primary's is recomputed and truncated by ``_set_code``,
+        so the two can differ by up to a second, which is why both lookups
+        re-check the primary.
 
         THE CHECK IS NOT ATOMIC WITH THE WRITE, and that is accepted rather
         than overlooked. Two replicas can both read a count under the cap and
@@ -770,8 +947,14 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             raise DeviceCodeStoreFull(int(held), self._max_codes)
 
         device_code = _generate_device_code()
-        user_code = _generate_user_code()
         expires_in = expires_in or self._default_ttl
+        secondary_ttl = max(1, int(expires_in))
+        user_code = await self._claim_secondary(
+            self._user_code_key, _generate_user_code, device_code, secondary_ttl, "user_code"
+        )
+        display_handle = await self._claim_secondary(
+            self._handle_key, _generate_display_handle, device_code, secondary_ttl, "display handle"
+        )
         expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
         code = DeviceCode(
             device_code=device_code,
@@ -781,7 +964,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             interval=interval,
             client_id=client_id,
             scopes=scopes,
-            display_handle=_generate_display_handle(),
+            display_handle=display_handle,
             qr_secret=_generate_qr_secret(),
             creator_ip=creator_ip,
         )
@@ -798,6 +981,26 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         except (KeyError, ValueError, TypeError) as exc:  # pragma: no cover
             logger.warning("Failed to deserialize device code %s: %s", device_code, exc)
             return None
+
+    async def get_by_display_handle(self, display_handle: str) -> DeviceCode | None:
+        """The live code this display handle keys, or ``None``."""
+        if not display_handle:
+            return None
+        device_code = await self._redis.get(self._handle_key(display_handle))
+        if device_code is None:
+            return None
+        return _live_match(
+            await self.get_device_code(device_code), "display_handle", display_handle
+        )
+
+    async def get_by_user_code(self, user_code: str) -> DeviceCode | None:
+        """The live code this stored-form pairing code keys, or ``None``."""
+        if not user_code:
+            return None
+        device_code = await self._redis.get(self._user_code_key(user_code))
+        if device_code is None:
+            return None
+        return _live_match(await self.get_device_code(device_code), "user_code", user_code)
 
     async def approve_device_code(self, device_code: str) -> bool:
         """Mark a device code as approved. Returns True if found and updated."""
@@ -872,14 +1075,25 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         return False
 
     async def revoke_device_code(self, device_code: str) -> None:
-        """Remove a device code, and its index member with it.
+        """Remove a device code, its index member and its two secondary keys.
 
-        Both, or the cap counts codes that no longer exist and a service that
-        revokes normally would refuse pairings it has room for.
+        The index member, or the cap counts codes that no longer exist and a
+        service that revokes normally would refuse pairings it has room for.
+        The secondary keys, or a revoked pairing's ``user_code`` would still
+        resolve until its TTL ran out -- to nothing, since the lookup re-reads
+        the primary, but at the cost of holding the value out of reuse.
+
+        The row is read first to learn the secondary names. A row that is
+        already gone leaves its secondary keys to their own TTL, which is
+        what they would have done anyway.
         """
+        stored = await self.get_device_code(device_code)
         pipe = self._redis.pipeline()
         pipe.delete(self._key(device_code))
         pipe.zrem(self._index_key(), device_code)
+        if stored is not None:
+            for key in self._secondary_keys(stored):
+                pipe.delete(key)
         await pipe.execute()
 
     async def update_device_code(self, device_code: str, code: DeviceCode) -> None:
