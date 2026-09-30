@@ -102,7 +102,7 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from postern_core.auth.device_codes import (
     DeviceCode,
@@ -115,6 +115,8 @@ from postern_core.auth.device_codes import (
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.revocation import RevocationStoreUnavailable
 from postern_core.identity import CustomerRef
+from postern_core.risk.pairing_network import classify, pairing_network_signal
+from postern_core.risk.types import signal_to_json
 from postern_core.store.engine import Database
 from pydantic import ValidationError
 from starlette.requests import Request
@@ -415,11 +417,12 @@ async def device_authorization(request: Request) -> JSONResponse:
             verification_uri=settings.device_verification_uri,
             expires_in=settings.device_code_ttl_seconds,
             interval=settings.device_poll_interval_seconds,
-            # RECORDED AND READ BY NOTHING YET. The creator-versus-scanner
-            # comparison that would use it is a later spec's; recording it
-            # now is what gives that spec something to compare. Under the
+            # READ BY `POST /scan`, which compares it with the scanner's
+            # address and records the relation on the scan's audit row. It
+            # lives only on this row, for the pairing's lifetime. Under the
             # default of zero trusted hops this is the direct peer, which
-            # behind a load balancer is the balancer's address.
+            # behind a load balancer is the balancer's address on both sides
+            # of that comparison, so the relation then means nothing.
             creator_ip=pairing_client_ip(request, settings.trusted_proxy_hops),
         )
     except DeviceCodeStoreFull as exc:
@@ -1566,6 +1569,10 @@ class _Scanned:
     #: ``PairingAudit.approved_again``: ``DETAIL_ALREADY_SCANNED`` before
     #: approving, ``DETAIL_ALREADY_APPROVED`` after. ``None`` on every other exit.
     repeat_detail: str | None = None
+    #: The serialized ``PAIRING_NETWORK`` signal for the row, on ``CLAIMED``
+    #: and ``ALREADY_MINE`` and on no other exit: ``APPROVED_MINE`` and every
+    #: refusal keep ``risk_signals`` NULL.
+    risk_signals: list[dict[str, Any]] | None = None
 
 
 async def scan_callback(request: Request) -> JSONResponse:
@@ -1652,9 +1659,9 @@ async def scan_callback(request: Request) -> JSONResponse:
 
     try:
         if outcome.repeat_detail is not None:
-            await audit.approved_again(outcome.repeat_detail)
+            await audit.approved_again(outcome.repeat_detail, risk_signals=outcome.risk_signals)
         elif outcome.detail is None:
-            await audit.approved()
+            await audit.approved(risk_signals=outcome.risk_signals)
         else:
             await audit.refused(outcome.detail)
     except Exception as audit_exc:
@@ -1781,9 +1788,24 @@ async def _scan(
         await _withdraw_pairing(store, code.device_code, cause="store", state="claimed")
         raise
     if claim is ScanClaim.CLAIMED:
-        return _Scanned(_scan_context_response(code), claimed_device_code=code.device_code)
+        # `code` is the row read before the claim, and that is the right one
+        # to read `creator_ip` from: it is written once, at creation.
+        signals = await _pairing_network_signals(request, code.creator_ip, scanner_ip)
+        return _Scanned(
+            _scan_context_response(code),
+            claimed_device_code=code.device_code,
+            risk_signals=signals,
+        )
     if claim is ScanClaim.ALREADY_MINE:
-        return _Scanned(_scan_context_response(code), repeat_detail=DETAIL_ALREADY_SCANNED)
+        # THIS request's address, not the stored `scanner_ip`, so the row
+        # describes the request it records: the `client_ip` beside it in
+        # `arguments` is the address the relation was computed from.
+        signals = await _pairing_network_signals(request, code.creator_ip, scanner_ip)
+        return _Scanned(
+            _scan_context_response(code),
+            repeat_detail=DETAIL_ALREADY_SCANNED,
+            risk_signals=signals,
+        )
     if claim is ScanClaim.APPROVED_MINE:
         return _Scanned(_scan_context_response(code), repeat_detail=DETAIL_ALREADY_APPROVED)
     if claim is ScanClaim.CONFLICT_REVOKED or claim is ScanClaim.CONFLICT_EXCHANGED:
@@ -1796,6 +1818,25 @@ async def _scan(
         )
         return _Scanned(_scan_conflict_response(), DETAIL_SCAN_CONFLICT)
     return _Scanned(_unpairable_response(), DETAIL_USER_CODE_NOT_FOUND)
+
+
+async def _pairing_network_signals(
+    request: Request, creator_ip: str | None, scanner_ip: str | None
+) -> list[dict[str, Any]]:
+    """The one-element ``risk_signals`` array a successful scan's row carries.
+
+    Where the pairing was created against where it was scanned
+    (``postern_core.risk.pairing_network``). It refuses nothing and changes no
+    response: the 200 body is the same for every relation.
+
+    MUST NOT RAISE AN ``Exception``. ``scan_callback``'s exception branch
+    records a refusal and withdraws nothing, on the premise that nothing after
+    a successful claim can raise; ``classify`` is total, so this keeps it.
+    """
+    settings: ConfirmSettings = request.app.state.settings
+    relation = classify(creator_ip, scanner_ip)
+    signal = pairing_network_signal(relation, settings.trusted_proxy_hops)
+    return [signal_to_json(signal)]
 
 
 # ---------------------------------------------------------------------------

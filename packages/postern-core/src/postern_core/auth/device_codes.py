@@ -297,8 +297,9 @@ class DeviceCode:
             the store and never appears in ``repr``. Empty on an older
             record, which is therefore unscannable -- the safe direction.
         creator_ip: The address ``POST /device_authorization`` came from.
-            Recorded for the creator-versus-scanner comparison a later spec
-            owns; nothing reads it yet.
+            Read by ``POST /scan``, which compares it with the scanning
+            request's address and records only the relation on its audit
+            row. Lives here and nowhere else, so it is gone when the row is.
         scanned_by: The customer whose app scanned first, from a verified
             assertion ``sub`` at ``POST /scan``. Empty until scanned.
         scanned_at: When that scan was claimed.
