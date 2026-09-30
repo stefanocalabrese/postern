@@ -96,6 +96,7 @@ Usage in ``main.py``::
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -115,7 +116,16 @@ from postern_core.auth.device_codes import (
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.revocation import RevocationStoreUnavailable
 from postern_core.identity import CustomerRef
-from postern_core.risk.pairing_network import classify, pairing_network_signal
+from postern_core.risk.pairing_network import (
+    MatchResult,
+    NetworkEnricher,
+    NetworkFacts,
+    NetworkRelation,
+    classify,
+    compare_facts,
+    pairing_network_signal,
+    sanitised,
+)
 from postern_core.risk.types import signal_to_json
 from postern_core.store.engine import Database
 from pydantic import ValidationError
@@ -1194,7 +1204,7 @@ async def _withdraw_pairing(
     store: DeviceCodeStoreBase,
     device_code_value: str,
     *,
-    cause: Literal["audit", "store"],
+    cause: Literal["audit", "store", "cancelled"],
     state: Literal["approved", "claimed"],
 ) -> None:
     """Undo a pairing whose audit row could not be written, or whose approval
@@ -1207,7 +1217,7 @@ async def _withdraw_pairing(
     live, and a racing poll or a racing scan could still find it in the state
     the failed request could not record.
 
-    ``cause`` and ``state`` say which of the four callers this is, because
+    ``cause`` and ``state`` say which of the five callers this is, because
     the ERROR line below states what is left behind and each leaves a
     different thing. ``state`` names the write: ``"approved"`` on
     ``POST /approve``, ``"claimed"`` on ``POST /scan``. ``cause`` names the
@@ -1223,6 +1233,9 @@ async def _withdraw_pairing(
     - ``_scan``, ``cause="store"``: ``claim_scan`` raised. The code MAY be
       claimed, and a row recording the store's exception as a refusal will
       follow.
+    - ``_scan``, ``cause="cancelled"``: the request was cancelled while the
+      pairing network enrichment was awaited after a ``CLAIMED`` result. The
+      code IS claimed and NO row names it.
 
     ITS OWN FAILURE IS SWALLOWED, deliberately and exactly once. The caller is
     already unwinding a failure and owes the operator THAT exception;
@@ -1239,6 +1252,16 @@ async def _withdraw_pairing(
             logger.error(
                 "a device pairing could not be audited AND could not be withdrawn; "
                 "device code %s is %s with no audit_log row behind it: %s",
+                device_code_handle(device_code_value),
+                state,
+                revoke_exc,
+                exc_info=revoke_exc,
+            )
+        elif cause == "cancelled":
+            logger.error(
+                "a device pairing's scan claim was cancelled before its audit_log row "
+                "AND could not be withdrawn; device code %s is %s with no audit_log row "
+                "behind it (the request was cancelled): %s",
                 device_code_handle(device_code_value),
                 state,
                 revoke_exc,
@@ -1790,7 +1813,24 @@ async def _scan(
     if claim is ScanClaim.CLAIMED:
         # `code` is the row read before the claim, and that is the right one
         # to read `creator_ip` from: it is written once, at creation.
-        signals = await _pairing_network_signals(request, code.creator_ip, scanner_ip)
+        #
+        # A CANCELLATION HERE WITHDRAWS THE CLAIM AND RE-RAISES. A
+        # `CancelledError` from a client disconnect or a shutdown, arriving
+        # while the enricher is awaited, is not an `Exception`, so
+        # `scan_callback`'s branch would not see it and a committed claim
+        # would stand with no row at all: the fail-open shape `PairingAudit`
+        # rejects. This handler sits OUTSIDE the enrichment step and
+        # `asyncio.timeout` sits inside it, so the budget's own cancellation
+        # has already become an "unknown" result by the time anything reaches
+        # here, and a slow provider never withdraws a legitimate claim.
+        # `_withdraw_pairing` swallows its own failure, so what propagates is
+        # still the cancellation; a second cancellation during the withdrawal
+        # is the residual `_pair` accepts around `approve_scanned`.
+        try:
+            signals = await _pairing_network_signals(request, code.creator_ip, scanner_ip)
+        except BaseException:
+            await _withdraw_pairing(store, code.device_code, cause="cancelled", state="claimed")
+            raise
         return _Scanned(
             _scan_context_response(code),
             claimed_device_code=code.device_code,
@@ -1826,17 +1866,123 @@ async def _pairing_network_signals(
     """The one-element ``risk_signals`` array a successful scan's row carries.
 
     Where the pairing was created against where it was scanned
-    (``postern_core.risk.pairing_network``). It refuses nothing and changes no
-    response: the 200 body is the same for every relation.
+    (``postern_core.risk.pairing_network``), with the ASN and country matches
+    when an enricher is installed and without those keys when none is. It
+    refuses nothing and changes no response: the 200 body is the same for
+    every relation and every enrichment outcome.
 
     MUST NOT RAISE AN ``Exception``. ``scan_callback``'s exception branch
     records a refusal and withdraws nothing, on the premise that nothing after
-    a successful claim can raise; ``classify`` is total, so this keeps it.
+    a successful claim can raise. ``classify`` and ``compare_facts`` are total
+    and ``_enriched_matches`` turns every lookup failure into ``"unknown"``,
+    which is what keeps that premise true. A ``CancelledError`` from outside
+    is not converted: ``_scan`` withdraws the claim for it.
     """
     settings: ConfirmSettings = request.app.state.settings
     relation = classify(creator_ip, scanner_ip)
-    signal = pairing_network_signal(relation, settings.trusted_proxy_hops)
+    enricher: NetworkEnricher | None = request.app.state.pairing_network_enricher
+    if enricher is None:
+        signal = pairing_network_signal(relation, settings.trusted_proxy_hops)
+    else:
+        asn_match, country_match = await _enriched_matches(
+            enricher,
+            request.app.state.pairing_network_slots,
+            relation,
+            creator_ip,
+            scanner_ip,
+            budget=settings.pairing_enricher_timeout_seconds,
+        )
+        signal = pairing_network_signal(
+            relation, settings.trusted_proxy_hops, asn_match, country_match
+        )
     return [signal_to_json(signal)]
+
+
+_UNKNOWN_MATCHES: tuple[MatchResult, MatchResult] = ("unknown", "unknown")
+
+
+def _enrichment_failed(reason: str) -> tuple[MatchResult, MatchResult]:
+    """One WARNING, then ``"unknown"`` for both matches.
+
+    ``reason`` is ``timeout``, ``saturated``, ``wrong_type`` or an exception's
+    type name, and nothing else: no ``exc_info``, no exception message and no
+    traceback, because a provider's message can quote the address it was
+    asked about, and never either address.
+    """
+    logger.warning("pairing network enrichment: %s", reason)
+    return _UNKNOWN_MATCHES
+
+
+def _failure_name(exc: Exception) -> str:
+    """The type name to log, looking through the group a ``TaskGroup`` raises."""
+    while isinstance(exc, ExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return type(exc).__name__
+
+
+async def _enriched_matches(
+    enricher: NetworkEnricher,
+    slots: asyncio.Semaphore,
+    relation: NetworkRelation,
+    creator_ip: str | None,
+    scanner_ip: str | None,
+    *,
+    budget: float,
+) -> tuple[MatchResult, MatchResult]:
+    """``(asn_match, country_match)`` from the enricher, under the budget and the cap.
+
+    NO LOOKUP FOR ``unknown``: there is no pair to compare. ONE for
+    ``same_ip``, for that one address, passed to ``compare_facts`` on both
+    sides so a match is ``True`` only for a field the provider returned. TWO
+    otherwise, concurrently, inside one ``asyncio.timeout``; a lookup that
+    finished while the other did not is discarded, because a comparison needs
+    both sides.
+
+    THE CAP DOES NOT WAIT. ``slots.locked()`` and ``async with slots`` have no
+    ``await`` between them, so on one event loop the check cannot race, and a
+    scan that finds every slot taken records ``"unknown"`` at once.
+
+    WHAT THE BUDGET CANNOT STOP. ``asyncio.timeout`` cancels only at an
+    ``await`` that yields. A ``lookup`` that never yields, or calls blocking
+    I/O inside ``async def``, holds the loop for every request on the replica
+    and the budget fires only after it returns. Nothing in this process can
+    prevent that short of a subprocess, which is why the provider contract
+    requires async I/O throughout.
+    """
+    if relation is NetworkRelation.UNKNOWN or creator_ip is None or scanner_ip is None:
+        return _UNKNOWN_MATCHES
+    if slots.locked():
+        return _enrichment_failed("saturated")
+    answers: list[object]
+    async with slots:
+        try:
+            async with asyncio.timeout(budget):
+                if relation is NetworkRelation.SAME_IP:
+                    one = await enricher.lookup(scanner_ip)
+                    answers = [one, one]
+                else:
+                    async with asyncio.TaskGroup() as group:
+                        creator_lookup = group.create_task(enricher.lookup(creator_ip))
+                        scanner_lookup = group.create_task(enricher.lookup(scanner_ip))
+                    answers = [creator_lookup.result(), scanner_lookup.result()]
+        except TimeoutError:
+            return _enrichment_failed("timeout")
+        except Exception as exc:  # noqa: BLE001 -- every provider failure is "unknown"
+            return _enrichment_failed(_failure_name(exc))
+    facts: list[NetworkFacts | None] = []
+    discarded = False
+    for answer in answers:
+        if answer is None:
+            facts.append(None)
+            continue
+        if not isinstance(answer, NetworkFacts):
+            return _enrichment_failed("wrong_type")
+        cleaned, dropped = sanitised(answer)
+        discarded = discarded or dropped
+        facts.append(cleaned)
+    if discarded:
+        logger.warning("pairing network enrichment: invalid_field")
+    return compare_facts(facts[0], facts[1])
 
 
 # ---------------------------------------------------------------------------
