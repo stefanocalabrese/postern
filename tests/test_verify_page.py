@@ -381,7 +381,7 @@ def _js_constant(script: str, name: str) -> int:
 
 
 # NO TEST HERE RUNS THE SCRIPT. There is no JavaScript runtime in the
-# toolchain, so the five below read the served text: the constants, the
+# toolchain, so the eight below read the served text: the constants, the
 # strings and the branches are present, and no HTML sink is. What the browser
 # does with them is not executed anywhere in this suite.
 
@@ -394,9 +394,30 @@ async def test_the_script_takes_the_qr_down_before_a_back_off_outlives_its_token
     script = (await get(app, "/verify.js")).text
 
     assert _js_constant(script, "QR_STALE_AFTER_MS") == SLOTS_BACK * SLOT_SECONDS * 1000
-    assert "delay > QR_STALE_AFTER_MS" in script
     assert "Too many requests. Retrying..." in script
     assert _js_constant(script, "MAX_DELAY_MS") == 30000
+
+
+async def test_the_script_ages_the_qr_from_when_it_was_shown(app: Starlette) -> None:
+    """The next delay alone undercounts: a QR shown 6 s ago and a 8 s wait is
+    already past the window. The age is measured from the last refresh, on the
+    429 path and on the failure path alike."""
+    script = (await get(app, "/verify.js")).text
+
+    assert "freshAt = Date.now()" in script
+    assert "Date.now() - freshAt + delay > QR_STALE_AFTER_MS" in script
+    assert script.count("isStale()") >= 3, "declared, and checked on 429 and on failure"
+
+
+async def test_the_script_hides_the_app_link_with_the_qr(app: Starlette) -> None:
+    """The link carries the same rotation token as the QR, so it goes stale at
+    the same moment and is held, detached and re-inserted with it."""
+    script = (await get(app, "/verify.js")).text
+
+    assert 'var linkNode = document.getElementById("app-link");' in script
+    assert "linkNode.parentNode.removeChild(linkNode)" in script
+    assert "insertBefore(linkNode" in script
+    assert "linkNode = null" in script
 
 
 async def test_the_script_says_what_the_page_says(app: Starlette) -> None:
@@ -413,9 +434,29 @@ async def test_the_script_stops_after_five_consecutive_failures(app: Starlette) 
 
     assert _js_constant(script, "MAX_FAILURES") == 5
     assert "failures >= MAX_FAILURES" in script
-    assert "response.status >= 500" in script
-    assert "failures = 0" in script, "a 200 resets the count"
     assert "reload" in script.casefold()
+
+
+async def test_the_script_counts_every_unexpected_answer_as_a_failure(app: Starlette) -> None:
+    """Anything but 200, 404 and 429 is a failure, and the count is reset only
+    once a 200's body has parsed, so a malformed body still reaches give-up."""
+    script = (await get(app, "/verify.js")).text
+
+    assert "response.status >= 500" not in script
+    assert "if (response.status !== 200) {\n          fail();" in script
+    parsed = script.index("if (!body) {")
+    resets = [m.start() for m in re.finditer(r"(?<!var )failures = 0;", script)]
+    assert resets, "a parsed 200 resets the count"
+    assert all(at > parsed for at in resets), "every reset sits after the parse"
+
+
+async def test_the_script_times_out_each_fetch(app: Starlette) -> None:
+    script = (await get(app, "/verify.js")).text
+
+    assert _js_constant(script, "FETCH_TIMEOUT_MS") == 8000
+    assert "new AbortController()" in script
+    assert "signal: controller.signal" in script
+    assert "controller.abort()" in script
 
 
 async def test_the_script_pauses_while_the_tab_is_hidden(app: Starlette) -> None:

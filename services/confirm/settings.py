@@ -12,7 +12,8 @@ Device authorization (§7.3 of the handoff) adds:
   token, so a phone camera hands it to the bank app. It must be ``https`` with
   a hostname, and that host must differ from ``device_verification_uri``'s;
   ``from_env`` refuses to start otherwise. ``from_env`` also refuses a
-  ``device_verification_uri`` whose path is not ``/verify``.
+  ``device_verification_uri`` whose path is not ``/verify``, or that carries a
+  query or a fragment.
 - ``device_code_ttl_seconds`` — lifetime of a device code (default 900 = 15
   min), refused below ``MIN_DEVICE_CODE_TTL_SECONDS`` because the Redis store
   cannot represent a shorter one (bug B1; that constant carries the working).
@@ -236,12 +237,19 @@ VERIFY_PAGE_PATH = "/verify"
 
 
 def _verification_uri(page_uri: str) -> str:
-    """Return ``page_uri``, refusing one whose path is not the page's route.
+    """Return ``page_uri``, refusing one ``?d=`` cannot be appended to.
 
     ``verification_uri_complete`` is this value plus ``?d=`` and a display
-    handle, and this service serves the page at ``/verify`` and nowhere else,
-    so any other path hands the user a 404 at the first step of pairing. The
-    path must be exactly that: ``/verify/`` does not match the route either.
+    handle. Two refusals, each a ``ValueError`` naming the variable:
+
+    - A path other than ``/verify``. This service serves the page there and
+      nowhere else, so any other path hands the user a 404 at the first step
+      of pairing. ``/verify/`` does not match the route either.
+    - A ``?`` or a ``#`` anywhere in the value. A query makes ``?a=1?d=``, and
+      a fragment carries ``?d=`` inside it, where the server never sees the
+      handle. The characters are tested rather than ``urlsplit``'s query and
+      fragment, which are empty for a bare trailing ``?`` or ``#``.
+
     The value itself comes from ``from_env``, which reads the variable.
     """
     if urlsplit(page_uri).path != VERIFY_PAGE_PATH:
@@ -250,6 +258,12 @@ def _verification_uri(page_uri: str) -> str:
             f"{VERIFY_PAGE_PATH!r}, the route the pairing page is served on. "
             "verification_uri_complete is this value plus ?d=, so any other path "
             "sends the user to a 404."
+        )
+    if "?" in page_uri or "#" in page_uri:
+        raise ValueError(
+            f"POSTERN_DEVICE_VERIFICATION_URI ({page_uri!r}) must carry no query and "
+            "no fragment. verification_uri_complete is this value plus ?d=, which a "
+            "query would turn into ?a=1?d= and a fragment would hide from the server."
         )
     return page_uri
 

@@ -11,14 +11,21 @@
 // fetch() of a same-origin URL sends Sec-Fetch-Site: same-origin, which is
 // what the state endpoint and the image require.
 //
-// THREE THINGS THE TABLE DOES NOT SAY, each so the page never shows a QR that
+// WHAT THE TABLE DOES NOT SAY, each so the page never shows a token that
 // POST /scan would refuse:
-//   - A wait longer than QR_STALE_AFTER_MS takes the QR off the page and says
-//     so. A token is accepted for SLOTS_BACK slots after its own
-//     (services/confirm/qr_token.py), 10 s at the least, and the back-off
-//     reaches 16 s on its fourth step. The next pending 200 puts it back.
-//   - MAX_FAILURES network errors or 5xx answers in a row stop polling and
-//     ask for a reload. A 200 resets the count; a 429 neither adds nor resets.
+//   - The QR and the app link carry the same rotation token, so they are
+//     shown and hidden together. A token is accepted for SLOTS_BACK slots
+//     after its own (services/confirm/qr_token.py), and SLOTS_BACK *
+//     SLOT_SECONDS = 5 * 2 s = 10 s is the least any token gets, so
+//     QR_STALE_AFTER_MS is that 10 s and must move if either constant does.
+//     Age is counted from freshAt, the last pending 200, plus the wait before
+//     the next poll: when that sum passes QR_STALE_AFTER_MS on a 429 or a
+//     failure, both come off the page with a message saying why. The next
+//     pending 200 puts both back and restores the pending text.
+//   - Any answer but 200, 404 and 429, a network error, a body that does not
+//     parse, and a fetch still unanswered after FETCH_TIMEOUT_MS are all
+//     failures. MAX_FAILURES in a row stop polling and ask for a reload. Only
+//     a 200 whose body parsed resets the count; a 429 neither adds nor resets.
 //   - A hidden tab does not poll. Becoming visible polls at once, which also
 //     replaces whatever token went stale while it was hidden.
 (function () {
@@ -28,12 +35,14 @@
   var MAX_DELAY_MS = 30000;
   var QR_STALE_AFTER_MS = 10000;
   var MAX_FAILURES = 5;
+  var FETCH_TIMEOUT_MS = 8000;
   // The page's own three texts, character for character: PENDING_TEXT is put
   // back after a back-off replaced it.
   var PENDING_TEXT = "Check that the code in your app matches this one, and only continue if you started this on your own computer just now.";
   var CLOSED_TEXT = "This pairing is closed. Return to your AI client.";
   var SCANNED_TEXT = "Compare the code in your app with this one.";
   var BACKING_OFF_TEXT = "Too many requests. Retrying...";
+  var RETRYING_TEXT = "Trouble reaching the server. Retrying...";
   var GAVE_UP_TEXT = "This page lost contact with the server. Reload the page to try again.";
 
   var handle = document.body.getAttribute("data-handle");
@@ -45,13 +54,16 @@
   var failures = 0;
   var stopped = false;
   // True while the instruction says something other than PENDING_TEXT
-  // because of a back-off, so the next pending answer knows to restore it.
+  // because the token was taken down, so the next pending answer restores it.
   var degraded = false;
   var timer = null;
   var inFlight = false;
-  // Held so a back-off can take the QR off the page and put the same element
-  // back. Dropped for good once the pairing is scanned or closed.
+  // The page was rendered with a token cut for this moment.
+  var freshAt = Date.now();
+  // Held so a stale token can be taken off the page and the same two elements
+  // put back. Dropped for good once the pairing is scanned or closed.
   var qrNode = document.getElementById("qr");
+  var linkNode = document.getElementById("app-link");
 
   function byId(id) {
     return document.getElementById(id);
@@ -71,51 +83,63 @@
     }
   }
 
-  function hideQr() {
+  function isStale() {
+    return Date.now() - freshAt + delay > QR_STALE_AFTER_MS;
+  }
+
+  function hideToken() {
     if (qrNode && qrNode.parentNode) {
       qrNode.parentNode.removeChild(qrNode);
     }
+    if (linkNode && linkNode.parentNode) {
+      linkNode.parentNode.removeChild(linkNode);
+    }
   }
 
-  function restoreQr() {
-    if (!qrNode || qrNode.parentNode) {
+  function restoreToken() {
+    var instruction = byId("instruction");
+    if (!instruction || !instruction.parentNode) {
       return;
     }
-    var before = byId("app-link") || byId("instruction");
-    if (before && before.parentNode) {
-      before.parentNode.insertBefore(qrNode, before);
+    var parent = instruction.parentNode;
+    if (linkNode && !linkNode.parentNode) {
+      parent.insertBefore(linkNode, instruction);
+    }
+    if (qrNode && !qrNode.parentNode) {
+      parent.insertBefore(qrNode, linkNode && linkNode.parentNode ? linkNode : instruction);
     }
   }
 
   function showPending(appLink) {
-    var link = byId("app-link");
-    if (link && typeof appLink === "string") {
-      link.setAttribute("href", appLink);
+    if (linkNode && typeof appLink === "string") {
+      linkNode.setAttribute("href", appLink);
     }
     if (qrNode) {
       qrNode.setAttribute("src", "/verify/qr.svg?" + query + "&t=" + Date.now());
-      restoreQr();
     }
+    freshAt = Date.now();
+    restoreToken();
     if (degraded) {
       degraded = false;
       say(PENDING_TEXT);
     }
   }
 
-  function showBackingOff() {
+  function takeDown(text) {
     degraded = true;
-    hideQr();
-    say(BACKING_OFF_TEXT);
+    hideToken();
+    say(text);
   }
 
   function showGaveUp() {
     stopped = true;
-    hideQr();
+    hideToken();
     say(GAVE_UP_TEXT);
   }
 
   function showScanned() {
     qrNode = null;
+    linkNode = null;
     remove("qr");
     remove("app-link");
     say(SCANNED_TEXT);
@@ -124,6 +148,7 @@
   function showClosed() {
     stopped = true;
     qrNode = null;
+    linkNode = null;
     remove("qr");
     remove("app-link");
     remove("pairing-code");
@@ -141,13 +166,23 @@
     failures += 1;
     if (failures >= MAX_FAILURES) {
       showGaveUp();
+    } else if (isStale()) {
+      takeDown(RETRYING_TEXT);
     }
   }
 
   function poll() {
     timer = null;
     inFlight = true;
-    fetch("/verify/state?" + query, { cache: "no-store", credentials: "same-origin" })
+    var controller = new AbortController();
+    var deadline = window.setTimeout(function () {
+      controller.abort();
+    }, FETCH_TIMEOUT_MS);
+    fetch("/verify/state?" + query, {
+      cache: "no-store",
+      credentials: "same-origin",
+      signal: controller.signal
+    })
       .then(function (response) {
         if (response.status === 404) {
           showClosed();
@@ -155,26 +190,23 @@
         }
         if (response.status === 429) {
           delay = Math.min(delay * 2, MAX_DELAY_MS);
-          if (delay > QR_STALE_AFTER_MS) {
-            showBackingOff();
+          if (isStale()) {
+            takeDown(BACKING_OFF_TEXT);
           }
           return null;
         }
-        if (response.status >= 500) {
+        if (response.status !== 200) {
           fail();
           return null;
         }
-        if (response.status !== 200) {
-          return null;
-        }
         delay = BASE_DELAY_MS;
-        failures = 0;
         return response.json();
       })
       .then(function (body) {
         if (!body) {
           return;
         }
+        failures = 0;
         if (body.status === "pending") {
           showPending(body.app_link);
         } else if (body.status === "scanned") {
@@ -182,11 +214,13 @@
         }
       })
       .catch(function () {
-        // A network error or an unreadable body: neither a 404 nor a 429, so
-        // keep the current delay and count it.
+        // A network error, the deadline's abort, or a 200 whose body did not
+        // parse: neither a 404 nor a 429, so keep the current delay and count
+        // it.
         fail();
       })
       .then(function () {
+        window.clearTimeout(deadline);
         inFlight = false;
         schedule();
       });

@@ -6,7 +6,8 @@ URL on the page's host opens the browser page instead of the bank app, so the
 pairing could never reach ``POST /scan``. ``ConfirmSettings.from_env`` refuses
 that configuration at startup, and refuses two more: an app link that is not
 ``https`` with a hostname, which no phone opens as an app link, and a page URI
-whose path is not ``/verify``, the one route the page is served on.
+whose path is not ``/verify``, the one route the page is served on, or that
+carries a query or a fragment.
 """
 
 from __future__ import annotations
@@ -104,12 +105,22 @@ def test_an_app_link_a_phone_cannot_open_refuses_to_start(
         ConfirmSettings.from_env()
 
 
+@pytest.mark.parametrize(
+    "page",
+    [
+        pytest.param("https://auth.bank.test/other", id="other path"),
+        pytest.param("https://auth.bank.test/verify/", id="trailing slash"),
+        pytest.param("https://auth.bank.test/verify?a=1", id="query"),
+        pytest.param("https://auth.bank.test/verify#x", id="fragment"),
+    ],
+)
 def test_a_page_uri_off_the_verify_route_refuses_to_start(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, page: str
 ) -> None:
-    """``verification_uri_complete`` is this URI plus ``?d=``; any other path
-    hands the user a 404."""
-    monkeypatch.setenv(PAGE, "https://auth.bank.test/other")
+    """``verification_uri_complete`` is this URI plus ``?d=``. Another path
+    hands the user a 404; a query makes ``?a=1?d=``, and a fragment swallows
+    ``?d=`` so the server never sees the handle."""
+    monkeypatch.setenv(PAGE, page)
     with pytest.raises(ValueError, match=PAGE):
         ConfirmSettings.from_env()
 
