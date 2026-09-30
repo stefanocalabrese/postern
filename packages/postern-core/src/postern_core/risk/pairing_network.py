@@ -41,6 +41,7 @@ __all__ = [
     "NetworkRelation",
     "classify",
     "compare_facts",
+    "normalised_address",
     "pairing_network_signal",
     "sanitised",
 ]
@@ -152,6 +153,17 @@ def _normalised(raw: str | None) -> _Address | None:
     return address
 
 
+def normalised_address(raw: str | None) -> str | None:
+    """``raw`` in the form ``classify`` compares, as a string, or ``None``.
+
+    The zone dropped and an IPv4-mapped address unwrapped, so an enricher is
+    asked about the same address the relation was computed from:
+    ``::ffff:1.2.3.4`` is looked up as ``1.2.3.4``.
+    """
+    address = _normalised(raw)
+    return None if address is None else str(address)
+
+
 def _is_unknown_range(address: _Address) -> bool:
     if not isinstance(address, ipaddress.IPv6Address) or address in _NOT_COMPATIBLE:
         return False
@@ -193,17 +205,26 @@ def sanitised(facts: NetworkFacts) -> tuple[NetworkFacts, bool]:
     """``facts`` with every field that fails validation set to ``None``.
 
     Returns the cleaned facts and whether anything was discarded. ``asn`` must
-    be an ``int`` that is not a ``bool`` and lies in 0 to ``MAX_ASN``;
-    ``country`` must be two ASCII letters. A discarded value is never stored
-    and never logged: the caller learns only that something was dropped.
+    be exactly an ``int`` (not a ``bool``, not a subclass) in 0 to ``MAX_ASN``;
+    ``country`` must be exactly a ``str`` of two ASCII letters. A discarded
+    value is never stored and never logged: the caller learns only that
+    something was dropped.
+
+    EXACT TYPES AND A GUARDED READ, because the answer comes from a provider.
+    A subclass could override ``__eq__`` or ``upper``, which ``compare_facts``
+    calls, and a ``NetworkFacts`` subclass could make a field a property that
+    raises. A read that raises discards both fields rather than propagating,
+    since an exception here would escape after a committed claim. The result
+    is always a plain ``NetworkFacts``.
     """
-    asn = facts.asn
-    country = facts.country
-    asn_ok = asn is None or (
-        isinstance(asn, int) and not isinstance(asn, bool) and 0 <= asn <= MAX_ASN
-    )
+    try:
+        asn = facts.asn
+        country = facts.country
+    except Exception:
+        return NetworkFacts(), True
+    asn_ok = asn is None or (type(asn) is int and 0 <= asn <= MAX_ASN)
     country_ok = country is None or (
-        isinstance(country, str) and len(country) == 2 and country.isascii() and country.isalpha()
+        type(country) is str and len(country) == 2 and country.isascii() and country.isalpha()
     )
     cleaned = NetworkFacts(
         asn=asn if asn_ok else None,

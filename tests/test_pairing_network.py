@@ -24,6 +24,7 @@ from postern_core.risk.pairing_network import (
     NetworkRelation,
     classify,
     compare_facts,
+    normalised_address,
     pairing_network_signal,
     sanitised,
 )
@@ -190,6 +191,67 @@ def test_one_answer_passed_twice_is_true_only_for_returned_fields() -> None:
 )
 def test_sanitised(facts: NetworkFacts, expected: NetworkFacts, discarded: bool) -> None:
     assert sanitised(facts) == (expected, discarded)
+
+
+class _Asn(int):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = int.__hash__
+
+
+class _Country(str):
+    def upper(self) -> str:
+        raise RuntimeError("a hostile str subclass")
+
+
+def test_sanitised_accepts_only_exact_int_and_str() -> None:
+    """A subclass can override ``__eq__`` or ``upper``, which ``compare_facts``
+    calls, so only the exact built-in types are kept."""
+    cleaned, discarded = sanitised(NetworkFacts(asn=_Asn(64500), country=_Country("ES")))
+    assert discarded is True
+    assert cleaned == NetworkFacts()
+    assert type(cleaned) is NetworkFacts
+
+
+class _HostileFacts(NetworkFacts):
+    """A ``NetworkFacts`` whose ``asn`` raises when read, and whose message
+    quotes an address, as a hostile or broken provider's could."""
+
+    def __init__(self) -> None:
+        pass
+
+    @property
+    def asn(self) -> int | None:
+        raise RuntimeError("provider state for 198.51.100.7")
+
+
+def test_a_field_that_raises_when_read_is_discarded_not_propagated() -> None:
+    cleaned, discarded = sanitised(_HostileFacts())
+    assert (cleaned, discarded) == (NetworkFacts(), True)
+    assert type(cleaned) is NetworkFacts
+
+
+# ---------------------------------------------------------------------------
+# normalised_address: the form ``classify`` compares, as a string.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1.2.3.4", "1.2.3.4"),
+        ("::ffff:1.2.3.4", "1.2.3.4"),
+        ("::ffff:102:304", "1.2.3.4"),
+        ("fe80::1%eth0", "fe80::1"),
+        ("2001:DB8::1", "2001:db8::1"),
+        ("not an address", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_normalised_address(raw: str | None, expected: str | None) -> None:
+    assert normalised_address(raw) == expected
 
 
 # ---------------------------------------------------------------------------

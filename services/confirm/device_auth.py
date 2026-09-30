@@ -123,6 +123,7 @@ from postern_core.risk.pairing_network import (
     NetworkRelation,
     classify,
     compare_facts,
+    normalised_address,
     pairing_network_signal,
     sanitised,
 )
@@ -1217,7 +1218,7 @@ async def _withdraw_pairing(
     live, and a racing poll or a racing scan could still find it in the state
     the failed request could not record.
 
-    ``cause`` and ``state`` say which of the five callers this is, because
+    ``cause`` and ``state`` say which of the six callers this is, because
     the ERROR line below states what is left behind and each leaves a
     different thing. ``state`` names the write: ``"approved"`` on
     ``POST /approve``, ``"claimed"`` on ``POST /scan``. ``cause`` names the
@@ -1236,6 +1237,9 @@ async def _withdraw_pairing(
     - ``_scan``, ``cause="cancelled"``: the request was cancelled while the
       pairing network enrichment was awaited after a ``CLAIMED`` result. The
       code IS claimed and NO row names it.
+    - ``scan_callback``, ``cause="cancelled"``: the request was cancelled
+      while a ``CLAIMED`` scan's row was being written. The code IS claimed,
+      and the row may or may not have committed.
 
     ITS OWN FAILURE IS SWALLOWED, deliberately and exactly once. The caller is
     already unwinding a failure and owes the operator THAT exception;
@@ -1702,6 +1706,19 @@ async def scan_callback(request: Request) -> JSONResponse:
             exc_info=audit_exc,
         )
         raise
+    except BaseException:
+        # A CANCELLATION DURING THE ROW WRITE is not an `Exception`, so the
+        # branch above would not see it and a committed claim would stand
+        # with no row naming it. Withdraw it and re-raise, as `_scan` does
+        # for one arriving during enrichment; `_withdraw_pairing` swallows
+        # its own failure, so what propagates is still the cancellation. The
+        # write may have committed before the cancellation landed, and then
+        # a `returned` row names a withdrawn pairing: the safe direction.
+        if outcome.claimed_device_code is not None:
+            await _withdraw_pairing(
+                store, outcome.claimed_device_code, cause="cancelled", state="claimed"
+            )
+        raise
     return outcome.response
 
 
@@ -1958,7 +1975,11 @@ async def _enriched_matches(
     prevent that short of a subprocess, which is why the provider contract
     requires async I/O throughout.
     """
-    if relation is NetworkRelation.UNKNOWN or creator_ip is None or scanner_ip is None:
+    # THE ADDRESS `classify` COMPARED, not the stored string: an IPv4-mapped
+    # or zoned form is looked up as the address the relation was computed from.
+    creator = normalised_address(creator_ip)
+    scanner = normalised_address(scanner_ip)
+    if relation is NetworkRelation.UNKNOWN or creator is None or scanner is None:
         return _UNKNOWN_MATCHES
     if slots.locked():
         return _enrichment_failed("saturated")
@@ -1967,12 +1988,12 @@ async def _enriched_matches(
         try:
             async with asyncio.timeout(budget):
                 if relation is NetworkRelation.SAME_IP:
-                    one = await enricher.lookup(scanner_ip)
+                    one = await enricher.lookup(scanner)
                     answers = [one, one]
                 else:
                     async with asyncio.TaskGroup() as group:
-                        creator_lookup = group.create_task(enricher.lookup(creator_ip))
-                        scanner_lookup = group.create_task(enricher.lookup(scanner_ip))
+                        creator_lookup = group.create_task(enricher.lookup(creator))
+                        scanner_lookup = group.create_task(enricher.lookup(scanner))
                     answers = [creator_lookup.result(), scanner_lookup.result()]
         except TimeoutError:
             return _enrichment_failed("timeout")

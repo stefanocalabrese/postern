@@ -129,7 +129,12 @@ ends any of the three is recorded as `raised` under its class name.
   repeats are answered with the first scan's 200 body and write nothing to the
   store. `raised` with
   `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale` or
-  `scan_conflict` (a second customer scanned).
+  `scan_conflict` (a second customer scanned). Since 30 September 2026 the first
+  scan's row and the `already_scanned` repeat's row each carry one `PAIRING_NETWORK`
+  signal in `risk_signals`: the relation between the address that created the pairing
+  and the one that scanned it (`same_ip`, `same_prefix`, `different` or `unknown`),
+  the trusted hop count, and ASN and country matches when an enricher is installed.
+  Every other `/scan` row keeps `risk_signals` NULL.
 - `POST /approve` (the app confirming a pairing): `returned` with a NULL `detail` for
   the approval that granted the pairing, so `WHERE outcome = 'returned' AND detail IS
   NULL` counts one row per pairing granted; `returned` with `already_approved` for the

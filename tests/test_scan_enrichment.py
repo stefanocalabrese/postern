@@ -30,7 +30,7 @@ from postern_core.store.engine import Database
 from postern_core.store.models import OUTCOME_RETURNED
 from starlette.applications import Starlette
 
-from services.confirm.audit import DETAIL_ALREADY_SCANNED, device_code_handle
+from services.confirm.audit import DETAIL_ALREADY_SCANNED, PairingAudit, device_code_handle
 from services.confirm.device_auth import PAIRING_ENRICHMENT_SLOTS
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
@@ -128,6 +128,17 @@ class CancelsItself:
     async def lookup(self, ip: str) -> NetworkFacts | None:
         self.asked.append(ip)
         raise asyncio.CancelledError
+
+
+class _HostileFacts(NetworkFacts):
+    """A ``NetworkFacts`` whose ``asn`` raises when read."""
+
+    def __init__(self) -> None:
+        pass
+
+    @property
+    def asn(self) -> int | None:
+        raise RuntimeError("provider state for 198.51.100.7")
 
 
 class Blocks:
@@ -437,6 +448,49 @@ async def test_a_provider_raising_cancelled_itself_records_unknown_and_keeps_the
     assert slots._value == PAIRING_ENRICHMENT_SLOTS
 
 
+async def test_a_facts_object_whose_field_raises_is_an_invalid_field_not_a_failed_scan(
+    pg_url: str, clean: Database, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
+) -> None:
+    provider = Table({LAPTOP: _HostileFacts(), PHONE: NetworkFacts(asn=64500, country="ES")})
+    app = build(pg_url, key_pair, provider)
+    code = await start(app, forwarded_for=LAPTOP)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        resp = await scan(app, key_pair, ALICE, code, forwarded_for=PHONE)
+
+    assert resp.status_code == 200
+    stored = await device_store_of(app).get_device_code(code.device_code)
+    assert stored is not None and stored.scanned_by == ALICE
+    (row,) = await rows(clean)
+    assert row.outcome == OUTCOME_RETURNED and row.detail is None
+    assert row.risk_signals == expected_signal(
+        "different", asn_match="unknown", country_match="unknown"
+    )
+    messages = [w.getMessage() for w in enrichment_warnings(caplog)]
+    assert messages == ["pairing network enrichment: invalid_field"]
+
+
+async def test_the_provider_is_asked_about_the_address_classify_compares(
+    pg_url: str, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """An IPv4-mapped creator is classified as its IPv4 address, so it is
+    looked up as that address too, not in the mapped form the pairing stores."""
+    provider = Table(
+        {
+            "1.2.3.4": NetworkFacts(asn=64500, country="ES"),
+            PHONE: NetworkFacts(asn=64500, country="ES"),
+        }
+    )
+    app = build(pg_url, key_pair, provider)
+    code = await start(app, forwarded_for="::ffff:1.2.3.4")
+
+    assert (await scan(app, key_pair, ALICE, code, forwarded_for=PHONE)).status_code == 200
+
+    assert sorted(provider.asked) == sorted(["1.2.3.4", PHONE])
+    (row,) = await rows(clean)
+    assert row.risk_signals == expected_signal("different", asn_match=True, country_match=True)
+
+
 async def test_a_saturated_cap_records_unknown_without_waiting(
     pg_url: str, clean: Database, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -491,6 +545,32 @@ async def test_a_request_cancelled_after_the_claim_withdraws_it_and_re_raises(
     with pytest.raises(asyncio.CancelledError):
         await request
     assert slots._value == PAIRING_ENRICHMENT_SLOTS
+    assert await device_store_of(app).get_device_code(code.device_code) is None
+    assert await rows(clean) == []
+
+
+async def test_a_request_cancelled_during_the_success_row_write_withdraws_the_claim(
+    pg_url: str, clean: Database, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row write is the last ``await`` after a committed claim. A
+    cancellation there is not an ``Exception``, and without its own handler it
+    would leave the code claimed with no row naming it."""
+    entered = asyncio.Event()
+
+    async def blocked(self: PairingAudit, **kwargs: Any) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(PairingAudit, "approved", blocked)
+    app = build(pg_url, key_pair, None)
+    code = await start(app, forwarded_for=LAPTOP)
+
+    request = asyncio.create_task(scan(app, key_pair, ALICE, code, forwarded_for=PHONE))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    request.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await request
     assert await device_store_of(app).get_device_code(code.device_code) is None
     assert await rows(clean) == []
 

@@ -86,7 +86,7 @@ It decides which address three things see:
 
 - the per-address rate limiter's bucket (section 7);
 - `arguments.client_ip` on the `/scan` and `/approve` audit rows;
-- `creator_ip`, stored on every pairing at `POST /device_authorization`. Nothing reads it yet; a later spec will compare it with the scanner's address to catch the phishing-link form of consent phishing (`dev-docs/qr-page-spec.md`, "What this does not fix"). That comparison means nothing unless this variable is right.
+- `creator_ip`, stored on every pairing at `POST /device_authorization`. Since 30 September 2026 every successful `POST /scan` compares it with the scanner's address and records the relation on its `audit_log` row, the trace the phishing-link form of consent phishing leaves (`dev-docs/pairing-network-signal-spec.md`). That comparison means nothing unless this variable is right.
 
 How it resolves (`postern_core.net`'s `client_ip`):
 
