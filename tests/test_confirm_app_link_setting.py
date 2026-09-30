@@ -4,7 +4,9 @@ Section 3 of ``dev-docs/qr-page-spec.md``. The page and the app link are two
 URIs, and the app link's host must not be the page's: a phone camera handed a
 URL on the page's host opens the browser page instead of the bank app, so the
 pairing could never reach ``POST /scan``. ``ConfirmSettings.from_env`` refuses
-that configuration at startup.
+that configuration at startup, and refuses two more: an app link that is not
+``https`` with a hostname, which no phone opens as an app link, and a page URI
+whose path is not ``/verify``, the one route the page is served on.
 """
 
 from __future__ import annotations
@@ -82,3 +84,37 @@ def test_two_different_hosts_start(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = ConfirmSettings.from_env()
     assert settings.device_verification_uri == "https://auth.bank.test/verify"
     assert settings.device_app_link_uri == "https://app.bank.test/pair"
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        pytest.param("http://app.bank.test/pair", id="http"),
+        pytest.param("/pair", id="no host"),
+        pytest.param("app.bank.test/pair", id="no scheme"),
+    ],
+)
+def test_an_app_link_a_phone_cannot_open_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, link: str
+) -> None:
+    """Universal links and verified app links are ``https`` only, and a
+    host-less value names nothing the camera can hand to an app."""
+    monkeypatch.setenv(LINK, link)
+    with pytest.raises(ValueError, match=LINK):
+        ConfirmSettings.from_env()
+
+
+def test_a_page_uri_off_the_verify_route_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``verification_uri_complete`` is this URI plus ``?d=``; any other path
+    hands the user a 404."""
+    monkeypatch.setenv(PAGE, "https://auth.bank.test/other")
+    with pytest.raises(ValueError, match=PAGE):
+        ConfirmSettings.from_env()
+
+
+def test_the_default_page_uri_starts() -> None:
+    assert (
+        ConfirmSettings.from_env().device_verification_uri == "https://auth.postern.internal/verify"
+    )

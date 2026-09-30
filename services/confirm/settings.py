@@ -9,8 +9,10 @@ Device authorization (§7.3 of the handoff) adds:
   handle.
 - ``device_app_link_uri`` -- the operator's universal-link / app-link base.
   The QR on the pairing page encodes this plus ``user_code`` and a rotation
-  token, so a phone camera hands it to the bank app. Its host must differ from
-  ``device_verification_uri``'s, and ``from_env`` refuses to start otherwise.
+  token, so a phone camera hands it to the bank app. It must be ``https`` with
+  a hostname, and that host must differ from ``device_verification_uri``'s;
+  ``from_env`` refuses to start otherwise. ``from_env`` also refuses a
+  ``device_verification_uri`` whose path is not ``/verify``.
 - ``device_code_ttl_seconds`` — lifetime of a device code (default 900 = 15
   min), refused below ``MIN_DEVICE_CODE_TTL_SECONDS`` because the Redis store
   cannot represent a shorter one (bug B1; that constant carries the working).
@@ -192,18 +194,34 @@ def _device_code_ttl(name: str, default: int) -> int:
 
 
 def _app_link_uri(page_uri: str) -> str:
-    """Read ``POSTERN_DEVICE_APP_LINK_URI``, or refuse a host shared with the page.
+    """Read ``POSTERN_DEVICE_APP_LINK_URI``, refusing one a phone cannot open as an app link.
 
-    A phone camera handed a URL on the page's host opens the browser page, not
-    the bank app, so the pairing could never reach ``POST /scan``. Hostnames
-    are compared after ``urlsplit`` and case-folded; a port does not make a
-    different host. The offending values are echoed, as `_device_code_ttl`
-    does, because they are an operator's own environment.
+    Empty or unset is the local placeholder default. Three refusals, each a
+    ``ValueError`` naming the variable:
+
+    - A scheme other than ``https``. Apple universal links and Android
+      verified app links are ``https`` only; an ``http`` link opens a browser.
+    - No hostname, which is what ``urlsplit`` makes of a bare ``/pair`` and of
+      ``app.bank.test/pair`` with its scheme missing. There is no host to
+      publish the associated-domains or asset-links file on.
+    - A host shared with the page. A phone camera handed a URL on the page's
+      host opens the browser page, not the bank app, so the pairing could
+      never reach ``POST /scan``. Hostnames are compared case-folded; a port
+      does not make a different host.
+
+    The offending values are echoed, as `_device_code_ttl` does, because they
+    are an operator's own environment.
     """
     link = os.environ.get("POSTERN_DEVICE_APP_LINK_URI") or "https://app.postern.internal/pair"
+    parts = urlsplit(link)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError(
+            f"POSTERN_DEVICE_APP_LINK_URI ({link!r}) must be an https URL with a hostname. "
+            "Universal links and verified app links are https only, and the pairing QR "
+            "encodes this value for a phone camera to hand to the bank app."
+        )
     page_host = (urlsplit(page_uri).hostname or "").casefold()
-    link_host = (urlsplit(link).hostname or "").casefold()
-    if link_host == page_host:
+    if parts.hostname.casefold() == page_host:
         raise ValueError(
             f"POSTERN_DEVICE_APP_LINK_URI ({link!r}) must not share a host with "
             f"POSTERN_DEVICE_VERIFICATION_URI ({page_uri!r}). "
@@ -211,6 +229,29 @@ def _app_link_uri(page_uri: str) -> str:
             "instead of the bank app, so a pairing could never be scanned."
         )
     return link
+
+
+#: The path the pairing page is served on, in ``services/confirm/verify_page.py``.
+VERIFY_PAGE_PATH = "/verify"
+
+
+def _verification_uri(page_uri: str) -> str:
+    """Return ``page_uri``, refusing one whose path is not the page's route.
+
+    ``verification_uri_complete`` is this value plus ``?d=`` and a display
+    handle, and this service serves the page at ``/verify`` and nowhere else,
+    so any other path hands the user a 404 at the first step of pairing. The
+    path must be exactly that: ``/verify/`` does not match the route either.
+    The value itself comes from ``from_env``, which reads the variable.
+    """
+    if urlsplit(page_uri).path != VERIFY_PAGE_PATH:
+        raise ValueError(
+            f"POSTERN_DEVICE_VERIFICATION_URI ({page_uri!r}) must have the path "
+            f"{VERIFY_PAGE_PATH!r}, the route the pairing page is served on. "
+            "verification_uri_complete is this value plus ?d=, so any other path "
+            "sends the user to a 404."
+        )
+    return page_uri
 
 
 @dataclass(frozen=True)
@@ -480,9 +521,11 @@ class ConfirmSettings:
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
-        device_verification_uri = os.environ.get(
-            "POSTERN_DEVICE_VERIFICATION_URI",
-            "https://auth.postern.internal/verify",
+        device_verification_uri = _verification_uri(
+            os.environ.get(
+                "POSTERN_DEVICE_VERIFICATION_URI",
+                "https://auth.postern.internal/verify",
+            )
         )
         return cls(
             write_key_pem_path=os.environ.get("POSTERN_WRITE_KEY_PEM_PATH") or None,

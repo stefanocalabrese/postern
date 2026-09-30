@@ -9,6 +9,7 @@ writes ``audit_log``, and the app builds without connecting.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,7 @@ from starlette.applications import Starlette
 
 from services.confirm import verify_page
 from services.confirm.main import create_confirm_app
-from services.confirm.qr_token import QrVerdict, slot_at, verify_token
+from services.confirm.qr_token import SLOT_SECONDS, SLOTS_BACK, QrVerdict, slot_at, verify_token
 from services.confirm.settings import ConfirmSettings
 from services.confirm.verify_page import (
     CLOSED_TEXT,
@@ -370,6 +371,73 @@ async def test_the_script_is_served_as_javascript(app: Starlette) -> None:
     assert resp.headers["x-content-type-options"] == "nosniff"
     assert "/verify/state?" in resp.text
     assert "30000" in resp.text, "the 429 back-off ceiling"
+
+
+def _js_constant(script: str, name: str) -> int:
+    """The integer ``var NAME = <n>;`` in the served script."""
+    found = re.search(rf"var {name} = (\d+);", script)
+    assert found is not None, f"{name} is not declared in verify.js"
+    return int(found.group(1))
+
+
+# NO TEST HERE RUNS THE SCRIPT. There is no JavaScript runtime in the
+# toolchain, so the five below read the served text: the constants, the
+# strings and the branches are present, and no HTML sink is. What the browser
+# does with them is not executed anywhere in this suite.
+
+
+async def test_the_script_takes_the_qr_down_before_a_back_off_outlives_its_token(
+    app: Starlette,
+) -> None:
+    """A token is accepted for at least ``SLOTS_BACK`` slots after its own, so
+    a wait longer than that leaves a QR on screen that ``POST /scan`` refuses."""
+    script = (await get(app, "/verify.js")).text
+
+    assert _js_constant(script, "QR_STALE_AFTER_MS") == SLOTS_BACK * SLOT_SECONDS * 1000
+    assert "delay > QR_STALE_AFTER_MS" in script
+    assert "Too many requests. Retrying..." in script
+    assert _js_constant(script, "MAX_DELAY_MS") == 30000
+
+
+async def test_the_script_says_what_the_page_says(app: Starlette) -> None:
+    """The pending text is restored after a back-off, so it must be the
+    page's own, character for character, as the other two already are."""
+    script = (await get(app, "/verify.js")).text
+
+    for text in (PENDING_TEXT, SCANNED_TEXT, CLOSED_TEXT):
+        assert f'"{text}"' in script
+
+
+async def test_the_script_stops_after_five_consecutive_failures(app: Starlette) -> None:
+    script = (await get(app, "/verify.js")).text
+
+    assert _js_constant(script, "MAX_FAILURES") == 5
+    assert "failures >= MAX_FAILURES" in script
+    assert "response.status >= 500" in script
+    assert "failures = 0" in script, "a 200 resets the count"
+    assert "reload" in script.casefold()
+
+
+async def test_the_script_pauses_while_the_tab_is_hidden(app: Starlette) -> None:
+    script = (await get(app, "/verify.js")).text
+
+    assert '"visibilitychange"' in script
+    assert 'document.visibilityState === "hidden"' in script
+    assert "window.clearTimeout(" in script
+
+
+async def test_the_script_writes_no_markup(app: Starlette) -> None:
+    script = (await get(app, "/verify.js")).text
+
+    for sink in (
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "eval(",
+        "document.write",
+        "Function(",
+    ):
+        assert sink not in script
 
 
 async def test_the_stylesheet_is_served_as_css(app: Starlette) -> None:
