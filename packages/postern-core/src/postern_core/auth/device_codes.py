@@ -864,6 +864,19 @@ def asdict_frozen(obj: Any) -> dict[str, Any]:
 #: code some other request has by then almost certainly spent.
 _CLAIM_ATTEMPTS = 3
 
+#: Delete ``KEYS[1]`` only while it still holds ``ARGV[1]``, the device code
+#: that claimed it. A secondary key can expire on its own and be claimed by
+#: another live code's ``SET NX EX`` before this code's revoke runs; an
+#: unconditional ``DEL`` would then drop the new pairing's pointer and leave
+#: it unfindable by that value. One script, so the compare and the delete are
+#: one server-side step, and it queues inside a ``MULTI`` like any command,
+#: which keeps ``claim_scan``'s conflict revoke a single transaction.
+#: `InMemoryDeviceCodeStore._forget` applies the same rule.
+_DELETE_IF_OWNED = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+
 
 class RedisDeviceCodeStore(DeviceCodeStoreBase):
     """Redis-backed device code store.
@@ -990,6 +1003,15 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         if code.display_handle:
             keys.append(self._handle_key(code.display_handle))
         return keys
+
+    def _queue_secondary_deletes(self, pipe: Any, code: DeviceCode) -> None:
+        """Queue a compare-and-delete of each secondary key `code` owns.
+
+        Each key goes only while it still names ``code.device_code``; one that
+        another code has since claimed is left to that code.
+        """
+        for key in self._secondary_keys(code):
+            pipe.eval(_DELETE_IF_OWNED, 1, key, code.device_code)
 
     async def _claim_secondary(
         self,
@@ -1182,9 +1204,10 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         ``WATCH``/``MULTI`` on the primary, the shape ``consume_device_code``
         uses and for its reasons, with ``KEEPTTL`` on the claim so the scan
         does not move the expiry. ``CONFLICT_REVOKED`` deletes the primary,
-        its index member and both secondary keys inside the same ``MULTI``,
-        so no replica can observe the pairing half-revoked. A value that will
-        not deserialize is ``GONE``: a row this store cannot read is not one
+        its index member and both secondary keys inside the same ``MULTI``
+        (each secondary only while it still names this code), so no replica
+        can observe the pairing half-revoked. A value that will not
+        deserialize is ``GONE``: a row this store cannot read is not one
         a scan may claim.
         """
         from redis.exceptions import WatchError
@@ -1218,8 +1241,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
                         pipe.multi()
                         pipe.delete(key)
                         pipe.zrem(self._index_key(), device_code)
-                        for secondary in self._secondary_keys(code):
-                            pipe.delete(secondary)
+                        self._queue_secondary_deletes(pipe, code)
                         await pipe.execute()
                     return claim
                 except WatchError:
@@ -1283,15 +1305,16 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
 
         The row is read first to learn the secondary names. A row that is
         already gone leaves its secondary keys to their own TTL, which is
-        what they would have done anyway.
+        what they would have done anyway. A secondary key that expired after
+        the read and was claimed by another code is left alone, because each
+        delete is conditional on the key still naming this code.
         """
         stored = await self.get_device_code(device_code)
         pipe = self._redis.pipeline()
         pipe.delete(self._key(device_code))
         pipe.zrem(self._index_key(), device_code)
         if stored is not None:
-            for key in self._secondary_keys(stored):
-                pipe.delete(key)
+            self._queue_secondary_deletes(pipe, stored)
         await pipe.execute()
 
     async def _set_code(self, device_code: str, code: DeviceCode) -> None:

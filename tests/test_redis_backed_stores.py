@@ -723,6 +723,74 @@ async def test_a_revoke_deletes_both_secondary_keys(stores: RedisStores) -> None
     assert await store._redis.exists(store._handle_key(code.display_handle)) == 0
 
 
+#: Which of a code's two secondary keys the gap below re-homes. Each names the
+#: key builder on the store and the field on the code it is built from.
+RECLAIMED_SECONDARY = pytest.mark.parametrize(
+    ("key_for", "field"),
+    [("_user_code_key", "user_code"), ("_handle_key", "display_handle")],
+    ids=["user_code", "display_handle"],
+)
+
+
+async def _reclaim_secondary_for_another_code(
+    store: RedisDeviceCodeStore, code: DeviceCode, key_for: str, field: str
+) -> tuple[str, str]:
+    """Replay the gap: `code`'s secondary key expired and a second live code's
+    ``SET NX EX`` claimed the same value, so the key now points at that one.
+
+    Answers the re-homed key and the device code it now belongs to.
+    """
+    key = getattr(store, key_for)(getattr(code, field))
+    other = await _create(store)
+    await store._redis.set(key, other.device_code, ex=600)
+    return key, other.device_code
+
+
+@RECLAIMED_SECONDARY
+async def test_a_revoke_leaves_a_secondary_key_another_code_has_since_claimed(
+    stores: RedisStores, key_for: str, field: str
+) -> None:
+    """``revoke_device_code`` reads the row, then deletes its secondaries. If
+    one expired in between and another code claimed the value, an
+    unconditional ``DEL`` would drop the new pairing's pointer, and that
+    pairing would stop resolving by that value while still live."""
+    store = stores.device_codes()
+    code = await _create(store)
+    key, owner = await _reclaim_secondary_for_another_code(store, code, key_for, field)
+
+    await store.revoke_device_code(code.device_code)
+
+    assert await store._redis.get(key) == owner
+    for own_key in store._secondary_keys(code):
+        if own_key != key:
+            assert await store._redis.exists(own_key) == 0, "the key it still owns is deleted"
+    assert await store._redis.exists(store._key(code.device_code)) == 0
+
+    await store.revoke_device_code(code.device_code)  # still idempotent
+    assert await store._redis.get(key) == owner
+
+
+@RECLAIMED_SECONDARY
+async def test_a_conflict_revoke_leaves_a_secondary_key_another_code_has_since_claimed(
+    stores: RedisStores, key_for: str, field: str
+) -> None:
+    """The same gap on ``claim_scan``'s ``CONFLICT_REVOKED`` branch, which
+    deletes the same two keys inside its ``MULTI``."""
+    store = stores.device_codes()
+    code = await _create(store)
+    assert await store.claim_scan(code.device_code, OTHER) is ScanClaim.CLAIMED
+    key, owner = await _reclaim_secondary_for_another_code(store, code, key_for, field)
+
+    assert await store.claim_scan(code.device_code, OWNER) is ScanClaim.CONFLICT_REVOKED
+
+    assert await store._redis.get(key) == owner
+    for own_key in store._secondary_keys(code):
+        if own_key != key:
+            assert await store._redis.exists(own_key) == 0, "the key it still owns is deleted"
+    assert await store._redis.exists(store._key(code.device_code)) == 0
+    assert await store._redis.zscore(store._index_key(), code.device_code) is None
+
+
 async def test_a_consumed_code_still_resolves_by_both_keys(stores: RedisStores) -> None:
     store = stores.device_codes()
     code = await _create(store)
