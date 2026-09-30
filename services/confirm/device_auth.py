@@ -193,7 +193,12 @@ def _unredeemable_response() -> JSONResponse:
 
 
 def _store_full_response(retry_after: int) -> JSONResponse:
-    """The 503 ``POST /device_authorization`` answers when the store is full.
+    """The 503 ``POST /device_authorization`` answers when it cannot create a code.
+
+    Two causes share it: the store is full, and every freshly generated
+    ``user_code`` or display handle collided with a live one
+    (``DeviceCodeStoreContended``). The browser can do nothing different for
+    either, so it gets one body; only ``Retry-After`` differs.
 
     THE SAME SHAPE AND THE SAME ARGUMENT AS
     `services/confirm/revocation.py`'s ``store_unavailable_response``, which
@@ -204,10 +209,12 @@ def _store_full_response(retry_after: int) -> JSONResponse:
     a private one would be worse. The browser here holds no credential, has
     done nothing wrong, and the honest signal for it is one it can retry.
 
-    ``Retry-After`` carries the device code lifetime, because that is the
-    interval after which capacity is guaranteed to have been released: the
-    oldest code in a full store expires within one TTL, and
-    ``create_device_code`` sweeps before it refuses.
+    ``Retry-After`` carries the device code lifetime for a full store, because
+    that is the interval after which capacity is guaranteed to have been
+    released: the oldest code in a full store expires within one TTL, and
+    ``create_device_code`` sweeps before it refuses. For exhausted generation
+    it carries the poll interval, because a fresh draw needs no code to
+    expire first.
 
     NOT ``access_denied`` and NOT a 429. ``access_denied`` is terminal and
     would end every pairing attempt during a capacity event, dressing an
@@ -254,7 +261,8 @@ async def device_authorization(request: Request) -> JSONResponse:
     RFC 8628 §3.1 — the device_code is 40+ chars, user_code is 6+ chars
     of uppercase alphanumeric (no ambiguous characters).
 
-    Response (503): the device code store is at its cap. See
+    Response (503): the device code store is at its cap, or every generated
+    pairing code or display handle collided with a live one. See
     ``_store_full_response``.
 
     WHAT THIS HANDLER STORES FROM AN UNAUTHENTICATED BODY, and why both
@@ -384,6 +392,11 @@ async def device_authorization(request: Request) -> JSONResponse:
             exc.held,
         )
         return _store_full_response(settings.device_code_ttl_seconds)
+    except DeviceCodeStoreContended as exc:
+        # Five draws all taken is a generator problem, not bad luck, so it is
+        # logged; the browser did nothing wrong and a retry draws again.
+        logger.warning("device authorization refused: %s", exc)
+        return _store_full_response(settings.device_poll_interval_seconds)
 
     return JSONResponse(
         status_code=200,
@@ -1295,8 +1308,22 @@ async def _approve_refusal_detail(
     ``invalid_grant`` as every other refusal. Raising here would turn a race
     the caller can trigger into a 500, which is a second response shape and
     so an oracle.
+
+    A RE-READ THAT RAISES is labelled ``DETAIL_NOT_SCANNED`` for the same
+    reason: the refusal has happened, the label only describes it, and a
+    store outage here must not turn the one ``invalid_grant`` into a 500.
+    The exception's type goes to a WARNING instead. ``Exception`` and not
+    ``BaseException``, so a cancelled request still stops.
     """
-    row = await store.get_device_code(device_code_value)
+    try:
+        row = await store.get_device_code(device_code_value)
+    except Exception as exc:
+        logger.warning(
+            "device approve: re-reading a refused pairing failed with %s; "
+            "recording it as not_scanned",
+            type(exc).__name__,
+        )
+        return DETAIL_NOT_SCANNED
     if row is None or row.is_expired:
         return DETAIL_USER_CODE_NOT_FOUND
     if not row.scanned_by:

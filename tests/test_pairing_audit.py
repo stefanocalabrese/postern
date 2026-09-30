@@ -570,6 +570,52 @@ async def test_a_scan_racing_a_refused_approval_is_still_the_identical_refusal(
     assert stored.approved is False
 
 
+async def test_a_refusal_whose_re_read_fails_is_still_the_identical_refusal(
+    app: Starlette,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The store goes away between the refused compare-and-set and the re-read.
+
+    The re-read only labels the row, so its failure must not change the
+    answer: until 2026-09-30 it propagated and a refusal the spec answers
+    with the one ``invalid_grant`` body became a 500, a second response shape.
+    The row is labelled ``not_scanned``, the label that describes a refusal
+    whose row could not be read and decides nothing, and a WARNING names the
+    exception type.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+    unknown = await approve(app, {"user_code": "ZZZ-ZZZ"}, bearer(key_pair))
+    await _wipe(clean)
+
+    async def refuse(device_code: str, customer_ref: str) -> bool:
+        return False
+
+    async def outage(device_code: str) -> DeviceCode | None:
+        raise ConnectionError("store gone")
+
+    monkeypatch.setattr(store, "approve_scanned", refuse)
+    monkeypatch.setattr(store, "get_device_code", outage)
+
+    with caplog.at_level(logging.WARNING, logger="services.confirm.device_auth"):
+        resp = await approve(
+            app,
+            {"user_code": code.user_code_display},
+            bearer(key_pair),
+            as_a_server_would=True,
+        )
+
+    assert resp.status_code == 400
+    assert resp.content == unknown.content
+    row = await one_row(clean)
+    assert row.detail == DETAIL_NOT_SCANNED
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("ConnectionError" in m for m in warnings), warnings
+
+
 async def test_every_refusal_about_a_pairing_answers_one_identical_body(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:

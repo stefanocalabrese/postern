@@ -64,6 +64,7 @@ import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from postern_core.auth.device_codes import (
     DEFAULT_MAX_DEVICE_CODES,
+    DeviceCodeStoreContended,
     DeviceCodeStoreFull,
     InMemoryDeviceCodeStore,
 )
@@ -924,6 +925,40 @@ class TestThroughTheAssembledApp:
         # Refused, not evicted: the pairing already in flight is untouched.
         store = app.state.device_code_store
         assert await store.get_device_code(first.json()["device_code"]) is not None
+
+    async def test_exhausted_code_generation_answers_the_store_full_shape(
+        self, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Five generated codes all taken is a 503 the browser can retry, not a 500.
+
+        ``create_device_code`` raises ``DeviceCodeStoreContended`` when every
+        freshly generated ``user_code`` or display handle collides with a live
+        one. Until 2026-09-30 the handler caught only ``DeviceCodeStoreFull``,
+        so that exception left an unauthenticated public endpoint as a 500.
+        The body is the store-full one byte for byte; the ``Retry-After`` is
+        the poll interval, because a fresh draw needs no code to expire first.
+        """
+        full_app = _app(key_pair, max_device_codes=1)
+        async with _client(full_app) as client:
+            await client.post("/device_authorization", json={"client_id": "browser-1"})
+            full = await client.post("/device_authorization", json={"client_id": "browser-2"})
+        assert full.status_code == 503
+
+        app = _app(key_pair)
+        store = app.state.device_code_store
+
+        async def collide(**_: Any) -> Any:
+            raise DeviceCodeStoreContended("5 generated user_code values were all already in use")
+
+        monkeypatch.setattr(store, "create_device_code", collide)
+        async with _client(app) as client:
+            contended = await client.post("/device_authorization", json={"client_id": "browser"})
+
+        assert contended.status_code == 503
+        assert contended.content == full.content
+        assert (
+            int(contended.headers["retry-after"]) == app.state.settings.device_poll_interval_seconds
+        )
 
     async def test_the_rate_limit_sits_in_front_of_authentication(
         self, key_pair: RSAKeyPair
