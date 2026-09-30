@@ -814,6 +814,9 @@ async def test_two_customers_scanning_one_fresh_code_settle_to_one_claim_and_a_r
         ScanClaim.CONFLICT_REVOKED.value,
     ]
     assert await first._redis.exists(first._key(code.device_code)) == 0
+    assert await first._redis.exists(first._user_code_key(code.user_code)) == 0
+    assert await first._redis.exists(first._handle_key(code.display_handle)) == 0
+    assert await first._redis.zscore(first._index_key(), code.device_code) is None
 
 
 async def test_a_conflict_on_an_exchanged_code_writes_nothing(stores: RedisStores) -> None:

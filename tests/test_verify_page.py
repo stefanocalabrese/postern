@@ -402,6 +402,10 @@ async def test_a_pending_pages_image_and_link_escape_stored_markup(app: Starlett
 
     assert f'src="/verify/qr.svg?d={quote(HOSTILE_HANDLE, safe="")}"' in page
     assert "user_code=%3Cb%3EABC" in page
+    # Percent-encoding does not touch the `&` between the link's parameters;
+    # only html.escape turns it into `&amp;` inside the href attribute.
+    assert "&amp;qr=" in page
+    assert "&qr=" not in page.replace("&amp;qr=", "")
 
 
 NOSCRIPT_REFRESH = '<noscript><meta http-equiv="refresh" content="5"></noscript>'
