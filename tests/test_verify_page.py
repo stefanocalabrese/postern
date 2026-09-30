@@ -519,7 +519,8 @@ async def test_the_script_stops_after_five_consecutive_failures(app: Starlette) 
 
 async def test_the_script_counts_every_unexpected_answer_as_a_failure(app: Starlette) -> None:
     """Anything but 200, 404 and 429 is a failure, and the count is reset only
-    once a 200's body has parsed, so a malformed body still reaches give-up.
+    by a 200 whose body parses as a pending or scanned answer, so a malformed
+    or unrecognised body still reaches give-up.
     ``tests/test_verify_js_behaviour.py`` runs the script and checks that an
     unrecognised 200 is counted too, which reading the text cannot."""
     script = (await get(app, "/verify.js")).text
