@@ -3866,11 +3866,12 @@ git commit -m "feat(confirm): enrich the pairing network signal under a budget, 
 
 ### Task 8: Operator documentation
 
-Spec section 6: one sentence on `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS`'s row, a row for the new variable, and a section in the confirm service guide with the JSON shape, the entry-point group, the trust statement and the two warnings. The two code comments section 6 names were rewritten in Task 6. No test: nothing in the suite parses either document.
+Spec section 6: one sentence on `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS`'s row, a row for the new variable, and a section in the confirm service guide with the JSON shape, the entry-point group, the trust statement and the two warnings. The two code comments section 6 names were rewritten in Task 6. Also two lines section 6 does not name and Task 2 makes false: the `claim_scan` signature in the session store guide and the `DeviceCode` listing in the confirm service guide, which lacks `scanner_ip`. No test: nothing in the suite parses these documents.
 
 **Files:**
 - Modify: `docs/user-guide/getting-started.md` (the write-path variables table)
-- Modify: `docs/user-guide/components/confirm-service.md` (new `### Pairing network signal` section before `### Device Code Model`)
+- Modify: `docs/user-guide/components/confirm-service.md` (new `### Pairing network signal` section before `### Device Code Model`; one line in the `DeviceCode` listing)
+- Modify: `docs/user-guide/components/session-store.md` (the `claim_scan` line of the `DeviceCodeStoreBase` listing)
 
 - [ ] **Step 1: The variables table**
 
@@ -3956,15 +3957,46 @@ under its own prefix, because the service refuses unknown `POSTERN_` variables.
 ### Device Code Model (`packages/postern-core/src/postern_core/auth/device_codes.py`)
 ````
 
-- [ ] **Step 3: Run the gate**
+- [ ] **Step 3: The `DeviceCode` listing**
+
+In `docs/user-guide/components/confirm-service.md`, replace:
+
+```python
+    scanned_at: datetime | None  # When
+```
+
+with:
+
+```python
+    scanned_at: datetime | None  # When
+    scanner_ip: str | None    # Where the claiming /scan came from, set only by the claim
+```
+
+- [ ] **Step 4: The `claim_scan` signature in the session store guide**
+
+In `docs/user-guide/components/session-store.md`, replace:
+
+```python
+    async def claim_scan(self, device_code: str, customer_ref: str) -> ScanClaim: ...
+```
+
+with:
+
+```python
+    async def claim_scan(
+        self, device_code: str, customer_ref: str, *, scanner_ip: str | None
+    ) -> ScanClaim: ...
+```
+
+- [ ] **Step 5: Run the gate**
 
 Run: `make ci`
-Expected: exit 0. `make citations` scans both documents; neither adds an anchored citation.
+Expected: exit 0. `make citations` scans all three documents; none adds an anchored citation.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add docs/user-guide/getting-started.md docs/user-guide/components/confirm-service.md
+git add docs/user-guide/getting-started.md docs/user-guide/components/confirm-service.md docs/user-guide/components/session-store.md
 git commit -m "docs: document the pairing network signal and its enricher seam" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
@@ -4010,6 +4042,7 @@ Every section of `dev-docs/pairing-network-signal-spec.md` and every item of its
 | §5 success body byte-identical | 6, 7 |
 | §6 getting-started sentence and row; confirm-service section with both warnings | 8 |
 | §6 the `DeviceCode` docstring and the `device_authorization` comment rewritten | 6 |
+| Not in §6, made false by Task 2: the `claim_scan` signature in `session-store.md` and the `DeviceCode` listing in `confirm-service.md` | 8 |
 | Testing: classifier table incl. mapped, NAT64, unparsable, totality | 1 |
 | Testing: `compare_facts` combinations, case-insensitive | 1 |
 | Testing: signal JSON with and without an enricher, no input in the output | 1 |
@@ -4064,7 +4097,7 @@ The baseline at `07053c6`, before Task 1, was exit 0 with 3260 passed. Every run
 
 ## Concerns for the reviewer
 
-- **Two documents state the old `claim_scan` signature or field list and are not in section 6's list.** `docs/user-guide/components/session-store.md` shows `async def claim_scan(self, device_code: str, customer_ref: str) -> ScanClaim: ...`, and the `DeviceCode` listing in `docs/user-guide/components/confirm-service.md` ends at `scanned_at`. Both go stale in Task 2. The spec does not name them, so this plan does not edit them; one line each fixes them if you want that.
+- **Two documents go stale at Task 2 and are fixed only at Task 8.** The `claim_scan` signature in `docs/user-guide/components/session-store.md` and the `DeviceCode` listing in `docs/user-guide/components/confirm-service.md`. Section 6 of the spec does not name them; they were added to Task 8 at the coordinator's request. Nothing checks either document's prose, so every commit in between stays green.
 - **`services/confirm/audit.py::pairing_client_ip`'s docstring says an in-process test client has no peer.** It has one (discrepancy 2). Pre-existing and out of scope.
 - **The saturation test holds the semaphore directly.** The spec describes eight slots "held by a provider blocked on an event the test controls". Driving eight concurrent scans into a blocked provider needs every one of them to reach the lookup inside the budget, which under `make ci` load is a timing race; `test_a_saturated_cap_records_unknown_without_waiting` acquires the eight slots itself instead, which is the same state with no race, and asserts the provider is never called.
 - **Between Task 4 and Task 7 an installed enricher is loaded and ignored.** None ships, so no deployment of an intermediate commit changes behaviour, but a reviewer reading Task 4 alone sees a semaphore nothing acquires.
