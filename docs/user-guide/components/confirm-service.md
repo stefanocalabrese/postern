@@ -135,7 +135,7 @@ exchanged revokes it (`400 scan_conflict`).
 revoked. Every refusal that could reveal whether a pairing exists -- unknown,
 expired, unscanned, scanned by someone else, already approved, a forged rotation
 token -- is the same **400** `invalid_grant`; `/scan` answers `qr_stale` for a
-genuine token that has aged out (a token is accepted for 10 to 12 seconds from the start of its two-second slot) and `scan_conflict` as above. The
+genuine token that has aged out (a token is accepted until 12 seconds after the start of its two-second slot, so 10 to 12 seconds after the page showed it) and `scan_conflict` as above. The
 distinction lives in each request's `audit_log.detail`.
 
 Any store exception from the claim at `/scan` or the approval at `/approve`,
