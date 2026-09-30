@@ -74,3 +74,21 @@ class RiskSignal:
 
     details: dict[str, Any] = field(default_factory=dict)
     """Structured data for alerting systems (record counts, thresholds, etc.)."""
+
+
+def signal_to_json(signal: RiskSignal) -> dict[str, Any]:
+    """The object one ``RiskSignal`` becomes in ``audit_log.risk_signals``.
+
+    Four keys, in the order ``services/api/middleware/audit.py`` writes them
+    inline for the read path, with ``severity`` as the member's name. It lives
+    here, beside the type, because ``.importlinter`` forbids
+    ``services.confirm`` from importing ``services.api``, and one query shape
+    must read both services' rows. ``tests/test_pairing_network.py`` pins the
+    two against each other.
+    """
+    return {
+        "code": signal.code,
+        "severity": signal.severity.name,
+        "description": signal.description,
+        "details": dict(signal.details),
+    }
