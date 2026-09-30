@@ -236,9 +236,9 @@ class DeviceCodeStoreBase(ABC):
 There is no whole-row write. `consume_device_code`, `claim_scan` and
 `approve_scanned` are compare-and-set operations -- `WATCH`/`MULTI` on Redis, no
 `await` between read and write in memory -- because a snapshot read before one of
-them and written back after it would silently undo it. The two lookups are
+them and written back after it would silently undo it. On the Redis backend the two lookups are
 secondary keys created with `SET NX EX`, deleted on revoke and left in place by
-consume.
+consume; the in-memory backend keeps them in dicts.
 
 Factory: `create_device_code_store()` picks the backend based on `POSTERN_REDIS_URL`.
 

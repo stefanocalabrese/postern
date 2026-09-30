@@ -90,7 +90,7 @@ Implements RFC 8628 Device Authorization Grant with QR pairing codes.
 because the caller is the **browser**, which holds no credential — that is the
 premise of RFC 8628, not an oversight. The `device_code` (43 characters from
 `secrets.token_urlsafe(32)`) is the authority at `/token` and never appears in
-the page, the QR or the page URL. All eight are listed in `PUBLIC_PATHS` in
+the page, the QR or the page URL. All seven are listed in `PUBLIC_PATHS`, alongside `/.well-known/jwks.json` (eight entries in all), in
 [`services/confirm/auth.py`](../../../services/confirm/auth.py); every other
 route on this service is denied by default. Decision record 0021 is why the page
 is served here rather than by `services/api`.
@@ -135,14 +135,15 @@ exchanged revokes it (`400 scan_conflict`).
 revoked. Every refusal that could reveal whether a pairing exists -- unknown,
 expired, unscanned, scanned by someone else, already approved, a forged rotation
 token -- is the same **400** `invalid_grant`; `/scan` answers `qr_stale` for a
-genuine token more than ten seconds old and `scan_conflict` as above. The
+genuine token that has aged out (a token is accepted for 10 to 12 seconds from the start of its two-second slot) and `scan_conflict` as above. The
 distinction lives in each request's `audit_log.detail`.
 
-A store error at `/scan` or `/approve` that may have committed the write (a lost
-reply from Redis) withdraws the pairing before the error is returned, so the
-refusal recorded for the call never sits over a live claim or approval; the
-recovery is a fresh QR. A store write that definitely did not happen is not
-withdrawn.
+Any store exception from the claim at `/scan` or the approval at `/approve`,
+other than the contention error (every `WATCH` beaten, so nothing committed),
+revokes the pairing before the exception propagates as a 500, because on Redis a
+lost `EXEC` reply can hide a committed write. If that revoke also fails, an
+ERROR line names the pairing's handle and says it may be claimed or approved
+while its audit row records a refusal. The recovery either way is a fresh QR.
 
 ### Device Code Model (`packages/postern-core/src/postern_core/auth/device_codes.py`)
 
