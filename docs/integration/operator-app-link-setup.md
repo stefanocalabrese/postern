@@ -27,6 +27,7 @@ The bank app sends `POST /scan` and `POST /approve` to the confirm service's own
 
 - The scheme is not `https`.
 - There is no hostname (a bare `/pair`, or `app.bank.example/pair` with the scheme missing).
+- The value contains `?` or `#` anywhere (a query, a fragment, or a bare trailing one). The QR appends `?user_code=...&qr=...` to the base, and after a fragment those parameters reach no server or app.
 - The hostname equals the pairing page's hostname. The comparison is case-folded and ignores the port, so `https://Auth.Bank.example:8443/pair` against a page on `auth.bank.example` is refused. A phone camera handed a URL on the page's own host opens the browser page, not the app, and no pairing could ever reach `/scan`.
 
 **`POSTERN_DEVICE_VERIFICATION_URI`** (`services/confirm/settings.py::_verification_uri`):
@@ -38,8 +39,6 @@ What the service does **not** check, so you must:
 
 - **Unset is accepted.** An empty or unset `POSTERN_DEVICE_APP_LINK_URI` becomes the placeholder `https://app.postern.internal/pair`, with no warning. A deployment that forgets it starts normally and every QR it draws points at a host no phone can resolve.
 - **The path is free.** `/pair` is only the default. Pick a path your association files cover.
-- **A query in the base is allowed.** The two parameters are then appended with `&`.
-- **Do not put a fragment in it.** Nothing refuses one, and `services/confirm/verify_page.py::app_link` decides between `?` and `&` by looking for a `?`, so a base ending in `#x` gets `?user_code=...&qr=...` appended after the fragment, where no server or app link handler receives it.
 - **Reachability and association.** Nothing checks that the host resolves, serves TLS, or publishes the files below.
 
 A separate subdomain, for example `app.bank.example` next to `auth.bank.example` for the page, meets every rule above.
@@ -143,7 +142,7 @@ The per-address limiter does not use Redis at all; it stays per replica whatever
 ## 9. Checklist
 
 - [ ] `POSTERN_DEVICE_VERIFICATION_URI` set to `https://<page host>/verify`.
-- [ ] `POSTERN_DEVICE_APP_LINK_URI` set, `https`, on a different host, no fragment.
+- [ ] `POSTERN_DEVICE_APP_LINK_URI` set, `https`, on a different host, no `?` and no `#`.
 - [ ] `apple-app-site-association` and `assetlinks.json` published on the app-link host, covering its path, checked against current platform documentation.
 - [ ] A fallback page on the app-link path for phones without the app.
 - [ ] `POSTERN_APP_ASSERTION_JWKS_URI`, `_ISSUER` and `_AUDIENCE` set, with an audience distinct from `services/api`'s, and the app backend setting `exp`.

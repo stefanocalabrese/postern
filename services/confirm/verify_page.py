@@ -141,11 +141,12 @@ def app_link(settings: ConfirmSettings, code: DeviceCode, now: float) -> str:
     ``{device_app_link_uri}?user_code=<user_code>&qr=<slot>.<mac>``. The
     ``user_code`` is the stored six-character form; the token is
     ``services/confirm/qr_token.py``'s, keyed by the row's own secret.
+    The base carries no ``?`` or ``#``:
+    ``settings.py::_app_link_uri`` refuses both at startup.
     """
     token = token_for(code.qr_secret, code.user_code, slot_at(now))
-    separator = "&" if "?" in settings.device_app_link_uri else "?"
     query = urlencode({"user_code": code.user_code, "qr": token})
-    return f"{settings.device_app_link_uri}{separator}{query}"
+    return f"{settings.device_app_link_uri}?{query}"
 
 
 def render_qr_svg(link: str) -> bytes:

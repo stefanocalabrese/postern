@@ -134,3 +134,24 @@ def test_the_default_page_uri_starts() -> None:
     assert (
         ConfirmSettings.from_env().device_verification_uri == "https://auth.postern.internal/verify"
     )
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        pytest.param("https://app.bank.test/pair#frag", id="fragment"),
+        pytest.param("https://app.bank.test/pair?a=1", id="query"),
+        pytest.param("https://app.bank.test/pair?", id="bare trailing question mark"),
+        pytest.param("https://app.bank.test/pair#", id="bare trailing hash"),
+    ],
+)
+def test_an_app_link_base_that_swallows_the_pairing_parameters_refuses(
+    monkeypatch: pytest.MonkeyPatch, link: str
+) -> None:
+    """The QR appends ``?user_code=...&qr=...``. After a ``#`` those land in the
+    fragment, which no server or app link handler receives; after a ``?`` they
+    merge into an operator query string. The characters are tested, not
+    ``urlsplit``'s parts, which are empty for a bare trailing one."""
+    monkeypatch.setenv(LINK, link)
+    with pytest.raises(ValueError, match=LINK):
+        ConfirmSettings.from_env()

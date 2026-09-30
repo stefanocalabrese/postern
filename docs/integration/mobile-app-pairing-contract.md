@@ -29,7 +29,7 @@ The QR on the pairing page encodes:
 {POSTERN_DEVICE_APP_LINK_URI}?user_code=<user_code>&qr=<slot>.<mac>
 ```
 
-built by `services/confirm/verify_page.py::app_link`. If the configured base already carries a query, the two parameters are appended with `&` instead of `?`. Example, with a placeholder host:
+built by `services/confirm/verify_page.py::app_link`. The configured base carries no query and no fragment: the service refuses both at startup, so the two parameters always follow a single `?`. Example, with a placeholder host:
 
 ```
 https://app.bank.example/pair?user_code=K7M2QX&qr=893456712.q1Fz0bT7cN4pLm9wXy2VgA

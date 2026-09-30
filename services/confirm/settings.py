@@ -226,9 +226,15 @@ def _device_code_ttl(name: str, default: int) -> int:
 def _app_link_uri(page_uri: str) -> str:
     """Read ``POSTERN_DEVICE_APP_LINK_URI``, refusing one a phone cannot open as an app link.
 
-    Empty or unset is the local placeholder default. Three refusals, each a
+    Empty or unset is the local placeholder default. Four refusals, each a
     ``ValueError`` naming the variable:
 
+    - A ``?`` or a ``#`` anywhere in the value. The pairing QR appends
+      ``?user_code=...&qr=...`` to it, so after a fragment the parameters land
+      where no server or app link handler receives them, and after a query they
+      merge into the operator's own query string. The characters are tested
+      rather than ``urlsplit``'s query and fragment, which are empty for a bare
+      trailing ``?`` or ``#``, as `_verification_uri` does.
     - A scheme other than ``https``. Apple universal links and Android
       verified app links are ``https`` only; an ``http`` link opens a browser.
     - No hostname, which is what ``urlsplit`` makes of a bare ``/pair`` and of
@@ -243,6 +249,12 @@ def _app_link_uri(page_uri: str) -> str:
     are an operator's own environment.
     """
     link = os.environ.get("POSTERN_DEVICE_APP_LINK_URI") or "https://app.postern.internal/pair"
+    if "?" in link or "#" in link:
+        raise ValueError(
+            f"POSTERN_DEVICE_APP_LINK_URI ({link!r}) must not contain '?' or '#'. "
+            "The pairing QR appends ?user_code=...&qr=... to it: after a fragment the "
+            "parameters reach no server or app, and after a query they merge into it."
+        )
     parts = urlsplit(link)
     if parts.scheme != "https" or not parts.hostname:
         raise ValueError(
