@@ -824,7 +824,7 @@ def _arguments(challenge_id: str, body: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# PairingAudit -- one row per ``POST /approve``.
+# PairingAudit -- one row per recorded ``/scan``, ``/approve`` or ``/token``.
 # ---------------------------------------------------------------------------
 #
 # WHY THIS EXISTS. Until 2026-09-26 ``services/confirm/device_auth.py`` wrote
@@ -911,11 +911,11 @@ DETAIL_STORED_IDENTITY_MALFORMED = "stored_identity_malformed"
 # ``ApprovalAudit``'s refusals already do.
 #
 # ``DETAIL_REVOKED`` above is REUSED rather than duplicated, and that is the
-# one decision in this block worth arguing. Both endpoints refuse a revoked
-# customer through the same ``services/confirm/revocation.py`` call, and one
-# literal makes ``WHERE detail = 'revoked'`` the whole answer to "did my
+# one decision in this block worth arguing. All three endpoints refuse a
+# revoked customer through the same ``services/confirm/revocation.py`` call,
+# and one literal makes ``WHERE detail = 'revoked'`` the whole answer to "did my
 # revocation take effect on the write path". Two literals would make it an
-# answer that silently omits half of it, which is the failure mode
+# answer that silently omits part of it, which is the failure mode
 # ``services/confirm/customer_rate_limit.py`` names: a query that undercounts
 # by exactly the half nobody thought about is worse than one that returns
 # nothing, because the first is trusted.
@@ -1098,12 +1098,13 @@ class PairingAudit:
     own docstring.
 
     ONE ROW, NOT THE READ PATH'S TWO, and the reason is that the second row's
-    reason is absent on both. ``ApprovalAudit`` writes an entry row because the
+    reason is absent on all three. ``ApprovalAudit`` writes an entry row because the
     request reaches an operator backend, the touch leaves nothing on this
     side, and a crash mid-call would otherwise erase that customer data was
-    reached at all. Neither endpoint here reaches a backend: one sets three
-    fields on a device code held in this deployment's own store, the other
-    signs a string in this process. There is no touch to record early.
+    reached at all. No endpoint here reaches a backend: ``/scan`` and
+    ``/approve`` each set fields on a device code held in this deployment's
+    own store, and ``/token`` signs a string in this process. There is no touch to record
+    early.
 
     The same conclusion is forced by the schema, which matters more than the
     argument because it cannot be reasoned around. ``OUTCOME_REACHING`` is

@@ -304,8 +304,8 @@ async def device_authorization(request: Request) -> JSONResponse:
     an address bucket is not an identity. Under decision 0006 an audit write
     that fails fails the request, so a row here would additionally mean that
     no pairing can BEGIN while the audit store is merely slow -- bought for a
-    row naming nobody, on the one endpoint of the three that reaches no
-    customer data whatsoever.
+    row naming nobody, on the one device grant endpoint of the four that
+    resolves no identity whatsoever.
 
     WHAT IS INVISIBLE BECAUSE OF THIS, stated plainly. Device code creation.
     An attacker can mint codes against any ``client_id`` they like and this

@@ -76,7 +76,7 @@ part. It reaches no store, no database and no handler, so the property
 preserved exactly: this module holds counters and a clock.
 
 THERE IS A SECOND LIMITER, AND IT IS NOT THIS ONE RE-KEYED.
-`services/confirm/customer_rate_limit.py` bounds the two
+`services/confirm/customer_rate_limit.py` bounds the three
 assertion-authenticated paths per CUSTOMER, which is the unit an address
 cannot express, and it must run AFTER `AppAssertionMiddleware` because that is
 where the verified ``sub`` appears. The two positions are mutually exclusive,
@@ -170,7 +170,7 @@ class Limit:
 #: EVERY ONE OF THESE IS OVERRIDABLE, per `services/confirm/settings.py`'s
 #: eleven ``rate_limit_*`` fields, and that setting carries the sentence that
 #: says which way to set them. The knob exists for one case in particular: if
-#: the operator's banking app backend calls the two authenticated paths on the
+#: the operator's banking app backend calls the three authenticated paths on the
 #: phone's behalf, every approval in the bank arrives from a handful of egress
 #: addresses and 60/min is a bank-wide ceiling on payment approvals. Finding
 #: that out should cost a restart, not a release.

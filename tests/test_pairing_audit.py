@@ -1100,11 +1100,13 @@ async def test_an_expired_device_code_writes_nothing(
 async def test_an_unknown_device_code_at_the_token_endpoint_writes_nothing(
     app: Starlette, clean: Database
 ) -> None:
-    """The deliberate asymmetry with ``POST /approve``, which DOES record this.
+    """The deliberate asymmetry with ``POST /approve``, which records its miss.
 
-    Same shape, opposite answer, and the difference is authentication. At
-    ``/approve`` an unknown device code is a conclusion about a customer the
-    assertion already named, so it is the enumeration signal. Here the caller
+    ``/approve`` takes a ``user_code`` now, not a device code, and an unknown
+    one is written as ``user_code_not_found``. Same shape, opposite answer,
+    and the difference is authentication. At ``/approve`` an unknown pairing
+    code is a conclusion about a customer the assertion already named, so it
+    is the enumeration signal. Here the caller
     holds nothing at all, so there is nobody to attribute the guess to, and a
     row would be an INSERT an unauthenticated caller can drive 300 times a
     minute per address bucket.

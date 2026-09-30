@@ -1,13 +1,14 @@
-"""A bound on how fast ONE CUSTOMER can approve, on the two paths that have one.
+"""A bound on how fast ONE CUSTOMER can approve, on the three paths that have one.
 
 THE DEFECT THIS CLOSES, AND WHY IT IS NOT A RE-KEY OF THE OTHER LIMITER.
-`services/confirm/rate_limit.py` limits ``POST /approve`` and
-``POST /challenges/{challenge_id}/approve`` per CLIENT ADDRESS BUCKET. That is
-the wrong unit for these two, and the sentence that says why is short: sixty
-payment approvals a minute from one customer is a signal, and sixty from a
-bank's egress address is a Tuesday. Its own settings comment already recorded
-the gap -- "a per-address bound is the wrong UNIT for an authenticated path,
-where the meaningful one is per customer" -- and the environment overrides
+`services/confirm/rate_limit.py` limits ``POST /approve``,
+``POST /challenges/{challenge_id}/approve`` and ``POST /scan`` per CLIENT
+ADDRESS BUCKET. That is the wrong unit for these three, and the sentence that
+says why is short: sixty payment approvals a minute from one customer is a
+signal, and sixty from a bank's egress address is a Tuesday. Its own
+settings comment already recorded the gap -- "a per-address bound is the
+wrong UNIT for an authenticated path, where the meaningful one is per
+customer" -- and the environment overrides
 that landed with it made the wrong unit SURVIVABLE without making it right: an
 operator whose banking app calls from its own backend raises the address
 ceiling and thereby raises it for every customer at once.
@@ -76,8 +77,8 @@ logger = logging.getLogger(__name__)
 #: someone at 3am, so each number below names what a legitimate human could
 #: plausibly do in a minute and then says what multiple of that it admits.
 #:
-#: Both of these paths are ONE TAP ON A PHONE per unit of work. That is the
-#: fact that sets the scale, and it is why neither number is in the hundreds.
+#: All three paths are ONE ACTION ON A PHONE per unit of work. That is the
+#: fact that sets the scale, and it is why no number is in the hundreds.
 #:
 #: ``/approve`` -- 10/min. This is a device pairing: the customer opens the
 #:     bank app, scans a QR, reads a six-character pairing code off the
@@ -96,11 +97,12 @@ logger = logging.getLogger(__name__)
 #:     seconds is the floor for an attentive person, i.e. about seven a
 #:     minute. 10/min is ~1.4x that.
 #:
-#: WHY THE SAME NUMBER FOR BOTH, since the two derivations above are not the
-#: same derivation. They land within a factor of two of each other, and two
-#: settings differing by five would claim a precision neither has. What makes
-#: the sameness safe is that they are separately configurable: an operator who
-#: measures a real distribution and finds one of them tight raises that one.
+#: WHY THE SAME NUMBER FOR ALL THREE, since the derivations above are not the
+#: same derivation. The first two land within a factor of two of each other,
+#: and settings differing by five would claim a precision neither has; ``/scan``
+#: reuses the first. What makes the sameness safe is that they are separately
+#: configurable: an operator who measures a real distribution and finds one of
+#: them tight raises that one.
 #:
 #: WHAT THIS DELIBERATELY DOES NOT TRY TO BE. 10/min is 600/hour, and 600
 #: payments is a great deal of money. This limiter is not the control that
@@ -225,15 +227,15 @@ class CustomerRateLimitStoreUnavailable(RuntimeError):
     flood is the most plausible explanation for the store being slow or gone,
     which is the shape `postern_core.auth.revocation`'s
     ``RevocationStoreUnavailable`` refuses for the same reason one line further
-    into the same two handlers.
+    into the same three handlers.
 
     WHAT FAILING CLOSED COSTS, and why it costs nothing new. If the shared
     store is unreachable then the revocation store is too -- they are the same
     Redis, reached through the same ``POSTERN_REDIS_URL`` -- and
-    `services/confirm/revocation.py`'s check is the first statement of both of
-    these handlers. So a request this refuses would have been refused a few
-    microseconds later anyway, by a control that already chose to fail closed
-    and whose choice is not being relitigated here. This adds no outage that
+    `services/confirm/revocation.py`'s check runs in each of these three
+    handlers, before any body is read. So a request this refuses would have
+    been refused a few microseconds later anyway, by a control that already
+    chose to fail closed and whose choice is not being relitigated here. This adds no outage that
     the deployment did not already have; failing open would have added a
     window in which it did not.
     """
@@ -590,20 +592,21 @@ class CustomerRateLimit:
            has an audit trail at all", naming `services/confirm/
            device_auth.py`'s ``approve_callback`` as writing no ``audit_log``
            row on any branch. Commit 10496a3, the same day, gave it one:
-           `services/confirm/audit.py`'s ``PairingAudit`` now writes exactly
-           one row per ``POST /approve`` attempt, on the grant and on each of
-           revoked customer, invalid subject, unknown device code,
-           already-approved code, ``user_code`` mismatch and ``user_code``
-           budget exhaustion. Both limited paths have a trail now, so the
+           `services/confirm/audit.py`'s ``PairingAudit`` wrote exactly one
+           row per ``POST /approve`` attempt, on the grant and on each
+           refusal that concludes something about a customer. Its refusal
+           vocabulary has changed since (the ``DETAIL_*`` constants in that
+           module are the current list), and ``POST /scan`` writes through
+           the same class. All three limited paths have a trail now, so the
            undercount this reason warned against does not exist.
-        3. Getting the row would cost the position, and for ``/approve`` this
-           is the harder of the two paths to reach, not the easier one.
+        3. Getting the row would cost the position, and for the pairing
+           paths this is the harder case to reach, not the easier one.
            `ApprovalAudit` is built from the parsed JSON body, and
            `services/confirm/revocation.py` records why that puts it out of
            reach here: "An ASGI middleware cannot reach that body without
            draining ``receive``". `PairingAudit` is built the same way, from
-           ``user_code`` in ``POST /approve``'s own body -- where
-           `services/confirm/audit.py`'s ``APPROVE_ROUTE`` shows the
+           ``user_code`` in the body of ``POST /approve`` and ``POST /scan``
+           -- where `services/confirm/audit.py`'s ``APPROVE_ROUTE`` shows the
            challenge carries its id in the URL instead. So a row from this
            position could at least name a challenge without draining
            anything, and could never name a pairing at all: the one
@@ -660,7 +663,7 @@ class CustomerRateLimit:
         outage is not a denial".
 
         It DIVERGES from the 500 that an unreachable revocation store
-        produces on these same two endpoints, and that divergence is
+        produces on these same three endpoints, and that divergence is
         deliberate rather than overlooked: these are two controls answering
         for themselves, the 500 is that control's recorded choice and is not
         being changed here, and an operator seeing both codes in one Redis

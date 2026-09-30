@@ -466,28 +466,28 @@ class ConfirmSettings:
     # "how many customers sit behind one address in this deployment?", and
     # there are two cases where the answer is "a great many":
     #
-    # - CARRIER-GRADE NAT, on the two public paths. A mobile carrier can put
+    # - CARRIER-GRADE NAT, on the public paths. A mobile carrier can put
     #   thousands of subscribers behind one IPv4 address, so a browser-facing
     #   limit low enough to bite an attacker holding a handful of addresses is
     #   low enough to hurt a real NAT pool. The defaults are set on the side
     #   that does not break customers, and the store cap rather than this is
     #   what bounds memory.
-    # - THE APP BACKEND, on the two assertion-authenticated paths, and this is
-    #   the one that will hurt if it is wrong. ``rate_limit_approve`` and
-    #   ``rate_limit_challenge_approve`` default to 60/min per bucket, which
-    #   is right if the operator's banking app calls this service FROM THE
-    #   CUSTOMER'S PHONE, because then the addresses are as diverse as the
-    #   customers. If instead the app's BACKEND calls on the phone's behalf,
+    # - THE APP BACKEND, on the three assertion-authenticated paths, and this is
+    #   the one that will hurt if it is wrong. ``rate_limit_approve``,
+    #   ``rate_limit_challenge_approve`` and ``rate_limit_scan`` default to
+    #   60/min per bucket, which is right if the operator's banking app calls
+    #   this service FROM THE CUSTOMER'S PHONE, because then the addresses are
+    #   as diverse as the customers. If instead the app's BACKEND calls on the phone's behalf,
     #   every approval in the bank arrives from a handful of egress addresses
     #   and 60/min becomes a bank-wide ceiling on payment approvals. An
-    #   operator in that shape must raise these two, and the fact that it is
+    #   operator in that shape must raise these three, and the fact that it is
     #   an environment variable rather than a release is the whole point:
     #   discovering it at 3am costs a restart, not a deploy.
     #
     # The honest limit of all five: a per-address bound is the wrong UNIT for
     # an authenticated path, where the meaningful one is per customer. That
     # gap is now closed by a SECOND limiter rather than by re-keying these --
-    # the two ``customer_rate_limit_*`` fields below configure it -- and these
+    # the three ``customer_rate_limit_*`` fields below configure it -- and these
     # five keep their numbers because that second limiter runs after
     # authentication and needs this one in front of it as the backstop.
     rate_limit_device_authorization: int = 60
@@ -503,8 +503,8 @@ class ConfirmSettings:
     # WHICH WAY TO SET THESE, and it is the opposite question from the five
     # above. Those ask "how many customers sit behind one address?"; these ask
     # "how fast can one person tap approve?", and the answer does not vary
-    # with the deployment's network shape at all. Both paths are one tap on a
-    # phone per unit of work, so an operator who finds these tight should look
+    # with the deployment's network shape at all. All three paths are one tap
+    # on a phone per unit of work, so an operator who finds these tight should look
     # first at whether their app retries on a timeout, because a client-side
     # retry loop is the only legitimate traffic that reaches ten a minute.
     #

@@ -70,6 +70,12 @@ WHERE EACH CALL SITE PUTS IT, AND WHY THERE:
     being written onto the device code at all, which is strictly better than
     refusing the mint that would read it back.
 
+``POST /scan``
+    The same place as ``POST /approve``: after the assertion's subject parses
+    as a customer reference, before the body is read. Refusing here stops
+    ``scanned_by`` being written onto the pairing, so a revoked customer never
+    holds the claim that ``POST /approve`` requires.
+
 ``POST /token``
     Immediately before the read token is minted, keyed on the ``customer_ref``
     STORED on the device code -- written from a verified assertion at
@@ -82,7 +88,7 @@ FAIL CLOSED, in the shape each caller can use. `RevocationStoreUnavailable`
 is never collapsed into "not revoked" -- that would un-revoke every entry at
 the moment an operator most believes they have acted, and this service already
 fails closed on an audit write it cannot make
-(``dev-docs/decisions/0006-audit-write-failure.md``). The two assertion-backed
+(``dev-docs/decisions/0006-audit-write-failure.md``). The three assertion-backed
 endpoints let it propagate: the approval path's own ``except Exception``
 records a completion row whose ``detail`` is the exception type, per
 `services/confirm/audit.py`'s convention, and the caller gets a 500 with the
@@ -101,7 +107,7 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
-#: The error code both assertion-backed endpoints answer with. A distinct
+#: The error code all three assertion-backed endpoints answer with. A distinct
 #: value rather than the 404 the ownership check uses: the check runs before
 #: any challenge is read, so this answer depends on nothing but the caller's
 #: own revocation state and discloses nothing about a challenge, a device code
@@ -143,7 +149,7 @@ async def customer_revoked(request: Request, customer_ref: str) -> bool:
 
 
 def revoked_response(description: str) -> JSONResponse:
-    """The 403 both assertion-backed endpoints return.
+    """The 403 all three assertion-backed endpoints return.
 
     Shared for the reason `services/confirm/auth.py`'s
     `unauthenticated_response` is shared: two call sites answering the same

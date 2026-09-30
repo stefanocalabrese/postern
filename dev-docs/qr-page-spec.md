@@ -1,7 +1,7 @@
 # QR page: the browser half of the device grant, and the scan that binds it
 
 **Date:** 29 September 2026, revised 30 September 2026
-**Status:** specification, approved in design review on 29 September 2026. Nothing here is built.
+**Status:** specification, approved in design review on 29 September 2026. Built on branch `worktree-qr-exec`, work of 30 September 2026. The plan that carried it out is `docs/superpowers/plans/postern-qr-page-and-scan-2026-09-30.md`. The sections below still read as the specification they were written as, so where they say "today" or describe the absent page, they describe `58ad120`.
 **Against:** `services/confirm/device_auth.py` and `packages/postern-core/src/postern_core/auth/device_codes.py` at `58ad120`.
 **Reviewed by:** a security review and a code-fit review, both on 29 September 2026, and a spec review on 30 September 2026, all folded in below.
 

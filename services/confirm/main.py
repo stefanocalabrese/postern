@@ -3,7 +3,7 @@
 uvicorn targets ``services.confirm.main:app`` (see the ``confirm`` stage in
 the Dockerfile).
 
-Today this process does three things:
+Today this process does four things:
 1. Hold a write signing key and publish its public half at
    ``/.well-known/jwks.json``, under the write issuer, disjoint from the read
    service's key and issuer. That is the minimum that makes "the tool handler
@@ -18,6 +18,8 @@ Today this process does three things:
 3. Handle verification challenge approvals (§6.3, §8.3): receive approvals
    from the banking app, mark challenges approved in Postgres, and execute
    backend write endpoints server-side.
+4. Serve the browser's pairing page and its QR
+   (``services.confirm.verify_page``), the only HTML this repository serves.
 
 ZT-7 revocation cuts across all three: an operator who revokes a customer
 stops their challenge approvals and their device-grant token mints as well as
@@ -439,7 +441,7 @@ def create_confirm_app(
             #
             # A SECOND LIMITER, NOT A RE-KEYING OF THE FIRST. The one at entry
             # zero counts per client address bucket, which is the wrong unit
-            # for these two authenticated paths: sixty payment approvals a
+            # for these three authenticated paths: sixty payment approvals a
             # minute from one customer is a signal and sixty from a bank's
             # egress address is a Tuesday. It stays where it is with its
             # numbers untouched, because a refusal from HERE has already cost
@@ -448,7 +450,7 @@ def create_confirm_app(
             # and the outer one is the backstop.
             #
             # `services/confirm/customer_rate_limit.py` carries the rest: the
-            # derivation of the two ceilings, why the counters are shared
+            # derivation of the ceilings, why the counters are shared
             # through `POSTERN_REDIS_URL` rather than held per replica, why an
             # unreachable counter refuses rather than admits, and why a
             # refusal writes a log line and no `audit_log` row.
@@ -473,7 +475,7 @@ def create_confirm_app(
     # Expose database for the approval callback.
     app.state.postern_database = db
     # ZT-7: read by `services/confirm/revocation.py`'s `revocation_store` on
-    # all three of this service's authenticated-or-minting paths. Same
+    # all four of this service's authenticated-or-minting paths. Same
     # attribute name as `services/api/main.py` uses, so one grep over both
     # services finds every place the control is wired.
     app.state.postern_revocation_store = revocation_store

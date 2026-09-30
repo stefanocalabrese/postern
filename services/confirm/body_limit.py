@@ -61,7 +61,7 @@ direction this service already runs in -- ``services/confirm/auth.py``'s
 service tomorrow is therefore authenticated by omission rather than
 unauthenticated by omission" -- and the same argument applies here: a route
 added tomorrow is bounded by omission. There is no carve-out for
-``/token``'s form encoding or for the two device-grant routes, because no
+``/token``'s form encoding or for any of the device-grant routes, because no
 route on this service has a legitimate body worth carving one out for; see
 ``ConfirmSettings.max_body_bytes`` for the sizes.
 

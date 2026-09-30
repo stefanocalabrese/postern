@@ -1114,15 +1114,16 @@ class TestTheConfiguredLimits:
 class TestTheLimitsAreSettableWithoutACodeChange:
     """The safety valve.
 
-    The four defaults are keyed on a client ADDRESS BUCKET, and there is one
-    deployment shape where that is badly wrong: if the operator's banking app
-    BACKEND calls the two assertion-authenticated paths on the phone's behalf,
-    every approval in the bank arrives from a handful of egress addresses and
-    60/min becomes a bank-wide ceiling on payment approvals. Per-address is
-    also the wrong unit for an authenticated path -- per customer is -- but
-    fixing that needs a second limiter after ``AppAssertionMiddleware`` and is
-    a different change. What these tests pin is that discovering the problem
-    costs a restart rather than a release.
+    The ten per-path defaults are keyed on a client ADDRESS BUCKET, and there
+    is one deployment shape where that is badly wrong: if the operator's
+    banking app BACKEND calls the three assertion-authenticated paths on the
+    phone's behalf, every approval in the bank arrives from a handful of
+    egress addresses and 60/min becomes a bank-wide ceiling on payment
+    approvals. Per-address is also the wrong unit for an authenticated path --
+    per customer is -- and ``services/confirm/customer_rate_limit.py`` is the
+    second limiter after ``AppAssertionMiddleware`` that keys on it. What
+    these tests pin is that discovering the problem costs a restart rather
+    than a release.
     """
 
     #: Every variable, and the field each one sets.

@@ -25,12 +25,12 @@ read. Measured on 2026-09-27 against planted shapes: ``raw =
 os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
 numeric rule completely, and it is the way a careless numeric read is most
 likely to be written. So the third rule keys on the one thing every spelling
-shares, the variable's NAME at the read site. The swept tree names 57
-``POSTERN_*`` variables in two disjoint populations: 20 read directly, all of
-them strings, and 37 handed to a reader, which are `BOUNDED`'s 32,
-`STORE_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both, nothing is in neither,
-and `TestEveryEnvironmentReadNamesAnInventoriedVariable` re-derives that from
-the tree on every run rather than trusting these numbers.
+shares, the variable's NAME at the read site. The swept tree names 72
+``POSTERN_*`` variables in two disjoint populations: 27 read directly, all of
+them strings, and 45 handed to a reader, which are `BOUNDED`'s 38,
+`STORE_BOUNDED`'s 2, `VAULT_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
+nothing is in neither, and `TestEveryEnvironmentReadNamesAnInventoriedVariable`
+re-derives that from the tree on every run rather than trusting these numbers.
 
 WHERE THE NAMES THEMSELVES NOW LIVE, since 2026-09-27: not here.
 `postern_core/env_inventory.py`'s `INVENTORY` is the one copy, because a
@@ -2069,13 +2069,13 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
     numeric read. A rule keyed on the CONSUMER can always be evaded by one
     assignment, because the consumer can be arbitrarily far from the read.
 
-    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 57 distinct
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 72 distinct
     ``POSTERN_*`` variables across the swept roots, in two disjoint
-    populations. 20 are read directly, and all 20 are strings -- a URL, a
+    populations. 27 are read directly, and all 27 are strings -- a URL, a
     path, a key id, an issuer, an audience, a key prefix, and the guard's own
-    two comma-separated lists of names. 37 are handed to a reader as its ``name``
-    argument, and those are the 32 in `BOUNDED`, the 2 in `STORE_BOUNDED` and
-    the 3 in `FLAGS`. Nothing is in both and nothing is in neither, which
+    two comma-separated lists of names. 45 are handed to a reader as its ``name``
+    argument, and those are the 38 in `BOUNDED`, the 2 in `STORE_BOUNDED`, the
+    2 in `VAULT_BOUNDED` and the 3 in `FLAGS`. Nothing is in both and nothing is in neither, which
     `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
     re-derives on every run.
 
