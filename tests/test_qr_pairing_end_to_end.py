@@ -25,11 +25,17 @@ from joserfc import jwt as joserfc_jwt
 from joserfc.jwk import KeySet
 from postern_core.auth.device_keys import no_enrolled_devices
 from postern_core.store.engine import Database
-from postern_core.store.models import OUTCOME_RETURNED, AuditEntry
+from postern_core.store.models import OUTCOME_RAISED, OUTCOME_RETURNED, AuditEntry
 from sqlalchemy import select
 from starlette.applications import Starlette
 
-from services.confirm.audit import PAIRING_TOOL_NAME, SCAN_TOOL_NAME, TOKEN_TOOL_NAME
+from services.confirm.audit import (
+    DETAIL_DEVICE_CODE_SPENT,
+    DETAIL_NOT_SCANNED,
+    PAIRING_TOOL_NAME,
+    SCAN_TOOL_NAME,
+    TOKEN_TOOL_NAME,
+)
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
 from tests.fixtures.append_only_bypass import (
@@ -93,6 +99,19 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
         qr = await browser.get("/verify/qr.svg", params={"d": handle}, headers=SAME_ORIGIN)
         assert qr.status_code == 200
         assert qr.content.startswith(b"<svg")
+        assert grant["device_code"] not in page.text
+        assert grant["device_code"].encode() not in qr.content
+        assert grant["device_code"] not in pending.text
+
+        # An approval before any scan is refused with the one opaque body.
+        early = await phone.post(
+            "/approve", json={"user_code": grant["user_code"]}, headers=phone_headers
+        )
+        assert early.status_code == 400
+        assert early.json() == {
+            "error": "invalid_grant",
+            "error_description": "this pairing cannot be completed",
+        }
 
         # What the phone's camera reads: the app link, and nothing else.
         link = parse_qs(urlsplit(pending.json()["app_link"]).query)
@@ -109,6 +128,7 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
 
         after_scan = await browser.get("/verify/state", params={"d": handle}, headers=SAME_ORIGIN)
         assert after_scan.json() == {"status": "scanned"}
+        assert grant["device_code"] not in after_scan.text
         no_more_qr = await browser.get("/verify/qr.svg", params={"d": handle}, headers=SAME_ORIGIN)
         assert no_more_qr.status_code == 404
 
@@ -121,24 +141,52 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
             "/verify/state", params={"d": handle}, headers=SAME_ORIGIN
         )
         assert after_approval.status_code == 404
+        qr_after = await browser.get("/verify/qr.svg", params={"d": handle}, headers=SAME_ORIGIN)
+        assert qr_after.status_code == 404
 
         token = await browser.post(
             "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
         )
+        second = await browser.post(
+            "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
+        )
 
     assert token.status_code == 200, token.text
-    claims = joserfc_jwt.decode(
-        token.json()["access_token"],
-        KeySet.import_key_set(confirm.state.postern_read_key_source.public_jwks()),
-        algorithms=["RS256"],
-    ).claims
+    assert second.status_code == 400
+    assert second.json()["error"] == "invalid_grant"
+
+    settings = ConfirmSettings.for_testing()
+    read_jwks = confirm.state.postern_read_key_source.public_jwks()
+    decoded = joserfc_jwt.decode(
+        token.json()["access_token"], KeySet.import_key_set(read_jwks), algorithms=["RS256"]
+    )
+    claims = decoded.claims
     assert claims["sub"] == CUSTOMER
+    # A READ token: the read key's kid and the read issuer from settings, the
+    # accounts audience and scope the token endpoint mints, this service as
+    # actor, and nothing that names the write side.
+    assert decoded.header["kid"] == settings.read_key_kid
+    assert decoded.header["kid"] in {k["kid"] for k in read_jwks["keys"]}
+    assert claims["iss"] == settings.read_token_issuer
+    assert claims["aud"] == "accounts.svc"
+    assert claims["scope"] == "accounts:read"
+    assert claims["act"] == {"sub": "svc:postern"}
+    assert "payments" not in claims["aud"] and "execute" not in claims["scope"]
 
     async with clean.sessionmaker() as s:
         written = list((await s.execute(select(AuditEntry).order_by(AuditEntry.id))).scalars())
-    assert [(r.tool_name, r.outcome, r.detail) for r in written] == [
+    everything = [(r.tool_name, r.outcome, r.detail) for r in written]
+    assert everything == [
+        (PAIRING_TOOL_NAME, OUTCOME_RAISED, DETAIL_NOT_SCANNED),
         (SCAN_TOOL_NAME, OUTCOME_RETURNED, None),
         (PAIRING_TOOL_NAME, OUTCOME_RETURNED, None),
         (TOKEN_TOOL_NAME, OUTCOME_RETURNED, None),
+        (TOKEN_TOOL_NAME, OUTCOME_RAISED, DETAIL_DEVICE_CODE_SPENT),
     ]
-    assert len({r.arguments["device_code_handle"] for r in written}) == 1
+    successes = [r for r in written if r.outcome == OUTCOME_RETURNED]
+    assert [(r.tool_name, r.detail) for r in successes] == [
+        (SCAN_TOOL_NAME, None),
+        (PAIRING_TOOL_NAME, None),
+        (TOKEN_TOOL_NAME, None),
+    ]
+    assert len({r.arguments["device_code_handle"] for r in successes}) == 1
