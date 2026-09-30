@@ -1029,7 +1029,9 @@ async def approve_callback(request: Request) -> JSONResponse:
         # anywhere names who authorised it. `PairingAudit` carries the full
         # argument and what the availability cost is.
         if outcome.approved_device_code is not None:
-            await _withdraw_pairing(store, outcome.approved_device_code, cause="audit")
+            await _withdraw_pairing(
+                store, outcome.approved_device_code, cause="audit", state="approved"
+            )
         logger.error(
             "audit write failed for a device pairing that answered %d; "
             "failing the request because the pairing could not be recorded",
@@ -1041,10 +1043,14 @@ async def approve_callback(request: Request) -> JSONResponse:
 
 
 async def _withdraw_pairing(
-    store: DeviceCodeStoreBase, device_code_value: str, *, cause: Literal["audit", "store"]
+    store: DeviceCodeStoreBase,
+    device_code_value: str,
+    *,
+    cause: Literal["audit", "store"],
+    state: Literal["approved", "claimed"],
 ) -> None:
     """Undo a pairing whose audit row could not be written, or whose approval
-    may have committed behind a store error.
+    or scan claim may have committed behind a store error.
 
     Revocation rather than an in-place undo, because the recovery the
     customer needs is a fresh QR anyway, and a fresh QR is what re-anchors the
@@ -1053,12 +1059,22 @@ async def _withdraw_pairing(
     live, and a racing poll or a racing scan could still find it in the state
     the failed request could not record.
 
-    ``cause`` says which of the two callers this is, because the ERROR line
-    below states what is left behind and the two leave different things.
-    ``"audit"`` is ``approve_callback`` after an approval whose row could not
-    be written: the code IS approved and NO row names it. ``"store"`` is
-    ``_pair`` after ``approve_scanned`` raised: the code MAY be approved, and
-    a row recording the store's exception as a refusal will follow.
+    ``cause`` and ``state`` say which of the four callers this is, because
+    the ERROR line below states what is left behind and each leaves a
+    different thing. ``state`` names the write: ``"approved"`` on
+    ``POST /approve``, ``"claimed"`` on ``POST /scan``. ``cause`` names the
+    failure:
+
+    - ``approve_callback``, ``cause="audit"``: an approval whose row could
+      not be written. The code IS approved and NO row names it.
+    - ``_pair``, ``cause="store"``: ``approve_scanned`` raised. The code MAY
+      be approved, and a row recording the store's exception as a refusal
+      will follow.
+    - ``scan_callback``, ``cause="audit"``: a claim whose row could not be
+      written. The code IS claimed and NO row names it.
+    - ``_scan``, ``cause="store"``: ``claim_scan`` raised. The code MAY be
+      claimed, and a row recording the store's exception as a refusal will
+      follow.
 
     ITS OWN FAILURE IS SWALLOWED, deliberately and exactly once. The caller is
     already unwinding a failure and owes the operator THAT exception;
@@ -1074,17 +1090,19 @@ async def _withdraw_pairing(
         if cause == "audit":
             logger.error(
                 "a device pairing could not be audited AND could not be withdrawn; "
-                "device code %s is approved with no audit_log row behind it: %s",
+                "device code %s is %s with no audit_log row behind it: %s",
                 device_code_handle(device_code_value),
+                state,
                 revoke_exc,
                 exc_info=revoke_exc,
             )
         else:
             logger.error(
                 "a device pairing's store write failed ambiguously AND it could not be "
-                "withdrawn; device code %s may be approved while its audit_log row "
+                "withdrawn; device code %s may be %s while its audit_log row "
                 "records a refusal: %s",
                 device_code_handle(device_code_value),
+                state,
                 revoke_exc,
                 exc_info=revoke_exc,
             )
@@ -1232,7 +1250,7 @@ async def _pair(
         # withdrawal. That is the same residual class as the hard process kill
         # `PairingAudit` already names -- the process stops running this code
         # at an arbitrary point -- and it is accepted on the same terms.
-        await _withdraw_pairing(store, existing.device_code, cause="store")
+        await _withdraw_pairing(store, existing.device_code, cause="store", state="approved")
         raise
 
     if approved:
@@ -1359,6 +1377,8 @@ class _Scanned:
     #: The device code this exit CLAIMED, so the caller can withdraw the claim
     #: if the row cannot be written. ``None`` on every other exit, including a
     #: repeat by the same customer: that claim was recorded when it was made.
+    #: A ``claim_scan`` that raises never reaches this field: ``_scan``
+    #: withdraws that claim itself before the exception propagates.
     claimed_device_code: str | None = None
 
 
@@ -1415,9 +1435,14 @@ async def scan_callback(request: Request) -> JSONResponse:
         outcome = await _scan(request, audit, store=store, subject=subject)
     except Exception as exc:
         # The shape `approve_callback` uses: an audit-write failure must not
-        # replace the exception that ended the request. Nothing was claimed
-        # on a path that raises -- `claim_scan` either commits and returns or
-        # raises having written nothing -- so there is nothing to withdraw.
+        # replace the exception that ended the request.
+        #
+        # A RAISE MAY FOLLOW A COMMITTED CLAIM. On Redis `claim_scan`'s
+        # `pipe.execute()` can raise after the server ran `EXEC`, so `_scan`
+        # withdraws the pairing before that exception reaches this branch,
+        # exactly as `_pair` does for `approve_scanned`. Nothing else in
+        # `_scan` writes, and nothing after a successful claim can raise, so
+        # there is nothing left to withdraw here.
         try:
             await audit.refused(type(exc).__name__)
         except Exception as audit_exc:
@@ -1443,7 +1468,9 @@ async def scan_callback(request: Request) -> JSONResponse:
         # `approve_callback` withdraws an approval: a claim nobody recorded
         # would still decide who may approve, and no row would say who made it.
         if outcome.claimed_device_code is not None:
-            await _withdraw_pairing(store, outcome.claimed_device_code, cause="audit")
+            await _withdraw_pairing(
+                store, outcome.claimed_device_code, cause="audit", state="claimed"
+            )
         logger.error(
             "audit write failed for a device pairing scan that answered %d; "
             "failing the request because the scan could not be recorded",
@@ -1522,7 +1549,22 @@ async def _scan(
     if verdict is QrVerdict.STALE:
         return _Scanned(_qr_stale_response(), DETAIL_QR_STALE)
 
-    claim = await store.claim_scan(code.device_code, customer.value)
+    try:
+        claim = await store.claim_scan(code.device_code, customer.value)
+    except DeviceCodeStoreContended:
+        # DEFINITELY NOT WRITTEN: every `WATCH` was beaten, so no transaction
+        # committed. Withdrawing would only end a pending pairing the customer
+        # can still scan, so this one propagates untouched.
+        raise
+    except Exception:
+        # AN EXCEPTION HERE DOES NOT MEAN NOTHING WAS WRITTEN, for the reason
+        # `_pair` gives for `approve_scanned`: the claim may have committed
+        # behind a lost reply, and `scan_callback` will record a refusal over
+        # it. Withdraw first; `_withdraw_pairing` swallows its own failure, so
+        # the exception re-raised is still the store's. `CancelledError` is
+        # not caught, on the terms `_pair` states.
+        await _withdraw_pairing(store, code.device_code, cause="store", state="claimed")
+        raise
     if claim is ScanClaim.CLAIMED:
         return _Scanned(_scan_context_response(code), claimed_device_code=code.device_code)
     if claim is ScanClaim.ALREADY_MINE:

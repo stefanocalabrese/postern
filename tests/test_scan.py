@@ -12,6 +12,7 @@ drawn; the page itself is ``tests/test_verify_page.py``'s subject.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -21,7 +22,11 @@ from unittest.mock import patch
 import httpx2
 import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
-from postern_core.auth.device_codes import DeviceCode
+from postern_core.auth.device_codes import (
+    DeviceCode,
+    DeviceCodeStoreBase,
+    DeviceCodeStoreContended,
+)
 from postern_core.auth.device_keys import no_enrolled_devices
 from postern_core.auth.revocation import RevocationStoreBase, RevocationStoreUnavailable
 from postern_core.store import audit as audit_store
@@ -556,3 +561,138 @@ async def test_a_repeat_scan_that_cannot_be_audited_withdraws_nothing(
     assert resp.status_code == 500
     stored = await device_store_of(app).get_device_code(code.device_code)
     assert stored is not None and stored.scanned_by == ALICE
+
+
+async def test_a_claim_whose_reply_is_lost_is_withdrawn_and_recorded_as_the_store_error(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The claim commits and its reply is lost, as a Redis ``EXEC`` can. The
+    row records the store's exception as a refusal, so a claim left standing
+    behind it would decide who may approve with no row saying it was made."""
+    store: DeviceCodeStoreBase = device_store_of(app)
+    code = await start(app)
+    real_claim = store.claim_scan
+
+    async def claim_then_time_out(device_code: str, customer_ref: str) -> Any:
+        await real_claim(device_code, customer_ref)
+        raise TimeoutError("reply lost after EXEC")
+
+    monkeypatch.setattr(store, "claim_scan", claim_then_time_out)
+
+    resp = await scan(app, key_pair, ALICE, code, as_a_server_would=True)
+
+    assert resp.status_code == 500
+    assert await store.get_device_code(code.device_code) is None
+    row = await one_row(clean)
+    assert row.outcome == OUTCOME_RAISED
+    assert row.detail == "TimeoutError"
+
+
+async def test_a_contended_claim_withdraws_nothing(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every ``WATCH`` beaten means nothing committed, so the pairing stays
+    live and unscanned for the customer to scan again."""
+    store: DeviceCodeStoreBase = device_store_of(app)
+    code = await start(app)
+
+    async def contended(device_code: str, customer_ref: str) -> Any:
+        raise DeviceCodeStoreContended("beaten on every try")
+
+    monkeypatch.setattr(store, "claim_scan", contended)
+
+    resp = await scan(app, key_pair, ALICE, code, as_a_server_would=True)
+
+    assert resp.status_code == 500
+    stored = await store.get_device_code(code.device_code)
+    assert stored is not None and stored.scanned_by == ""
+    assert (await one_row(clean)).detail == "DeviceCodeStoreContended"
+
+
+async def test_a_second_scan_of_an_approved_unexchanged_code_revokes_it_before_the_mint(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """B scanned and approved through the real endpoints, and the browser has
+    not polled yet. A's scan inside the window ends the pairing, so the next
+    poll mints nothing: the case where revocation actually stops a token."""
+    code = await start(app)
+    assert (await scan(app, key_pair, BOB, code)).status_code == 200
+    approved = await post(
+        app,
+        "/approve",
+        json_body={"user_code": code.user_code_display},
+        headers=bearer(key_pair, BOB),
+    )
+    assert approved.status_code == 200, approved.text
+
+    resp = await scan(app, key_pair, ALICE, code)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "scan_conflict"
+    assert await device_store_of(app).get_device_code(code.device_code) is None
+    poll = await post(
+        app, "/token", form={"grant_type": "device_code", "device_code": code.device_code}
+    )
+    assert poll.status_code == 400
+    assert poll.json()["error"] == "invalid_grant"
+    assert (await rows(clean))[-1].detail == DETAIL_SCAN_CONFLICT
+
+
+async def test_the_conflict_warning_names_the_handle_and_never_the_codes(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
+) -> None:
+    code = await start(app)
+    assert (await scan(app, key_pair, BOB, code)).status_code == 200
+
+    with caplog.at_level(logging.WARNING, logger="services.confirm.device_auth"):
+        resp = await scan(app, key_pair, ALICE, code)
+
+    assert resp.json()["error"] == "scan_conflict"
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "second customer" in r.getMessage()
+    ]
+    assert len(warnings) == 1, warnings
+    assert device_code_handle(code.device_code) in warnings[0]
+    assert code.device_code not in warnings[0]
+    assert code.user_code not in warnings[0]
+    assert code.user_code_display not in warnings[0]
+
+
+async def test_a_failed_withdrawal_of_an_ambiguous_claim_says_claimed_and_the_store_cause(
+    app: Starlette,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The double failure on the scan path: the claim commits and its reply is
+    lost, then the revocation fails too. The ERROR line says what is left
+    behind, a claim and not an approval, and that a store write caused it."""
+    store: DeviceCodeStoreBase = device_store_of(app)
+    code = await start(app)
+    real_claim = store.claim_scan
+
+    async def claim_then_time_out(device_code: str, customer_ref: str) -> Any:
+        await real_claim(device_code, customer_ref)
+        raise TimeoutError("reply lost after EXEC")
+
+    async def revoke_fails(device_code: str) -> None:
+        raise ConnectionError("store gone")
+
+    monkeypatch.setattr(store, "claim_scan", claim_then_time_out)
+    monkeypatch.setattr(store, "revoke_device_code", revoke_fails)
+
+    with caplog.at_level(logging.ERROR, logger="services.confirm.device_auth"):
+        resp = await scan(app, key_pair, ALICE, code, as_a_server_would=True)
+
+    assert resp.status_code == 500
+    assert (await one_row(clean)).detail == "TimeoutError"
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    withdrawal = [m for m in errors if "could not be withdrawn" in m]
+    assert len(withdrawal) == 1, errors
+    assert "may be claimed" in withdrawal[0]
+    assert "approved" not in withdrawal[0]
+    assert "store write failed ambiguously" in withdrawal[0]
+    assert device_code_handle(code.device_code) in withdrawal[0]
