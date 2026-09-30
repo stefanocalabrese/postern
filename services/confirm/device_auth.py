@@ -434,23 +434,65 @@ async def device_authorization(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-def _poll_times(request: Request) -> dict[str, datetime]:
-    """Per-device-code time of the last pending poll, for RFC 8628 ``slow_down``.
+#: Which ``app.state`` attribute holds which poll-time map. Two maps, not one,
+#: so the last PENDING poll never paces the first poll after approval: a
+#: browser that polled at t and whose customer approved at t+1 gets its answer
+#: at t+2, not ``slow_down``.
+_PENDING_POLLS = "_poll_times"
+_APPROVED_POLLS = "_approved_poll_times"
 
-    Keyed by the raw device code and never leaves the process: not logged,
-    not serialised. Only codes the store holds are ever recorded, and entries
-    are swept once older than ``device_code_ttl_seconds`` (see
-    ``token_endpoint``), so the map is bounded by the live-code population.
+
+def _poll_times(request: Request, which: str = _PENDING_POLLS) -> dict[str, datetime]:
+    """Per-device-code time of the last paced poll, for RFC 8628 ``slow_down``.
+
+    ``which`` picks the map: pending polls, or polls of an approved, unspent
+    code (paced since 2026-09-30, see ``_paced``). Keyed by the raw device
+    code and never leaves the process: not logged, not serialised. Only codes
+    the store holds are ever recorded, and entries are swept once older than
+    ``device_code_ttl_seconds`` (see ``_paced``), so each map is bounded by
+    the live-code population.
     """
-    poll_times: dict[str, datetime] | None = getattr(request.app.state, "_poll_times", None)
+    poll_times: dict[str, datetime] | None = getattr(request.app.state, which, None)
     if poll_times is None:
         poll_times = {}
-        request.app.state._poll_times = poll_times
+        setattr(request.app.state, which, poll_times)
     return poll_times
 
 
 def _drop_poll_time(request: Request, device_code_value: str) -> None:
-    _poll_times(request).pop(device_code_value, None)
+    _poll_times(request, _PENDING_POLLS).pop(device_code_value, None)
+    _poll_times(request, _APPROVED_POLLS).pop(device_code_value, None)
+
+
+def _paced(
+    request: Request, which: str, device_code_value: str, settings: ConfirmSettings
+) -> JSONResponse | None:
+    """``slow_down`` if this code was polled within the interval, else record the poll.
+
+    Pop first so the dict stays ordered by last poll, then sweep from the
+    front: nothing outlives the code's TTL, and the sweep is amortised O(1)
+    per poll.
+    """
+    poll_times = _poll_times(request, which)
+    last_poll = poll_times.get(device_code_value)
+    if last_poll is not None:
+        elapsed = (datetime.now(UTC) - last_poll).total_seconds()
+        if elapsed < settings.device_poll_interval_seconds:
+            return _error(
+                400,
+                "slow_down",
+                f"Poll again in {int(settings.device_poll_interval_seconds - elapsed)}s",
+            )
+    now = datetime.now(UTC)
+    poll_times.pop(device_code_value, None)
+    poll_times[device_code_value] = now
+    horizon = now - timedelta(seconds=settings.device_code_ttl_seconds)
+    while True:
+        oldest = next(iter(poll_times))
+        if poll_times[oldest] >= horizon:
+            break
+        del poll_times[oldest]
+    return None
 
 
 async def token_endpoint(request: Request) -> JSONResponse:
@@ -511,7 +553,9 @@ async def token_endpoint(request: Request) -> JSONResponse:
 
     Error codes per RFC 8628 §3.4:
         authorization_pending — not yet approved, keep polling.
-        slow_down — client is polling too fast (adds 5s to interval).
+        slow_down — client is polling too fast (adds 5s to interval). Since
+            2026-09-30 also answered to an approved, unspent code polled
+            within the interval, because such a poll gets a retryable 503.
         access_denied — user explicitly denied on mobile app, OR the customer
             who approved this code has been revoked (ZT-7). The two are
             deliberately indistinguishable here; see the comment at the check.
@@ -532,24 +576,32 @@ async def token_endpoint(request: Request) -> JSONResponse:
     exits -- the issuance-disabled refusal, a ZT-7 refusal, a stored identity
     that will not parse, a revocation store that could not answer, and a spent
     code -- plus one for any exception ``_exchange`` raises, and nothing on
-    the other seven.
+    the other eight: a wrong grant type, a missing ``device_code``, an unknown
+    code, an expired code, ``slow_down`` on a pending code, ``slow_down`` on
+    an approved one, ``authorization_pending``, and an approved code with no
+    customer on it.
 
-    RE-COUNTED ON 2026-09-30 from the ``return`` statements of this function
-    and ``_exchange`` together, which is the only way to count them. The count
-    was six recorded exits before: the mint went, the issuance refusal took its
-    place, and the second spent-code exit (a lost ``consume_device_code``
-    claim) went with the claim.
+    RE-COUNTED ON 2026-09-30, twice, from the exits of this function,
+    ``_paced`` and ``_exchange`` together, which is the only way to count
+    them. The count was six recorded and seven unrecorded before the
+    issuance refusal: the mint went, the refusal took its place, and the
+    second spent-code exit (a lost ``consume_device_code`` claim) went with
+    the claim, leaving five and seven. Pacing approved codes then added the
+    eighth unrecorded exit.
 
     EVERY UNRECORDED EXIT IS ONE THAT RESOLVED NOBODY, and that is the rule
     rather than a list: ``services/confirm/audit.py``'s ``PairingAudit`` owes a
     row only where the server resolved an identity and then decided something
     about its authority. ``customer_ref`` is read off the device code AFTER the
-    grant type, the code lookup, the expiry check and the approval check, so a
-    wrong grant type, a missing or unknown ``device_code``, an expired code,
-    ``slow_down`` and ``authorization_pending`` are all answered before any
-    identity exists. That is what keeps this table from becoming a log of a
-    browser waiting: at the configured 5-second interval and 900-second
-    lifetime a poll loop can run 180 times and write nothing.
+    grant type, the code lookup, the expiry check, the approval check and the
+    pacing check, so a wrong grant type, a missing or unknown ``device_code``,
+    an expired code, either ``slow_down`` and ``authorization_pending`` are all
+    answered before any identity exists. That is what keeps this table from
+    becoming a log of a browser waiting: at the configured 5-second interval
+    and 900-second lifetime a poll loop can run 180 times and write nothing
+    while pending, and at most one ``issuance_disabled`` row per interval once
+    approved. The empty-``customer_ref`` exit is the one that reads the field
+    and finds nobody, and it is logged instead.
 
     NOTHING OF A TOKEN WOULD GO ANYWHERE, and the rule stands for the
     session-token change: not the string, not a segment of it, not a digest.
@@ -601,37 +653,31 @@ async def token_endpoint(request: Request) -> JSONResponse:
         return _error(400, "expired_token", "device code has expired")
 
     # RFC 8628 §3.4 — "slow_down": client is polling faster than the
-    # ``interval`` parameter. Only enforced while authorization is pending;
-    # once approved the client should get tokens immediately.
+    # ``interval`` parameter. Enforced while authorization is pending, and
+    # since 2026-09-30 also on an approved code that is not spent.
+    #
+    # WHY APPROVED CODES ARE PACED NOW. They used to be exempt because an
+    # approved poll got its token at once. While issuance is disabled an
+    # approved poll gets a retryable 503 instead, and a client honouring it
+    # would retry at the address-bucket limiter's pace (300 a minute) until
+    # the 900-second TTL, each retry costing an ``audit_log`` INSERT and a
+    # revocation read. Paced, it costs one of each per interval.
+    #
+    # ANSWERED HERE, before ``customer_ref`` is read, so a paced poll writes
+    # no row, exactly as the pending ``slow_down`` never has. A SPENT code is
+    # not paced: its ``invalid_grant`` is terminal, so there is no retry loop
+    # to slow, and a replay stays recorded on every attempt.
     if not code.approved:
-        poll_times = _poll_times(request)
-        last_poll = poll_times.get(device_code_value)
-        if last_poll is not None:
-            elapsed = (datetime.now(UTC) - last_poll).total_seconds()
-            if elapsed < settings.device_poll_interval_seconds:
-                return _error(
-                    400,
-                    "slow_down",
-                    f"Poll again in {int(settings.device_poll_interval_seconds - elapsed)}s",
-                )
-        # Record this poll time. Pop first so the dict stays ordered by last
-        # poll, then sweep from the front: nothing outlives the code's TTL,
-        # and the sweep is amortised O(1) per poll.
-        now = datetime.now(UTC)
-        poll_times.pop(device_code_value, None)
-        poll_times[device_code_value] = now
-        horizon = now - timedelta(seconds=settings.device_code_ttl_seconds)
-        while True:
-            oldest = next(iter(poll_times))
-            if poll_times[oldest] >= horizon:
-                break
-            del poll_times[oldest]
-    else:
-        # Approved: the interval no longer applies, so the entry is dead.
-        _drop_poll_time(request, device_code_value)
-
-    if not code.approved:
+        slowed = _paced(request, _PENDING_POLLS, device_code_value, settings)
+        if slowed is not None:
+            return slowed
         return _error(400, "authorization_pending", "waiting for user approval on mobile app")
+
+    _poll_times(request, _PENDING_POLLS).pop(device_code_value, None)
+    if code.exchanged_at is None:
+        slowed = _paced(request, _APPROVED_POLLS, device_code_value, settings)
+        if slowed is not None:
+            return slowed
 
     # Approved. Nothing is minted below: issuance is disabled pending the
     # layer-1 session token (`_exchange`'s last return says why).
@@ -852,11 +898,19 @@ async def _exchange(
     # the customer refused a pairing they in fact approved. The read minter is
     # still wired on ``app.state``; removing it belongs to the session-token
     # change.
+    #
+    # ``Retry-After`` carries the poll interval, which is also what
+    # ``token_endpoint`` now paces approved codes at: a client that honours
+    # the header is never answered ``slow_down``.
+    settings: ConfirmSettings = request.app.state.settings
     return (
-        _error(
-            503,
-            "temporarily_unavailable",
-            "session token issuance is not enabled",
+        JSONResponse(
+            status_code=503,
+            content={
+                "error": "temporarily_unavailable",
+                "error_description": "session token issuance is not enabled",
+            },
+            headers={"Retry-After": str(settings.device_poll_interval_seconds)},
         ),
         DETAIL_ISSUANCE_DISABLED,
     )

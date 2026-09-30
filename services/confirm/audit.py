@@ -916,7 +916,10 @@ DETAIL_STORED_IDENTITY_MALFORMED = "stored_identity_malformed"
 #: these is a pairing that completed and a client that got nothing for it.
 #:
 #: THE CODE IS NOT SPENT on this refusal, so a browser that keeps polling
-#: writes one of these rows per poll, each under the same device code handle.
+#: writes another of these rows, under the same device code handle, each time
+#: a poll arrives at least ``device_poll_interval_seconds`` after the last one
+#: that did. A poll inside the interval is answered ``slow_down`` and writes
+#: nothing, so a code yields at most one row per interval, not one per poll.
 DETAIL_ISSUANCE_DISABLED = "issuance_disabled"
 
 # THE CLOSED VOCABULARY OF ``detail`` ON A PAIRING ROW, and the same
@@ -1381,6 +1384,7 @@ class PairingAudit:
         """Record that this pairing was granted."""
         await self._write(OUTCOME_RETURNED, None)
 
+    # No caller since 2026-09-30; the pending session-token change uses it again.
     async def minted(self) -> None:
         """Record that a read token was signed for this customer.
 

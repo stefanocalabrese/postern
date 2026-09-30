@@ -29,8 +29,8 @@ implementation can satisfy in appearance and miss in substance:
 1. ``test_a_pairing_that_cannot_be_audited_does_not_stand`` counts the DEVICE
    CODE'S STATE, not the status code. A handler that answered 500 and left
    ``approved=True`` on the code would pass every status assertion here and
-   fail closed in name only -- the browser polling ``POST /token`` would still
-   be handed a read token, for a pairing no row records.
+   fail closed in name only -- ``POST /token`` would still treat the code as
+   approved for a customer no pairing row records.
 2. ``test_the_row_names_no_raw_device_code`` reads the whole row back as JSON
    and asserts the 43-character device code appears nowhere in it. The code is
    a bearer credential; ``audit_log`` is append-only and outlives it by years.
@@ -796,8 +796,11 @@ async def test_a_pairing_that_cannot_be_audited_does_not_stand(
     cannot be unmade from here. A pairing can: the device code lives in this
     deployment's own store and ``revoke_device_code`` undoes it. So fail
     closed here means the pairing is withdrawn, not merely reported as
-    failed -- otherwise the browser polls ``POST /token``, is handed a read
-    token, and no row anywhere says who authorised it.
+    failed -- otherwise ``POST /token`` treats the code as approved for a
+    customer no pairing row names: it reads that customer off the code, runs
+    the ZT-7 check against them and writes ``issuance_disabled`` rows under
+    their name. It hands out no token today only because issuance is
+    disabled; the pending session-token change would hand one out.
     """
     code = await issue(app)
 
@@ -818,7 +821,7 @@ async def test_a_pairing_that_cannot_be_audited_does_not_stand(
     stored = await app.state.device_code_store.get_device_code(code.device_code)
     assert stored is None or stored.approved is False, (
         "the pairing survived an audit write it could not make; "
-        "POST /token would mint a read token no row accounts for"
+        "POST /token would treat it as approved for a customer no pairing row names"
     )
 
 
@@ -984,8 +987,9 @@ async def test_an_approved_code_is_refused_503_unspent_and_recorded_as_issuance_
     with the read key ``services/api`` publishes, so a public client that
     completed a pairing held a credential the accounts backend accepts. Three
     properties of the refusal that replaced it: the body is the fixed 503, the
-    minter is never called, and the code is not spent -- a second poll gets
-    the same answer and a second row, not the spent-code refusal.
+    minter is never called, and the code is not spent -- a poll after the
+    interval gets the same answer and a second row, not the spent-code
+    refusal. The pacing is pinned in the next test.
     """
     code = await paired(app, key_pair)
 
@@ -1018,11 +1022,62 @@ async def test_an_approved_code_is_refused_503_unspent_and_recorded_as_issuance_
     stored = await unwrap(app.state.device_code_store, code.device_code)
     assert stored.exchanged_at is None, "a refused exchange spent the device code"
 
+    interval_ago(app, code.device_code)
     second = await exchange(app, code.device_code)
     assert second.status_code == 503, second.text
     assert second.json() == ISSUANCE_DISABLED_BODY
     assert [r.detail for r in await rows(clean)][1:] == [DETAIL_ISSUANCE_DISABLED] * 2
     assert MustNotBeCalled.calls == 0
+
+
+def interval_ago(app: Starlette, device_code: str) -> None:
+    """Move an approved code's last recorded poll one interval into the past,
+    as if the browser had waited, without the test sleeping for it."""
+    polls = app.state._approved_poll_times
+    polls[device_code] -= timedelta(seconds=app.state.settings.device_poll_interval_seconds)
+
+
+async def test_polls_of_an_approved_code_are_paced_at_the_interval(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """Two polls inside the interval: the 503 once, then ``slow_down``, one row.
+
+    Without pacing, a client honouring the retryable 503 would come straight
+    back at the address-bucket limiter's pace until the code's TTL, each poll
+    an ``audit_log`` INSERT and a revocation read. ``Retry-After`` tells it
+    the interval, which is the pace this endpoint enforces.
+    """
+    code = await paired(app, key_pair)
+    interval = app.state.settings.device_poll_interval_seconds
+
+    first = await exchange(app, code.device_code)
+    second = await exchange(app, code.device_code)
+
+    assert first.status_code == 503, first.text
+    assert first.json() == ISSUANCE_DISABLED_BODY
+    assert first.headers["retry-after"] == str(interval)
+    assert second.status_code == 400, second.text
+    assert second.json()["error"] == "slow_down"
+    token_rows = [r for r in await rows(clean) if r.tool_name == TOKEN_TOOL_NAME]
+    assert [r.detail for r in token_rows] == [DETAIL_ISSUANCE_DISABLED]
+
+
+async def test_the_first_poll_after_approval_is_not_paced_by_the_last_pending_one(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """A browser polls, the customer approves a moment later, the browser
+    polls again inside the interval: it gets its answer, not ``slow_down``,
+    because pending and approved polls are paced on separate clocks."""
+    code = await issue(app)
+    assert (await exchange(app, code.device_code)).json()["error"] == "authorization_pending"
+    assert (
+        await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+    ).status_code == 200
+
+    after = await exchange(app, code.device_code)
+
+    assert after.status_code == 503, after.text
+    assert after.json() == ISSUANCE_DISABLED_BODY
 
 
 async def test_a_token_exchange_writes_one_row(

@@ -1902,12 +1902,18 @@ class TestASpentDeviceCodeStaysSpent:
     async def test_a_refused_exchange_leaves_the_code_unspent(
         self, app: Starlette, key_pair: RSAKeyPair
     ) -> None:
-        """Two polls of one approved code, one answer, and nothing spent."""
+        """Two polls of one approved code a full interval apart, one answer,
+        and nothing spent. The wait is simulated by moving the recorded poll
+        back one interval; a poll inside it is ``slow_down`` (pinned in
+        ``tests/test_pairing_audit.py``)."""
         async with _client(app) as client:
             device = await _start_device_grant(client)
             assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
 
             first = await _exchange(client, device["device_code"])
+            app.state._approved_poll_times[device["device_code"]] -= timedelta(
+                seconds=app.state.settings.device_poll_interval_seconds
+            )
             second = await _exchange(client, device["device_code"])
 
         assert first.status_code == second.status_code == 503
@@ -1988,35 +1994,32 @@ class TestASpentDeviceCodeStaysSpent:
         assert replay.status_code == 400
         assert replay.json()["error"] == "invalid_grant"
 
-    async def test_two_exchanges_racing_past_the_spent_check_issue_nothing_and_spend_nothing(
+    async def test_two_concurrent_exchanges_issue_nothing_and_spend_nothing(
         self, app: Starlette, key_pair: RSAKeyPair
     ) -> None:
         """The race this class used to force for the claim, kept for the refusal.
 
-        Two requests are held INSIDE the revocation check by a barrier of two,
-        so both pass the spent check while the code is unspent and both reach
-        the point where a token used to be minted. Neither gets one, and the
+        Until the pacing of approved codes it held two requests inside the
+        revocation check with a barrier, so both reached the point where a
+        token used to be minted. Now the pacing check lets exactly one through
+        (the check and the record have no ``await`` between them), so the
+        other is answered ``slow_down`` before the revocation check, and a
+        barrier of two would never release. Neither gets a token, and the
         code is still unspent afterwards.
         """
-        held_at_the_revocation_check = asyncio.Barrier(2)
-
-        class BothAtOnce:
-            async def is_customer_revoked(self, customer_ref: str) -> bool:
-                await held_at_the_revocation_check.wait()
-                return False
-
         async with _client(app) as client:
             device = await _start_device_grant(client)
             assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
 
-            app.state.postern_revocation_store = BothAtOnce()
             both = await asyncio.gather(
                 _exchange(client, device["device_code"]),
                 _exchange(client, device["device_code"]),
             )
 
-        assert [r.status_code for r in both] == [503, 503]
-        assert [r.json() for r in both] == [ISSUANCE_DISABLED_BODY] * 2
+        assert sorted(r.status_code for r in both) == [400, 503]
+        by_status = {r.status_code: r for r in both}
+        assert by_status[503].json() == ISSUANCE_DISABLED_BODY
+        assert by_status[400].json()["error"] == "slow_down"
         assert [jwt_shaped_strings(r.text) for r in both] == [[], []]
         stored = await app.state.device_code_store.get_device_code(device["device_code"])
         assert stored is not None

@@ -136,9 +136,12 @@ exchanged revokes it (`400 scan_conflict`).
 ### Token issuance is disabled
 
 Since 30 September 2026 `/token` returns no token. For an approved, unexpired
-code whose customer is not revoked it answers the 503 above, spends nothing
-(the code stays unspent, so every poll gets the same answer), and writes one
-`audit_log` row with `detail = 'issuance_disabled'`. A revoked customer still
+code whose customer is not revoked it answers the 503 above with
+`Retry-After` set to the poll interval (`POSTERN_DEVICE_POLL_INTERVAL_SECONDS`,
+default 5), spends nothing, and writes one `audit_log` row with
+`detail = 'issuance_disabled'`. The code stays unspent, so the next poll gets
+the same answer; a poll that arrives inside the interval gets `400 slow_down`
+and writes no row, as a pending code's does. A revoked customer still
 gets `400 access_denied`, because the ZT-7 check runs first.
 
 Until then it returned a read token: `aud=accounts.svc`, `scope=accounts:read`,

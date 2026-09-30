@@ -8,7 +8,8 @@ QR: the ``user_code`` and the rotation token come out of the ``app_link`` the
 state endpoint serves, which is the string the QR encodes, and the
 ``device_code`` never leaves the browser.
 
-``POST /token`` ends the flow with a 503 and no token, twice, because
+``POST /token`` ends the flow with a 503 and no token, twice, one interval
+apart (a poll inside the interval gets ``slow_down`` and no row), because
 issuance is disabled until the layer-1 session token lands: the token it used
 to return was a layer-2 backend token, signed with the read key
 ``services/api`` publishes. This test builds ``services/api`` over the SAME
@@ -16,7 +17,7 @@ read key as the confirm service, so a token like that one would verify
 against the api's own JWKS, and asserts that no ``/token`` body carries one.
 
 The audit trail is read back at the end: one row each for the scan and the
-approval, and one ``issuance_disabled`` row per ``/token`` poll after the
+approval, and one ``issuance_disabled`` row per ``/token`` 503 after the
 approval, joined on the device code's handle.
 """
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -194,6 +196,14 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
         token = await browser.post(
             "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
         )
+        too_soon = await browser.post(
+            "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
+        )
+        # The browser waits one interval, as the 503's Retry-After tells it
+        # to; simulated by moving the recorded poll back rather than sleeping.
+        confirm.state._approved_poll_times[grant["device_code"]] -= timedelta(
+            seconds=int(token.headers["retry-after"])
+        )
         second = await browser.post(
             "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
         )
@@ -209,11 +219,17 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
 
     # The regression, before the status checks so a reintroduced token fails
     # on the property that matters rather than on a status code.
-    assert_no_body_carries_a_token_the_api_trusts([token.text, second.text], api_jwks)
+    assert_no_body_carries_a_token_the_api_trusts(
+        [token.text, too_soon.text, second.text], api_jwks
+    )
 
-    # Issuance is disabled: the same 503 twice, because the code is not spent.
+    # Issuance is disabled: the same 503 twice, because the code is not spent,
+    # with a poll inside the interval answered slow_down in between.
     assert token.status_code == 503, token.text
     assert token.json() == ISSUANCE_DISABLED_BODY
+    assert token.headers["retry-after"] == str(confirm.state.settings.device_poll_interval_seconds)
+    assert too_soon.status_code == 400, too_soon.text
+    assert too_soon.json()["error"] == "slow_down"
     assert second.status_code == 503, second.text
     assert second.json() == ISSUANCE_DISABLED_BODY
     stored = await confirm.state.device_code_store.get_device_code(grant["device_code"])
