@@ -84,6 +84,8 @@ Both rules exist because the literal reading is wrong, not merely imprecise. `cl
 
 A NAT64 address (RFC 6052's well-known prefix) embeds an IPv4 destination in its low 32 bits, but `ipv4_mapped` is `None` for it (measured), and as a client address it names the NAT64 gateway, not a subscriber. Its /48 is shared by every client behind every such gateway, so it has no truthful classification here and is `unknown`.
 
+*Note, 30 September 2026, from review of the classifier.* The same flaw exists in three more ranges, all measured on CPython 3.12.13 with `ipv4_mapped` of `None` and all answering `unknown` now: RFC 8215's local-use NAT64 prefix `64:ff9b:1::/48` (not inside `64:ff9b::/96`); the deprecated IPv4-compatible addresses, `::/96` except `::` and `::1` (`::1.2.3.4` and `::a00:1` both lie in `::/48`, so unrelated hosts would be `same_prefix`); and Teredo `2001::/32` (`.teredo` yields `(server, client)`, the client sits behind a tunnel and the /48 is the relay's). One more rule: an IPv6 zone is dropped before comparison. `ip_address('fe80::1%eth0')` has `scope_id == 'eth0'` and is unequal to `ip_address('fe80::1')`, so `fe80::1%eth0` against `fe80::1` is `same_ip`, not `same_prefix`. The `unknown` row above lists the NAT64 prefix only and is read together with this note.
+
 **`NetworkFacts`**, a frozen dataclass with `asn: int | None` and `country: str | None`: what an enricher knows about one address.
 
 **`MatchResult`**, a tri-state: `True`, `False` or the string `"unknown"`. §5 gives the JSON.

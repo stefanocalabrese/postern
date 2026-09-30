@@ -60,6 +60,23 @@ CLASSIFY_TABLE: list[tuple[str | None, str | None, NetworkRelation]] = [
     ("64:ff9b::102:304", "1.2.3.4", UNKNOWN),
     ("1.2.3.4", "64:ff9b::102:304", UNKNOWN),
     ("64:ff9b::102:304", "64:ff9b::102:304", UNKNOWN),
+    # RFC 8215 local-use NAT64, IPv4-compatible and Teredo: two unrelated hosts, unknown
+    ("64:ff9b:1::102:304", "64:ff9b:1::909:909", UNKNOWN),
+    ("64:ff9b:1::102:304", "1.2.3.4", UNKNOWN),
+    ("1.2.3.4", "64:ff9b:1::102:304", UNKNOWN),
+    ("::1.2.3.4", "::9.9.9.9", UNKNOWN),
+    ("::1.2.3.4", "1.2.3.4", UNKNOWN),
+    ("1.2.3.4", "::1.2.3.4", UNKNOWN),
+    ("::a00:1", "::a00:2", UNKNOWN),
+    ("2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:0:5555:e378:8000:63bf:3fff:fdd3", UNKNOWN),
+    ("2001::1", "2001::2", UNKNOWN),
+    ("2001::1", "203.0.113.9", UNKNOWN),
+    ("203.0.113.9", "2001::1", UNKNOWN),
+    # a zone is not part of the address
+    ("fe80::1%eth0", "fe80::1", SAME_IP),
+    ("fe80::1", "fe80::1%eth0", SAME_IP),
+    ("fe80::1%eth0", "fe80::1%eth1", SAME_IP),
+    ("fe80::1%eth0", "fe80::2", SAME_PREFIX),
     # absent or unparsable
     (None, "203.0.113.9", UNKNOWN),
     ("203.0.113.9", None, UNKNOWN),
@@ -85,6 +102,13 @@ def test_classify_raises_for_no_input_in_the_table() -> None:
     for creator, scanner, _ in CLASSIFY_TABLE:
         classify(creator, scanner)
         classify(scanner, creator)
+
+
+def test_ranges_next_to_the_unknown_ones_still_classify() -> None:
+    """2001:db8::/32 is not Teredo and 64:ff9b::/96 is not its local-use sibling."""
+    assert classify("2001:db8::1", "2001:db8::2") is SAME_PREFIX
+    assert classify("2001:1::1", "2001:1::2") is SAME_PREFIX
+    assert classify("64:ff9a::1", "64:ff9a::2") is SAME_PREFIX
 
 
 def test_two_unrelated_mapped_addresses_are_not_the_benign_answer() -> None:

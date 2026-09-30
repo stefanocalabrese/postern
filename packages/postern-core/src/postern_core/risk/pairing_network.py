@@ -58,10 +58,32 @@ MAX_ASN = 4_294_967_295
 #: read path's ``IMPOSSIBLE_TRAVEL``.
 SIGNAL_CODE = "PAIRING_NETWORK"
 
-#: RFC 6052's well-known NAT64 prefix. An address inside it names the NAT64
-#: gateway, not a subscriber, and its /48 is shared by every client behind
-#: every such gateway, so it has no truthful classification here.
-_NAT64_WELL_KNOWN = ipaddress.IPv6Network("64:ff9b::/96")
+#: Ranges whose /48 is shared by unrelated hosts, so an address inside one has
+#: no truthful classification here and is ``unknown``. Each was measured on
+#: CPython 3.12.13 with ``ipaddress``, and none is unwrapped by ``ipv4_mapped``
+#: (``None`` for all of them):
+#:
+#: * ``64:ff9b::/96``, RFC 6052's well-known NAT64 prefix. It names the gateway,
+#:   not a subscriber.
+#: * ``64:ff9b:1::/48``, RFC 8215's local-use NAT64 prefix, the same flaw. It
+#:   is not inside ``64:ff9b::/96`` (``64:ff9b:1::1 in ::/48`` is ``False``).
+#: * ``::/96`` minus ``::`` and ``::1``, the deprecated IPv4-compatible
+#:   addresses. ``::1.2.3.4`` and ``::a00:1`` both parse as plain IPv6 with
+#:   ``ipv4_mapped is None`` and both lie in ``::/48``, so any two unrelated
+#:   hosts would be ``same_prefix``.
+#: * ``2001::/32``, Teredo. ``.teredo`` returns ``(server, client)`` and the
+#:   embedded client is behind a tunnel, not the peer's network; the /48 is
+#:   the relay's, shared by every client.
+_UNKNOWN_RANGES = (
+    ipaddress.IPv6Network("64:ff9b::/96"),
+    ipaddress.IPv6Network("64:ff9b:1::/48"),
+    ipaddress.IPv6Network("::/96"),
+    ipaddress.IPv6Network("2001::/32"),
+)
+
+#: Inside ``::/96`` but not IPv4-compatible: the unspecified address and
+#: loopback. They stay classified as they were.
+_NOT_COMPATIBLE = frozenset({ipaddress.IPv6Address("::"), ipaddress.IPv6Address("::1")})
 
 type _Address = ipaddress.IPv4Address | ipaddress.IPv6Address
 
@@ -103,7 +125,12 @@ class NetworkEnricher(Protocol):
 
 
 def _normalised(raw: str | None) -> _Address | None:
-    """Parse ``raw`` and unwrap an IPv4-mapped address, or ``None``.
+    """Parse ``raw``, drop an IPv6 zone and unwrap an IPv4-mapped address, or ``None``.
+
+    A ZONE IS NOT PART OF THE ADDRESS. ``ip_address('fe80::1%eth0')`` has
+    ``scope_id == 'eth0'`` and compares unequal to ``ip_address('fe80::1')``
+    (measured), as does a different zone on the same address, so the zone is
+    dropped by rebuilding the address from its packed bytes.
 
     UNWRAPPED BEFORE ANYTHING IS COMPARED, because every IPv4-mapped address
     has 80 zero bits before its ``ffff`` and so falls in ``::/48``: left
@@ -117,9 +144,18 @@ def _normalised(raw: str | None) -> _Address | None:
         address = ipaddress.ip_address(raw)
     except (ValueError, TypeError):
         return None
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        return address.ipv4_mapped
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.scope_id is not None:
+            address = ipaddress.IPv6Address(address.packed)
+        if address.ipv4_mapped is not None:
+            return address.ipv4_mapped
     return address
+
+
+def _is_unknown_range(address: _Address) -> bool:
+    if not isinstance(address, ipaddress.IPv6Address) or address in _NOT_COMPATIBLE:
+        return False
+    return any(address in network for network in _UNKNOWN_RANGES)
 
 
 def _site(address: _Address) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
@@ -131,7 +167,8 @@ def classify(creator_ip: str | None, scanner_ip: str | None) -> NetworkRelation:
     """The relation between two addresses. Total: it never raises.
 
     ``unknown`` when either is ``None``, either will not parse, or either lies
-    in the NAT64 well-known prefix after normalisation. An unparsable string is
+    in a range ``_UNKNOWN_RANGES`` lists (NAT64, IPv4-compatible, Teredo) after
+    normalisation. An unparsable string is
     ``unknown`` rather than an exception because ``creator_ip`` is read back
     out of a store, and a corrupted value must not fail a scan. Mixed families
     are always ``different``.
@@ -141,7 +178,7 @@ def classify(creator_ip: str | None, scanner_ip: str | None) -> NetworkRelation:
     if creator is None or scanner is None:
         return NetworkRelation.UNKNOWN
     for address in (creator, scanner):
-        if isinstance(address, ipaddress.IPv6Address) and address in _NAT64_WELL_KNOWN:
+        if _is_unknown_range(address):
             return NetworkRelation.UNKNOWN
     if creator == scanner:
         return NetworkRelation.SAME_IP
