@@ -159,7 +159,7 @@ Content-Type: application/json
 | 400 | `invalid_request` | Body is not JSON, not an object, or `user_code`/`qr` missing, empty or not strings. | An app bug. A generic failure message; report it. |
 | 400 | `invalid_grant` | One identical body (`"this pairing cannot be completed"`) for: an unknown or expired code, a code this customer already approved, a malformed or forged `qr`, a `qr` for a different pairing, or a slot more than one ahead of the server's clock. | "This code can no longer be used. Start again from your AI client." The server deliberately does not say which case it was. |
 | 400 | `qr_stale` | A genuine token for this pairing, older than the window. | "The code on your screen has changed. Scan it again." The QR is still on the page if nobody has scanned it yet. |
-| 400 | `scan_conflict` | Another customer's app scanned this pairing first. If the AI client had not yet exchanged its code, the server has now cancelled the pairing; if it had, nothing is cancelled and the token already issued to the AI client stays valid until it expires. | "This pairing was cancelled because another device scanned the same code. Start again from your AI client, and do not share your screen while pairing." Both cases give the same body. |
+| 400 | `scan_conflict` | Another customer's app scanned this pairing first. The server has now cancelled the pairing, including one already approved, because `/token` issues nothing and so spends no code. A code spent by an earlier build is the one case where nothing is cancelled. | "This pairing was cancelled because another device scanned the same code. Start again from your AI client, and do not share your screen while pairing." Both cases give the same body. |
 | 401 | `invalid_token` | No valid assertion (section 3). | Refresh the assertion once and retry; if it fails again, a generic failure. |
 | 403 | `invalid_subject` | The assertion verified but its `sub` is not a `cust_` / `cust:` reference. | An app-backend bug. A generic failure message; report it. |
 | 403 | `access_revoked` | This customer's AI access is revoked (ZT-7). | "AI client access is turned off for your account." Do not retry. |
@@ -216,7 +216,7 @@ Content-Type: application/json
 {"status": "approved"}
 ```
 
-The app can then tell the user to return to their computer. The AI client picks up its token on its next poll.
+The app can then tell the user to return to their computer, but the AI client gets nothing from its next poll yet: `POST /token` answers 503 `temporarily_unavailable` with a `Retry-After` header for an approved code and issues nothing, and does not spend the code. Issuance returns with the pending session-token change.
 
 **Refusals:**
 

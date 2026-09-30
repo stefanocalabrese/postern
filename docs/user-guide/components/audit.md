@@ -93,7 +93,7 @@ The confirm service writes to `audit_log` through two writers of its own,
 `services/confirm/audit.py`'s `ApprovalAudit` and `PairingAudit`. Both landed after
 the read path: `ApprovalAudit` on 2026-09-23, `PairingAudit` on 2026-09-26.
 
-### `POST /challenges/{challenge_id}/approve` — `ApprovalAudit`
+### `POST /challenges/{challenge_id}/approve` (`ApprovalAudit`)
 
 Same shape as the read path: up to **two** rows, an entry row committed before the
 backend write and a completion row after, correlated by `call_id`. A refused
@@ -101,34 +101,61 @@ approval (revoked customer, unowned challenge, expired, already terminal, a
 signature that fails to verify) writes exactly one row, because none of those
 refusals reaches the backend.
 
-### `POST /approve` and `POST /token` (device grant) — `PairingAudit`
+### `POST /scan`, `POST /approve` and `POST /token` (device grant), `PairingAudit`
 
-One row per request, never two — a pairing and a token mint each touch this
+One row per recorded request, never two. A pairing and a token poll each touch this
 deployment's own store, not the operator's backend, so there is no early touch to
 record. A row is written only when the request both resolved a customer identity
 **and** reached a conclusion about that identity's authority; a request that fails
-on shape alone (a malformed body, an unknown grant type) resolves nobody and
-writes nothing.
+on shape alone (a malformed body, a missing field, an unknown grant type) resolves
+nobody and writes nothing. Each endpoint has its own `tool_name`, all under
+`device_grant.*`, and the route is in `arguments.route`:
 
-- `POST /approve` (the mobile app confirming a pairing) writes on every outcome
-  that reaches an identity check: success, a revoked customer, a `sub` that isn't
-  a valid customer reference, an unknown device code, a code already approved, and
-  both halves of a wrong pairing code.
-- `POST /token` (the browser's exchange) writes on an approved code refused
-  because issuance is disabled (`issuance_disabled`, one row per poll, since
-  30 September 2026 no token is minted), a revoked customer, a stored identity
-  that fails to parse, a revocation store that could not answer, and a spent
-  code. Most of its exits — an unknown or expired code, `slow_down`,
-  `authorization_pending` — write nothing, because none of them has read a
-  customer off the code yet.
+| Endpoint | `tool_name` | `arguments.route` |
+|---|---|---|
+| `POST /scan` | `device_grant.scan` | `/scan` |
+| `POST /approve` | `device_grant.approve` | `/approve` |
+| `POST /token` | `device_grant.token` | `/token` |
+
+`WHERE tool_name LIKE 'device_grant.%'` returns the whole flow. An exception that
+ends any of the three is recorded as `raised` under its class name.
+
+- `POST /scan` (the app claiming a pairing from the QR): `returned` with a NULL
+  `detail` for a first scan and for the same customer's repeat; `raised` with
+  `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale`,
+  `already_approved` (the scanning customer's own pairing is already approved) or
+  `scan_conflict` (a second customer scanned).
+- `POST /approve` (the app confirming a pairing): `returned` with a NULL `detail` for
+  the approval that granted the pairing, so `WHERE outcome = 'returned' AND detail IS
+  NULL` counts one row per pairing granted; `returned` with `already_approved` for the
+  approver's repeat, which is answered with the same 200 and writes nothing to the
+  store; `raised` with `invalid_subject`, `revoked`, `user_code_not_found`,
+  `not_scanned`, `scanned_by_other`, or `already_approved` for a code approved for a
+  different customer.
+- `POST /token` (the browser's poll): since 30 September 2026 nothing is issued. An
+  approved code for a customer who is not revoked is answered 503 and recorded `raised`
+  with `issuance_disabled`, at most one row per poll interval because a poll inside
+  the interval is answered `slow_down` and writes nothing. The other recorded exits are
+  `revoked`, `stored_identity_malformed` (the stored identity fails to parse), the
+  exception's class name when the revocation store could not answer, and
+  `device_code_spent` for a code an earlier build spent. An unknown or expired code,
+  `slow_down` and `authorization_pending` write nothing, because none of them has read
+  a customer off the code yet.
 - `POST /device_authorization` (creating the code) writes nothing at all: it
   resolves no identity, ever.
 
-A replay of an already-spent device code is recorded under its own `detail`,
-`device_code_spent` — `WHERE detail = 'device_code_spent'` is the whole replay
-query. `WHERE detail = 'revoked'` is the whole answer, on the write path, to
-whether a revocation took effect: the challenge approval and both device-grant
-endpoints all record a revocation refusal under this one shared detail.
+**Historical constants.** `device_code_not_found` (an unknown `device_code` at
+`POST /approve`), `user_code_mismatch` and `user_code_budget_exhausted` (the per-code
+pairing-code attempt budget) are defined in `services/confirm/audit.py` because
+`audit_log` is append-only and rows carrying them exist, but nothing writes them since
+30 September 2026: `/approve` takes a `user_code` and records `user_code_not_found`
+for a miss, and the budget was removed with the old lookup. The `minted` method has no
+caller until the session-token change.
+
+`WHERE detail = 'device_code_spent'` is the whole replay query. `WHERE detail =
+'revoked'` is the whole answer, on the write path, to whether a revocation took
+effect: the challenge approval and all three device-grant endpoints record a
+revocation refusal under this one shared detail.
 
 ## Fail-Closed Writes (ADR-0006)
 
