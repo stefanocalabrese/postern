@@ -336,6 +336,21 @@ Rows by exit:
 - **`refresh_token`**: `REFRESH_TOOL_NAME`, only past §6 step 3's proof.
 - **Recall**: `RECALL_TOOL_NAME`, subject the recalled family's customer, `claims={}`. `returned` when the family was revoked and every jti written to a shared store; `raised` with `DETAIL_RECALL_LOCAL_ONLY`, `DETAIL_RECALL_NO_SESSION` or an exception type name otherwise.
 
+**Counts are per endpoint, and `tool_name` is what separates them.** Once `PairingAudit.minted()` is called again, several device-grant endpoints write `outcome='returned'` with a NULL `detail` on success: `/approve` (`PairingAudit.approved()`), `/scan` (the same method, `dev-docs/qr-page-spec.md` §7), `/token` for both grants (`minted()`), and the recall. And since `d0674e5` a repeat `/approve` by the customer who already approved is answered 200 and recorded by `PairingAudit.approved_again()` as `outcome='returned'` with `detail = DETAIL_ALREADY_APPROVED` (`already_approved`), so on `/approve` rows "one pairing granted" is `outcome='returned' AND detail IS NULL`. A count that filters on outcome and detail alone therefore mixes pairings, scans, sessions, refreshes and recalls.
+
+**Minted rows are told apart by `tool_name`, not by a detail of their own.** Every endpoint already writes its own `tool_name` (`device_grant.approve`, `device_grant.scan`, `device_grant.token`, `device_grant.refresh`, `device_grant.recall`), so the column that says which endpoint wrote a row is already there and already populated on every row, historical ones included. A success detail such as `minted` would be a second, redundant discriminator that only new rows carry, and it would break the reading "NULL `detail` on a `returned` row means plain success", which the approval fix keeps for every row except the repeat approval. So `minted()` keeps writing NULL, and the queries are:
+
+| Question | Predicate |
+|---|---|
+| Pairings granted | `tool_name = 'device_grant.approve' AND outcome = 'returned' AND detail IS NULL` |
+| Repeat approvals | `tool_name = 'device_grant.approve' AND outcome = 'returned' AND detail = 'already_approved'` |
+| Pairings scanned | `tool_name = 'device_grant.scan' AND outcome = 'returned' AND detail IS NULL` |
+| Sessions issued | `tool_name = 'device_grant.token' AND outcome = 'returned' AND detail IS NULL` |
+| Refreshes issued | `tool_name = 'device_grant.refresh' AND outcome = 'returned' AND detail IS NULL` |
+| Recalls completed | `tool_name = 'device_grant.recall' AND outcome = 'returned'` |
+
+`WHERE tool_name LIKE 'device_grant.%' AND outcome = 'returned' AND detail IS NULL` is the wrong query for any of them: it adds scans, approvals, sessions and refreshes together. Two tests pin the rule. One asserts that `minted()` is reached only from a `PairingAudit` built with `TOKEN_TOOL_NAME` or `REFRESH_TOOL_NAME`. The other drives one full pairing, one exchange and one refresh, then runs each predicate above against the table and asserts a count of exactly one for each (and zero repeat approvals). `docs/user-guide/components/audit.md`, which documents these rows for operators, carries the table.
+
 No migration: `detail` is unconstrained `Text` and no constraint names `tool_name`.
 
 ### 10. Public paths, rate limits, body limit
