@@ -210,7 +210,8 @@ resolving to an instance with an `async def lookup(self, ip)` that returns
 `NetworkFacts(asn, country)` or `None`. The service refuses to start with more
 than one installed, or with one whose `lookup` is not async. Lookups share one
 time budget (`POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS`) and at most 8
-scans per process enrich at once; a timeout, a full cap, an exception or an
+scans per process enrich at once; a timeout, a full cap, an exception (a
+`CancelledError` raised by the provider itself included) or an
 answer of the wrong type records `"unknown"` for both matches, and one WARNING
 line that names neither address. An `asn` outside 0 to 4294967295 or a
 `country` that is not two ASCII letters is dropped alone: that field's match is

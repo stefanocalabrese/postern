@@ -1942,6 +1942,15 @@ async def _enriched_matches(
     ``await`` between them, so on one event loop the check cannot race, and a
     scan that finds every slot taken records ``"unknown"`` at once.
 
+    A PROVIDER'S OWN ``CancelledError`` IS A FAILED LOOKUP. Raised from inside
+    ``lookup`` it reaches here directly on the one-lookup path and through the
+    finished task's ``result()`` on the two-lookup path, and in both cases
+    this task's ``cancelling()`` is 0: nobody asked to cancel the request, so
+    withdrawing the claim for it would end a legitimate pairing. It records
+    ``"unknown"`` under the reason ``CancelledError``. A cancellation of the
+    request itself leaves ``cancelling()`` above 0 and still propagates, to
+    ``_scan``'s withdrawal.
+
     WHAT THE BUDGET CANNOT STOP. ``asyncio.timeout`` cancels only at an
     ``await`` that yields. A ``lookup`` that never yields, or calls blocking
     I/O inside ``async def``, holds the loop for every request on the replica
@@ -1967,6 +1976,14 @@ async def _enriched_matches(
                     answers = [creator_lookup.result(), scanner_lookup.result()]
         except TimeoutError:
             return _enrichment_failed("timeout")
+        except asyncio.CancelledError:
+            # The provider's own, or the request's? Only an outer cancellation
+            # leaves this task with a pending cancel request; the budget's has
+            # already been uncancelled and turned into `TimeoutError` above.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() == 0:
+                return _enrichment_failed("CancelledError")
+            raise
         except Exception as exc:  # noqa: BLE001 -- every provider failure is "unknown"
             return _enrichment_failed(_failure_name(exc))
     facts: list[NetworkFacts | None] = []

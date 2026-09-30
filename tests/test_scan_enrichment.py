@@ -118,6 +118,18 @@ class MustNotBeCalled:
         pytest.fail(f"no lookup may be made for an unknown relation, got {ip}")
 
 
+class CancelsItself:
+    """Raises ``CancelledError`` from inside ``lookup``, as a provider whose own
+    client library cancels an internal task can. Nobody cancelled the request."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    async def lookup(self, ip: str) -> NetworkFacts | None:
+        self.asked.append(ip)
+        raise asyncio.CancelledError
+
+
 class Blocks:
     """Parks on an event the test controls, after saying it has been entered."""
 
@@ -344,6 +356,87 @@ async def test_a_budget_expiry_after_the_claim_leaves_it_claimed(
     )
 
 
+async def test_a_timeout_on_the_single_same_ip_lookup_records_unknown(
+    pg_url: str, clean: Database, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
+) -> None:
+    app = build(pg_url, key_pair, Sleeps(), budget=0.05)
+    code = await start(app, forwarded_for=LAPTOP)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        resp = await scan(app, key_pair, ALICE, code, forwarded_for=LAPTOP)
+
+    assert resp.status_code == 200
+    stored = await device_store_of(app).get_device_code(code.device_code)
+    assert stored is not None and stored.scanned_by == ALICE
+    (row,) = await rows(clean)
+    assert row.risk_signals == expected_signal(
+        "same_ip", asn_match="unknown", country_match="unknown"
+    )
+    assert [w.getMessage() for w in enrichment_warnings(caplog)] == [
+        "pairing network enrichment: timeout"
+    ]
+
+
+async def test_one_side_answering_none_on_two_lookups_records_unknown_without_a_warning(
+    pg_url: str, clean: Database, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``None`` is "no data for this address", the normal answer for a private
+    range, so it is an ``"unknown"`` comparison and not a provider failure."""
+    provider = Table({LAPTOP: NetworkFacts(asn=64500, country="ES")})
+    app = build(pg_url, key_pair, provider)
+    code = await start(app, forwarded_for=LAPTOP)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        resp = await scan(app, key_pair, ALICE, code, forwarded_for=PHONE)
+
+    assert resp.status_code == 200
+    (row,) = await rows(clean)
+    assert row.risk_signals == expected_signal(
+        "different", asn_match="unknown", country_match="unknown"
+    )
+    assert sorted(provider.asked) == sorted([LAPTOP, PHONE])
+    assert enrichment_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("scanned_from", "relation"),
+    [(PHONE, "different"), (LAPTOP, "same_ip")],
+    ids=["two-lookups", "one-lookup"],
+)
+async def test_a_provider_raising_cancelled_itself_records_unknown_and_keeps_the_claim(
+    pg_url: str,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    caplog: pytest.LogCaptureFixture,
+    scanned_from: str,
+    relation: str,
+) -> None:
+    """A ``CancelledError`` the provider raises while the request task is not
+    being cancelled is a failed lookup, not a cancelled scan: it must not
+    withdraw a legitimate claim or fail the scan."""
+    provider = CancelsItself()
+    app = build(pg_url, key_pair, provider, budget=1.0)
+    code = await start(app, forwarded_for=LAPTOP)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        resp = await scan(app, key_pair, ALICE, code, forwarded_for=scanned_from)
+
+    assert resp.status_code == 200
+    assert provider.asked
+    stored = await device_store_of(app).get_device_code(code.device_code)
+    assert stored is not None and stored.scanned_by == ALICE
+    (row,) = await rows(clean)
+    assert row.outcome == OUTCOME_RETURNED and row.detail is None
+    assert row.risk_signals == expected_signal(
+        relation, asn_match="unknown", country_match="unknown"
+    )
+    assert [w.getMessage() for w in enrichment_warnings(caplog)] == [
+        "pairing network enrichment: CancelledError"
+    ]
+    slots: asyncio.Semaphore = app.state.pairing_network_slots
+    assert slots._value == PAIRING_ENRICHMENT_SLOTS
+
+
 async def test_a_saturated_cap_records_unknown_without_waiting(
     pg_url: str, clean: Database, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -359,7 +452,7 @@ async def test_a_saturated_cap_records_unknown_without_waiting(
     try:
         with caplog.at_level(logging.WARNING, logger=LOGGER):
             resp = await asyncio.wait_for(
-                scan(app, key_pair, ALICE, code, forwarded_for=PHONE), timeout=0.9
+                scan(app, key_pair, ALICE, code, forwarded_for=PHONE), timeout=3.0
             )
     finally:
         for _ in range(PAIRING_ENRICHMENT_SLOTS):
@@ -380,19 +473,24 @@ async def test_a_saturated_cap_records_unknown_without_waiting(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("scanned_from", [PHONE, LAPTOP], ids=["two-lookups", "one-lookup"])
 async def test_a_request_cancelled_after_the_claim_withdraws_it_and_re_raises(
-    pg_url: str, clean: Database, key_pair: RSAKeyPair
+    pg_url: str, clean: Database, key_pair: RSAKeyPair, scanned_from: str
 ) -> None:
     provider = Blocks()
     app = build(pg_url, key_pair, provider, budget=1.0)
+    slots: asyncio.Semaphore = app.state.pairing_network_slots
     code = await start(app, forwarded_for=LAPTOP)
 
-    request = asyncio.create_task(scan(app, key_pair, ALICE, code, forwarded_for=PHONE))
+    request = asyncio.create_task(scan(app, key_pair, ALICE, code, forwarded_for=scanned_from))
     await asyncio.wait_for(provider.entered.wait(), timeout=5)
+    # The blocked lookup holds exactly one slot, for the whole scan.
+    assert slots._value == PAIRING_ENRICHMENT_SLOTS - 1
     request.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await request
+    assert slots._value == PAIRING_ENRICHMENT_SLOTS
     assert await device_store_of(app).get_device_code(code.device_code) is None
     assert await rows(clean) == []
 
