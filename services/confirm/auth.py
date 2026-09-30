@@ -62,7 +62,8 @@ checks ``exp`` only when present and never reads ``iat``, so until
 2026-09-30 an assertion minted without ``exp`` authorised money movement
 forever. ``_lifetime_refusal`` now refuses one with no numeric ``exp``, one
 whose ``exp`` is further ahead than ``POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS``
-allows, and one whose ``iat`` is in the future, each with the same 401.
+allows, one whose ``iat`` is in the future, and one whose ``nbf`` is unreadable or in
+the future, each with the same 401.
 """
 
 from __future__ import annotations
@@ -275,7 +276,7 @@ def _lifetime_refusal(claims: dict[str, Any], *, now: float, max_lifetime: int) 
     so ``services/api`` and this service keep checking tokens through one
     unmodified implementation.
 
-    Three refusals. The returned string goes into the log line and never a
+    Four refusals. The returned string goes into the log line and never a
     claim value, which is the shape every other refusal here logs:
 
     - ``exp`` absent or not a number.
@@ -288,7 +289,9 @@ def _lifetime_refusal(claims: dict[str, Any], *, now: float, max_lifetime: int) 
       accepted: RFC 7519 makes it optional and ``exp`` already bounds the
       token's remaining life.
 
-    ``nbf`` is not checked here.
+    - ``nbf`` present and either not a finite number or more than
+      ``ASSERTION_CLOCK_SKEW_SECONDS`` ahead of now. Absent ``nbf`` is
+      accepted, as absent ``iat`` is. A past ``nbf`` is not a refusal.
     """
     exp = claims.get("exp")
     if not _is_time(exp):
@@ -299,6 +302,10 @@ def _lifetime_refusal(claims: dict[str, Any], *, now: float, max_lifetime: int) 
         iat = claims["iat"]
         if not _is_time(iat) or iat - now > ASSERTION_CLOCK_SKEW_SECONDS:
             return "assertion iat is not a number or is in the future"
+    if "nbf" in claims:
+        nbf = claims["nbf"]
+        if not _is_time(nbf) or nbf - now > ASSERTION_CLOCK_SKEW_SECONDS:
+            return "assertion nbf is not a number or is not yet valid"
     return None
 
 

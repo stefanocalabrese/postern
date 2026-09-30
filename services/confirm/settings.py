@@ -247,8 +247,20 @@ def _app_link_uri(page_uri: str) -> str:
 
     The offending values are echoed, as `_device_code_ttl` does, because they
     are an operator's own environment.
+
+    The checks live in `_check_app_link_uri`, which `ConfirmSettings.__post_init__`
+    calls as well, so a value built in code is held to the same rules.
     """
     link = os.environ.get("POSTERN_DEVICE_APP_LINK_URI") or "https://app.postern.internal/pair"
+    return _check_app_link_uri(link, page_uri)
+
+
+def _check_app_link_uri(link: str, page_uri: str) -> str:
+    """Return ``link`` if it is a usable app link beside ``page_uri``, else raise ``ValueError``.
+
+    The rules are `_app_link_uri`'s; the messages name the environment
+    variable, which is what an operator reading a startup failure acts on.
+    """
     if "?" in link or "#" in link:
         raise ValueError(
             f"POSTERN_DEVICE_APP_LINK_URI ({link!r}) must not contain '?' or '#'. "
@@ -291,7 +303,8 @@ def _verification_uri(page_uri: str) -> str:
       handle. The characters are tested rather than ``urlsplit``'s query and
       fragment, which are empty for a bare trailing ``?`` or ``#``.
 
-    The value itself comes from ``from_env``, which reads the variable.
+    The value itself comes from ``from_env``, which reads the variable, and
+    from ``ConfirmSettings.__post_init__``, which passes the field.
     """
     if urlsplit(page_uri).path != VERIFY_PAGE_PATH:
         raise ValueError(
@@ -588,6 +601,14 @@ class ConfirmSettings:
     rate_limit_verify_js: int = 60
     rate_limit_verify_css: int = 60
     customer_rate_limit_scan: int = 10
+
+    def __post_init__(self) -> None:
+        # The pairing URIs are checked however the settings are built, because
+        # `verify_page.py`'s app link always appends ``?`` to the base, so a
+        # base carrying ``?`` or ``#`` yields a link no app handler receives.
+        # `from_env` runs the same validators and so passes through here twice.
+        _verification_uri(self.device_verification_uri)
+        _check_app_link_uri(self.device_app_link_uri, self.device_verification_uri)
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":

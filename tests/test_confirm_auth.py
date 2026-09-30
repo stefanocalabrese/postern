@@ -367,6 +367,10 @@ def _bad_headers(key_pair: RSAKeyPair) -> dict[str, dict[str, str]]:
         "iat in the future": raw_bearer(
             key_pair, claims_now(iat=int(time.time()) + 10 * ASSERTION_CLOCK_SKEW_SECONDS)
         ),
+        "nbf in the future": raw_bearer(
+            key_pair, claims_now(nbf=int(time.time()) + 10 * ASSERTION_CLOCK_SKEW_SECONDS)
+        ),
+        "nbf not a number": raw_bearer(key_pair, claims_now(nbf="soon")),
     }
 
 
@@ -619,6 +623,32 @@ async def test_an_iat_in_the_future_beyond_the_skew_is_refused(
 async def test_an_iat_that_is_not_a_number_is_refused(app: Starlette, key_pair: RSAKeyPair) -> None:
     """Present and unreadable is not the same as absent."""
     assert await _status(app, raw_bearer(key_pair, claims_now(iat="now"))) == 401
+
+
+async def test_an_nbf_in_the_future_beyond_the_skew_is_refused(
+    app: Starlette, key_pair: RSAKeyPair
+) -> None:
+    future = int(time.time()) + ASSERTION_CLOCK_SKEW_SECONDS + 60
+    assert await _status(app, raw_bearer(key_pair, claims_now(nbf=future))) == 401
+
+
+@pytest.mark.parametrize("nbf", ["soon", True, float("nan"), float("inf"), [1]])
+async def test_an_nbf_that_is_not_a_finite_number_is_refused(
+    app: Starlette, key_pair: RSAKeyPair, nbf: Any
+) -> None:
+    """Present and unreadable is not the same as absent."""
+    assert await _status(app, raw_bearer(key_pair, claims_now(nbf=nbf))) == 401
+
+
+async def test_an_nbf_now_or_in_the_past_passes(app: Starlette, key_pair: RSAKeyPair) -> None:
+    now = int(time.time())
+    assert await _status(app, raw_bearer(key_pair, claims_now(nbf=now))) == 400
+    assert await _status(app, raw_bearer(key_pair, claims_now(nbf=now - 3600))) == 400
+
+
+async def test_an_nbf_inside_the_skew_passes(app: Starlette, key_pair: RSAKeyPair) -> None:
+    nbf = int(time.time()) + ASSERTION_CLOCK_SKEW_SECONDS // 2
+    assert await _status(app, raw_bearer(key_pair, claims_now(nbf=nbf))) == 400
 
 
 async def test_a_short_lived_assertion_passes(app: Starlette, key_pair: RSAKeyPair) -> None:

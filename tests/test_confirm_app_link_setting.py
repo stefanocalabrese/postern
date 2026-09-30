@@ -155,3 +155,57 @@ def test_an_app_link_base_that_swallows_the_pairing_parameters_refuses(
     monkeypatch.setenv(LINK, link)
     with pytest.raises(ValueError, match=LINK):
         ConfirmSettings.from_env()
+
+
+# ---------------------------------------------------------------------------
+# Direct construction is held to the same rules as the environment path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        pytest.param("https://app.bank.test/pair#x", id="fragment"),
+        pytest.param("https://app.bank.test/pair?a=1", id="query"),
+        pytest.param("https://app.bank.test/pair?", id="bare question mark"),
+        pytest.param("http://app.bank.test/pair", id="http"),
+        pytest.param("/pair", id="no host"),
+    ],
+)
+def test_a_constructed_app_link_a_phone_cannot_use_is_refused(link: str) -> None:
+    with pytest.raises(ValueError, match=LINK):
+        ConfirmSettings(device_app_link_uri=link)
+
+
+def test_a_constructed_app_link_on_the_page_host_is_refused() -> None:
+    with pytest.raises(ValueError, match=LINK):
+        ConfirmSettings(
+            device_verification_uri="https://auth.bank.test/verify",
+            device_app_link_uri="https://AUTH.bank.test:8443/pair",
+        )
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        pytest.param("https://auth.bank.test/other", id="other path"),
+        pytest.param("https://auth.bank.test/verify/", id="trailing slash"),
+        pytest.param("https://auth.bank.test/verify?a=1", id="query"),
+        pytest.param("https://auth.bank.test/verify#x", id="fragment"),
+    ],
+)
+def test_a_constructed_page_uri_off_the_verify_route_is_refused(page: str) -> None:
+    with pytest.raises(ValueError, match=PAGE):
+        ConfirmSettings(device_verification_uri=page)
+
+
+def test_replace_cannot_produce_a_malformed_app_link() -> None:
+    import dataclasses
+
+    with pytest.raises(ValueError, match=LINK):
+        dataclasses.replace(ConfirmSettings.for_testing(), device_app_link_uri="https://a.test/p#")
+
+
+def test_testing_and_default_settings_still_construct() -> None:
+    assert ConfirmSettings.for_testing().device_app_link_uri
+    assert ConfirmSettings().device_verification_uri == "https://auth.postern.internal/verify"
