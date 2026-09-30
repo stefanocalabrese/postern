@@ -2224,7 +2224,33 @@ with
 3c. Directly after `_device_code_ttl` and before `@dataclass(frozen=True)`, add:
 
 ```python
-@@SNIP|t5|services/confirm/settings.py|def _app_link_uri(page_uri: str) -> str:|@dataclass(frozen=True)@@
+def _app_link_uri(page_uri: str) -> str:
+    """Read ``POSTERN_DEVICE_APP_LINK_URI``, or refuse to start.
+
+    THE ONE CROSS-FIELD CHECK IN THIS FILE, and the reason it is not left to
+    an operator. The QR encodes the app link; the page lives at
+    ``device_verification_uri``. A phone camera handed a URL on the page's
+    host opens the page in a browser rather than the bank app, so no pairing
+    could ever reach ``POST /scan``, and the default of each would pass a
+    review that looked at one value at a time. Hostnames are compared after
+    ``urllib.parse.urlsplit`` and case-folded; the port is not part of the
+    comparison, because universal links and app links are bound to a host.
+
+    ``ValueError``, the way `_device_code_ttl` refuses an unrepresentable
+    lifetime, naming both variables because either could be the one to change.
+    """
+    link_uri = os.environ.get("POSTERN_DEVICE_APP_LINK_URI", "https://app.postern.internal/pair")
+    link_host = (urlsplit(link_uri).hostname or "").casefold()
+    page_host = (urlsplit(page_uri).hostname or "").casefold()
+    if link_host == page_host:
+        raise ValueError(
+            "POSTERN_DEVICE_APP_LINK_URI and POSTERN_DEVICE_VERIFICATION_URI name the same "
+            f"host ({link_host!r}). A phone camera handed the app link would open the "
+            "browser pairing page instead of the bank app, so no pairing could reach "
+            "POST /scan. Point POSTERN_DEVICE_APP_LINK_URI at the operator's universal-link "
+            "or app-link host."
+        )
+    return link_uri
 ```
 
 3d. In `ConfirmSettings`, directly after the `device_verification_uri` field, add:
@@ -2571,7 +2597,21 @@ def customer_limits_from_settings(
 5a. Directly after the field `customer_rate_limit_challenge_approve: int = 10`, add:
 
 ```python
-@@SNIP|t6|services/confirm/settings.py|    # THE QR PAGE AND ``POST /scan``, added 2026-09-30: six more per-address|    @classmethod@@
+    # THE QR PAGE AND ``POST /scan``, added 2026-09-30: six more per-address
+    # counts and one more per-customer count, each reproducing its entry in
+    # `services/confirm/rate_limit.py`'s ``DEFAULT_LIMITS`` or
+    # `services/confirm/customer_rate_limit.py`'s ``DEFAULT_CUSTOMER_LIMITS``
+    # exactly, where the working behind each number lives. The five public
+    # routes are the browser's, so the carrier-grade NAT reasoning above
+    # applies to them; ``/scan`` is the app's, so the app-backend reasoning
+    # applies to it.
+    rate_limit_scan: int = 60
+    rate_limit_verify: int = 60
+    rate_limit_verify_qr: int = 300
+    rate_limit_verify_state: int = 300
+    rate_limit_verify_js: int = 60
+    rate_limit_verify_css: int = 60
+    customer_rate_limit_scan: int = 10
 ```
 
 5b. In `from_env`, directly after the `customer_rate_limit_challenge_approve=_positive_int(...)` argument and before the closing `)` of `cls(`, add:
@@ -3980,7 +4020,37 @@ with
 11d. Directly after `_normalize_user_code` and before `@dataclasses.dataclass(frozen=True, slots=True)` / `class _Pairing`, add:
 
 ```python
-@@SNIP|t8|services/confirm/device_auth.py|#: The length of a stored pairing code. A presented value that normalises to|@dataclasses.dataclass(frozen=True, slots=True)@@
+#: The length of a stored pairing code. A presented value that normalises to
+#: any other length cannot name a pairing, so it is answered as a lookup miss
+#: without a store round trip -- which also keeps a 64 KiB body from becoming
+#: a 64 KiB Redis key.
+_USER_CODE_LENGTH = 6
+
+
+async def _lookup_by_user_code(store: DeviceCodeStoreBase, presented: str) -> DeviceCode | None:
+    """The live pairing a presented ``user_code`` names, or ``None``."""
+    normalized = _normalize_user_code(presented)
+    if len(normalized) != _USER_CODE_LENGTH:
+        return None
+    return await store.get_by_user_code(normalized)
+
+
+def _unpairable_response() -> JSONResponse:
+    """The one 400 both app routes answer for every refusal that could leak
+    whether a pairing exists.
+
+    ``POST /scan`` gives it for an unknown or expired code, an approved one,
+    and a malformed or forged rotation token; ``POST /approve`` for an
+    unknown or expired code, one nobody scanned, one another customer
+    scanned, and one already approved. Byte for byte the same, for the reason
+    ``_unredeemable_response`` gives at ``POST /token``: the distinction the
+    caller does not get is exactly the one an operator needs, so it lives in
+    ``audit_log.detail`` and nowhere a caller can read it.
+
+    ``invalid_grant`` is RFC 6749 section 5.2's code for a grant that is
+    "invalid, expired, revoked", which is true of every case above.
+    """
+    return _error(400, "invalid_grant", "this pairing cannot be completed")
 ```
 
 11e. `approve_callback`'s docstring. Replace
