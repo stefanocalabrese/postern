@@ -134,10 +134,18 @@ the service refuses and names this variable as the one you meant.
 | `POSTERN_CONFIRM_RATE_LIMIT_TOKEN` | No | `300` | As above, for `/token` |
 | `POSTERN_CONFIRM_RATE_LIMIT_APPROVE` | No | `60` | As above, for `/approve`. Raise this if the banking app calls from its own backend rather than from the phone |
 | `POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE` | No | `60` | As above, for the challenge approval callback |
+| `POSTERN_CONFIRM_RATE_LIMIT_SCAN` | No | `60` | As above, for `/scan`. Raise it for the same reason as `/approve`'s |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY` | No | `60` | As above, for the pairing page `/verify`: page loads plus the 12 a minute its noscript refresh adds |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY_QR` | No | `300` | As above, for `/verify/qr.svg`, which the page reloads every two seconds: 30 a minute per open tab, so 300 is ten tabs behind one address |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY_STATE` | No | `300` | As above, for `/verify/state`, which the page polls every two seconds |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY_JS` | No | `60` | As above, for `/verify.js`, loaded once per page |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS` | No | `60` | As above, for `/verify.css`, loaded once per page |
 | `POSTERN_CONFIRM_RATE_LIMIT_DEFAULT` | No | `60` | As above, for every other path |
 | `POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_APPROVE` | No | `10` | Requests per minute per **customer** (the verified assertion `sub`), for `/approve`. A second limiter behind the assertion check; the address-keyed one above stays in front. **At least 1** |
 | `POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_CHALLENGE_APPROVE` | No | `10` | As above, for the challenge approval callback. One payment approval is one tap on a phone, so ten a minute is already well above what a person does |
+| `POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN` | No | `10` | As above, for `/scan`, which precedes every pairing approval once. **At least 1** |
 | `POSTERN_DEVICE_VERIFICATION_URI` | No | `https://auth.postern.internal/verify` | Base URI for the user verification page (QR code target) |
+| `POSTERN_DEVICE_APP_LINK_URI` | **Yes, in any deployment** | `https://app.postern.internal/pair` | Base of the universal link / app link the pairing QR encodes, as `?user_code=...&qr=...`. The default is a local placeholder: a deployment must set its own host and publish the Apple associated-domains and Android asset-links files for it, or a phone camera will not open the bank app. **Refused at startup** when its host equals `POSTERN_DEVICE_VERIFICATION_URI`'s host (case-insensitive, port ignored) |
 | `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code. Refused at startup below 30 seconds — the Redis store cannot represent a shorter one |
 | `POSTERN_REDIS_DEVICE_CODE_TTL` | No | `900` (15 min) | Lifetime a device code gets when the caller passes no `expires_in`, on the Redis store. Refused below the same 30 seconds, and for the same reason: it sets the lifetime of the same object |
 | `POSTERN_DEVICE_POLL_INTERVAL_SECONDS` | No | `5` | Minimum seconds between token polls. **At least 1**; must also stay below `POSTERN_DEVICE_CODE_TTL_SECONDS`, which is not checked: an interval at or above the lifetime expires the code before the browser may poll once |
