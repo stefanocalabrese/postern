@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import enum
 import heapq
 import json as _json
 import os
@@ -222,6 +223,32 @@ class DeviceCodeStoreContended(RuntimeError):
 #: `DeviceCodeStoreContended`. Five is generous: a collision needs a live
 #: pairing already holding the same six-character code or 128-bit handle.
 _SECONDARY_KEY_ATTEMPTS = 5
+
+
+class ScanClaim(enum.Enum):
+    """What ``claim_scan`` found and did, in one transaction.
+
+    Exactly one per call. ``POST /scan`` maps each onto a response and an
+    ``audit_log.detail``; the mapping lives there, and this type says only
+    what happened to the row.
+    """
+
+    #: ``scanned_by`` was empty and the code unexpired and unapproved. It now
+    #: names this customer, with ``scanned_at`` set.
+    CLAIMED = "claimed"
+    #: This customer already holds the scan and the code is unapproved.
+    #: Nothing written. A retried ``POST /scan`` inside the token window.
+    ALREADY_MINE = "already_mine"
+    #: This customer holds the scan and has approved. Nothing written.
+    APPROVED_MINE = "approved_mine"
+    #: Another customer holds the scan and the code was never exchanged. The
+    #: pairing is revoked in the same transaction: the session-swap defence.
+    CONFLICT_REVOKED = "conflict_revoked"
+    #: Another customer holds the scan and the code was already exchanged.
+    #: Nothing written, because revoking a spent code recalls nothing.
+    CONFLICT_EXCHANGED = "conflict_exchanged"
+    #: The row is missing or expired.
+    GONE = "gone"
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +474,36 @@ class DeviceCodeStoreBase(ABC):
         """
 
     @abstractmethod
+    async def claim_scan(self, device_code: str, customer_ref: str) -> ScanClaim:
+        """Record the first scan of a code, or say why this one is not it.
+
+        A COMPARE-AND-SET, modelled on ``consume_device_code``: one
+        transaction reads the row, decides with ``_scan_verdict``, and writes
+        only for ``CLAIMED`` (``scanned_by``, ``scanned_at``) and
+        ``CONFLICT_REVOKED`` (the whole pairing, secondaries included). Every
+        other result writes nothing. The same atomicity contract as
+        ``consume_device_code`` holds, for the same reason: two phones
+        scanning one QR on two replicas must not both win.
+
+        Raises:
+            DeviceCodeStoreContended: if the transaction could not settle.
+        """
+
+    @abstractmethod
+    async def approve_scanned(self, device_code: str, customer_ref: str) -> bool:
+        """Approve a code for the customer who scanned it. ``True`` to one caller.
+
+        Sets ``approved``, ``approved_at`` and ``customer_ref`` only when the
+        code is unexpired, unapproved and ``scanned_by == customer_ref``,
+        in one compare-and-set; answers ``False`` otherwise and writes
+        nothing. It replaces the read-check-write that let two replicas both
+        approve and the last writer's ``customer_ref`` win.
+
+        Raises:
+            DeviceCodeStoreContended: if the transaction could not settle.
+        """
+
+    @abstractmethod
     async def revoke_device_code(self, device_code: str) -> None:
         """Remove a device code and both of its secondary lookups.
 
@@ -531,6 +588,42 @@ def _unused(generate: Callable[[], str], taken: dict[str, str], what: str) -> st
             return value
     raise DeviceCodeStoreContended(
         f"{_SECONDARY_KEY_ATTEMPTS} generated {what} values were all already in use"
+    )
+
+
+def _scan_verdict(code: DeviceCode, customer_ref: str) -> ScanClaim:
+    """Which ``ScanClaim`` a stored code earns, decided from the row alone.
+
+    One pure function both backends call inside their read-then-write, so the
+    two cannot disagree about the table in ``dev-docs/qr-page-spec.md``
+    section 1. A code can only be approved by the customer in ``scanned_by``
+    (``_may_approve``), so "scanned or approved by someone else" is the one
+    test ``scanned_by != customer_ref``.
+
+    AN UNSCANNED CODE THAT IS ALREADY APPROVED IS ``GONE``. Nothing this
+    release writes produces one; only a record the previous release approved
+    does, and that record has no ``qr_secret`` either, so ``POST /scan``
+    refuses it earlier. Answering ``GONE`` keeps this function total without
+    inventing a seventh result.
+    """
+    if code.is_expired:
+        return ScanClaim.GONE
+    if not code.scanned_by:
+        return ScanClaim.GONE if code.approved else ScanClaim.CLAIMED
+    if code.scanned_by == customer_ref:
+        return ScanClaim.APPROVED_MINE if code.approved else ScanClaim.ALREADY_MINE
+    if code.exchanged_at is None:
+        return ScanClaim.CONFLICT_REVOKED
+    return ScanClaim.CONFLICT_EXCHANGED
+
+
+def _may_approve(code: DeviceCode, customer_ref: str) -> bool:
+    """Whether ``approve_scanned`` may approve this code for this customer."""
+    return (
+        bool(customer_ref)
+        and not code.is_expired
+        and not code.approved
+        and code.scanned_by == customer_ref
     )
 
 
@@ -709,6 +802,35 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
             return False
         self._codes[device_code] = existing.__class__(
             **{**asdict_frozen(existing), "exchanged_at": datetime.now(UTC)}
+        )
+        return True
+
+    async def claim_scan(self, device_code: str, customer_ref: str) -> ScanClaim:
+        """Record the first scan, or say why this one is not it.
+
+        ATOMIC BY NOT YIELDING, for the reason ``consume_device_code`` gives:
+        no ``await`` between the read, ``_scan_verdict`` and the write, and
+        ``_forget`` is synchronous for exactly this caller.
+        """
+        existing = self._codes.get(device_code)
+        if existing is None:
+            return ScanClaim.GONE
+        claim = _scan_verdict(existing, customer_ref)
+        if claim is ScanClaim.CLAIMED:
+            self._codes[device_code] = dataclasses.replace(
+                existing, scanned_by=customer_ref, scanned_at=datetime.now(UTC)
+            )
+        elif claim is ScanClaim.CONFLICT_REVOKED:
+            self._forget(device_code)
+        return claim
+
+    async def approve_scanned(self, device_code: str, customer_ref: str) -> bool:
+        """Approve for the scanner, atomically by not yielding."""
+        existing = self._codes.get(device_code)
+        if existing is None or not _may_approve(existing, customer_ref):
+            return False
+        self._codes[device_code] = dataclasses.replace(
+            existing, approved=True, approved_at=datetime.now(UTC), customer_ref=customer_ref
         )
         return True
 
@@ -1073,6 +1195,102 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             _CLAIM_ATTEMPTS,
         )
         return False
+
+    async def claim_scan(self, device_code: str, customer_ref: str) -> ScanClaim:
+        """Record the first scan, or say why this one is not it.
+
+        ``WATCH``/``MULTI`` on the primary, the shape ``consume_device_code``
+        uses and for its reasons, with ``KEEPTTL`` on the claim so the scan
+        does not move the expiry. ``CONFLICT_REVOKED`` deletes the primary,
+        its index member and both secondary keys inside the same ``MULTI``,
+        so no replica can observe the pairing half-revoked. A value that will
+        not deserialize is ``GONE``: a row this store cannot read is not one
+        a scan may claim.
+        """
+        from redis.exceptions import WatchError
+
+        key = self._key(device_code)
+        for _ in range(_CLAIM_ATTEMPTS):
+            async with self._redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if raw is None:
+                        return ScanClaim.GONE
+                    try:
+                        code = DeviceCode.from_json(raw)
+                    except (KeyError, ValueError, TypeError):
+                        logger.warning(
+                            "refusing a scan of device code %s: its stored value will not "
+                            "deserialize",
+                            device_code,
+                        )
+                        return ScanClaim.GONE
+                    claim = _scan_verdict(code, customer_ref)
+                    if claim is ScanClaim.CLAIMED:
+                        scanned = dataclasses.replace(
+                            code, scanned_by=customer_ref, scanned_at=datetime.now(UTC)
+                        )
+                        pipe.multi()
+                        pipe.set(key, scanned.to_json(), keepttl=True)
+                        await pipe.execute()
+                    elif claim is ScanClaim.CONFLICT_REVOKED:
+                        pipe.multi()
+                        pipe.delete(key)
+                        pipe.zrem(self._index_key(), device_code)
+                        for secondary in self._secondary_keys(code):
+                            pipe.delete(secondary)
+                        await pipe.execute()
+                    return claim
+                except WatchError:
+                    continue
+        raise DeviceCodeStoreContended(
+            f"a scan claim was beaten by another writer {_CLAIM_ATTEMPTS} times"
+        )
+
+    async def approve_scanned(self, device_code: str, customer_ref: str) -> bool:
+        """Approve for the scanner, with the server settling the race.
+
+        The same ``WATCH``/``MULTI``/``KEEPTTL`` shape as ``claim_scan``. The
+        loser of two concurrent approvals retries, reads ``approved`` the
+        winner wrote, and answers ``False``.
+        """
+        from redis.exceptions import WatchError
+
+        key = self._key(device_code)
+        for _ in range(_CLAIM_ATTEMPTS):
+            async with self._redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if raw is None:
+                        return False
+                    try:
+                        code = DeviceCode.from_json(raw)
+                    except (KeyError, ValueError, TypeError):
+                        logger.warning(
+                            "refusing to approve device code %s: its stored value will not "
+                            "deserialize",
+                            device_code,
+                        )
+                        return False
+                    if not _may_approve(code, customer_ref):
+                        return False
+                    approved = dataclasses.replace(
+                        code,
+                        approved=True,
+                        approved_at=datetime.now(UTC),
+                        customer_ref=customer_ref,
+                    )
+                    pipe.multi()
+                    pipe.set(key, approved.to_json(), keepttl=True)
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+        raise DeviceCodeStoreContended(
+            f"an approval was beaten by another writer {_CLAIM_ATTEMPTS} times"
+        )
 
     async def revoke_device_code(self, device_code: str) -> None:
         """Remove a device code, its index member and its two secondary keys.

@@ -78,6 +78,7 @@ from postern_core.auth.device_codes import (
     DeviceCodeStoreContended,
     DeviceCodeStoreFull,
     RedisDeviceCodeStore,
+    ScanClaim,
     create_device_code_store,
 )
 from postern_core.auth.revocation import RedisRevocationStore, RevocationStoreUnavailable
@@ -807,6 +808,106 @@ async def test_a_generator_that_only_collides_raises_rather_than_looping(
     with pytest.raises(DeviceCodeStoreContended):
         await _create(store)
     assert await store._redis.zcard(store._index_key()) == 0, "nothing half-created was indexed"
+
+
+async def test_every_non_conflict_scan_result_against_a_real_server(stores: RedisStores) -> None:
+    """``claimed``, ``already_mine`` and ``approved_mine``, each read back
+    through a second connection, and none of them moves the expiry."""
+    writer = stores.device_codes()
+    reader = stores.device_codes()
+    code = await _create(writer, expires_in=120)
+    ttl_before = await writer._redis.ttl(writer._key(code.device_code))
+
+    assert await writer.claim_scan(code.device_code, OWNER) is ScanClaim.CLAIMED
+    seen = await reader.get_device_code(code.device_code)
+    assert seen is not None and seen.scanned_by == OWNER and seen.scanned_at is not None
+
+    assert await reader.claim_scan(code.device_code, OWNER) is ScanClaim.ALREADY_MINE
+    assert await reader.approve_scanned(code.device_code, OWNER) is True
+    assert await writer.claim_scan(code.device_code, OWNER) is ScanClaim.APPROVED_MINE
+
+    ttl_after = await writer._redis.ttl(writer._key(code.device_code))
+    assert ttl_before - 1 <= ttl_after <= ttl_before, "a claim or an approval moved the expiry"
+
+
+async def test_a_conflict_on_an_unexchanged_code_revokes_all_of_it(stores: RedisStores) -> None:
+    store = stores.device_codes()
+    code = await _create(store)
+    assert await store.claim_scan(code.device_code, OTHER) is ScanClaim.CLAIMED
+
+    assert await store.claim_scan(code.device_code, OWNER) is ScanClaim.CONFLICT_REVOKED
+
+    assert await store._redis.exists(store._key(code.device_code)) == 0
+    assert await store._redis.exists(store._user_code_key(code.user_code)) == 0
+    assert await store._redis.exists(store._handle_key(code.display_handle)) == 0
+    assert await store._redis.zscore(store._index_key(), code.device_code) is None
+
+
+async def test_a_conflict_on_an_exchanged_code_writes_nothing(stores: RedisStores) -> None:
+    store = stores.device_codes()
+    code = await _create(store)
+    await store.claim_scan(code.device_code, OTHER)
+    await store.approve_scanned(code.device_code, OTHER)
+    await store.consume_device_code(code.device_code)
+    before = await store._redis.get(store._key(code.device_code))
+
+    assert await store.claim_scan(code.device_code, OWNER) is ScanClaim.CONFLICT_EXCHANGED
+    assert await store._redis.get(store._key(code.device_code)) == before
+
+
+async def test_a_missing_or_expired_code_is_gone(stores: RedisStores) -> None:
+    store = stores.device_codes()
+    assert await store.claim_scan("never-existed", OWNER) is ScanClaim.GONE
+
+    code = await _create(store)
+    stale = dataclasses.replace(code, expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    await store._redis.set(store._key(code.device_code), stale.to_json(), keepttl=True)
+    assert await store.claim_scan(code.device_code, OWNER) is ScanClaim.GONE
+
+
+async def test_approve_scanned_refuses_every_shape_it_must(stores: RedisStores) -> None:
+    store = stores.device_codes()
+
+    unscanned = await _create(store)
+    assert await store.approve_scanned(unscanned.device_code, OWNER) is False
+
+    someone_elses = await _create(store)
+    await store.claim_scan(someone_elses.device_code, OTHER)
+    assert await store.approve_scanned(someone_elses.device_code, OWNER) is False
+
+    approved = await _create(store)
+    await store.claim_scan(approved.device_code, OWNER)
+    assert await store.approve_scanned(approved.device_code, OWNER) is True
+    assert await store.approve_scanned(approved.device_code, OWNER) is False
+
+    expired = await _create(store)
+    await store.claim_scan(expired.device_code, OWNER)
+    scanned = await store.get_device_code(expired.device_code)
+    assert scanned is not None
+    stale = dataclasses.replace(scanned, expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    await store._redis.set(store._key(expired.device_code), stale.to_json(), keepttl=True)
+    assert await store.approve_scanned(expired.device_code, OWNER) is False
+
+    for refused in (unscanned, someone_elses):
+        stored = await store.get_device_code(refused.device_code)
+        assert stored is not None and stored.approved is False and stored.customer_ref == ""
+
+
+async def test_two_concurrent_approvals_on_one_key_approve_exactly_once(
+    stores: RedisStores,
+) -> None:
+    """Two replicas, one Redis: the server refuses the second writer."""
+    first = stores.device_codes()
+    second = stores.device_codes()
+    code = await _create(first)
+    await first.claim_scan(code.device_code, OWNER)
+
+    won = await asyncio.gather(
+        first.approve_scanned(code.device_code, OWNER),
+        second.approve_scanned(code.device_code, OWNER),
+    )
+
+    assert sorted(won) == [False, True]
 
 
 # ---------------------------------------------------------------------------
