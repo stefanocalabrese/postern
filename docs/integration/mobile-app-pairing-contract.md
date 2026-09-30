@@ -15,7 +15,7 @@ Every statement below was checked against the code named beside it. Where the co
 3. On 200, the app shows the pairing confirmation screen built from the `/scan` response (section 5). The user confirms the pairing code matches their computer and answers "Did you start this on your own computer just now?".
 4. Only after that confirmation does the app run app identity verification, if the operator requires it for pairing.
 5. The app calls `POST /approve` with the `user_code` (section 6).
-6. The AI client's own poll of `POST /token` then receives a read token. The app plays no part in that step.
+6. The AI client's own poll of `POST /token` then receives no token: since 30 September 2026 it answers 503 `temporarily_unavailable` ("session token issuance is not enabled") until a layer-1 session token exists, because the read token it used to return was one the accounts backend accepts. The app plays no part in that step.
 
 Steps 3 and 4 are the app's alone: the server cannot see whether either happened (section 9).
 
@@ -149,7 +149,7 @@ Content-Type: application/json
 | `expires_at` | When the pairing expires, ISO 8601 with a UTC offset, possibly with fractional seconds. Set at creation, `POSTERN_DEVICE_CODE_TTL_SECONDS` after it (default 900 seconds). | Show the remaining time, and do not call `/approve` after it. |
 | `user_code` | The stored pairing code in `XXX-XXX` form. | Show this one, not the one parsed from the link, as the code the user compares. |
 
-**The scopes shown are not the scopes enforced.** Read from `services/confirm/device_auth.py`: the token `POST /token` mints after approval is always `aud=accounts.svc`, `scope=accounts:read`, 60-second expiry, whatever the pairing's `scopes` string says. The string is what the client asked for, stored and echoed back, and no code path in this repository reads it after `/scan`. The app can show it faithfully; it cannot promise the user that it describes the token.
+**The scopes shown are not the scopes enforced.** Read from `services/confirm/device_auth.py`: `POST /token` issues no token after approval since 30 September 2026, and the one it issued before that was always `aud=accounts.svc`, `scope=accounts:read`, 60-second expiry, whatever the pairing's `scopes` string said. The string is what the client asked for, stored and echoed back, and no code path in this repository reads it after `/scan`. The app can show it faithfully; it cannot promise the user that it describes any token.
 
 **Refusals.** Every error body is `{"error": ..., "error_description": ...}` except the 500. The `error_description` text is the server's English and may change; branch on `error` and on the status.
 

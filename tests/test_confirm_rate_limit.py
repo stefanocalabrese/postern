@@ -85,7 +85,7 @@ from services.confirm.rate_limit import (
     route_key,
 )
 from services.confirm.settings import ConfirmSettings
-from tests.device_grant_helpers import scan_in_store
+from tests.device_grant_helpers import ISSUANCE_DISABLED_BODY, scan_in_store
 from tests.test_device_grant import AUDIENCE, ISSUER, bearer
 
 # ---------------------------------------------------------------------------
@@ -847,8 +847,10 @@ class TestThroughTheAssembledApp:
         """The control must not break the flow it protects.
 
         A full device pairing: the browser starts one, the operator's app
-        approves it with a verified assertion, the browser exchanges it for a
-        read token. Three requests, nowhere near any limit.
+        approves it with a verified assertion, the browser polls ``/token``.
+        Three requests, nowhere near any limit. The poll reaches the handler
+        and gets the issuance-disabled 503 (no token since 2026-09-30), which
+        is not the limiter's 429.
         """
         app = _app(key_pair)
         async with _client(app) as client:
@@ -869,9 +871,8 @@ class TestThroughTheAssembledApp:
                 data={"grant_type": "device_code", "device_code": device["device_code"]},
             )
 
-        assert exchanged.status_code == 200
-        assert exchanged.json()["token_type"] == "Bearer"  # noqa: S105
-        assert "access_token" in exchanged.json()
+        assert exchanged.status_code == 503
+        assert exchanged.json() == ISSUANCE_DISABLED_BODY
         assert "write_token" not in exchanged.json()
 
     async def test_a_legitimate_pairing_still_completes_while_another_bucket_floods(
@@ -907,7 +908,10 @@ class TestThroughTheAssembledApp:
                 data={"grant_type": "device_code", "device_code": device["device_code"]},
                 headers=customer,
             )
-        assert exchanged.status_code == 200
+        # Reached the handler, not the flooded bucket's 429: the issuance-
+        # disabled 503 every approved code gets since 2026-09-30.
+        assert exchanged.status_code == 503
+        assert exchanged.json() == ISSUANCE_DISABLED_BODY
 
     async def test_a_full_store_answers_retryable_and_leaves_pairings_alone(
         self, key_pair: RSAKeyPair
@@ -1027,7 +1031,14 @@ class TestTheSlowDownInteraction:
         self, key_pair: RSAKeyPair
     ) -> None:
         """The per-code ``slow_down`` is still skipped once a code is approved,
-        and the thing that bounds an approved code is now the code itself.
+        and the thing that bounds an approved code is the code itself.
+
+        SINCE 2026-09-30 NO EXCHANGE SPENDS A CODE, because issuance is
+        disabled pending the layer-1 session token, so the first poll here gets
+        the issuance-disabled 503 and leaves the code unspent. The code is then
+        spent through the store, the state a build before 2026-09-30 left
+        behind and the session-token change will produce again, and the other
+        19 polls meet the spent-code refusal.
 
         THIS TEST ASSERTED THE OPPOSITE UNTIL 2026-09-26, and what it asserted
         was a defect rather than a property: 20 exchanges of one approved code,
@@ -1035,10 +1046,10 @@ class TestTheSlowDownInteraction:
         the address-bucket limit was "loose" and each poll cost "an RSA
         signature and a revocation lookup". It cost a READ TOKEN as well.
         ``dev-docs/decisions/0012-device-code-single-use.md`` carries what that
-        was worth and why the code is spent by the exchange that succeeds on it.
+        was worth and why a code is worth at most one token.
 
-        Two things survive the change and both are still worth pinning here,
-        because they are this file's subject and not that record's. The per-code
+        Two things survive and both are still worth pinning here, because they
+        are this file's subject and not that record's. The per-code
         ``slow_down`` block runs only while a code is UNAPPROVED, so none of
         these 20 requests is answered with it however fast they arrive. And 20
         requests are far inside the 300-per-minute bucket, so the limiter is not
@@ -1054,10 +1065,15 @@ class TestTheSlowDownInteraction:
                 headers=bearer(key_pair),
             )
             body = {"grant_type": "device_code", "device_code": device["device_code"]}
-            answers = [await client.post("/token", data=body) for _ in range(20)]
+            answers = [await client.post("/token", data=body)]
+            assert await app.state.device_code_store.consume_device_code(device["device_code"]), (
+                "the refused first poll had already spent the code"
+            )
+            answers += [await client.post("/token", data=body) for _ in range(19)]
 
         statuses = [r.status_code for r in answers]
-        assert statuses == [200] + [400] * 19
+        assert statuses == [503] + [400] * 19
+        assert answers[0].json() == ISSUANCE_DISABLED_BODY
         errors = [r.json()["error"] for r in answers[1:]]
         assert errors == ["invalid_grant"] * 19
         assert 429 not in statuses, "the address-bucket limit fired inside its own budget"

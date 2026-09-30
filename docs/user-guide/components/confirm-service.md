@@ -61,7 +61,8 @@ requirement.
 ### Key split exception
 
 The confirm service holds **both** read and write keys. This is a deliberate, documented
-exception: the device grant needs the read key to mint the browser's access token. No
+exception: the device grant used the read key to mint the browser's token, and the key
+stays wired while that issuance is disabled (see "Token issuance is disabled" below). No
 other code path hands one process both keys for general use, the separation is preserved
 at startup.
 
@@ -78,7 +79,7 @@ Implements RFC 8628 Device Authorization Grant with QR pairing codes.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `POST` | `/device_authorization` | public | Generate device code + user_code (pairing code) |
-| `POST` | `/token` | public | Exchange device code for a read token (polling; error until approved) |
+| `POST` | `/token` | public | The browser's poll: an error until approved, then 503 (issuance disabled) |
 | `GET` | `/verify` | public | The browser's pairing page: pairing code, QR, app link |
 | `GET` | `/verify/qr.svg` | public, same-origin only | The QR the page embeds, rotated every two seconds |
 | `GET` | `/verify/state` | public, same-origin only | What the page's script polls: pending, scanned, or 404 |
@@ -127,8 +128,27 @@ exchanged revokes it (`400 scan_conflict`).
 ```
 5. Browser → POST /token (grant_type=device_code, device_code=...)
    ← 400 authorization_pending (until approved)
-   ← 200 { access_token, token_type, expires_in } (after approval)
+   ← 503 { "error": "temporarily_unavailable",
+           "error_description": "session token issuance is not enabled" }
+     (after approval)
 ```
+
+### Token issuance is disabled
+
+Since 30 September 2026 `/token` returns no token. For an approved, unexpired
+code whose customer is not revoked it answers the 503 above, spends nothing
+(the code stays unspent, so every poll gets the same answer), and writes one
+`audit_log` row with `detail = 'issuance_disabled'`. A revoked customer still
+gets `400 access_denied`, because the ZT-7 check runs first.
+
+Until then it returned a read token: `aud=accounts.svc`, `scope=accounts:read`,
+`act.sub=svc:postern`, 60 seconds, signed with the read key. That is a layer-2
+backend token (handoff §7.1). Under Vault both services sign with transit key
+`postern-read`, which `services/api` publishes at its JWKS and Istio trusts, so
+any client that completed a pairing, a phishing client included, held a token
+the accounts backend accepts. The browser should get a layer-1 session token
+that only this deployment's MCP server accepts. That is a separate, later
+change; until it lands, a completed pairing yields nothing the browser can use.
 
 `/scan` and `/approve` return **401** for a missing or unverifiable assertion and
 **403** if the assertion's `sub` is not a `cust_...` reference or the customer is
@@ -160,7 +180,7 @@ class DeviceCode:
     approved: bool            # Whether mobile app has approved
     approved_at: datetime | None  # Approval timestamp
     customer_ref: str         # Verified assertion `sub`, empty until approved
-    exchanged_at: datetime | None  # When /token spent it
+    exchanged_at: datetime | None  # When /token spent it (nothing spends it since 2026-09-30)
     display_handle: str       # 128 random bits; keys the page, useless at /token
     qr_secret: bytes          # Per-pairing HMAC key for the QR's rotation token
     creator_ip: str | None    # Where /device_authorization came from
@@ -171,7 +191,8 @@ class DeviceCode:
 `customer_ref` used to be `client_id`, reused for two purposes. That overload was
 the enabling half of audit finding C-01: `/token` minted from a field the caller
 of `/device_authorization` had populated. They are separate fields now, and
-`/token` reads `customer_ref`, which only a verified approval ever writes.
+`/token` reads `customer_ref`, which only a verified approval ever writes, for
+its ZT-7 check and its audit row.
 
 The `user_code` uses an ambiguous-character-free alphabet:
 `23456789ABCDEFGHJKLMNPQRSTUVWXYZ` (no I, L, O, 0, 1 to prevent confusion).

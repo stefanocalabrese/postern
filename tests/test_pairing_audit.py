@@ -10,8 +10,11 @@ none: an attacker who paired a rogue client was visible only in the payments
 that followed it, and only if any followed.
 
 THE CHAIN, AND WHICH LINKS ARE RECORDED. ``POST /approve`` and
-``POST /token`` each write one row, so a pairing and the token minted off the
-back of it are both countable and join on ``arguments['device_code_handle']``.
+``POST /token`` each write one row, so a pairing and each exchange attempted
+off the back of it are both countable and join on
+``arguments['device_code_handle']``. Since 2026-09-30 the exchange row is the
+``issuance_disabled`` refusal, because ``POST /token`` mints nothing until the
+layer-1 session token exists.
 ``POST /device_authorization`` writes none, deliberately, and
 ``test_device_authorization_writes_nothing`` is where that is asserted rather
 than assumed. So is most of ``POST /token``: at the configured 5-second poll
@@ -78,6 +81,7 @@ from services.confirm.audit import (
     DETAIL_DEVICE_CODE_NOT_FOUND,
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
+    DETAIL_ISSUANCE_DISABLED,
     DETAIL_NOT_SCANNED,
     DETAIL_REVOKED,
     DETAIL_SCANNED_BY_OTHER,
@@ -92,7 +96,12 @@ from services.confirm.audit import (
 )
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
-from tests.device_grant_helpers import overwrite_in_memory, scan_in_store
+from tests.device_grant_helpers import (
+    ISSUANCE_DISABLED_BODY,
+    jwt_shaped_strings,
+    overwrite_in_memory,
+    scan_in_store,
+)
 from tests.fixtures.append_only_bypass import (
     delete_audit_rows_by_bypassing_the_append_only_triggers,
 )
@@ -931,7 +940,7 @@ async def test_a_failed_withdrawal_after_an_ambiguous_write_names_the_store_caus
 
 
 # ---------------------------------------------------------------------------
-# 5. POST /token -- the mint, which is the middle link of the chain.
+# 5. POST /token -- the middle link of the chain, refused since 2026-09-30.
 # ---------------------------------------------------------------------------
 
 
@@ -966,26 +975,78 @@ async def paired(app: Starlette, key_pair: RSAKeyPair) -> DeviceCode:
     return code
 
 
+async def test_an_approved_code_is_refused_503_unspent_and_recorded_as_issuance_disabled(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """Issuance is disabled until the layer-1 session token lands.
+
+    The token this endpoint used to return was a layer-2 backend token, signed
+    with the read key ``services/api`` publishes, so a public client that
+    completed a pairing held a credential the accounts backend accepts. Three
+    properties of the refusal that replaced it: the body is the fixed 503, the
+    minter is never called, and the code is not spent -- a second poll gets
+    the same answer and a second row, not the spent-code refusal.
+    """
+    code = await paired(app, key_pair)
+
+    class MustNotBeCalled:
+        """Stands in for the read minter. A stand-in rather than
+        ``patch.object``, because ``InternalTokenMinter`` is a frozen
+        dataclass."""
+
+        calls = 0
+
+        def mint(self, **kwargs: Any) -> str:
+            MustNotBeCalled.calls += 1
+            raise AssertionError("POST /token reached the read minter")
+
+    app.state.read_minter = MustNotBeCalled()
+
+    first = await exchange(app, code.device_code)
+    assert first.status_code == 503, first.text
+    assert first.json() == ISSUANCE_DISABLED_BODY
+
+    written = await rows(clean)
+    assert [r.tool_name for r in written] == [PAIRING_TOOL_NAME, TOKEN_TOOL_NAME]
+    refusal = written[1]
+    assert refusal.outcome == OUTCOME_RAISED
+    assert refusal.detail == DETAIL_ISSUANCE_DISABLED
+    assert refusal.customer_ref == CUSTOMER
+    assert refusal.arguments["route"] == TOKEN_ROUTE
+    assert refusal.arguments["device_code_handle"] == handle_of(code.device_code)
+
+    stored = await unwrap(app.state.device_code_store, code.device_code)
+    assert stored.exchanged_at is None, "a refused exchange spent the device code"
+
+    second = await exchange(app, code.device_code)
+    assert second.status_code == 503, second.text
+    assert second.json() == ISSUANCE_DISABLED_BODY
+    assert [r.detail for r in await rows(clean)][1:] == [DETAIL_ISSUANCE_DISABLED] * 2
+    assert MustNotBeCalled.calls == 0
+
+
 async def test_a_token_exchange_writes_one_row(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """The mint, which until now was the one link of the chain with no record.
+    """The exchange, which until 2026-09-26 was the one link with no record.
 
     ``tool_name`` is its own literal rather than the pairing's, so an operator
-    can ask "which pairings completed" and "which tokens were issued"
+    can ask "which pairings completed" and "which exchanges were attempted"
     separately. Both are ``device_grant.*``, neither is a registered MCP tool.
+    Since 2026-09-30 the row records the issuance-disabled refusal, because no
+    token is minted.
     """
     code = await paired(app, key_pair)
 
     resp = await exchange(app, code.device_code)
-    assert resp.status_code == 200
-    assert "access_token" in resp.json()
+    assert resp.status_code == 503
+    assert "access_token" not in resp.json()
 
     written = await rows(clean)
     assert [r.tool_name for r in written] == [PAIRING_TOOL_NAME, TOKEN_TOOL_NAME]
     mint = written[1]
-    assert mint.outcome == OUTCOME_RETURNED
-    assert mint.detail is None
+    assert mint.outcome == OUTCOME_RAISED
+    assert mint.detail == DETAIL_ISSUANCE_DISABLED
     assert mint.customer_ref == CUSTOMER
     assert mint.reaching_at is None
     assert mint.arguments["route"] == TOKEN_ROUTE
@@ -1017,18 +1078,19 @@ async def test_the_two_rows_of_one_pairing_join_on_the_device_code_handle(
     assert pairing.customer_ref == mint.customer_ref == CUSTOMER
 
 
-async def test_the_row_names_no_part_of_the_minted_token(
+async def test_the_token_row_names_no_credential(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """Nothing of the credential this endpoint issues reaches the table.
+    """Nothing of a credential reaches the table from the token endpoint.
 
-    Asserted segment by segment rather than on the whole string: a JWT is
-    three base64url parts joined by dots, and a row carrying only the payload
-    would pass a naive ``token not in row`` check while holding the customer
-    reference, the audience and the scope in a form anybody can decode.
+    Until 2026-09-30 this took the minted token apart segment by segment and
+    asserted none of it was on the row. No token is minted now, so the body
+    is asserted to hold nothing JWT-shaped, and the one credential this
+    request did carry, the device code, is asserted absent from the row.
     """
     code = await paired(app, key_pair)
-    token: str = (await exchange(app, code.device_code)).json()["access_token"]
+    resp = await exchange(app, code.device_code)
+    assert jwt_shaped_strings(resp.text) == []
 
     _, mint = await rows(clean)
     serialised = json.dumps(
@@ -1039,9 +1101,7 @@ async def test_the_row_names_no_part_of_the_minted_token(
             "client_id": mint.client_id,
         }
     )
-    assert token not in serialised
-    for segment in token.split("."):
-        assert segment not in serialised
+    assert jwt_shaped_strings(serialised) == []
     assert code.device_code not in serialised
 
 
@@ -1239,7 +1299,7 @@ async def test_a_stored_identity_that_is_not_a_customer_reference_is_recorded(
 
 
 # ---------------------------------------------------------------------------
-# 8. Fail closed at a mint, which cannot be unminted.
+# 8. Fail closed at the token endpoint (decision 0006).
 # ---------------------------------------------------------------------------
 
 
@@ -1247,6 +1307,11 @@ async def test_a_token_that_cannot_be_audited_is_never_returned(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
     """The ordering decision, asserted on the RESPONSE BODY rather than the status.
+
+    Since 2026-09-30 the exchange mints nothing, so what fails closed here is
+    the issuance-disabled refusal: its row cannot be written, the request
+    answers 500, and nothing reaches the caller. The order below is kept
+    because the session-token change will mint here again.
 
     ``/approve`` fails closed by withdrawing the pairing, because the pairing
     is in this deployment's own store. A mint cannot be withdrawn: the token is
@@ -1274,17 +1339,17 @@ async def test_a_token_that_cannot_be_audited_is_never_returned(
     assert await rows(clean) == []
 
 
-async def test_a_mint_that_fails_leaves_no_row_claiming_one(
+async def test_a_signing_key_that_would_fail_is_never_reached(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """The other half of the ordering, and the one prose alone cannot pin.
+    """The minter is wired and not called, so its failure cannot surface.
 
-    Writing the row BEFORE the mint is the obvious alternative and it has this
-    defect: a signing key source that raises leaves a durable row saying a
-    token was issued when none was. That is the direction this repository
-    refuses on a success row -- ``outcome='returned'`` with a NULL ``detail``
-    is a claim that the work finished -- so the row goes after the mint, and a
-    mint that raises produces a ``raised`` row naming the exception instead.
+    Until 2026-09-30 this asserted that a mint which raised left a ``raised``
+    row naming the exception rather than a ``returned`` row claiming a token.
+    Issuance is disabled now, so a minter that raises on every call is the
+    sharpest witness that ``/token`` never reaches it: the answer is the
+    issuance-disabled 503 and the row says so, with no success row claiming
+    a mint.
     """
     code = await paired(app, key_pair)
     await _wipe(clean)
@@ -1301,12 +1366,12 @@ async def test_a_mint_that_fails_leaves_no_row_claiming_one(
 
     resp = await exchange(app, code.device_code, as_a_server_would=True)
 
-    assert resp.status_code == 500
-    assert "access_token" not in resp.text
+    assert resp.status_code == 503
+    assert resp.json() == ISSUANCE_DISABLED_BODY
 
     row = await one_row(clean)
     assert row.outcome == OUTCOME_RAISED, "a row claimed a mint that never happened"
-    assert row.detail == "RuntimeError"
+    assert row.detail == DETAIL_ISSUANCE_DISABLED
     assert row.customer_ref == CUSTOMER
 
 
@@ -1337,9 +1402,14 @@ async def test_a_replay_of_a_spent_device_code_is_recorded(
     deletes the store row, a replay is then answered by the unknown-code
     branch before any identity is read, and this row is the thing that would
     be lost.
+
+    SPENT THROUGH THE STORE since 2026-09-30, because no exchange spends a
+    code any more; a code an earlier build spent is how this row still
+    arises, in a shared store that outlives the deploy.
     """
     code = await paired(app, key_pair)
-    assert (await exchange(app, code.device_code)).status_code == 200
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    assert await store.consume_device_code(code.device_code) is True
     await _wipe(clean)
 
     replay = await exchange(app, code.device_code)
@@ -1369,7 +1439,8 @@ async def test_a_replayed_code_produces_one_row_per_attempt_under_one_handle(
     distinct ``call_id`` values, because three requests arrived.
     """
     code = await paired(app, key_pair)
-    assert (await exchange(app, code.device_code)).status_code == 200
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    assert await store.consume_device_code(code.device_code) is True
     await _wipe(clean)
 
     for _ in range(3):

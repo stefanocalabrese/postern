@@ -114,9 +114,11 @@ writes nothing.
   that reaches an identity check: success, a revoked customer, a `sub` that isn't
   a valid customer reference, an unknown device code, a code already approved, and
   both halves of a wrong pairing code.
-- `POST /token` (the browser's exchange) writes on a successful mint, a revoked
-  customer, a stored identity that fails to parse, and a revocation store that
-  could not answer. Most of its exits — an unknown or expired code, `slow_down`,
+- `POST /token` (the browser's exchange) writes on an approved code refused
+  because issuance is disabled (`issuance_disabled`, one row per poll, since
+  30 September 2026 no token is minted), a revoked customer, a stored identity
+  that fails to parse, a revocation store that could not answer, and a spent
+  code. Most of its exits — an unknown or expired code, `slow_down`,
   `authorization_pending` — write nothing, because none of them has read a
   customer off the code yet.
 - `POST /device_authorization` (creating the code) writes nothing at all: it

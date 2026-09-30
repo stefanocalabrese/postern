@@ -455,14 +455,15 @@ async def test_session_swap_after_the_exchange_is_refused_with_nothing_revoked(
 ) -> None:
     """The window this spec does not close: B's token is already out. The
     conflict is refused and recorded; the spent row is left exactly as it was,
-    because revoking it would recall nothing."""
+    because revoking it would recall nothing.
+
+    SPENT THROUGH THE STORE since 2026-09-30: ``POST /token`` spends nothing
+    while issuance is disabled, so the spent state is reached the way an
+    earlier build left it, and the way the session-token change will again."""
     code = await start(app)
     assert (await scan(app, key_pair, BOB, code)).status_code == 200
     assert await device_store_of(app).approve_scanned(code.device_code, BOB) is True
-    exchanged = await post(
-        app, "/token", form={"grant_type": "device_code", "device_code": code.device_code}
-    )
-    assert exchanged.status_code == 200
+    assert await device_store_of(app).consume_device_code(code.device_code) is True
     before = await device_store_of(app).get_device_code(code.device_code)
 
     resp = await scan(app, key_pair, ALICE, code)

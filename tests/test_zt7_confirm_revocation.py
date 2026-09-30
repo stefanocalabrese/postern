@@ -62,7 +62,7 @@ from services.confirm.audit import DETAIL_REVOKED, UNRESOLVED_TOOL_NAME
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
-from tests.device_grant_helpers import scan_in_store
+from tests.device_grant_helpers import ISSUANCE_DISABLED_BODY, scan_in_store
 from tests.fixtures.append_only_bypass import (
     delete_audit_rows_by_bypassing_the_append_only_triggers,
 )
@@ -661,7 +661,7 @@ async def test_the_cli_restores_and_the_confirm_replica_approves_again(
 
 
 async def paired(app: Starlette, key_pair: RSAKeyPair, customer: str) -> str:
-    """Drive a real device pairing to the point where ``/token`` would mint.
+    """Drive a real device pairing to the point where ``/token`` used to mint.
 
     Every step but the scan is the production path: the browser opens the
     grant, the banking app approves it with a verified assertion, and the
@@ -689,20 +689,19 @@ async def paired(app: Starlette, key_pair: RSAKeyPair, customer: str) -> str:
 async def test_a_revoked_customers_device_code_exchange_mints_nothing(
     app: Starlette, key_pair: RSAKeyPair
 ) -> None:
-    """Verification step 4, first half: ``/token`` refuses at the mint.
+    """Verification step 4, first half: ``/token`` refuses a revoked customer.
 
-    ``services/api`` would refuse the minted token on use, so the practical
-    exposure is narrow -- but ZT-7's bar is that a revoked identity stops
-    OBTAINING access, and a freshly signed token is access obtained. Both
-    directions in one test: one device code yields a token before the
-    revocation, another yields nothing after it.
+    ZT-7's bar is that a revoked identity stops OBTAINING access. Since
+    2026-09-30 ``/token`` issues nothing to anyone (issuance is disabled
+    pending the layer-1 session token), so what this pins is the ORDER: the
+    revocation check still runs before the issuance refusal, so a revoked
+    customer's code is answered ``access_denied`` and not the 503 every other
+    approved code gets. Both directions in one test: before the revocation a
+    code gets the issuance-disabled 503, after it another gets
+    ``access_denied``.
 
-    TWO CODES, WHERE THIS WAS ONE UNTIL 2026-09-26, and the change is forced
-    rather than stylistic. A successful exchange now spends the code
-    (`dev-docs/decisions/0012-device-code-single-use.md`), so re-presenting the
-    one that was served is refused ``invalid_grant`` for being spent, before the
-    ZT-7 check it is here to exercise is reached. Reusing it would leave this
-    test passing on a build with no revocation check at all. Both codes are
+    TWO CODES, kept from when a successful exchange spent the code
+    (`dev-docs/decisions/0012-device-code-single-use.md`). Both codes are
     paired BEFORE the revocation because they have to be: ``POST /approve``
     refuses a revoked customer too, one step earlier, which is what
     ``test_a_revoked_customer_cannot_approve_a_device_pairing_at_all`` below
@@ -714,8 +713,8 @@ async def test_a_revoked_customers_device_code_exchange_mints_nothing(
     served = await post_form(
         app, "/token", {"grant_type": "device_code", "device_code": served_code}
     )
-    assert served.status_code == 200, served.text
-    assert served.json()["access_token"]
+    assert served.status_code == 503, served.text
+    assert served.json() == ISSUANCE_DISABLED_BODY
 
     await store_of(app).revoke_customer_client(customer_ref=OWNER, client_id=CLIENT)
 
@@ -839,6 +838,9 @@ async def test_an_unreachable_store_makes_the_token_endpoint_retryable_not_denie
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "temporarily_unavailable"
     assert "access_token" not in response.json()
+    # The outage's own 503, not the issuance-disabled one: the revocation
+    # check still runs before the issuance refusal.
+    assert response.json() != ISSUANCE_DISABLED_BODY
 
 
 # ---------------------------------------------------------------------------

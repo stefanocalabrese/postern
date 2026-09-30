@@ -190,6 +190,7 @@ __all__ = [
     "DETAIL_DEVICE_CODE_SPENT",
     "DETAIL_DEVICE_NOT_ENROLLED",
     "DETAIL_EXPIRED",
+    "DETAIL_ISSUANCE_DISABLED",
     "DETAIL_INVALID_SUBJECT",
     "DETAIL_MALFORMED_BODY",
     "DETAIL_MISSING_SIGNATURE",
@@ -900,6 +901,23 @@ SCAN_ROUTE = "/scan"
 #: finding C-01. Those are different incidents with different first responders,
 #: and one literal would make a reader guess which a row describes.
 DETAIL_STORED_IDENTITY_MALFORMED = "stored_identity_malformed"
+#: ``POST /token`` was presented an approved, unexpired, unspent device code
+#: for a customer who is not revoked, and refused to issue anything, because
+#: issuance is disabled (since 2026-09-30) until the layer-1 session token
+#: exists.
+#:
+#: WHY IT IS DISABLED. The token this endpoint used to return was a layer-2
+#: backend token: ``aud=accounts.svc``, ``scope=accounts:read``,
+#: ``act.sub=svc:postern``, signed with the READ key. Under Vault both
+#: services sign with the same transit key, which ``services/api`` publishes
+#: at its JWKS and Istio trusts, so any client that completed a pairing held a
+#: credential the accounts backend accepts. That conflates handoff §7.1's two
+#: authentication layers. The row keeps the event countable: every one of
+#: these is a pairing that completed and a client that got nothing for it.
+#:
+#: THE CODE IS NOT SPENT on this refusal, so a browser that keeps polling
+#: writes one of these rows per poll, each under the same device code handle.
+DETAIL_ISSUANCE_DISABLED = "issuance_disabled"
 
 # THE CLOSED VOCABULARY OF ``detail`` ON A PAIRING ROW, and the same
 # ``refusal_reason`` gap applies: ``REFUSAL_REASONS`` is closed at
