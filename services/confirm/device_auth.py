@@ -977,7 +977,8 @@ def _unpairable_response() -> JSONResponse:
     ``POST /scan`` gives it for an unknown or expired code, an approved one,
     and a malformed or forged rotation token; ``POST /approve`` for an
     unknown or expired code, one nobody scanned, one another customer
-    scanned, and one already approved. Byte for byte the same, for the reason
+    scanned, and one already approved for somebody else. Byte for byte the
+    same, for the reason
     ``_unredeemable_response`` gives at ``POST /token``: the distinction the
     caller does not get is exactly the one an operator needs, so it lives in
     ``audit_log.detail`` and nowhere a caller can read it.
@@ -986,6 +987,15 @@ def _unpairable_response() -> JSONResponse:
     "invalid, expired, revoked", which is true of every case above.
     """
     return _error(400, "invalid_grant", "this pairing cannot be completed")
+
+
+def _approved_response() -> JSONResponse:
+    """``POST /approve``'s one success body, for the approval and its repeat.
+
+    One function so the approver's retry cannot drift from the first answer:
+    the app is told the same thing both times because the same thing is true.
+    """
+    return JSONResponse(status_code=200, content={"status": "approved"})
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1004,7 +1014,7 @@ class _Pairing:
     response: JSONResponse
     #: The ``DETAIL_*`` literal for a refusal that concluded something about
     #: a customer or a device code. ``None`` on the exit that granted the
-    #: pairing.
+    #: pairing and on the approver's repeat, which ``repeated`` names instead.
     detail: str | None = None
     #: Whether this exit owes a row at all. ``False`` is the other half of
     #: ``PairingAudit``'s rule: a malformed request is answered by looking at
@@ -1012,8 +1022,14 @@ class _Pairing:
     recorded: bool = True
     #: The device code this exit APPROVED, so the caller can withdraw the
     #: pairing if the row cannot be written. ``None`` wherever nothing was
-    #: approved, which is every exit but one.
+    #: approved, which is every exit but one. ``None`` on the approver's
+    #: repeat too: it approved nothing, and the approval it reports was
+    #: recorded by the first request's row, so a failed second row withdraws
+    #: nothing.
     approved_device_code: str | None = None
+    #: The approver's repeat of an approval that stands, answered with the
+    #: first one's 200 and recorded by ``PairingAudit.approved_again``.
+    repeated: bool = False
 
 
 async def approve_callback(request: Request) -> JSONResponse:
@@ -1027,7 +1043,9 @@ async def approve_callback(request: Request) -> JSONResponse:
             ``XXX-XXX`` or bare. A body that also carries ``device_code`` is
             refused.
 
-    Response (200): ``{"status": "approved"}``
+    Response (200): ``{"status": "approved"}``, for the approval and, since
+        2026-09-30, for the approving customer's repeat of it while it is
+        unexpired (see ``_answer_refused_approval``).
     Response (400): ``invalid_request`` for a malformed body or one still
         carrying ``device_code``, and the one ``invalid_grant`` body of
         ``_unpairable_response`` for every refusal that concerns a pairing.
@@ -1121,7 +1139,9 @@ async def approve_callback(request: Request) -> JSONResponse:
         return outcome.response
 
     try:
-        if outcome.detail is None:
+        if outcome.repeated:
+            await audit.approved_again()
+        elif outcome.detail is None:
             await audit.approved()
         else:
             await audit.refused(outcome.detail)
@@ -1236,7 +1256,10 @@ async def _pair(
     ``customer_ref`` won. ``approve_scanned`` settles it inside the store: it
     approves only a code that is unexpired, unapproved and scanned by this
     same customer, and answers ``True`` to one caller. What this function
-    reads after a refusal labels the audit row and decides nothing.
+    reads after a refusal writes nothing and approves nothing: it labels the
+    audit row, and since 2026-09-30 it also picks the approver's repeat out
+    of the refusals and answers it with the success body
+    (``_answer_refused_approval``).
     """
     try:
         customer = CustomerRef(value=subject)
@@ -1370,28 +1393,36 @@ async def _pair(
         # makes "no row" mean "no pairing" on every path but one: a hard
         # process kill between this line and the INSERT, which `PairingAudit`
         # names as the residual.
-        return _Pairing(
-            JSONResponse(status_code=200, content={"status": "approved"}),
-            approved_device_code=existing.device_code,
-        )
+        return _Pairing(_approved_response(), approved_device_code=existing.device_code)
 
-    return _Pairing(
-        _unpairable_response(),
-        await _approve_refusal_detail(store, existing.device_code, customer.value),
-    )
+    return await _answer_refused_approval(store, existing.device_code, customer.value)
 
 
-async def _approve_refusal_detail(
+async def _answer_refused_approval(
     store: DeviceCodeStoreBase, device_code_value: str, customer_ref: str
-) -> str:
-    """Which ``DETAIL_*`` a refused ``approve_scanned`` is recorded under.
+) -> _Pairing:
+    """What a refused ``approve_scanned`` answers, and under which ``detail``.
 
     Read from the row AFTER the compare-and-set refused, in the order
     ``dev-docs/qr-page-spec.md`` section 6 fixes: gone or expired by now,
     then nobody scanned it, then somebody else did, then it is already
-    approved. The read decides nothing -- the refusal has happened -- so the
-    race between the two reads can only move a row from one label to another,
-    never approve anything.
+    approved. The read writes nothing -- the refusal has happened -- so the
+    race between the two reads can only move a row from one answer to
+    another, never approve anything.
+
+    ONE EXIT ANSWERS 200, SINCE 2026-09-30: a row that is approved, unexpired,
+    scanned by this customer and approved FOR this customer. That is the
+    approver retrying, normally because the first 200 was lost, and until
+    then the retry got the one ``invalid_grant`` body, so the app could not
+    tell "your approval stands" from "refused". It now gets the first
+    request's body back, ``PairingAudit.approved_again`` records it, and the
+    store is not written. Nothing leaks: only the customer who scanned and
+    approved the code can reach this answer, and they know the pairing
+    exists. Every other refusal keeps the identical 400.
+
+    The race runs the harmless way here. A same-customer approval that
+    commits between the refused compare-and-set and this read is an approval
+    that stands, and reporting it as one is true.
 
     A ROW THAT PASSES ALL FOUR is scanned by this customer, unexpired and
     unapproved, which is what ``approve_scanned`` approves -- so at the moment
@@ -1406,8 +1437,10 @@ async def _approve_refusal_detail(
     A RE-READ THAT RAISES is labelled ``DETAIL_NOT_SCANNED`` for the same
     reason: the refusal has happened, the label only describes it, and a
     store outage here must not turn the one ``invalid_grant`` into a 500.
-    The exception's type goes to a WARNING instead. ``Exception`` and not
-    ``BaseException``, so a cancelled request still stops.
+    Nor into the 200: that answer is earned only by a row this read
+    returned, so without one the approver's repeat stays the identical
+    refusal. The exception's type goes to a WARNING instead. ``Exception``
+    and not ``BaseException``, so a cancelled request still stops.
     """
     try:
         row = await store.get_device_code(device_code_value)
@@ -1417,16 +1450,18 @@ async def _approve_refusal_detail(
             "recording it as not_scanned",
             type(exc).__name__,
         )
-        return DETAIL_NOT_SCANNED
+        return _Pairing(_unpairable_response(), DETAIL_NOT_SCANNED)
     if row is None or row.is_expired:
-        return DETAIL_USER_CODE_NOT_FOUND
+        return _Pairing(_unpairable_response(), DETAIL_USER_CODE_NOT_FOUND)
     if not row.scanned_by:
-        return DETAIL_NOT_SCANNED
+        return _Pairing(_unpairable_response(), DETAIL_NOT_SCANNED)
     if row.scanned_by != customer_ref:
-        return DETAIL_SCANNED_BY_OTHER
+        return _Pairing(_unpairable_response(), DETAIL_SCANNED_BY_OTHER)
+    if row.approved and row.customer_ref == customer_ref:
+        return _Pairing(_approved_response(), repeated=True)
     if row.approved:
-        return DETAIL_ALREADY_APPROVED
-    return DETAIL_NOT_SCANNED
+        return _Pairing(_unpairable_response(), DETAIL_ALREADY_APPROVED)
+    return _Pairing(_unpairable_response(), DETAIL_NOT_SCANNED)
 
 
 # ---------------------------------------------------------------------------

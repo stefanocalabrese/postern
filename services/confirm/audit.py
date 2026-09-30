@@ -1018,6 +1018,16 @@ DETAIL_DEVICE_CODE_SPENT = "device_code_spent"
 #: request: at ``POST /approve`` when the code is already approved, and at
 #: ``POST /scan`` through ``ScanClaim.APPROVED_MINE``.
 #:
+#: TWO OUTCOMES SINCE 2026-09-30, one per route. At ``POST /scan`` it is still
+#: a refusal (``outcome='raised'``). At ``POST /approve`` it is the one
+#: ``detail`` a ``returned`` row carries: the approver's retry, typically
+#: after a lost 200, is answered with that same 200, because the approval it
+#: asks for stands and only the customer who scanned and approved the code can
+#: reach this answer. ``returned`` because the request succeeded; a non-NULL
+#: ``detail`` because a first approval (NULL) must stay countable apart from
+#: its repeats, and ``WHERE outcome = 'returned' AND detail IS NULL`` is still
+#: exactly one row per pairing granted. The repeat writes nothing to the store.
+#:
 #: REWRITTEN ON 2026-09-30, because the rationale it carried stopped being
 #: possible. It used to be a caller holding an assertion of their own swapping
 #: ``customer_ref`` to themselves in the window before the browser polls
@@ -1184,7 +1194,9 @@ class PairingAudit:
     What the rule ADMITS, on each endpoint. At ``POST /approve``: a revoked
     customer, a subject that is not a customer reference, a ``user_code``
     naming no live pairing, a code nobody scanned, a code another customer
-    scanned, and a code already approved.
+    scanned, a code already approved for somebody else, and the approver's
+    own repeat of an approval that stands, which is answered 200 and
+    recorded as ``returned`` with ``DETAIL_ALREADY_APPROVED``.
     At ``POST /token``: the mint itself, a revoked customer, a stored identity
     that will not parse, and a revocation store that could not answer -- four
     exits, all of them past the point where the code named a customer.
@@ -1383,6 +1395,16 @@ class PairingAudit:
     async def approved(self) -> None:
         """Record that this pairing was granted."""
         await self._write(OUTCOME_RETURNED, None)
+
+    async def approved_again(self) -> None:
+        """Record the approver's repeat of an approval that already stands.
+
+        ``returned``, because the request is answered with the same 200 the
+        first one was, and ``DETAIL_ALREADY_APPROVED`` rather than NULL, so the
+        table never counts a retry as a second pairing granted. The
+        ``DETAIL_ALREADY_APPROVED`` comment carries the reasoning.
+        """
+        await self._write(OUTCOME_RETURNED, DETAIL_ALREADY_APPROVED)
 
     # No caller since 2026-09-30; the pending session-token change uses it again.
     async def minted(self) -> None:

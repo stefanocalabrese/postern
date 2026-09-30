@@ -353,7 +353,11 @@ class AuditEntry(Base):
     # refusal or an argument rejection.
     #
     # NULL on every `returned` row and on every `reaching` row: nothing went
-    # wrong, and this column only ever describes something that did.
+    # wrong, and this column only ever describes something that did. ONE
+    # EXCEPTION since 2026-09-30: a `device_grant.approve` row that repeats an
+    # approval already standing is `returned` with `already_approved`, so a
+    # first approval (NULL) stays countable apart from its retries
+    # (`services/confirm/audit.py`'s `DETAIL_ALREADY_APPROVED`).
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Reports one fact: this call's redaction checksum allowance ran out
     # (`_ScanBudget.exhausted`, masking.py, is `remaining <= 0`). That is

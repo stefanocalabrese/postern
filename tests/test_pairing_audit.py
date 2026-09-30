@@ -490,23 +490,176 @@ async def test_a_code_another_customer_scanned_is_recorded_as_scanned_by_other(
     assert stored.scanned_by == "cust_a11ce"
 
 
-async def test_a_repeat_approval_by_the_scanner_is_recorded_as_already_approved(
+async def test_a_repeat_approval_by_the_approver_answers_its_success_again(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """Normally a retried request. Both rows name the same pairing."""
+    """A retry after a lost 200: the same body, a second row, the store untouched.
+
+    Until 2026-09-30 this answered the one ``invalid_grant`` body, so an app
+    whose first response was lost could not tell "your approval stands" from
+    "refused". Only the customer who scanned AND approved the code reaches
+    this answer, and they already know the pairing exists, so it leaks
+    nothing. The row is ``returned`` with ``already_approved``, which keeps a
+    first approval (NULL ``detail``) countable apart from its repeats.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
     code = await issue(app)
     first = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
     assert first.status_code == 200
+    after_first = await unwrap(store, code.device_code)
 
     second = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
-    assert second.status_code == 400
+    assert second.status_code == 200
+    assert second.content == first.content
 
     written = await rows(clean)
-    assert [r.outcome for r in written] == [OUTCOME_RETURNED, OUTCOME_RAISED]
-    assert written[1].detail == DETAIL_ALREADY_APPROVED
+    assert [r.outcome for r in written] == [OUTCOME_RETURNED, OUTCOME_RETURNED]
+    assert [r.detail for r in written] == [None, DETAIL_ALREADY_APPROVED]
+    assert written[1].customer_ref == CUSTOMER
     assert (
         written[0].arguments["device_code_handle"] == (written[1].arguments["device_code_handle"])
     ), "both rows name the same pairing, which is what makes the pair readable"
+    assert await unwrap(store, code.device_code) == after_first, (
+        "the repeat wrote to the store; it must only report the approval that stands"
+    )
+
+
+async def test_another_customer_retrying_an_approved_code_gets_the_identical_refusal(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """The repeat's 200 is the approver's alone. Anyone else still gets the
+    one ``invalid_grant`` body, so an approved code stays indistinguishable
+    from an unknown one to every other customer."""
+    code = await issue(app)
+    assert (
+        await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+    ).status_code == 200
+    unknown = await approve(app, {"user_code": "ZZZ-ZZZ"}, bearer(key_pair, "cust_b0b"))
+    await _wipe(clean)
+
+    resp = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair, "cust_b0b"))
+
+    assert resp.status_code == 400
+    assert resp.content == unknown.content
+    row = await one_row(clean)
+    assert row.outcome == OUTCOME_RAISED
+    assert row.detail == DETAIL_SCANNED_BY_OTHER
+    assert row.customer_ref == "cust_b0b"
+
+
+async def test_the_approver_retrying_after_expiry_gets_the_identical_refusal(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """An approval that has expired no longer stands, so its repeat is not
+    answered as though it did."""
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+    assert (
+        await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+    ).status_code == 200
+    unknown = await approve(app, {"user_code": "ZZZ-ZZZ"}, bearer(key_pair))
+    await _wipe(clean)
+    stored = await unwrap(store, code.device_code)
+    overwrite_in_memory(app, replace(stored, expires_at=datetime.now(UTC) - timedelta(seconds=1)))
+
+    resp = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+
+    assert resp.status_code == 400
+    assert resp.content == unknown.content
+    row = await one_row(clean)
+    assert row.outcome == OUTCOME_RAISED
+    assert row.detail == DETAIL_USER_CODE_NOT_FOUND
+
+
+async def test_an_approved_row_whose_customer_ref_is_another_is_the_identical_refusal(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """``scanned_by`` alone does not earn the 200: the approval must also be
+    FOR this customer. Unreachable through ``approve_scanned``, which writes
+    ``customer_ref`` from the scanner; forced here so the condition is pinned
+    rather than assumed."""
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+    assert (
+        await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+    ).status_code == 200
+    unknown = await approve(app, {"user_code": "ZZZ-ZZZ"}, bearer(key_pair))
+    await _wipe(clean)
+    stored = await unwrap(store, code.device_code)
+    overwrite_in_memory(app, replace(stored, customer_ref="cust_a11ce"))
+
+    resp = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+
+    assert resp.status_code == 400
+    assert resp.content == unknown.content
+    assert (await one_row(clean)).outcome == OUTCOME_RAISED
+
+
+async def test_a_repeat_whose_re_read_fails_is_still_the_identical_refusal(
+    app: Starlette,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 200 is decided by the re-read, so a re-read that raises cannot
+    grant it: the answer stays the one ``invalid_grant`` body and the row
+    ``not_scanned``, as for any other refusal whose row could not be read."""
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+    assert (
+        await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+    ).status_code == 200
+    unknown = await approve(app, {"user_code": "ZZZ-ZZZ"}, bearer(key_pair))
+    await _wipe(clean)
+
+    async def outage(device_code: str) -> DeviceCode | None:
+        raise ConnectionError("store gone")
+
+    monkeypatch.setattr(store, "get_device_code", outage)
+
+    resp = await approve(
+        app, {"user_code": code.user_code_display}, bearer(key_pair), as_a_server_would=True
+    )
+
+    assert resp.status_code == 400
+    assert resp.content == unknown.content
+    row = await one_row(clean)
+    assert row.outcome == OUTCOME_RAISED
+    assert row.detail == DETAIL_NOT_SCANNED
+
+
+async def test_a_repeat_that_cannot_be_audited_fails_and_leaves_the_approval_standing(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """Fail closed in the response, and nothing withdrawn.
+
+    The repeat approved nothing: the approval it reports was recorded by the
+    first request's row. Withdrawing it because the SECOND row could not be
+    written would take away a pairing that is fully accounted for.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+    assert (
+        await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+    ).status_code == 200
+    await _wipe(clean)
+
+    async def unavailable(session: Any, **kw: Any) -> None:
+        raise RuntimeError("audit store unavailable")
+
+    with patch.object(audit_store, "append", unavailable):
+        resp = await approve(
+            app,
+            {"user_code": code.user_code_display},
+            bearer(key_pair),
+            as_a_server_would=True,
+        )
+
+    assert resp.status_code == 500
+    assert await rows(clean) == []
+    stored = await unwrap(store, code.device_code)
+    assert stored.approved is True
+    assert stored.customer_ref == CUSTOMER
 
 
 @pytest.mark.parametrize("vanishes_by", ["revocation", "expiry"])
@@ -630,13 +783,21 @@ async def test_a_refusal_whose_re_read_fails_is_still_the_identical_refusal(
 async def test_every_refusal_about_a_pairing_answers_one_identical_body(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """Unknown, unscanned, scanned by another, already approved: four
-    different rows and one response, so the response is not an oracle."""
+    """Unknown, unscanned, scanned by another, approved for another: four
+    different rows and one response, so the response is not an oracle.
+
+    An approved code is in this set only for a customer who did not approve
+    it. Its approver's repeat answers 200 since 2026-09-30, and
+    ``test_a_repeat_approval_by_the_approver_answers_its_success_again`` pins
+    that instead.
+    """
     unscanned = await issue(app, scanned_by=None)
     someone_elses = await issue(app, scanned_by="cust_a11ce")
-    approved = await issue(app)
+    approved = await issue(app, scanned_by="cust_a11ce")
     assert (
-        await approve(app, {"user_code": approved.user_code_display}, bearer(key_pair))
+        await approve(
+            app, {"user_code": approved.user_code_display}, bearer(key_pair, "cust_a11ce")
+        )
     ).status_code == 200
     await _wipe(clean)
 
@@ -656,7 +817,7 @@ async def test_every_refusal_about_a_pairing_answers_one_identical_body(
         DETAIL_USER_CODE_NOT_FOUND,
         DETAIL_NOT_SCANNED,
         DETAIL_SCANNED_BY_OTHER,
-        DETAIL_ALREADY_APPROVED,
+        DETAIL_SCANNED_BY_OTHER,
     ]
 
 

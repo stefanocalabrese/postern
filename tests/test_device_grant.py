@@ -823,8 +823,10 @@ class TestApproveCallback:
     async def test_every_pairing_refusal_answers_the_identical_body(
         self, app: Starlette, key_pair: RSAKeyPair
     ) -> None:
-        """Unknown, unscanned, scanned by another and already approved: one
-        body, so a caller learns nothing about whether a pairing exists."""
+        """Unknown, unscanned, scanned by another and approved for another:
+        one body, so a caller learns nothing about whether a pairing exists.
+        The approver's own repeat answers 200 since 2026-09-30, so the
+        approved code here belongs to a different customer."""
         store: InMemoryDeviceCodeStore = app.state.device_code_store
         unscanned = await store.create_device_code(
             client_id="c", scopes="accounts:read", verification_uri="https://a.test/v"
@@ -836,8 +838,8 @@ class TestApproveCallback:
         approved = await store.create_device_code(
             client_id="c", scopes="accounts:read", verification_uri="https://a.test/v"
         )
-        await scan_in_store(app, approved.user_code, "cust_7f3a")
-        assert await store.approve_scanned(approved.device_code, "cust_7f3a") is True
+        await scan_in_store(app, approved.user_code, "cust_9e21")
+        assert await store.approve_scanned(approved.device_code, "cust_9e21") is True
 
         bodies = []
         async with _client(app) as client:

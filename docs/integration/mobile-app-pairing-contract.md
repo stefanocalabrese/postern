@@ -223,12 +223,12 @@ The app can then tell the user to return to their computer. The AI client picks 
 | Status | `error` | When |
 |---|---|---|
 | 400 | `invalid_request` | Body not JSON or not an object, `user_code` missing, empty or not a string, or a `device_code` key present. |
-| 400 | `invalid_grant` | One identical body (`"this pairing cannot be completed"`) for every refusal that concerns a pairing: unknown or expired code, nobody scanned it, another customer scanned it, or it is already approved. |
+| 400 | `invalid_grant` | One identical body (`"this pairing cannot be completed"`) for every refusal that concerns a pairing: unknown or expired code, nobody scanned it, another customer scanned it, or another customer approved it. |
 | 401 | `invalid_token` | As on `/scan`. |
 | 403 | `invalid_subject`, `access_revoked` | As on `/scan`. |
 | 413, 429, 503, 500 | as on `/scan` | Same middleware, same bodies. A 500 after the store may have approved causes the server to withdraw the pairing before answering. |
 
-**A retried approval looks like a refusal.** If the first `/approve` succeeded and its response was lost, a retry answers `invalid_grant` (recorded server-side as `already_approved`), while the AI client still receives its token. The app cannot tell this apart from a genuine refusal. Only retry `/approve` when the app knows the first request never reached the server.
+**A retried approval answers 200 for the approver.** If the first `/approve` succeeded and its response was lost, a retry by the same customer before `expires_at` answers the same `200 {"status": "approved"}` and changes nothing on the server (recorded as `returned` with `detail` `already_approved`). So retrying `/approve` after a timeout or a dropped connection is safe, and its 200 means the approval stands. After `expires_at` the retry answers `invalid_grant`, as does a retry under a different `sub`. This is the behaviour since 30 September 2026; before it, the retry answered `invalid_grant`.
 
 ## 7. Rate limits and retries
 
@@ -279,14 +279,14 @@ Both endpoints write one `audit_log` row per recorded call through `services/con
 | `tool_name` | `device_grant.scan` or `device_grant.approve` |
 | `customer_ref` | The assertion's `sub` (NULL with a reason when it is not a customer reference) |
 | `client_id` | The assertion's `client_id` claim, else `azp`, else NULL |
-| `outcome`, `detail` | `returned` with NULL detail on success; `raised` with a detail on refusal |
+| `outcome`, `detail` | `returned` with NULL detail on success; `returned` with `already_approved` for the approver's repeated `/approve`; `raised` with a detail on refusal |
 | `at`, `duration_ms` | Arrival time and handling time |
 | `arguments.route` | `/scan` or `/approve` |
 | `arguments.device_code_handle` | 16 hex characters of SHA-256 of the pairing's device code, never the code |
 | `arguments.client_ip` | The caller's address, when one can be attributed |
 | `arguments.paired_client_id` | The AI client's self-declared `client_id` |
 
-Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale`, `already_approved`, `scan_conflict`. On `/approve`: `invalid_subject`, `revoked`, `user_code_not_found`, `not_scanned`, `scanned_by_other`, `already_approved`. An exception is recorded under its class name.
+Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale`, `already_approved`, `scan_conflict`. On `/approve`: `invalid_subject`, `revoked`, `user_code_not_found`, `not_scanned`, `scanned_by_other`, and `already_approved` for a code approved for another customer. An exception is recorded under its class name.
 
 **Not recorded, on purpose:** the `user_code`, the `qr` token, the scopes, and any request the server refused before reaching a pairing. A malformed body (400 `invalid_request`) leaves no row and no log line. A 401, 413, 429 or 503 leaves a log line and no row.
 
@@ -304,5 +304,4 @@ Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not
 - Any device binding on `/approve`; handoff §7.3's device-bound signature on pairing is not implemented.
 - Whether the operator requires app identity verification for pairing at all. The server does not know either way.
 - The copy of every user-facing message. The suggestions above are suggestions.
-- A way for the app to learn, after a lost `/approve` response, whether the approval took effect.
 - The confirm service's base URL. The app must be configured with it; nothing in the link or the server tells the app where to send `/scan`.
