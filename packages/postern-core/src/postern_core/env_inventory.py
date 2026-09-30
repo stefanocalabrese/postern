@@ -210,11 +210,12 @@ EVERYWHERE = ("api", "confirm", "migrations")
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 73 rows since
-#: 2026-09-30: 27 strings (25 settings plus this guard's own two lists), 43
+#: against it by `tests/test_settings_bounds.py` on every run. 72 rows since
+#: 2026-09-30: 27 strings (25 settings plus this guard's own two lists), 42
 #: numbers, 3 flags. The eight ``POSTERN_VAULT_*`` rows below the device-code
 #: block arrived on 2026-09-29; ``POSTERN_DEVICE_APP_LINK_URI`` and the seven
-#: QR-page rate limits arrived on 2026-09-30.
+#: QR-page rate limits arrived on 2026-09-30, the day
+#: ``POSTERN_USER_CODE_MAX_ATTEMPTS`` left with the attempt budget it set.
 INVENTORY: tuple[EnvVar, ...] = (
     EnvVar(ALLOWED_UNREAD_ENV, "string", EVERYWHERE),
     EnvVar(REQUIRED_ENV, "string", EVERYWHERE),
@@ -277,7 +278,6 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_STRICT_HEADERS", "flag", ("api",)),
     EnvVar("POSTERN_TOKEN_ISSUER", "string", ("api",)),
     EnvVar("POSTERN_TRUSTED_PROXY_HOPS", "number", ("api",)),
-    EnvVar("POSTERN_USER_CODE_MAX_ATTEMPTS", "number", ("confirm",)),
     # THE VAULT FAMILY, added 2026-09-29 with transit signing. Six are about
     # the Vault and are read once, in `postern_core.auth.vault.vault_from_env`,
     # so both services get identical parsing and both are recorded as reading

@@ -602,7 +602,7 @@ class CustomerRateLimit:
            `services/confirm/revocation.py` records why that puts it out of
            reach here: "An ASGI middleware cannot reach that body without
            draining ``receive``". `PairingAudit` is built the same way, from
-           ``device_code`` in ``POST /approve``'s own body -- where
+           ``user_code`` in ``POST /approve``'s own body -- where
            `services/confirm/audit.py`'s ``APPROVE_ROUTE`` shows the
            challenge carries its id in the URL instead. So a row from this
            position could at least name a challenge without draining

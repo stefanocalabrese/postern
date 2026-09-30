@@ -7,13 +7,19 @@ Redis-compatible service).
 
 The device authorization flow (§7.3 of the handoff):
 
-1. Browser calls ``/device_authorization`` → gets a device code and a
-   user-visible pairing code (6 chars).
-2. A QR code encodes the verification URI + pairing code.
-3. User scans with mobile app → bank app shows pairing code + context.
-4. User confirms pairing code matches → proceeds to identity verification.
+1. Browser calls ``/device_authorization`` and gets a device code, a
+   user-visible pairing code (6 chars) and ``verification_uri_complete``,
+   the pairing page keyed by the code's display handle.
+2. The page shows the pairing code and a QR that encodes the operator's app
+   link with the ``user_code`` and a rotation token; ``device_code`` is in
+   neither.
+3. The bank app scans it and calls ``POST /scan``, which records the first
+   scanning customer by compare-and-set (``claim_scan``).
+4. The user compares the pairing codes and completes identity verification;
+   the app calls ``POST /approve`` with the ``user_code``, which approves by
+   compare-and-set only for the customer who scanned (``approve_scanned``).
 5. After approval, the browser polls ``/token`` with
-   ``grant_type=device_code`` to receive access tokens.
+   ``grant_type=device_code`` to receive a read token.
 
 The pairing code (``user_code``) carries the anti-phishing control for
 A2 (QR relay), and it is worth being precise about which half lives where,
@@ -25,13 +31,14 @@ because the two halves are not interchangeable:
   pairing screen, which is not in this repository and is still an open
   question (handoff §10.10). Nothing here can perform it or verify that it
   happened.
-- The SERVER half, ``services/confirm/device_auth.py::approve_callback``,
-  makes the approving app PROVE it holds the ``user_code`` before an approval
-  is accepted. That turns a stolen or leaked ``device_code`` on its own into
-  an insufficient credential, and it bounds guessing through
-  ``user_code_attempts`` below (RFC 8628 §5.2 asks for exactly that). It does
-  NOT detect a relay, because a relaying attacker who obtained the QR holds
-  both codes.
+- The SERVER half is the scan. A code can be approved only by the customer
+  whose app scanned it with a genuine, current rotation token, and a second
+  customer's scan of an unexchanged code ends the pairing. Guessing a
+  ``user_code`` at ``POST /approve`` therefore approves nothing the same
+  customer did not scan first. It does NOT detect a relay, because a
+  relaying attacker who shows the victim the attacker's own page holds a
+  genuine QR; ``dev-docs/qr-page-spec.md`` says so in "What this does not
+  fix".
 
 Usage::
 
@@ -174,11 +181,9 @@ class DeviceCodeStoreFull(RuntimeError):
     """Raised by ``create_device_code`` when the store is at its cap.
 
     REFUSING IS THE DECISION, and the alternative was evicting the oldest
-    code. `services/confirm/device_auth.py::approve_callback` already faced
-    the same trade and recorded the answer: it accepted leaking "this code is
-    approved" rather than let a caller "burn the attempt budget ... and
-    REVOKE it, denying the legitimate user the token they are already waiting
-    on", because "only one of them destroys a session in flight".
+    code. Eviction would let an unauthenticated caller end another customer's
+    pairing in flight simply by filling the store, and nothing else on this
+    path lets a party without an assertion do that.
 
     Eviction is that same destruction, aimed by age. It preferentially kills
     the OLDEST pending pairing, which is the customer who has already
@@ -279,7 +284,6 @@ class DeviceCode:
         customer_ref: The customer this code was approved FOR, taken from the
             verified ``sub`` of the banking app's assertion at approval time
             and from nowhere else. Empty until approved.
-        user_code_attempts: Failed ``user_code`` comparisons at ``/approve``.
         exchanged_at: When this code was spent at ``POST /token``, or ``None``
             while it is still redeemable. Written only by
             ``consume_device_code`` below, which is the atomic claim the mint
@@ -332,7 +336,6 @@ class DeviceCode:
     approved: bool = False
     approved_at: datetime | None = None
     customer_ref: str = ""
-    user_code_attempts: int = 0
     exchanged_at: datetime | None = None
     display_handle: str = ""
     qr_secret: bytes = field(default=b"", repr=False)
@@ -452,10 +455,6 @@ class DeviceCodeStoreBase(ABC):
         """
 
     @abstractmethod
-    async def approve_device_code(self, device_code: str) -> bool:
-        """Mark a device code as approved. Returns True if found and updated."""
-
-    @abstractmethod
     async def consume_device_code(self, device_code: str) -> bool:
         """Claim a device code for one token exchange. ``True`` to one caller only.
 
@@ -521,14 +520,13 @@ class DeviceCodeStoreBase(ABC):
         primary.
         """
 
-    @abstractmethod
-    async def update_device_code(self, device_code: str, code: DeviceCode) -> None:
-        """Replace a device code with an updated version.
-
-        Used by the approval callback to attach the customer identity
-        (``customer_ref``, from the verified assertion) after the user
-        approves on mobile, and to record a failed ``user_code`` comparison.
-        """
+    # NO WHOLE-SNAPSHOT WRITE, deliberately, since 2026-09-30. This class
+    # offered ``update_device_code`` and ``approve_device_code``, and each
+    # wrote a whole row back: a snapshot read before a concurrent
+    # ``claim_scan`` or ``approve_scanned`` and written after it silently
+    # undoes that compare-and-set, and neither touched the two secondary
+    # keys. Every write to an existing code now goes through one of the three
+    # compare-and-set methods above or through ``revoke_device_code``.
 
 
 # ---------------------------------------------------------------------------
@@ -783,17 +781,6 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         code = self._codes.get(device_code) if device_code is not None else None
         return _live_match(code, "user_code", user_code)
 
-    async def approve_device_code(self, device_code: str) -> bool:
-        """Mark a device code as approved. Returns True if found and updated."""
-        existing = self._codes.get(device_code)
-        if existing is None or existing.approved:
-            return False
-        # Dataclass is frozen, so we replace with a new instance.
-        self._codes[device_code] = existing.__class__(
-            **{**asdict_frozen(existing), "approved": True, "approved_at": datetime.now(UTC)}
-        )
-        return True
-
     async def consume_device_code(self, device_code: str) -> bool:
         """Claim this code for one exchange. ``True`` to one caller only.
 
@@ -845,10 +832,6 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
     async def revoke_device_code(self, device_code: str) -> None:
         """Remove a device code and both of its secondary entries."""
         self._forget(device_code)
-
-    async def update_device_code(self, device_code: str, code: DeviceCode) -> None:
-        """Replace a device code with an updated version."""
-        self._codes[device_code] = code
 
 
 def asdict_frozen(obj: Any) -> dict[str, Any]:
@@ -1132,17 +1115,6 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             return None
         return _live_match(await self.get_device_code(device_code), "user_code", user_code)
 
-    async def approve_device_code(self, device_code: str) -> bool:
-        """Mark a device code as approved. Returns True if found and updated."""
-        existing = await self.get_device_code(device_code)
-        if existing is None or existing.approved:
-            return False
-        updated = DeviceCode(
-            **{**asdict_frozen(existing), "approved": True, "approved_at": datetime.now(UTC)}
-        )
-        await self._set_code(device_code, updated)
-        return True
-
     async def consume_device_code(self, device_code: str) -> bool:
         """Claim this code for one exchange. ``True`` to one caller only.
 
@@ -1322,18 +1294,15 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
                 pipe.delete(key)
         await pipe.execute()
 
-    async def update_device_code(self, device_code: str, code: DeviceCode) -> None:
-        """Replace a device code with an updated version."""
-        await self._set_code(device_code, code)
-
     async def _set_code(self, device_code: str, code: DeviceCode) -> None:
         """Store a device code with TTL, and index it by the same expiry.
 
-        ``ZADD`` on every write and not only on creation, so an update
-        re-scores rather than leaving the index holding an older expiry than
-        the value it points at. Both are skipped when the TTL has already
-        passed, which is the existing behaviour for the value and keeps the
-        index from gaining a member that is due the moment it lands.
+        Called by ``create_device_code`` only. Every later write to a code --
+        the scan claim, the approval, the exchange -- is a ``WATCH``/``MULTI``
+        transaction with ``KEEPTTL``, because none of them moves the expiry
+        and none may be undone by a stale snapshot. Both writes here are
+        skipped when the TTL has already passed, which keeps the index from
+        gaining a member that is due the moment it lands.
 
         THE ``int`` BELOW TRUNCATES, AND THAT IS STILL TRUE (bug B1). It
         loses up to one whole second, so a code asked for one second has
@@ -1361,17 +1330,14 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         tests/test_redis_backed_stores.py::SHORTEST_STORED_TTL exists
         precisely because of it.
 
-        NO GUARD IS RAISED HERE, deliberately. This method has three callers
-        and a zero TTL means a different thing in each: from
-        ``create_device_code`` it is a caller asking for a lifetime that
-        cannot be represented, but from ``approve_device_code`` and
-        ``update_device_code`` it is an ordinary race -- a customer who was
-        slow, whose code expired while they approved -- and turning that into
-        an exception would fail an approval on the write path for being
-        late. Nothing available here tells the two apart. Raising in
-        ``create_device_code`` instead, where they CAN be told apart, would
-        make this backend refuse a lifetime `InMemoryDeviceCodeStore`
-        accepts, which does not end the disagreement between them, it only
+        NO GUARD IS RAISED HERE, deliberately. Until 2026-09-30 this method
+        had two more callers, the whole-snapshot writers the compare-and-set
+        methods replaced, and for them a zero TTL was an ordinary race rather
+        than a caller asking for a lifetime that cannot be represented. With
+        ``create_device_code`` the only caller, raising here would be raising
+        there, and it would make this backend refuse a lifetime
+        `InMemoryDeviceCodeStore` accepts, which does not end the
+        disagreement between them, it only
         moves it from the outcome to the control flow and puts it in
         `DeviceCodeStoreBase`'s contract, where no in-memory test can reach
         it. Ending it properly means changing the arithmetic in BOTH
@@ -1408,7 +1374,6 @@ def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
         "approved": dc.approved,
         "approved_at": dc.approved_at.timestamp() if dc.approved_at else None,
         "customer_ref": dc.customer_ref,
-        "user_code_attempts": dc.user_code_attempts,
         "exchanged_at": dc.exchanged_at.timestamp() if dc.exchanged_at else None,
         "display_handle": dc.display_handle,
         # Standard base64 so the JSON stays text. ``None`` rather than ``""``
@@ -1455,7 +1420,9 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
         # old code deserializes with no identity, so `/token` refuses it
         # rather than minting from a stale `client_id`.
         customer_ref=str(data.get("customer_ref", "")),
-        user_code_attempts=int(data.get("user_code_attempts", 0)),
+        # A ``user_code_attempts`` key on a record the previous release wrote
+        # is ignored: the per-code attempt budget it counted was removed when
+        # the pairing code became the lookup key, where it means nothing.
         # ``None`` when the key is absent, and here that default is the TRUE
         # reading rather than the fail-closed one: a record written by the
         # previous release came from a build that could not spend a code, so

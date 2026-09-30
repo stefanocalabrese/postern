@@ -73,10 +73,13 @@ from services.confirm.audit import (
     DETAIL_DEVICE_CODE_NOT_FOUND,
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
+    DETAIL_NOT_SCANNED,
     DETAIL_REVOKED,
+    DETAIL_SCANNED_BY_OTHER,
     DETAIL_STORED_IDENTITY_MALFORMED,
     DETAIL_USER_CODE_BUDGET_EXHAUSTED,
     DETAIL_USER_CODE_MISMATCH,
+    DETAIL_USER_CODE_NOT_FOUND,
     PAIRING_ROUTE,
     PAIRING_TOOL_NAME,
     TOKEN_ROUTE,
@@ -84,6 +87,7 @@ from services.confirm.audit import (
 )
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.device_grant_helpers import overwrite_in_memory, scan_in_store
 from tests.fixtures.append_only_bypass import (
     delete_audit_rows_by_bypassing_the_append_only_triggers,
 )
@@ -199,14 +203,25 @@ def bearer(key_pair: RSAKeyPair, subject: str = CUSTOMER) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def issue(app: Starlette, client_id: str = BROWSER_CLIENT) -> DeviceCode:
-    """One device code, created through the store the app actually holds."""
+async def issue(
+    app: Starlette, client_id: str = BROWSER_CLIENT, *, scanned_by: str | None = CUSTOMER
+) -> DeviceCode:
+    """One device code, created through the store the app actually holds.
+
+    Scanned by ``scanned_by`` through the store, as ``POST /scan`` would have,
+    because ``POST /approve`` approves only a code the approving customer
+    scanned; ``None`` leaves it unscanned. Through the store and not over
+    HTTP so the scan's own row does not join the ones these tests count.
+    """
     store: DeviceCodeStoreBase = app.state.device_code_store
-    return await store.create_device_code(
+    code = await store.create_device_code(
         client_id=client_id,
         scopes="accounts:read",
         verification_uri="https://auth.test.invalid/verify",
     )
+    if scanned_by is not None:
+        await scan_in_store(app, code.user_code, scanned_by)
+    return code
 
 
 async def approve(
@@ -284,7 +299,7 @@ async def test_a_successful_pairing_writes_one_row(
 
     resp = await approve(
         app,
-        {"device_code": code.device_code, "user_code": code.user_code_display},
+        {"user_code": code.user_code_display},
         bearer(key_pair),
     )
     assert resp.status_code == 200
@@ -318,7 +333,7 @@ async def test_the_row_is_one_and_not_the_read_paths_pair(
     code = await issue(app)
     await approve(
         app,
-        {"device_code": code.device_code, "user_code": code.user_code_display},
+        {"user_code": code.user_code_display},
         bearer(key_pair),
     )
 
@@ -344,7 +359,7 @@ async def test_the_row_names_no_raw_device_code(
     code = await issue(app)
     await approve(
         app,
-        {"device_code": code.device_code, "user_code": code.user_code_display},
+        {"user_code": code.user_code_display},
         bearer(key_pair),
     )
 
@@ -385,7 +400,7 @@ async def test_the_row_records_the_address_the_request_came_from(
         code = await issue(app)
         resp = await approve(
             app,
-            {"device_code": code.device_code, "user_code": code.user_code_display},
+            {"user_code": code.user_code_display},
             bearer(key_pair),
             extra_headers={"X-Forwarded-For": "198.51.100.7, 203.0.113.9"},
         )
@@ -402,121 +417,161 @@ async def test_the_row_records_the_address_the_request_came_from(
 # ---------------------------------------------------------------------------
 
 
-async def test_an_unknown_device_code_is_recorded(
+async def test_an_unknown_user_code_is_recorded(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """The enumeration signal, and the one branch with no device code to name.
+    """The enumeration signal, and the branch with no pairing to name.
 
-    A caller guessing device codes gets an identical 400 for every guess. The
-    row is the only place the attempts are countable, and it carries the
-    handle of the value that was tried, so N rows with N distinct handles
-    under one ``customer_ref`` is a scan and N rows with one handle is a
-    retry.
+    A ``user_code`` is 30 bits, so guessing one is cheap, and the row is the
+    only place the attempts are countable: N rows of ``user_code_not_found``
+    under one ``customer_ref`` is somebody walking the code space. The row
+    names no device code, because the guess named none.
     """
-    resp = await approve(
-        app,
-        {"device_code": "no-such-device-code", "user_code": "ABC-DEF"},
-        bearer(key_pair),
-    )
+    resp = await approve(app, {"user_code": "ZZZ-ZZZ"}, bearer(key_pair))
     assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_grant"
 
     row = await one_row(clean)
     assert row.outcome == OUTCOME_RAISED
-    assert row.detail == DETAIL_DEVICE_CODE_NOT_FOUND
+    assert row.detail == DETAIL_USER_CODE_NOT_FOUND
     assert row.customer_ref == CUSTOMER
-    assert row.arguments["device_code_handle"] == handle_of("no-such-device-code")
+    assert "device_code_handle" not in row.arguments
     assert "paired_client_id" not in row.arguments
 
 
-async def test_a_wrong_pairing_code_is_recorded(
+async def test_an_unscanned_code_is_recorded_as_not_scanned(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """A2, at its cheapest: somebody holds the device code and is guessing.
+    """An app skipping ``POST /scan``, or something guessing codes that
+    happened to hit a live one. Either way nothing is approved."""
+    code = await issue(app, scanned_by=None)
 
-    The pairing code is the half of the A2 control only a human at the browser
-    can supply, so a mismatch against a code the caller already holds is the
-    relay attempt this endpoint exists to refuse.
-    """
-    code = await issue(app)
-
-    resp = await approve(
-        app,
-        {"device_code": code.device_code, "user_code": "ZZZ-ZZZ"},
-        bearer(key_pair),
-    )
+    resp = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
     assert resp.status_code == 400
 
     row = await one_row(clean)
-    assert row.outcome == OUTCOME_RAISED
-    assert row.detail == DETAIL_USER_CODE_MISMATCH
+    assert row.detail == DETAIL_NOT_SCANNED
     assert row.arguments["device_code_handle"] == handle_of(code.device_code)
     assert row.arguments["paired_client_id"] == BROWSER_CLIENT
+    stored = await unwrap(app.state.device_code_store, code.device_code)
+    assert stored.approved is False
 
 
-async def test_exhausting_the_pairing_code_budget_is_a_different_detail(
+async def test_a_code_another_customer_scanned_is_recorded_as_scanned_by_other(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """Three guesses, three rows, and the last one is not the other two.
+    """Scanned by A, approved by B: refused, and the row says so under B."""
+    code = await issue(app, scanned_by="cust_a11ce")
 
-    ``user_code_max_attempts`` defaults to 3 and the third wrong code REVOKES
-    the device code, which ends that pairing for the legitimate user as well.
-    Filing that under the same literal as an ordinary slip would bury the one
-    event on this endpoint an operator should be paged for.
-    """
-    code = await issue(app)
-    attempts = ConfirmSettings().user_code_max_attempts
+    resp = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+    assert resp.status_code == 400
 
-    for _ in range(attempts):
-        resp = await approve(
-            app,
-            {"device_code": code.device_code, "user_code": "ZZZ-ZZZ"},
-            bearer(key_pair),
-        )
-        assert resp.status_code == 400
-
-    written = await rows(clean)
-    assert len(written) == attempts
-    assert [r.detail for r in written] == (
-        [DETAIL_USER_CODE_MISMATCH] * (attempts - 1) + [DETAIL_USER_CODE_BUDGET_EXHAUSTED]
-    )
-    assert {r.call_id for r in written} == {r.call_id for r in written} and len(
-        {r.call_id for r in written}
-    ) == attempts, "each request is its own call, so no two rows share a call_id"
+    row = await one_row(clean)
+    assert row.detail == DETAIL_SCANNED_BY_OTHER
+    assert row.customer_ref == CUSTOMER
+    stored = await unwrap(app.state.device_code_store, code.device_code)
+    assert stored.approved is False
+    assert stored.scanned_by == "cust_a11ce"
 
 
-async def test_a_second_approval_of_an_approved_code_is_recorded(
+async def test_a_repeat_approval_by_the_scanner_is_recorded_as_already_approved(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """The swap attempt the ``already_approved`` check exists to stop.
-
-    A caller holding a valid assertion of their own, who reaches a code the
-    victim already approved, would otherwise rewrite ``customer_ref`` to
-    themselves in the window before the browser polls ``POST /token``. The
-    refusal is recorded because the attempt is the signal, not the outcome.
-    """
+    """Normally a retried request. Both rows name the same pairing."""
     code = await issue(app)
-    first = await approve(
-        app,
-        {"device_code": code.device_code, "user_code": code.user_code_display},
-        bearer(key_pair),
-    )
+    first = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
     assert first.status_code == 200
 
-    second = await approve(
-        app,
-        {"device_code": code.device_code, "user_code": code.user_code_display},
-        bearer(key_pair, subject="cust_9e21"),
-    )
+    second = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
     assert second.status_code == 400
 
     written = await rows(clean)
     assert [r.outcome for r in written] == [OUTCOME_RETURNED, OUTCOME_RAISED]
     assert written[1].detail == DETAIL_ALREADY_APPROVED
-    assert written[0].customer_ref == CUSTOMER
-    assert written[1].customer_ref == "cust_9e21"
     assert (
         written[0].arguments["device_code_handle"] == (written[1].arguments["device_code_handle"])
     ), "both rows name the same pairing, which is what makes the pair readable"
+
+
+@pytest.mark.parametrize("vanishes_by", ["revocation", "expiry"])
+async def test_a_row_gone_between_the_lookup_and_the_refusal_is_user_code_not_found(
+    app: Starlette,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    vanishes_by: str,
+) -> None:
+    """Section 6's first label: gone or expired by the time it is re-read.
+
+    The window is forced by replacing ``approve_scanned`` with one that makes
+    the row vanish and then refuses, which is the order a real race would
+    produce: the lookup found a live row, the compare-and-set did not approve
+    it, and the re-read finds nothing live.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+
+    async def vanish_then_refuse(device_code: str, customer_ref: str) -> bool:
+        if vanishes_by == "revocation":
+            await store.revoke_device_code(device_code)
+        else:
+            stored = await unwrap(store, device_code)
+            past = datetime.now(UTC) - timedelta(seconds=1)
+            overwrite_in_memory(app, replace(stored, expires_at=past))
+        return False
+
+    monkeypatch.setattr(store, "approve_scanned", vanish_then_refuse)
+
+    resp = await approve(app, {"user_code": code.user_code_display}, bearer(key_pair))
+    assert resp.status_code == 400
+
+    row = await one_row(clean)
+    assert row.detail == DETAIL_USER_CODE_NOT_FOUND
+    assert row.arguments["device_code_handle"] == handle_of(code.device_code)
+
+
+async def test_every_refusal_about_a_pairing_answers_one_identical_body(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """Unknown, unscanned, scanned by another, already approved: four
+    different rows and one response, so the response is not an oracle."""
+    unscanned = await issue(app, scanned_by=None)
+    someone_elses = await issue(app, scanned_by="cust_a11ce")
+    approved = await issue(app)
+    assert (
+        await approve(app, {"user_code": approved.user_code_display}, bearer(key_pair))
+    ).status_code == 200
+    await _wipe(clean)
+
+    bodies = []
+    for user_code in (
+        "ZZZ-ZZZ",
+        unscanned.user_code_display,
+        someone_elses.user_code_display,
+        approved.user_code_display,
+    ):
+        resp = await approve(app, {"user_code": user_code}, bearer(key_pair))
+        assert resp.status_code == 400
+        bodies.append(resp.json())
+
+    assert all(body == bodies[0] for body in bodies), bodies
+    assert [r.detail for r in await rows(clean)] == [
+        DETAIL_USER_CODE_NOT_FOUND,
+        DETAIL_NOT_SCANNED,
+        DETAIL_SCANNED_BY_OTHER,
+        DETAIL_ALREADY_APPROVED,
+    ]
+
+
+def test_the_retired_literals_stay_defined_for_the_rows_that_carry_them() -> None:
+    """``audit_log`` is append-only, so rows carrying these exist and nothing
+    in the tree may stop naming them, though nothing writes them any more."""
+    assert DETAIL_DEVICE_CODE_NOT_FOUND == "device_code_not_found"
+    assert DETAIL_USER_CODE_MISMATCH == "user_code_mismatch"
+    assert DETAIL_USER_CODE_BUDGET_EXHAUSTED == "user_code_budget_exhausted"
+    assert DETAIL_USER_CODE_NOT_FOUND == "user_code_not_found"
+    assert DETAIL_NOT_SCANNED == "not_scanned"
+    assert DETAIL_SCANNED_BY_OTHER == "scanned_by_other"
 
 
 async def test_a_revoked_customer_is_recorded_with_the_challenge_paths_literal(
@@ -534,7 +589,7 @@ async def test_a_revoked_customer_is_recorded_with_the_challenge_paths_literal(
 
     resp = await approve(
         app,
-        {"device_code": code.device_code, "user_code": code.user_code_display},
+        {"user_code": code.user_code_display},
         bearer(key_pair),
     )
     assert resp.status_code == 403
@@ -567,7 +622,7 @@ async def test_a_subject_that_is_not_a_customer_reference_is_recorded_as_an_abse
 
     resp = await approve(
         app,
-        {"device_code": "anything", "user_code": "ABC-DEF"},
+        {"user_code": "ABC-DEF"},
         bearer(key_pair, subject=pan_shaped),
     )
     assert resp.status_code == 403
@@ -591,10 +646,14 @@ async def test_a_subject_that_is_not_a_customer_reference_is_recorded_as_an_abse
     "body",
     [
         pytest.param([1, 2, 3], id="a JSON array rather than an object"),
-        pytest.param({}, id="neither field present"),
-        pytest.param({"device_code": "abc"}, id="no user_code"),
-        pytest.param({"device_code": 123, "user_code": "ABC-DEF"}, id="device_code is a number"),
-        pytest.param({"device_code": "abc", "user_code": ["x"]}, id="user_code is a list"),
+        pytest.param({}, id="no user_code"),
+        pytest.param({"user_code": ""}, id="user_code is empty"),
+        pytest.param({"user_code": 123}, id="user_code is a number"),
+        pytest.param({"user_code": ["x"]}, id="user_code is a list"),
+        pytest.param(
+            dict(device_code="abc", user_code="ABC-DEF"),
+            id="the removed device_code is still sent",
+        ),
     ],
 )
 async def test_a_malformed_request_writes_no_row(
@@ -622,7 +681,7 @@ async def test_a_request_with_no_assertion_writes_no_row(app: Starlette, clean: 
     class of absence and this service's writer reaches only one of the three
     the column admits.
     """
-    resp = await approve(app, {"device_code": "abc", "user_code": "ABC-DEF"})
+    resp = await approve(app, {"user_code": "ABC-DEF"})
     assert resp.status_code == 401
     assert await rows(clean) == []
 
@@ -653,7 +712,7 @@ async def test_a_pairing_that_cannot_be_audited_does_not_stand(
     with patch.object(audit_store, "append", unavailable):
         resp = await approve(
             app,
-            {"device_code": code.device_code, "user_code": code.user_code_display},
+            {"user_code": code.user_code_display},
             bearer(key_pair),
             as_a_server_would=True,
         )
@@ -697,7 +756,7 @@ async def paired(app: Starlette, key_pair: RSAKeyPair) -> DeviceCode:
     code = await issue(app)
     resp = await approve(
         app,
-        {"device_code": code.device_code, "user_code": code.user_code_display},
+        {"user_code": code.user_code_display},
         bearer(key_pair),
     )
     assert resp.status_code == 200
@@ -822,8 +881,8 @@ async def test_an_expired_device_code_writes_nothing(
     store: DeviceCodeStoreBase = app.state.device_code_store
     code = await paired(app, key_pair)
     await _wipe(clean)
-    await store.update_device_code(
-        code.device_code,
+    overwrite_in_memory(
+        app,
         replace(
             await unwrap(store, code.device_code),
             expires_at=datetime.now(UTC) - timedelta(seconds=1),
@@ -957,8 +1016,8 @@ async def test_a_stored_identity_that_is_not_a_customer_reference_is_recorded(
     store: DeviceCodeStoreBase = app.state.device_code_store
     code = await paired(app, key_pair)
     await _wipe(clean)
-    await store.update_device_code(
-        code.device_code,
+    overwrite_in_memory(
+        app,
         replace(await unwrap(store, code.device_code), customer_ref="4111111111111111"),
     )
 

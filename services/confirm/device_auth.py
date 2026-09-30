@@ -23,10 +23,11 @@ neither, because it is the only credential ``POST /token`` asks for, and
 anything in a QR is readable over a shoulder or a screen share.
 
 Pairing code (``user_code``): 6 uppercase alphanumeric chars, displayed as
-XXX-XXX on both surfaces. ``POST /approve`` REQUIRES it and compares it, in
-constant time, against the code stored for that device code
-(``postern_core.auth.device_codes`` records which half of the A2 control that
-is and which half only the operator's app can perform).
+XXX-XXX on both surfaces. ``POST /approve`` takes it and nothing else that
+names the pairing, looks the pairing up by it, and approves only if the same
+customer scanned it first (``postern_core.auth.device_codes`` records which
+half of the A2 control that is and which half only the operator's app can
+perform).
 
 WHO IS AUTHENTICATED, AND WHO IS NOT. ``POST /approve`` is the banking app,
 and it must present a bearer assertion the operator's app backend minted;
@@ -75,7 +76,6 @@ Usage in ``main.py``::
 from __future__ import annotations
 
 import dataclasses
-import hmac
 import json
 import logging
 import time
@@ -99,13 +99,13 @@ from starlette.routing import Route
 
 from services.confirm.audit import (
     DETAIL_ALREADY_APPROVED,
-    DETAIL_DEVICE_CODE_NOT_FOUND,
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
+    DETAIL_NOT_SCANNED,
     DETAIL_REVOKED,
+    DETAIL_SCANNED_BY_OTHER,
     DETAIL_STORED_IDENTITY_MALFORMED,
-    DETAIL_USER_CODE_BUDGET_EXHAUSTED,
-    DETAIL_USER_CODE_MISMATCH,
+    DETAIL_USER_CODE_NOT_FOUND,
     TOKEN_ROUTE,
     TOKEN_TOOL_NAME,
     PairingAudit,
@@ -801,13 +801,16 @@ async def _exchange(
 # ---------------------------------------------------------------------------
 # Approval callback — POST /approve.
 #
-# Called by the operator's banking app after the user completes identity
-# verification and confirms the device pairing. It marks the device code
-# approved so the browser can exchange it for tokens.
+# Called by the operator's banking app after the user has scanned the QR
+# (``POST /scan``), compared the pairing codes and completed identity
+# verification. It marks the device code approved so the browser can exchange
+# it for a read token.
 #
-# The app sends:
-#   device_code — the opaque device code, from the scanned QR.
-#   user_code   — the pairing code, from the same QR. REQUIRED and compared.
+# The app sends ``user_code`` and nothing else that names the pairing.
+# ``device_code`` is refused if present: it is the only credential
+# ``POST /token`` asks for, it is never in the QR, and the app never learns
+# it, so a body carrying one is an app on the old contract and must fail
+# loudly rather than be half-honoured.
 #
 # It does NOT send the customer. That is audit finding C-01: the handler used
 # to read `subject_value` from this body, write it onto the device code, and
@@ -831,6 +834,39 @@ def _normalize_user_code(raw: str) -> str:
     match, and this value is a credential.
     """
     return raw.strip().replace("-", "").replace(" ", "").upper()
+
+
+#: The length of a stored pairing code. A presented value that normalises to
+#: any other length cannot name a pairing, so it is answered as a lookup miss
+#: without a store round trip -- which also keeps a 64 KiB body from becoming
+#: a 64 KiB Redis key.
+_USER_CODE_LENGTH = 6
+
+
+async def _lookup_by_user_code(store: DeviceCodeStoreBase, presented: str) -> DeviceCode | None:
+    """The live pairing a presented ``user_code`` names, or ``None``."""
+    normalized = _normalize_user_code(presented)
+    if len(normalized) != _USER_CODE_LENGTH:
+        return None
+    return await store.get_by_user_code(normalized)
+
+
+def _unpairable_response() -> JSONResponse:
+    """The one 400 both app routes answer for every refusal that could leak
+    whether a pairing exists.
+
+    ``POST /scan`` gives it for an unknown or expired code, an approved one,
+    and a malformed or forged rotation token; ``POST /approve`` for an
+    unknown or expired code, one nobody scanned, one another customer
+    scanned, and one already approved. Byte for byte the same, for the reason
+    ``_unredeemable_response`` gives at ``POST /token``: the distinction the
+    caller does not get is exactly the one an operator needs, so it lives in
+    ``audit_log.detail`` and nowhere a caller can read it.
+
+    ``invalid_grant`` is RFC 6749 section 5.2's code for a grant that is
+    "invalid, expired, revoked", which is true of every case above.
+    """
+    return _error(400, "invalid_grant", "this pairing cannot be completed")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -868,13 +904,14 @@ async def approve_callback(request: Request) -> JSONResponse:
     customer is the assertion's ``sub``.
 
     Request body:
-        device_code: The opaque device code (required).
-        user_code: The pairing code shown in the QR, ``XXX-XXX`` or bare
-            (required -- audit finding C-04).
+        user_code: The pairing code the app read from the scanned QR,
+            ``XXX-XXX`` or bare. A body that also carries ``device_code`` is
+            refused.
 
     Response (200): ``{"status": "approved"}``
-    Response (400): device code unknown, already approved, or pairing code
-        wrong.
+    Response (400): ``invalid_request`` for a malformed body or one still
+        carrying ``device_code``, and the one ``invalid_grant`` body of
+        ``_unpairable_response`` for every refusal that concerns a pairing.
     Response (401): no verified assertion.
     Response (403): the assertion verified but its ``sub`` is not a customer
         reference (``invalid_subject``), or that customer's access has been
@@ -933,7 +970,7 @@ async def approve_callback(request: Request) -> JSONResponse:
     )
 
     try:
-        outcome = await _pair(request, audit, store=store, subject=subject, settings=settings)
+        outcome = await _pair(request, audit, store=store, subject=subject)
     except Exception as exc:
         # `raise exc from audit_exc`, never a bare `raise` from inside this
         # handler: an audit-write failure must not REPLACE the exception that
@@ -941,9 +978,10 @@ async def approve_callback(request: Request) -> JSONResponse:
         # what the database did and not what the pairing did. Same shape as
         # `services/confirm/callback.py`'s raised branch.
         #
-        # Nothing was approved on any path that raises -- the store write is
-        # the last statement of `_pair` and an exception from it leaves the
-        # code unapproved -- so there is nothing to withdraw here.
+        # Nothing was approved on any path that raises: the only write in
+        # `_pair` is `approve_scanned`, a compare-and-set that either commits
+        # and returns or raises having written nothing, and nothing after a
+        # successful one can raise. There is nothing to withdraw here.
         try:
             await audit.refused(type(exc).__name__)
         except Exception as audit_exc:
@@ -988,12 +1026,12 @@ async def approve_callback(request: Request) -> JSONResponse:
 async def _withdraw_pairing(store: DeviceCodeStoreBase, device_code_value: str) -> None:
     """Undo a pairing whose audit row could not be written.
 
-    Revocation rather than an in-place unapprove, and the reason is the same
-    one `_record_user_code_failure` gives for revoking on a spent attempt
-    budget: the recovery the customer needs is a fresh QR anyway, and a fresh
-    QR is what re-anchors the human pairing-code comparison that is the real
-    A2 control. Rewriting `approved` back to False would leave the same
-    ``device_code`` live and a racing poll could still find it approved.
+    Revocation rather than an in-place undo, because the recovery the
+    customer needs is a fresh QR anyway, and a fresh QR is what re-anchors the
+    human pairing-code comparison that is the real A2 control. Rewriting
+    ``approved`` or ``scanned_by`` back would leave the same ``device_code``
+    live, and a racing poll or a racing scan could still find it in the state
+    the failed request could not record.
 
     ITS OWN FAILURE IS SWALLOWED, deliberately and exactly once. The caller is
     already unwinding an audit-store failure and owes the operator THAT
@@ -1021,7 +1059,6 @@ async def _pair(
     *,
     store: DeviceCodeStoreBase,
     subject: str,
-    settings: ConfirmSettings,
 ) -> _Pairing:
     """The pairing itself, returning what the caller owes the audit log.
 
@@ -1030,6 +1067,14 @@ async def _pair(
     place rather than at each return where a new exit could forget to join.
     The same division ``services/confirm/callback.py``'s ``_approve`` makes,
     for the same reason.
+
+    THE APPROVAL IS A COMPARE-AND-SET. Until 2026-09-30 this read the code,
+    checked ``approved``, and wrote the whole snapshot back with a plain
+    ``SETEX``, so two replicas could both pass the check and the last writer's
+    ``customer_ref`` won. ``approve_scanned`` settles it inside the store: it
+    approves only a code that is unexpired, unapproved and scanned by this
+    same customer, and answers ``True`` to one caller. What this function
+    reads after a refusal labels the audit row and decides nothing.
     """
     try:
         customer = CustomerRef(value=subject)
@@ -1087,7 +1132,16 @@ async def _pair(
             _error(400, "invalid_request", "body must be a JSON object"), recorded=False
         )
 
-    device_code_value = body.get("device_code", "")
+    # THE OLD CONTRACT IS REFUSED, NOT IGNORED. An app still sending
+    # ``device_code`` was built against a QR that carried it, and ignoring the
+    # field would let that app half-work until the day it did not. A 400 it
+    # cannot mistake for a pairing refusal is the loud failure.
+    if "device_code" in body:
+        return _Pairing(
+            _error(400, "invalid_request", "device_code is not accepted; send user_code only"),
+            recorded=False,
+        )
+
     user_code_value = body.get("user_code", "")
 
     # `isinstance`, not just truthiness. JSON gives a caller ints, lists and
@@ -1095,168 +1149,82 @@ async def _pair(
     # reach `_normalize_user_code` and raise `AttributeError` -- a 500 from an
     # endpoint that should answer 400. On an authenticated write path a 500 is
     # also the shape that gets "fixed" by relaxing something.
-    if not isinstance(device_code_value, str) or not isinstance(user_code_value, str):
+    if not isinstance(user_code_value, str):
         return _Pairing(
-            _error(400, "invalid_request", "device_code and user_code must be strings"),
-            recorded=False,
+            _error(400, "invalid_request", "user_code must be a string"), recorded=False
         )
+    if not user_code_value:
+        return _Pairing(_error(400, "invalid_request", "user_code is required"), recorded=False)
 
-    if not device_code_value or not user_code_value:
-        return _Pairing(
-            _error(400, "invalid_request", "device_code and user_code are required"),
-            recorded=False,
-        )
+    # THE EXITS ABOVE ARE THE RULE'S OTHER HALF. Each is answered by looking
+    # at the request and consulting nothing, each names no pairing, and a row
+    # for each would hand a caller holding one valid assertion an INSERT per
+    # malformed body. `PairingAudit` carries the rule and what excluding them
+    # costs.
 
-    # THE FOUR EXITS ABOVE ARE THE RULE'S OTHER HALF. Each is answered by
-    # looking at the request and consulting nothing, each names no device
-    # code, and a row for each would hand a caller holding one valid
-    # assertion an INSERT per malformed body. `PairingAudit` carries the rule
-    # and what excluding them costs.
-
-    # From here the request names a device code, so every exit below is a
-    # conclusion about one and every exit below is recorded.
-    audit.names(device_code=device_code_value)
-
-    existing: DeviceCode | None = await store.get_device_code(device_code_value)
+    existing = await _lookup_by_user_code(store, user_code_value)
     if existing is None:
+        return _Pairing(_unpairable_response(), DETAIL_USER_CODE_NOT_FOUND)
+
+    # From here the request names a pairing, so every exit below is a
+    # conclusion about one and every exit below is recorded. WHICH CLIENT IS
+    # BEING PAIRED is the other half of the name: the browser supplied it,
+    # unauthenticated, at `/device_authorization`, and it is never an
+    # identity, but on every refused path below it exists nowhere else once
+    # the code expires.
+    audit.names(device_code=existing.device_code, paired_client_id=existing.client_id)
+
+    if await store.approve_scanned(existing.device_code, customer.value):
+        # THE STORE WRITE COMES FIRST AND THE ROW FOLLOWS, which is the
+        # opposite of the read path's entry row and is chosen for a measurable
+        # reason rather than by analogy. Writing the row first would make every
+        # failure of the line above -- a Redis timeout, a failover, an ordinary
+        # blip on the backend `POSTERN_REDIS_URL` names -- produce a durable
+        # row saying a pairing succeeded when none did. This order instead
+        # makes "no row" mean "no pairing" on every path but one: a hard
+        # process kill between this line and the INSERT, which `PairingAudit`
+        # names as the residual.
         return _Pairing(
-            _error(400, "invalid_grant", "device code not found"),
-            DETAIL_DEVICE_CODE_NOT_FOUND,
+            JSONResponse(status_code=200, content={"status": "approved"}),
+            approved_device_code=existing.device_code,
         )
 
-    # WHICH CLIENT IS BEING PAIRED, and the only place this row can learn it.
-    # The browser supplied it, unauthenticated, at `/device_authorization`,
-    # and it is never an identity -- but it is the whole answer to "which
-    # client did this customer authorise", and on every refused path below it
-    # exists nowhere else once the code expires.
-    audit.names(paired_client_id=existing.client_id)
-
-    # Checked BEFORE anything is written. A second approval of an already
-    # approved code must not reach the write below, or an attacker holding a
-    # valid assertion of their own could re-approve a code the victim already
-    # approved and swap `customer_ref` to themselves in the window before the
-    # browser polls `/token`.
-    #
-    # This sits BEFORE the `user_code` comparison, and that ordering is a
-    # deliberate trade of a small oracle against a real denial of service.
-    # Ordered this way, a caller who holds a `device_code` can learn whether
-    # it is already approved without proving they hold the pairing code.
-    # Ordered the other way, that same caller could burn the attempt budget
-    # below on an approved-but-not-yet-exchanged code and REVOKE it, denying
-    # the legitimate user the token they are already waiting on. Both
-    # presuppose the caller somehow has the 256-bit `device_code`; only one
-    # of them destroys a session in flight. Leaking "this code is approved"
-    # to someone who already holds the code is the cheaper loss.
-    #
-    # The oracle is unchanged by the row, which is worth saying because the
-    # row is new: `audit_log` is not reachable by the caller, so what an
-    # attacker learns here is still exactly the status code.
-    if existing.approved:
-        return _Pairing(
-            _error(400, "already_approved", "device code already approved"),
-            DETAIL_ALREADY_APPROVED,
-        )
-
-    if not _user_code_matches(user_code_value, existing.user_code):
-        return await _record_user_code_failure(store, settings, existing)
-
-    # ONE store write carrying approval and identity together. The previous
-    # shape was `approve_device_code` and then `update_device_code`, which
-    # left a window in which the code read as approved while the identity on
-    # it was still the caller-supplied `client_id` -- and `/token` minted
-    # from exactly that field. There is no such window now, and `/token`
-    # reads `customer_ref`, which is empty until this line runs.
-    await store.update_device_code(
-        device_code_value,
-        dataclasses.replace(
-            existing,
-            approved=True,
-            approved_at=datetime.now(UTC),
-            customer_ref=customer.value,
-        ),
-    )
-
-    # THE STORE WRITE COMES FIRST AND THE ROW FOLLOWS, which is the opposite
-    # of the read path's entry row and is chosen for a measurable reason
-    # rather than by analogy. Writing the row first would make every failure
-    # of the line above -- a Redis timeout, a failover, an ordinary blip on
-    # the backend `POSTERN_REDIS_URL` names -- produce a durable row saying a
-    # pairing succeeded when none did. That is not a rare crash, it is a
-    # routine outage shape, and it would make the success rows unreliable in
-    # exactly the conditions an operator is investigating. This order instead
-    # makes "no row" mean "no pairing" on every path but one: a hard process
-    # kill between this line and the INSERT, which `PairingAudit` names as
-    # the residual.
     return _Pairing(
-        JSONResponse(status_code=200, content={"status": "approved"}),
-        approved_device_code=device_code_value,
+        _unpairable_response(),
+        await _approve_refusal_detail(store, existing.device_code, customer.value),
     )
 
 
-def _user_code_matches(presented: str, stored: str) -> bool:
-    """Constant-time pairing-code comparison.
+async def _approve_refusal_detail(
+    store: DeviceCodeStoreBase, device_code_value: str, customer_ref: str
+) -> str:
+    """Which ``DETAIL_*`` a refused ``approve_scanned`` is recorded under.
 
-    ``hmac.compare_digest`` on ``bytes`` rather than ``str``: the ``str``
-    overload raises ``TypeError`` on any non-ASCII character, and ``presented``
-    is attacker-controlled, so the ``str`` form turns a hostile body into a
-    500 instead of a 400.
+    Read from the row AFTER the compare-and-set refused, in the order
+    ``dev-docs/qr-page-spec.md`` section 6 fixes: gone or expired by now,
+    then nobody scanned it, then somebody else did, then it is already
+    approved. The read decides nothing -- the refusal has happened -- so the
+    race between the two reads can only move a row from one label to another,
+    never approve anything.
 
-    Normalizing first is not constant time and leaks the presented length.
-    That is accepted: the length of a six-character code from a published
-    alphabet is not the secret.
+    A ROW THAT PASSES ALL FOUR is scanned by this customer, unexpired and
+    unapproved, which is exactly what ``approve_scanned`` approves. Neither
+    backend can refuse such a row: in memory nothing can run between the two
+    reads' decisions, and on Redis a transaction beaten on every try raises
+    ``DeviceCodeStoreContended`` rather than answering ``False``. So that
+    shape raises here too, and ``approve_callback`` records the exception's
+    type, which is the true statement.
     """
-    return hmac.compare_digest(
-        _normalize_user_code(presented).encode("utf-8"),
-        stored.encode("utf-8"),
-    )
-
-
-async def _record_user_code_failure(
-    store: DeviceCodeStoreBase,
-    settings: ConfirmSettings,
-    existing: DeviceCode,
-) -> _Pairing:
-    """Count a wrong pairing code and revoke the device code once over budget.
-
-    RFC 8628 §5.2 asks the authorization server to rate-limit ``user_code``
-    attempts. The budget is small (``user_code_max_attempts``, default 3)
-    because a legitimate app is comparing a code it just scanned: the only
-    benign cause of a mismatch is a user typing it by hand and slipping.
-
-    Revocation rather than a lockout timer, because the recovery the user
-    needs is a fresh QR anyway, and a fresh QR is what re-anchors the human
-    code comparison that is the real A2 control. A lockout would leave the
-    same phishable code on screen.
-
-    TWO ``DETAIL_*`` LITERALS FOR ONE STATUS CODE, because the caller cannot
-    tell these apart and the table must. Both answer 400 with
-    ``invalid_user_code``. One is a customer mistyping six characters; the
-    other ENDED the pairing for that customer, and in bulk it is the A2 relay
-    signal at its loudest -- something holds the ``device_code`` and is
-    guessing the half only a human reading the browser can supply.
-    """
-    attempts = existing.user_code_attempts + 1
-    if attempts >= settings.user_code_max_attempts:
-        await store.revoke_device_code(existing.device_code)
-        logger.warning(
-            "device approve: device code revoked after %d incorrect pairing codes", attempts
-        )
-        return _Pairing(
-            _error(
-                400,
-                "invalid_user_code",
-                "pairing code incorrect; device code revoked, start a new pairing",
-            ),
-            DETAIL_USER_CODE_BUDGET_EXHAUSTED,
-        )
-    await store.update_device_code(
-        existing.device_code,
-        dataclasses.replace(existing, user_code_attempts=attempts),
-    )
-    return _Pairing(
-        _error(400, "invalid_user_code", "pairing code does not match this device code"),
-        DETAIL_USER_CODE_MISMATCH,
-    )
+    row = await store.get_device_code(device_code_value)
+    if row is None or row.is_expired:
+        return DETAIL_USER_CODE_NOT_FOUND
+    if not row.scanned_by:
+        return DETAIL_NOT_SCANNED
+    if row.scanned_by != customer_ref:
+        return DETAIL_SCANNED_BY_OTHER
+    if row.approved:
+        return DETAIL_ALREADY_APPROVED
+    raise RuntimeError("approve_scanned refused a code this customer scanned and has not approved")
 
 
 # ---------------------------------------------------------------------------
@@ -1273,7 +1241,7 @@ def device_auth_routes(
 
     Args:
         store: Device code storage backend.
-        settings: Service settings (TTL, URIs, pairing-code attempt budget).
+        settings: Service settings (TTL, URIs, poll interval).
         read_minter: Minter for read tokens (during device code exchange).
 
     Returns:

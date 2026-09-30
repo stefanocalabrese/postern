@@ -73,6 +73,7 @@ from services.confirm.customer_rate_limit import (
 from services.confirm.main import create_confirm_app
 from services.confirm.rate_limit import RATE_LIMIT_WINDOW_SECONDS, Limit
 from services.confirm.settings import ConfirmSettings
+from tests.device_grant_helpers import scan_in_store
 from tests.test_device_grant import AUDIENCE, ISSUER, bearer
 
 CUSTOMER = "cust_7f3a"
@@ -160,17 +161,21 @@ def _client(app: Starlette, peer: str = "127.0.0.1") -> httpx2.AsyncClient:
     )
 
 
-async def _pair(client: httpx2.AsyncClient) -> tuple[str, str]:
-    """Start a device grant and return ``(device_code, user_code)``.
+async def _pair(app: Starlette, client: httpx2.AsyncClient, scanned_by: str = CUSTOMER) -> str:
+    """Start a device grant, scan it in the store as ``scanned_by``, and
+    return its ``user_code``.
 
     The pairing is real, so `test_a_legitimate_approval_completes_under_the_ceiling`
     below asserts a 200 from the handler rather than "not a 429", which a
-    limiter that let everything through would also satisfy.
+    limiter that let everything through would also satisfy. The scan goes
+    through the store rather than ``POST /scan``, so it spends nothing from
+    either limiter these tests count.
     """
     response = await client.post("/device_authorization", json={"client_id": "browser-1"})
     assert response.status_code == 200, response.text
-    body = response.json()
-    return body["device_code"], body["user_code"]
+    user_code = str(response.json()["user_code"])
+    await scan_in_store(app, user_code, scanned_by)
+    return user_code
 
 
 # --- Direct-ASGI harness, for the middleware in isolation. ------------------
@@ -421,8 +426,8 @@ class TestTheBudgetIsPerCustomer:
         """
         app = _app(key_pair, customer_rate_limit_approve=1)
         async with _client(app, peer="198.51.100.7") as client:
-            device_code, user_code = await _pair(client)
-            body = {"device_code": device_code, "user_code": user_code}
+            user_code = await _pair(app, client)
+            body = {"user_code": user_code}
 
             first = await client.post("/approve", json=body, headers=bearer(key_pair, CUSTOMER))
             assert first.status_code == 200
@@ -452,8 +457,8 @@ class TestTheBudgetIsPerCustomer:
             _client(app, peer="198.51.100.1") as first_client,
             _client(app, peer="203.0.113.99") as second_client,
         ):
-            device_code, user_code = await _pair(first_client)
-            body = {"device_code": device_code, "user_code": user_code}
+            user_code = await _pair(app, first_client)
+            body = {"user_code": user_code}
 
             first = await first_client.post(
                 "/approve", json=body, headers=bearer(key_pair, CUSTOMER)
@@ -477,10 +482,10 @@ class TestTheBudgetIsPerCustomer:
         app = _app(key_pair)
         async with _client(app) as client:
             for _ in range(3):
-                device_code, user_code = await _pair(client)
+                user_code = await _pair(app, client)
                 response = await client.post(
                     "/approve",
-                    json={"device_code": device_code, "user_code": user_code},
+                    json={"user_code": user_code},
                     headers=bearer(key_pair, CUSTOMER),
                 )
                 assert response.status_code == 200
@@ -510,7 +515,7 @@ class TestTheOuterLimiterIsStillFirst:
             for _ in range(6):
                 await client.post(
                     "/approve",
-                    json={"device_code": "x", "user_code": "y"},
+                    json={"user_code": "y"},
                     headers=bearer(key_pair, CUSTOMER),
                 )
         assert verifier.verifications == 2
@@ -525,12 +530,12 @@ class TestTheOuterLimiterIsStillFirst:
         async with _client(app) as client:
             await client.post(
                 "/approve",
-                json={"device_code": "x", "user_code": "y"},
+                json={"user_code": "y"},
                 headers=bearer(key_pair, CUSTOMER),
             )
             refused = await client.post(
                 "/approve",
-                json={"device_code": "x", "user_code": "y"},
+                json={"user_code": "y"},
                 headers=bearer(key_pair, CUSTOMER),
             )
         assert refused.status_code == 429
@@ -566,7 +571,7 @@ class TestAnOperatorCanTellTheTwoRefusalsApart:
         one is either a no-op or a hole.
         """
         app = _app(key_pair, rate_limit_approve=3, customer_rate_limit_approve=1)
-        body = {"device_code": "x", "user_code": "y"}
+        body = {"user_code": "y"}
         async with _client(app) as client:
             admitted = await client.post("/approve", json=body, headers=bearer(key_pair, CUSTOMER))
             assert admitted.status_code != 429

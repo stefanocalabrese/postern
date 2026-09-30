@@ -2,9 +2,10 @@
 
 Covers:
 - Device code generation (device_code, user_code, QR data).
-- In-memory store CRUD (create, get, approve, revoke, update), including the
-  ``customer_ref`` / ``user_code_attempts`` fields added for audit findings
-  C-01 and C-04.
+- In-memory store basics (create, get, revoke), including the
+  ``customer_ref`` field added for audit finding C-01. The pairing half of the
+  store -- lookups, ``claim_scan``, ``approve_scanned`` -- is in
+  ``tests/test_device_code_pairing_store.py``.
 - Device authorization endpoint (``POST /device_authorization``) — public,
   no bearer: the browser holds no credential (RFC 8628's entire premise).
 - Token exchange with the ``device_code`` grant type (pending, approved,
@@ -16,12 +17,12 @@ Covers:
   no longer name a customer at all.
 - The uniform-401 property: every way authentication can fail produces one
   identical response body, so an attacker cannot learn which check failed.
-- The required ``user_code`` pairing-code check (audit finding C-04):
-  accepted forms, wrong-code handling, and the attempt budget that revokes
-  the device code on the third failure.
-- Error cases (invalid_request, invalid_grant, invalid_user_code,
-  invalid_subject, slow_down, expired_token, already_approved,
-  invalid_state).
+- ``POST /approve`` by ``user_code`` only, after a scan: accepted forms of
+  the code, the refusal of a code nobody scanned, and the one identical
+  ``invalid_grant`` body. ``tests/test_pairing_audit.py`` holds the audit
+  ``detail`` each refusal is recorded under.
+- Error cases (invalid_request, invalid_grant, invalid_subject, slow_down,
+  expired_token, invalid_state).
 
 Until 2026-09-22 ``services/confirm`` authenticated nobody: ``POST /approve``
 took the customer from a ``subject_value`` field in its own request body, and
@@ -48,6 +49,7 @@ from joserfc import jwt as joserfc_jwt
 from joserfc.jwk import KeySet
 from postern_core.auth.device_codes import (
     DeviceCode,
+    DeviceCodeStoreBase,
     InMemoryDeviceCodeStore,
     RedisDeviceCodeStore,
     _device_code_to_dict,
@@ -63,6 +65,7 @@ from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
 from services.confirm.device_auth import approve_callback
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import MIN_DEVICE_CODE_TTL_SECONDS, ConfirmSettings
+from tests.device_grant_helpers import scan_in_store
 
 # Imported for its VALUE, not to run it: `SHORTEST_STORED_TTL` is where the
 # truncation that bug B1 rides on was measured, and the floor's derivation
@@ -174,19 +177,28 @@ async def _start_device_grant(
 
 
 async def _approve(
+    app: Starlette,
     client: httpx2.AsyncClient,
     device: dict[str, Any],
     headers: dict[str, str] | None,
     *,
     user_code: str | None = None,
+    scanned_by: str | None = "cust_7f3a",
 ) -> httpx2.Response:
-    """``POST /approve`` for ``device``, with ``headers`` (or none at all)."""
+    """Scan ``device`` in the store as ``scanned_by``, then ``POST /approve``.
+
+    ``scanned_by`` must name the customer the bearer names, because
+    ``approve_scanned`` approves only for the customer who scanned; the
+    default is ``bearer``'s own default subject. ``None`` skips the scan, for
+    the requests refused before the pairing is looked up (every 401, and
+    ``invalid_subject``). ``user_code`` overrides the value sent, for the
+    accepted-forms tests; the scan always uses the code the grant issued.
+    """
+    if scanned_by is not None:
+        await scan_in_store(app, device["user_code"], scanned_by)
     return await client.post(
         "/approve",
-        json={
-            "device_code": device["device_code"],
-            "user_code": user_code if user_code is not None else device["user_code"],
-        },
+        json={"user_code": user_code if user_code is not None else device["user_code"]},
         headers=headers or {},
     )
 
@@ -313,55 +325,25 @@ class TestInMemoryDeviceCodeStore:
         result = await store.get_device_code("nonexistent")
         assert result is None
 
-    async def test_new_device_code_defaults_customer_ref_empty_and_attempts_zero(
+    async def test_new_device_code_defaults_customer_ref_empty(
         self, store: InMemoryDeviceCodeStore
     ) -> None:
-        """The two fields audit findings C-01/C-04 added start unset: no
-        identity and no failed pairing-code attempts until `/approve` writes
-        them."""
+        """The field audit finding C-01 added starts unset: no identity until
+        `/approve` writes it."""
         code = await store.create_device_code(
             client_id="test-client",
             scopes="accounts:read",
             verification_uri="https://auth.example.com/verify",
         )
         assert code.customer_ref == ""
-        assert code.user_code_attempts == 0
 
-    async def test_approve(self, store: InMemoryDeviceCodeStore) -> None:
-        """The store-level `approve_device_code` still exists and still just
-        flips `approved`/`approved_at` -- it does NOT set `customer_ref`,
-        which is exactly why `services/confirm/device_auth.py::approve_callback`
-        no longer calls it: identity and approval are now written together,
-        in one `update_device_code` call, from a verified assertion."""
-        code = await store.create_device_code(
-            client_id="test-client",
-            scopes="accounts:read",
-            verification_uri="https://auth.example.com/verify",
-        )
-        assert code.approved is False
-
-        result = await store.approve_device_code(code.device_code)
-        assert result is True
-
-        updated = await store.get_device_code(code.device_code)
-        assert updated is not None
-        assert updated.approved is True
-        assert updated.approved_at is not None
-        assert updated.customer_ref == ""
-
-    async def test_double_approve_fails(self, store: InMemoryDeviceCodeStore) -> None:
-        code = await store.create_device_code(
-            client_id="test-client",
-            scopes="accounts:read",
-            verification_uri="https://auth.example.com/verify",
-        )
-        assert await store.approve_device_code(code.device_code) is True
-        # Second approval should fail.
-        assert await store.approve_device_code(code.device_code) is False
-
-    async def test_approve_nonexistent(self, store: InMemoryDeviceCodeStore) -> None:
-        result = await store.approve_device_code("nonexistent")
-        assert result is False
+    def test_the_store_offers_no_whole_snapshot_write(self) -> None:
+        """A snapshot read before a concurrent ``claim_scan`` or
+        ``approve_scanned`` and written back after it would silently undo that
+        compare-and-set, so neither writer exists on any backend."""
+        for cls in (DeviceCodeStoreBase, InMemoryDeviceCodeStore, RedisDeviceCodeStore):
+            assert not hasattr(cls, "update_device_code"), cls.__name__
+            assert not hasattr(cls, "approve_device_code"), cls.__name__
 
     async def test_revoke(self, store: InMemoryDeviceCodeStore) -> None:
         code = await store.create_device_code(
@@ -375,46 +357,6 @@ class TestInMemoryDeviceCodeStore:
     async def test_revoke_nonexistent(self, store: InMemoryDeviceCodeStore) -> None:
         # Should not raise.
         await store.revoke_device_code("nonexistent")
-
-    async def test_update_device_code(self, store: InMemoryDeviceCodeStore) -> None:
-        code = await store.create_device_code(
-            client_id="original",
-            scopes="accounts:read",
-            verification_uri="https://auth.example.com/verify",
-        )
-        updated = DeviceCode(
-            device_code=code.device_code,
-            user_code=code.user_code,
-            verification_uri=code.verification_uri,
-            expires_at=code.expires_at,
-            interval=code.interval,
-            client_id="updated-client",
-            scopes=code.scopes,
-            approved=True,
-            approved_at=datetime.now(UTC),
-        )
-        await store.update_device_code(code.device_code, updated)
-
-        found = await store.get_device_code(code.device_code)
-        assert found is not None
-        assert found.client_id == "updated-client"
-        assert found.approved is True
-
-    async def test_update_device_code_writes_customer_ref_and_user_code_attempts(
-        self, store: InMemoryDeviceCodeStore
-    ) -> None:
-        code = await store.create_device_code(
-            client_id="test-client",
-            scopes="accounts:read",
-            verification_uri="https://auth.example.com/verify",
-        )
-        updated = dataclasses.replace(code, customer_ref="cust_7f3a", user_code_attempts=2)
-        await store.update_device_code(code.device_code, updated)
-
-        found = await store.get_device_code(code.device_code)
-        assert found is not None
-        assert found.customer_ref == "cust_7f3a"
-        assert found.user_code_attempts == 2
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +517,7 @@ class TestTokenExchangeEndpoint:
         only a verified `/approve` write ever sets (audit finding C-01)."""
         async with _client(app) as client:
             device = await _start_device_grant(client, client_id="cust_should_be_ignored")
-            approve = await _approve(client, device, bearer(key_pair, subject="cust_7f3a"))
+            approve = await _approve(app, client, device, bearer(key_pair, subject="cust_7f3a"))
             assert approve.status_code == 200
 
             resp = await client.post(
@@ -705,7 +647,8 @@ class TestTokenExchangeEndpoint:
 class TestApproveCallback:
     """POST /approve — mobile app approval. Requires a verified bearer
     assertion (see TestApproveCallbackUniform401 below); the customer comes
-    from its `sub`, never from the body (audit finding C-01)."""
+    from its `sub`, never from the body (audit finding C-01), and the code must
+    have been scanned by that same customer first."""
 
     async def test_approve_success_takes_the_customer_from_the_bearer(
         self, app: Starlette, key_pair: RSAKeyPair
@@ -716,11 +659,12 @@ class TestApproveCallback:
             scopes="accounts:read",
             verification_uri="https://auth.example.com/verify",
         )
+        await scan_in_store(app, code.user_code, "cust_123")
 
         async with _client(app) as client:
             resp = await client.post(
                 "/approve",
-                json={"device_code": code.device_code, "user_code": code.user_code_display},
+                json={"user_code": code.user_code_display},
                 headers=bearer(key_pair, subject="cust_123"),
             )
 
@@ -749,46 +693,52 @@ class TestApproveCallback:
         async with _client(app) as client:
             resp = await client.post(
                 "/approve",
-                json={"device_code": "nonexistent", "user_code": "ABCDEF"},
+                json={"user_code": "ABCDEF"},
                 headers=bearer(key_pair),
             )
 
         assert resp.status_code == 400
         assert resp.json()["error"] == "invalid_grant"
 
-    async def test_approve_already_approved(self, app: Starlette, key_pair: RSAKeyPair) -> None:
+    async def test_a_second_customer_cannot_approve_a_code_the_first_scanned(
+        self, app: Starlette, key_pair: RSAKeyPair
+    ) -> None:
+        """The swap the old ``already_approved`` check guarded against, now
+        impossible by construction: ``approve_scanned`` approves only for the
+        customer in ``scanned_by``."""
         store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = await store.create_device_code(
             client_id="test-client",
             scopes="accounts:read",
             verification_uri="https://auth.example.com/verify",
         )
+        await scan_in_store(app, code.user_code, "cust_123")
 
         async with _client(app) as client:
             first = await client.post(
                 "/approve",
-                json={"device_code": code.device_code, "user_code": code.user_code_display},
+                json={"user_code": code.user_code_display},
                 headers=bearer(key_pair, subject="cust_123"),
             )
             assert first.status_code == 200
 
-            # A second approver, with their own genuine assertion, must not
-            # be able to swap the identity on an already-approved code.
             second = await client.post(
                 "/approve",
-                json={"device_code": code.device_code, "user_code": code.user_code_display},
+                json={"user_code": code.user_code_display},
                 headers=bearer(key_pair, subject="cust_attacker"),
             )
 
         assert second.status_code == 400
-        assert second.json()["error"] == "already_approved"
+        assert second.json()["error"] == "invalid_grant"
         updated = await store.get_device_code(code.device_code)
         assert updated is not None
         assert updated.customer_ref == "cust_123"
 
-    async def test_approve_wrong_user_code_is_400_and_does_not_approve(
+    async def test_an_unscanned_code_is_refused_and_not_approved(
         self, app: Starlette, key_pair: RSAKeyPair
     ) -> None:
+        """Knowing a ``user_code`` approves nothing: the same customer must
+        have scanned the QR with a current rotation token first."""
         store: InMemoryDeviceCodeStore = app.state.device_code_store
         code = await store.create_device_code(
             client_id="test-client",
@@ -799,16 +749,71 @@ class TestApproveCallback:
         async with _client(app) as client:
             resp = await client.post(
                 "/approve",
-                json={"device_code": code.device_code, "user_code": "ZZZZZZ"},
+                json={"user_code": code.user_code_display},
                 headers=bearer(key_pair),
             )
 
         assert resp.status_code == 400
-        assert resp.json()["error"] == "invalid_user_code"
+        assert resp.json()["error"] == "invalid_grant"
         updated = await store.get_device_code(code.device_code)
         assert updated is not None
         assert updated.approved is False
-        assert updated.user_code_attempts == 1
+
+    async def test_every_pairing_refusal_answers_the_identical_body(
+        self, app: Starlette, key_pair: RSAKeyPair
+    ) -> None:
+        """Unknown, unscanned, scanned by another and already approved: one
+        body, so a caller learns nothing about whether a pairing exists."""
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        unscanned = await store.create_device_code(
+            client_id="c", scopes="accounts:read", verification_uri="https://a.test/v"
+        )
+        someone_elses = await store.create_device_code(
+            client_id="c", scopes="accounts:read", verification_uri="https://a.test/v"
+        )
+        await scan_in_store(app, someone_elses.user_code, "cust_9e21")
+        approved = await store.create_device_code(
+            client_id="c", scopes="accounts:read", verification_uri="https://a.test/v"
+        )
+        await scan_in_store(app, approved.user_code, "cust_7f3a")
+        assert await store.approve_scanned(approved.device_code, "cust_7f3a") is True
+
+        bodies = []
+        async with _client(app) as client:
+            for user_code in ("ZZZ-ZZZ", unscanned.user_code, someone_elses.user_code):
+                resp = await client.post(
+                    "/approve", json={"user_code": user_code}, headers=bearer(key_pair)
+                )
+                assert resp.status_code == 400
+                bodies.append(resp.json())
+            resp = await client.post(
+                "/approve", json={"user_code": approved.user_code}, headers=bearer(key_pair)
+            )
+            assert resp.status_code == 400
+            bodies.append(resp.json())
+
+        assert all(body == bodies[0] for body in bodies), bodies
+        assert bodies[0]["error"] == "invalid_grant"
+
+    async def test_a_body_still_carrying_device_code_is_refused_loudly(
+        self, app: Starlette, key_pair: RSAKeyPair
+    ) -> None:
+        """An app on the old contract fails with ``invalid_request``, never
+        with a pairing refusal it could mistake for a wrong code."""
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        code = await store.create_device_code(
+            client_id="c", scopes="accounts:read", verification_uri="https://a.test/v"
+        )
+        await scan_in_store(app, code.user_code, "cust_7f3a")
+        legacy = dict(device_code=code.device_code, user_code=code.user_code_display)
+
+        async with _client(app) as client:
+            resp = await client.post("/approve", json=legacy, headers=bearer(key_pair))
+
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_request"
+        stored = await store.get_device_code(code.device_code)
+        assert stored is not None and stored.approved is False
 
 
 # ---------------------------------------------------------------------------
@@ -843,14 +848,13 @@ class TestFullLifecycle:
             assert resp.status_code == 400
             assert resp.json()["error"] == "authorization_pending"
 
-            # Step 3: Mobile app approves, with a verified assertion and the
-            # pairing code from the same QR.
+            # Step 3: Mobile app scans (through the store here; POST /scan has
+            # its own tests) and approves, with a verified assertion and the
+            # pairing code from the QR.
+            await scan_in_store(app, device_data["user_code"], "cust_abc")
             resp = await client.post(
                 "/approve",
-                json={
-                    "device_code": device_code_value,
-                    "user_code": device_data["user_code"],
-                },
+                json={"user_code": device_data["user_code"]},
                 headers=bearer(key_pair, subject="cust_abc"),
             )
             assert resp.status_code == 200
@@ -966,7 +970,7 @@ class TestSerialization:
         assert dc2.approved is False
         assert dc2.approved_at is None
 
-    def test_customer_ref_and_user_code_attempts_round_trip_through_json(self) -> None:
+    def test_customer_ref_round_trips_through_json(self) -> None:
         dc = DeviceCode(
             device_code="cref-json",
             user_code="ABCDEF",
@@ -975,32 +979,29 @@ class TestSerialization:
             approved=True,
             approved_at=datetime.now(UTC),
             customer_ref="cust_7f3a",
-            user_code_attempts=2,
         )
         dc2 = DeviceCode.from_json(dc.to_json())
         assert dc2.customer_ref == "cust_7f3a"
-        assert dc2.user_code_attempts == 2
 
-    def test_customer_ref_and_user_code_attempts_round_trip_through_dict(self) -> None:
+    def test_customer_ref_round_trips_through_dict(self) -> None:
         dc = DeviceCode(
             device_code="cref-dict",
             user_code="ABCDEF",
             verification_uri="https://auth.example.com/verify",
             expires_at=datetime.now(UTC) + timedelta(minutes=15),
             customer_ref="cust_9999",
-            user_code_attempts=1,
         )
         dc2 = DeviceCode.from_dict(_device_code_to_dict(dc))
         assert dc2.customer_ref == "cust_9999"
-        assert dc2.user_code_attempts == 1
 
-    def test_from_dict_without_the_new_fields_defaults_customer_ref_and_attempts(self) -> None:
+    def test_from_dict_without_the_new_fields_defaults_customer_ref(self) -> None:
         """A Redis-backed store can hold codes serialized by a previous
         release. `.get()` defaults, not `data[...]`, keep an old record
         deserializing instead of raising `KeyError` on every in-flight
-        device grant when this rolls out -- and defaulting to empty/zero is
-        the fail-closed direction: `/token` then refuses the code instead of
-        minting from a stale identity."""
+        device grant when this rolls out -- and defaulting to empty is the
+        fail-closed direction: `/token` then refuses the code instead of
+        minting from a stale identity. A ``user_code_attempts`` key, which
+        records written before 2026-09-30 carry, is ignored."""
         legacy: dict[str, Any] = {
             "device_code": "legacy",
             "user_code": "ABCDEF",
@@ -1011,11 +1012,12 @@ class TestSerialization:
             "scopes": "accounts:read",
             "approved": False,
             "approved_at": None,
-            # No "customer_ref" or "user_code_attempts" key at all.
+            "user_code_attempts": 2,
+            # No "customer_ref" key at all.
         }
         dc = DeviceCode.from_dict(legacy)
         assert dc.customer_ref == ""
-        assert dc.user_code_attempts == 0
+        assert not hasattr(dc, "user_code_attempts")
 
     def test_exchanged_at_round_trips_through_json(self) -> None:
         """The field a replay is refused on has to survive a Redis round trip.
@@ -1180,11 +1182,11 @@ class TestApproveCallbackEdgeCases:
                 headers={"content-type": "application/json"},
             )
             dc = dc_resp.json()
+            await scan_in_store(app, dc["user_code"], "cust_7f3a")
 
             resp = await c.post(
                 "/approve",
                 json={
-                    "device_code": dc["device_code"],
                     "user_code": dc["user_code"],
                     "subject_value": "cust_evil",
                     "approval_signature": "sig_xyz",
@@ -1200,12 +1202,12 @@ class TestApproveCallbackEdgeCases:
         assert updated is not None
         assert updated.customer_ref == "cust_7f3a"
 
-    async def test_approve_empty_device_code(self, app: Starlette, key_pair: RSAKeyPair) -> None:
-        """Empty device_code → 400, even with a valid bearer."""
+    async def test_approve_empty_user_code(self, app: Starlette, key_pair: RSAKeyPair) -> None:
+        """Empty user_code → 400, even with a valid bearer."""
         async with _client(app) as c:
             resp = await c.post(
                 "/approve",
-                json={"device_code": "", "user_code": "ABCDEF"},
+                json={"user_code": ""},
                 headers=bearer(key_pair),
             )
         assert resp.status_code == 400
@@ -1222,7 +1224,7 @@ class TestApproveCallbackEdgeCases:
         async with _client(app) as c:
             resp = await c.post(
                 "/approve",
-                json={"device_code": "some_code", "user_code": "ABCDEF"},
+                json={"user_code": "ABCDEF"},
                 headers=bearer(key_pair, subject=""),
             )
         assert resp.status_code == 401
@@ -1253,14 +1255,12 @@ class TestCompleteFlow:
             assert resp.status_code == 400
             assert resp.json()["error"] == "authorization_pending"
 
-            # 3. Approve via mobile app, with a verified assertion and the
-            # pairing code.
+            # 3. Scan and approve via mobile app, with a verified assertion and
+            # the pairing code.
+            await scan_in_store(app, dc["user_code"], "cust_7f3a")
             approve_resp = await c.post(
                 "/approve",
-                json={
-                    "device_code": dc["device_code"],
-                    "user_code": dc["user_code"],
-                },
+                json={"user_code": dc["user_code"]},
                 headers=bearer(key_pair, subject="cust_7f3a"),
             )
             assert approve_resp.status_code == 200
@@ -1334,13 +1334,13 @@ class TestApproveCallbackUniform401:
         self, app: Starlette, pending_code: dict[str, Any]
     ) -> None:
         async with _client(app) as client:
-            resp = await _approve(client, pending_code, None)
+            resp = await _approve(app, client, pending_code, None)
         assert resp.status_code == 401
 
     async def test_malformed_jwt(self, app: Starlette, pending_code: dict[str, Any]) -> None:
         async with _client(app) as client:
             resp = await _approve(
-                client, pending_code, {"Authorization": "Bearer not-a-jwt-at-all"}
+                app, client, pending_code, {"Authorization": "Bearer not-a-jwt-at-all"}
             )
         assert resp.status_code == 401
 
@@ -1348,7 +1348,9 @@ class TestApproveCallbackUniform401:
         self, app: Starlette, pending_code: dict[str, Any], key_pair: RSAKeyPair
     ) -> None:
         async with _client(app) as client:
-            resp = await _approve(client, pending_code, bearer(key_pair, expires_in_seconds=-10))
+            resp = await _approve(
+                app, client, pending_code, bearer(key_pair, expires_in_seconds=-10)
+            )
         assert resp.status_code == 401
 
     async def test_wrong_issuer(
@@ -1356,7 +1358,7 @@ class TestApproveCallbackUniform401:
     ) -> None:
         async with _client(app) as client:
             resp = await _approve(
-                client, pending_code, bearer(key_pair, issuer="https://wrong-issuer.invalid")
+                app, client, pending_code, bearer(key_pair, issuer="https://wrong-issuer.invalid")
             )
         assert resp.status_code == 401
 
@@ -1364,21 +1366,23 @@ class TestApproveCallbackUniform401:
         self, app: Starlette, pending_code: dict[str, Any], key_pair: RSAKeyPair
     ) -> None:
         async with _client(app) as client:
-            resp = await _approve(client, pending_code, bearer(key_pair, audience="wrong-audience"))
+            resp = await _approve(
+                app, client, pending_code, bearer(key_pair, audience="wrong-audience")
+            )
         assert resp.status_code == 401
 
     async def test_wrong_signature(
         self, app: Starlette, pending_code: dict[str, Any], other_key_pair: RSAKeyPair
     ) -> None:
         async with _client(app) as client:
-            resp = await _approve(client, pending_code, bearer(other_key_pair))
+            resp = await _approve(app, client, pending_code, bearer(other_key_pair))
         assert resp.status_code == 401
 
     async def test_empty_subject_claim(
         self, app: Starlette, pending_code: dict[str, Any], key_pair: RSAKeyPair
     ) -> None:
         async with _client(app) as client:
-            resp = await _approve(client, pending_code, bearer(key_pair, subject=""))
+            resp = await _approve(app, client, pending_code, bearer(key_pair, subject=""))
         assert resp.status_code == 401
 
     async def test_every_failure_mode_returns_the_identical_body(
@@ -1401,7 +1405,7 @@ class TestApproveCallbackUniform401:
         bodies: list[dict[str, Any]] = []
         async with _client(app) as client:
             for headers in variants:
-                resp = await _approve(client, pending_code, headers)
+                resp = await _approve(app, client, pending_code, headers)
                 assert resp.status_code == 401
                 bodies.append(resp.json())
 
@@ -1420,7 +1424,7 @@ class TestApproveCallbackInvalidSubjectShape:
     async def test_non_customer_subject_is_403(self, app: Starlette, key_pair: RSAKeyPair) -> None:
         async with _client(app) as client:
             device = await _start_device_grant(client)
-            resp = await _approve(client, device, bearer(key_pair, subject="not-a-customer"))
+            resp = await _approve(app, client, device, bearer(key_pair, subject="not-a-customer"))
         assert resp.status_code == 403
         assert resp.json() == {
             "error": "invalid_subject",
@@ -1449,7 +1453,7 @@ class TestAuditFindingC01SubjectValueInBodyIsIgnored:
 
             approve_resp = await client.post(
                 "/approve",
-                json={"device_code": device["device_code"], "subject_value": "cust_victim"},
+                json={"user_code": device["user_code"], "subject_value": "cust_victim"},
             )
             assert approve_resp.status_code == 401
             assert approve_resp.json() == {
@@ -1472,14 +1476,11 @@ class TestAuditFindingC01SubjectValueInBodyIsIgnored:
         name in the body."""
         async with _client(app) as client:
             device = await _start_device_grant(client, client_id="cust_victim")
+            await scan_in_store(app, device["user_code"], "cust_attacker")
 
             approve_resp = await client.post(
                 "/approve",
-                json={
-                    "device_code": device["device_code"],
-                    "user_code": device["user_code"],
-                    "subject_value": "cust_victim",
-                },
+                json={"user_code": device["user_code"], "subject_value": "cust_victim"},
                 headers=bearer(key_pair, subject="cust_attacker"),
             )
             assert approve_resp.status_code == 200
@@ -1514,67 +1515,23 @@ class TestUserCodeAcceptedForms:
     async def test_display_form_with_dashes(self, app: Starlette, key_pair: RSAKeyPair) -> None:
         async with _client(app) as client:
             device = await _start_device_grant(client)
-            resp = await _approve(client, device, bearer(key_pair))
+            resp = await _approve(app, client, device, bearer(key_pair))
         assert resp.status_code == 200
 
     async def test_bare_form_without_dashes(self, app: Starlette, key_pair: RSAKeyPair) -> None:
         async with _client(app) as client:
             device = await _start_device_grant(client)
             bare = device["user_code"].replace("-", "")
-            resp = await _approve(client, device, bearer(key_pair), user_code=bare)
+            resp = await _approve(app, client, device, bearer(key_pair), user_code=bare)
         assert resp.status_code == 200
 
     async def test_lowercase_form(self, app: Starlette, key_pair: RSAKeyPair) -> None:
         async with _client(app) as client:
             device = await _start_device_grant(client)
             resp = await _approve(
-                client, device, bearer(key_pair), user_code=device["user_code"].lower()
+                app, client, device, bearer(key_pair), user_code=device["user_code"].lower()
             )
         assert resp.status_code == 200
-
-
-class TestUserCodeAttemptBudgetRevokesTheCode:
-    """`ConfirmSettings.user_code_max_attempts` defaults to 3 (RFC 8628 §5.2)."""
-
-    async def test_first_two_wrong_attempts_increment_without_revoking(
-        self, app: Starlette, key_pair: RSAKeyPair
-    ) -> None:
-        store: InMemoryDeviceCodeStore = app.state.device_code_store
-        async with _client(app) as client:
-            device = await _start_device_grant(client)
-            for expected_attempts in (1, 2):
-                resp = await _approve(client, device, bearer(key_pair), user_code="ZZZZZZ")
-                assert resp.status_code == 400
-                assert resp.json()["error"] == "invalid_user_code"
-                updated = await store.get_device_code(device["device_code"])
-                assert updated is not None
-                assert updated.approved is False
-                assert updated.user_code_attempts == expected_attempts
-
-    async def test_three_wrong_attempts_revoke_the_device_code(
-        self, app: Starlette, key_pair: RSAKeyPair
-    ) -> None:
-        store: InMemoryDeviceCodeStore = app.state.device_code_store
-        async with _client(app) as client:
-            device = await _start_device_grant(client)
-
-            for _ in range(2):
-                resp = await _approve(client, device, bearer(key_pair), user_code="ZZZZZZ")
-                assert resp.status_code == 400
-
-            third = await _approve(client, device, bearer(key_pair), user_code="ZZZZZZ")
-            assert third.status_code == 400
-            third_body = third.json()
-            assert third_body["error"] == "invalid_user_code"
-            assert "revoked" in third_body["error_description"]
-            assert await store.get_device_code(device["device_code"]) is None
-
-            token_resp = await client.post(
-                "/token",
-                data={"grant_type": "device_code", "device_code": device["device_code"]},
-            )
-        assert token_resp.status_code == 400
-        assert token_resp.json()["error"] == "invalid_grant"
 
 
 class TestTokenResponseNeverIncludesAWriteToken:
@@ -1586,7 +1543,7 @@ class TestTokenResponseNeverIncludesAWriteToken:
     ) -> None:
         async with _client(app) as client:
             device = await _start_device_grant(client)
-            approve = await _approve(client, device, bearer(key_pair))
+            approve = await _approve(app, client, device, bearer(key_pair))
             assert approve.status_code == 200
 
             resp = await client.post(
@@ -1630,7 +1587,7 @@ class TestApproveCallbackHandlerFailsClosedWithoutMiddleware:
         """Seeding `scope["state"]` the way `AppAssertionMiddleware` would
         proves the 401 above is specifically about the missing assertion,
         not about anything else a direct call skips."""
-        body = json.dumps({"device_code": "", "user_code": ""}).encode()
+        body = json.dumps({"user_code": ""}).encode()
 
         async def receive() -> dict[str, Any]:
             return {"type": "http.request", "body": body, "more_body": False}
@@ -1841,7 +1798,9 @@ class TestAPairingCompletesAtTheConfiguredTtl:
             )
             assert pending.json()["error"] == "authorization_pending"
 
-            approved = await _approve(client, device, bearer(key_pair, subject="cust_abc"))
+            approved = await _approve(
+                app, client, device, bearer(key_pair, subject="cust_abc"), scanned_by="cust_abc"
+            )
             assert approved.status_code == 200
 
             issued = await client.post(
@@ -1853,95 +1812,6 @@ class TestAPairingCompletesAtTheConfiguredTtl:
             stored = await app.state.device_code_store.get_device_code(device["device_code"])
             assert stored is not None, "the code the pairing used was really stored"
             assert not stored.is_expired
-
-
-# ---------------------------------------------------------------------------
-# The floor under POSTERN_USER_CODE_MAX_ATTEMPTS.
-# ---------------------------------------------------------------------------
-
-
-class TestTheUserCodeAttemptBudgetFloor:
-    """What a budget of zero actually costs, which is not what it looks like.
-
-    Traced through `create_confirm_app` on 2026-09-25, because the obvious
-    reading -- "zero attempts, so pairing is dead" -- is wrong, and a floor
-    justified by it would rest on a claim the code does not support.
-    ``_record_user_code_failure`` is reached ONLY from the mismatch branch of
-    ``approve_callback``, so at zero a correct pairing code on the first try
-    still approves and ``/token`` still issues a read token.
-
-    What zero costs is the TOLERANCE. ``attempts =
-    existing.user_code_attempts + 1`` makes the first wrong code ``1 >= 0``,
-    so one mistyped pairing code revokes the device code outright and the
-    customer's next attempt -- with the RIGHT code -- is answered
-    ``invalid_grant: device code not found``. The default of 3 absorbs two.
-
-    WHY THE FLOOR IS ONE AND NOT THREE. ``1`` is already zero tolerance and
-    behaves identically to ``0`` and to ``-5``, so nothing below one
-    expresses anything ``1`` does not. An operator who wants no slack for a
-    typo can still say so; one who writes ``0`` reaching for "no limit" gets
-    the opposite, and that is the reading `_positive_int` refuses to guess.
-    """
-
-    def test_zero_refuses_at_startup_naming_the_variable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("POSTERN_USER_CODE_MAX_ATTEMPTS", "0")
-        with pytest.raises(ValueError, match="POSTERN_USER_CODE_MAX_ATTEMPTS"):
-            ConfirmSettings.from_env()
-
-    def _app(self, key_pair: RSAKeyPair, attempts: int) -> Starlette:
-        verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
-        return create_confirm_app(
-            dataclasses.replace(ConfirmSettings.for_testing(), user_code_max_attempts=attempts),
-            assertion_verifier=verifier,
-            device_key_store=no_enrolled_devices(),
-        )
-
-    async def test_the_floor_still_pairs_when_the_code_is_right_first_time(
-        self, key_pair: RSAKeyPair
-    ) -> None:
-        """A budget of one bounds MISTAKES, never the happy path."""
-        app = self._app(key_pair, 1)
-        async with _client(app) as client:
-            device = await _start_device_grant(client)
-            approved = await _approve(client, device, bearer(key_pair))
-            assert approved.status_code == 200
-            issued = await client.post(
-                "/token",
-                data={"grant_type": "device_code", "device_code": device["device_code"]},
-            )
-            assert issued.status_code == 200
-
-    async def test_the_floor_revokes_on_the_first_typo(self, key_pair: RSAKeyPair) -> None:
-        """And the right code afterwards cannot recover it: a fresh QR is the only way."""
-        app = self._app(key_pair, 1)
-        store: InMemoryDeviceCodeStore = app.state.device_code_store
-        async with _client(app) as client:
-            device = await _start_device_grant(client)
-
-            wrong = await _approve(client, device, bearer(key_pair), user_code="ZZZZZZ")
-            assert wrong.status_code == 400
-            assert "revoked" in wrong.json()["error_description"]
-            assert await store.get_device_code(device["device_code"]) is None
-
-            retry = await _approve(client, device, bearer(key_pair))
-            assert retry.status_code == 400
-            assert retry.json()["error"] == "invalid_grant"
-
-    async def test_the_default_absorbs_two_typos_before_revoking(
-        self, key_pair: RSAKeyPair
-    ) -> None:
-        """Which is the difference the floor exists to keep reachable."""
-        app = self._app(key_pair, ConfirmSettings().user_code_max_attempts)
-        store: InMemoryDeviceCodeStore = app.state.device_code_store
-        async with _client(app) as client:
-            device = await _start_device_grant(client)
-            for _ in range(2):
-                typo = await _approve(client, device, bearer(key_pair), user_code="ZZZZZZ")
-                assert typo.status_code == 400
-            assert await store.get_device_code(device["device_code"]) is not None
-            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -1988,7 +1858,7 @@ class TestASuccessfulExchangeSpendsTheDeviceCode:
         """The defect, as one assertion: the same code twice, two outcomes."""
         async with _client(app) as client:
             device = await _start_device_grant(client)
-            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+            assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
 
             first = await _exchange(client, device["device_code"])
             assert first.status_code == 200
@@ -2016,7 +1886,7 @@ class TestASuccessfulExchangeSpendsTheDeviceCode:
         store: InMemoryDeviceCodeStore = app.state.device_code_store
         async with _client(app) as client:
             device = await _start_device_grant(client)
-            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+            assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
             assert (await _exchange(client, device["device_code"])).status_code == 200
 
         spent = await store.get_device_code(device["device_code"])
@@ -2039,7 +1909,7 @@ class TestASuccessfulExchangeSpendsTheDeviceCode:
         """
         async with _client(app) as client:
             device = await _start_device_grant(client)
-            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+            assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
             assert (await _exchange(client, device["device_code"])).status_code == 200
 
             spent = await _exchange(client, device["device_code"])
@@ -2062,7 +1932,7 @@ class TestASuccessfulExchangeSpendsTheDeviceCode:
         """
         async with _client(app) as client:
             device = await _start_device_grant(client)
-            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+            assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
             assert (await _exchange(client, device["device_code"])).status_code == 200
 
             class Unavailable:
@@ -2104,7 +1974,7 @@ class TestASuccessfulExchangeSpendsTheDeviceCode:
 
         async with _client(app) as client:
             device = await _start_device_grant(client)
-            assert (await _approve(client, device, bearer(key_pair))).status_code == 200
+            assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
 
             app.state.postern_revocation_store = BothAtOnce()
             both = await asyncio.gather(
@@ -2122,7 +1992,7 @@ class TestASuccessfulExchangeSpendsTheDeviceCode:
 class TestConsumingADeviceCodeInTheStore:
     """``consume_device_code``, the atomic claim the mint sits behind.
 
-    A separate contract from ``approve_device_code``'s and the same shape:
+    A separate contract from ``approve_scanned``'s and the same shape:
     ``True`` to the caller that moved the code, ``False`` to every other,
     including one that arrives at the same instant.
     """

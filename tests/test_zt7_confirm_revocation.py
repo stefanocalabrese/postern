@@ -62,6 +62,7 @@ from services.confirm.audit import DETAIL_REVOKED, UNRESOLVED_TOOL_NAME
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
+from tests.device_grant_helpers import scan_in_store
 from tests.fixtures.append_only_bypass import (
     delete_audit_rows_by_bypassing_the_append_only_triggers,
 )
@@ -662,20 +663,23 @@ async def test_the_cli_restores_and_the_confirm_replica_approves_again(
 async def paired(app: Starlette, key_pair: RSAKeyPair, customer: str) -> str:
     """Drive a real device pairing to the point where ``/token`` would mint.
 
-    Every step is the production path: the browser opens the grant, the
-    banking app approves it with a verified assertion, and the customer lands
-    on the device code from that assertion's ``sub`` and from nowhere else.
-    Returns the ``device_code`` the browser would poll with.
+    Every step but the scan is the production path: the browser opens the
+    grant, the banking app approves it with a verified assertion, and the
+    customer lands on the device code from that assertion's ``sub`` and from
+    nowhere else. The scan is claimed through the store, which is where
+    ``POST /scan`` would have claimed it, so this file's audit counts stay
+    about revocation. Returns the ``device_code`` the browser would poll with.
     """
     opened = await post_form(app, "/device_authorization", {"client_id": CLIENT})
     assert opened.status_code == 200, opened.text
     device_code = opened.json()["device_code"]
     user_code = opened.json()["user_code"]
+    await scan_in_store(app, user_code, customer)
 
     approved = await post_json(
         app,
         "/approve",
-        {"device_code": device_code, "user_code": user_code},
+        {"user_code": user_code},
         bearer(key_pair, customer),
     )
     assert approved.status_code == 200, approved.text
@@ -771,7 +775,7 @@ async def test_a_revoked_customer_cannot_approve_a_device_pairing_at_all(
     refused = await post_json(
         app,
         "/approve",
-        {"device_code": device_code, "user_code": user_code},
+        {"user_code": user_code},
         bearer(key_pair, OWNER),
     )
     assert refused.status_code == 403, refused.text

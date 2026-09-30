@@ -84,6 +84,7 @@ from services.confirm.rate_limit import (
     route_key,
 )
 from services.confirm.settings import ConfirmSettings
+from tests.device_grant_helpers import scan_in_store
 from tests.test_device_grant import AUDIENCE, ISSUER, bearer
 
 # ---------------------------------------------------------------------------
@@ -854,9 +855,10 @@ class TestThroughTheAssembledApp:
             assert start.status_code == 200
             device = start.json()
 
+            await scan_in_store(app, device["user_code"], "cust_7f3a")
             approved = await client.post(
                 "/approve",
-                json={"device_code": device["device_code"], "user_code": device["user_code"]},
+                json={"user_code": device["user_code"]},
                 headers=bearer(key_pair),
             )
             assert approved.status_code == 200
@@ -891,9 +893,10 @@ class TestThroughTheAssembledApp:
             assert start.status_code == 200
             device = start.json()
 
+            await scan_in_store(app, device["user_code"], "cust_7f3a")
             approved = await flooder.post(
                 "/approve",
-                json={"device_code": device["device_code"], "user_code": device["user_code"]},
+                json={"user_code": device["user_code"]},
                 headers={**bearer(key_pair), **customer},
             )
             assert approved.status_code == 200
@@ -1009,9 +1012,10 @@ class TestTheSlowDownInteraction:
         app = _app(key_pair)
         async with _client(app) as client:
             device = (await client.post("/device_authorization", json={"client_id": "b"})).json()
+            await scan_in_store(app, device["user_code"], "cust_7f3a")
             await client.post(
                 "/approve",
-                json={"device_code": device["device_code"], "user_code": device["user_code"]},
+                json={"user_code": device["user_code"]},
                 headers=bearer(key_pair),
             )
             body = {"grant_type": "device_code", "device_code": device["device_code"]}

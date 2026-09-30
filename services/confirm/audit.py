@@ -191,13 +191,16 @@ __all__ = [
     "DETAIL_INVALID_SUBJECT",
     "DETAIL_MALFORMED_BODY",
     "DETAIL_MISSING_SIGNATURE",
+    "DETAIL_NOT_SCANNED",
     "DETAIL_REVOKED",
+    "DETAIL_SCANNED_BY_OTHER",
     "DETAIL_SIGNATURE_INVALID",
     "DETAIL_SIGNATURE_MALFORMED",
     "DETAIL_STORED_IDENTITY_MALFORMED",
     "DETAIL_UPDATE_MATCHED_NO_ROW",
     "DETAIL_USER_CODE_BUDGET_EXHAUSTED",
     "DETAIL_USER_CODE_MISMATCH",
+    "DETAIL_USER_CODE_NOT_FOUND",
     "PairingAudit",
     "device_code_handle",
     "pairing_client_ip",
@@ -905,9 +908,35 @@ DETAIL_STORED_IDENTITY_MALFORMED = "stored_identity_malformed"
 #: ``customer_ref_absence_reason`` names the class and the offending string
 #: is stored nowhere, for the reason ``_subject_columns`` gives.
 DETAIL_INVALID_SUBJECT = "invalid_subject"
-#: A device code that names nothing. The enumeration signal on this endpoint,
-#: and the analogue of ``DETAIL_CHALLENGE_NOT_FOUND`` one endpoint over.
+#: A ``device_code`` at ``POST /approve`` that named nothing, the endpoint's
+#: enumeration signal while the app sent a ``device_code``.
+#:
+#: HISTORICAL SINCE 2026-09-30, and kept for the rows that carry it.
+#: ``POST /approve`` takes a ``user_code`` now and writes
+#: ``DETAIL_USER_CODE_NOT_FOUND`` for its miss, and ``POST /token``'s unknown
+#: code writes no row at all, so no code in this repository writes this literal
+#: any more. ``audit_log`` is append-only, so deleting the name would leave
+#: those rows carrying a value nothing in the tree names.
 DETAIL_DEVICE_CODE_NOT_FOUND = "device_code_not_found"
+#: A ``user_code`` that names no live pairing: unknown, or expired, at
+#: ``POST /scan`` or ``POST /approve``, including a row revoked or expired
+#: between ``POST /approve``'s lookup and its re-read after a refused
+#: ``approve_scanned``.
+#:
+#: NEW RATHER THAN A REUSE OF ``DETAIL_DEVICE_CODE_NOT_FOUND``, because the two
+#: guesses are not the same size. A ``device_code`` miss is a guess at 256 bits
+#: of ``secrets`` entropy; a ``user_code`` miss is a guess at 30 bits, which is
+#: exactly the enumeration signal keying on the pairing code opens. One literal
+#: for both would mix the cheap guess into the expensive one's history.
+DETAIL_USER_CODE_NOT_FOUND = "user_code_not_found"
+#: ``POST /approve`` for a code nobody has scanned. Approval requires the
+#: approving customer to have scanned first, so this is either an app skipping
+#: ``POST /scan`` or something guessing ``user_code`` values.
+DETAIL_NOT_SCANNED = "not_scanned"
+#: ``POST /approve`` for a code another customer scanned. The response is the
+#: same ``invalid_grant`` every other refusal gets; this literal is where an
+#: operator sees one customer trying to approve a pairing another one holds.
+DETAIL_SCANNED_BY_OTHER = "scanned_by_other"
 #: A second exchange of a code the first one spent, at ``POST /token``. The
 #: replay signal, and the highest-value row this table can hold about the
 #: device grant: the code was approved by a verified assertion, so something
@@ -931,19 +960,26 @@ DETAIL_DEVICE_CODE_NOT_FOUND = "device_code_not_found"
 #: unreachable. ``dev-docs/decisions/0012-device-code-single-use.md`` carries
 #: that trade.
 DETAIL_DEVICE_CODE_SPENT = "device_code_spent"
-#: A second approval of a code already approved. Refused before anything is
-#: written, because otherwise a caller holding an assertion of their own could
-#: swap ``customer_ref`` to themselves in the window before the browser polls
-#: ``POST /token``; the attempt is the signal whether or not it succeeds.
+#: A repeat approval by the customer who scanned the code, normally a retried
+#: request, at ``POST /approve`` when the code is already approved.
+#:
+#: REWRITTEN ON 2026-09-30, because the rationale it carried stopped being
+#: possible. It used to be a caller holding an assertion of their own swapping
+#: ``customer_ref`` to themselves in the window before the browser polls
+#: ``POST /token``. ``approve_scanned`` now approves only for the customer in
+#: ``scanned_by``, in one compare-and-set, so nobody else can reach an
+#: approved code's identity at all; another customer's attempt is
+#: ``DETAIL_SCANNED_BY_OTHER``.
 DETAIL_ALREADY_APPROVED = "already_approved"
-#: A wrong pairing code, with attempts left. The A2 relay shape: something
-#: holds the ``device_code`` and is guessing the six characters only a human
-#: reading the browser can supply.
+#: A wrong pairing code with attempts left, from the per-code attempt budget.
+#:
+#: HISTORICAL SINCE 2026-09-30, like the literal below: the budget went when
+#: the pairing code became the lookup key, where a per-code budget means
+#: nothing, and nothing writes either literal any more. Both stay defined
+#: because ``audit_log`` is append-only and rows carrying them exist.
 DETAIL_USER_CODE_MISMATCH = "user_code_mismatch"
-#: The wrong pairing code that spent the last attempt and REVOKED the device
-#: code. Told apart from the literal above because the consequences differ:
-#: one is a slip a customer retries, the other ends the pairing for the
-#: legitimate user and is the event on this endpoint worth an alert.
+#: The wrong pairing code that spent the last attempt and revoked the device
+#: code. Historical since 2026-09-30; see the literal above.
 DETAIL_USER_CODE_BUDGET_EXHAUSTED = "user_code_budget_exhausted"
 
 
@@ -1081,16 +1117,17 @@ class PairingAudit:
 
     The SECOND half excludes the malformed-request exits of ``POST /approve``,
     where the caller IS authenticated: a body that is not a JSON object, a
-    missing ``device_code``, a ``user_code`` that arrives as a list. Each is
-    answered by looking at the request and consulting nothing, and recording
-    them would hand a caller holding one valid assertion an INSERT per
-    malformed body. The 401 for an absent assertion is excluded by the first
-    half, for the reason ``services/confirm/callback.py``'s own first backstop
-    gives.
+    missing ``user_code``, a ``user_code`` that arrives as a list, a body
+    still carrying the removed ``device_code``. Each is answered by looking
+    at the request and consulting nothing, and recording them would hand a
+    caller holding one valid assertion an INSERT per malformed body. The 401
+    for an absent assertion is excluded by the first half, for the reason
+    ``services/confirm/callback.py``'s own first backstop gives.
 
     What the rule ADMITS, on each endpoint. At ``POST /approve``: a revoked
-    customer, a subject that is not a customer reference, a device code naming
-    nothing, a code already approved, and both halves of a wrong pairing code.
+    customer, a subject that is not a customer reference, a ``user_code``
+    naming no live pairing, a code nobody scanned, a code another customer
+    scanned, and a code already approved.
     At ``POST /token``: the mint itself, a revoked customer, a stored identity
     that will not parse, and a revocation store that could not answer -- four
     exits, all of them past the point where the code named a customer.

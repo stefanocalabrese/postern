@@ -358,57 +358,6 @@ async def test_a_revoke_leaves_the_index_and_the_keys_agreeing(stores: RedisStor
         assert await store.get_device_code(code.device_code) is not None
 
 
-async def test_an_update_rescores_the_index_member_instead_of_adding_a_second(
-    stores: RedisStores,
-) -> None:
-    """``ZADD`` on every write, not only on creation.
-
-    A sorted set cannot hold a member twice, so a count alone proves nothing
-    here. The score is the assertion: after an update that moves the expiry,
-    the index must name the NEW instant, or the sweep would drop a live code
-    at the old one, or keep a dead code past it.
-    """
-    store = stores.device_codes()
-    code = await _create(store, expires_in=120)
-    assert await store._redis.zscore(store._index_key(), code.device_code) == pytest.approx(
-        code.expires_at.timestamp(), abs=0.001
-    )
-
-    extended = dataclasses.replace(code, expires_at=code.expires_at + timedelta(seconds=600))
-    await store.update_device_code(code.device_code, extended)
-
-    assert await store._redis.zcard(store._index_key()) == 1
-    assert await store._redis.zscore(store._index_key(), code.device_code) == pytest.approx(
-        extended.expires_at.timestamp(), abs=0.001
-    )
-    assert 700 <= await store._redis.ttl(store._key(code.device_code)) <= 720, (
-        "the key's own TTL moved with the score, so neither outlives the other"
-    )
-
-
-async def test_an_update_that_shortens_a_life_moves_the_member_earlier(
-    stores: RedisStores,
-) -> None:
-    """The direction the cap depends on.
-
-    An index that only ever grew scores would hold a member past the instant
-    its key died, and the sweep would never reach it. That the sweep then
-    does reach a due member is the same mechanism
-    ``test_a_store_full_of_expired_codes_still_admits_a_new_pairing`` proves
-    against the server's own clock; this pins the re-score that feeds it.
-    """
-    store = stores.device_codes()
-    code = await _create(store, expires_in=900)
-    original = await store._redis.zscore(store._index_key(), code.device_code)
-
-    shortened = dataclasses.replace(code, expires_at=datetime.now(UTC) + timedelta(seconds=5))
-    await store.update_device_code(code.device_code, shortened)
-
-    moved = await store._redis.zscore(store._index_key(), code.device_code)
-    assert moved < original
-    assert moved == pytest.approx(shortened.expires_at.timestamp(), abs=0.001)
-
-
 async def test_an_index_member_outlives_the_key_it_points_at_until_a_create_sweeps_it(
     stores: RedisStores,
 ) -> None:
@@ -478,7 +427,7 @@ async def test_a_code_whose_expiry_has_already_passed_is_never_written_or_indexe
         expires_at=datetime.now(UTC) - timedelta(seconds=30),
     )
 
-    await store.update_device_code(stale.device_code, stale)
+    await store._set_code(stale.device_code, stale)
 
     assert await store.get_device_code(stale.device_code) is None
     assert await store._redis.zcard(store._index_key()) == 0
@@ -514,16 +463,17 @@ async def test_a_device_code_round_trips_every_field_to_a_second_connection(
     """Two stores, two pools, one server: what a second replica reads back.
 
     ``expires_at`` crosses as a POSIX float and returns as a ``datetime``,
-    and ``customer_ref`` and ``user_code_attempts`` are the two fields audit
-    finding C-01 turned into separate fields, so a round trip that lost
-    either would re-open it.
+    and ``customer_ref`` is the field audit finding C-01 separated from
+    ``client_id``, so a round trip that lost it would re-open it. The identity
+    is written the only way this store writes one now, through a scan and an
+    approval, each a compare-and-set.
     """
     writer = stores.device_codes()
     reader = stores.device_codes()
     code = await _create(writer, expires_in=600)
 
-    updated = dataclasses.replace(code, customer_ref="cust_7f3a", user_code_attempts=2)
-    await writer.update_device_code(code.device_code, updated)
+    assert await writer.claim_scan(code.device_code, "cust_7f3a") is ScanClaim.CLAIMED
+    assert await writer.approve_scanned(code.device_code, "cust_7f3a") is True
 
     seen = await reader.get_device_code(code.device_code)
 
@@ -534,7 +484,7 @@ async def test_a_device_code_round_trips_every_field_to_a_second_connection(
     assert seen.client_id == "vendor-a"
     assert seen.scopes == "accounts:read"
     assert seen.customer_ref == "cust_7f3a"
-    assert seen.user_code_attempts == 2
+    assert seen.scanned_by == "cust_7f3a"
     assert seen.expires_at.timestamp() == pytest.approx(code.expires_at.timestamp(), abs=0.001)
     assert isinstance(await reader._redis.get(reader._key(code.device_code)), str), (
         "decode_responses=True comes from RedisDeviceCodeStore.__init__, not from a fixture"
@@ -544,18 +494,19 @@ async def test_a_device_code_round_trips_every_field_to_a_second_connection(
 async def test_an_approval_crosses_to_a_second_connection_and_cannot_be_repeated(
     stores: RedisStores,
 ) -> None:
-    """``approve_device_code`` reads, rebuilds and writes back over the wire."""
+    """``approve_scanned`` is a WATCH/MULTI round trip, read back elsewhere."""
     writer = stores.device_codes()
     reader = stores.device_codes()
     code = await _create(writer)
+    await writer.claim_scan(code.device_code, "cust_7f3a")
 
-    assert await writer.approve_device_code(code.device_code) is True
+    assert await writer.approve_scanned(code.device_code, "cust_7f3a") is True
 
     seen = await reader.get_device_code(code.device_code)
     assert seen is not None
     assert seen.approved is True
     assert seen.approved_at is not None
-    assert await reader.approve_device_code(code.device_code) is False, (
+    assert await reader.approve_scanned(code.device_code, "cust_7f3a") is False, (
         "a second approval is refused on the value the server holds"
     )
 

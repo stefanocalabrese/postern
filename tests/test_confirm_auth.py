@@ -394,7 +394,7 @@ async def test_a_valid_assertion_reaches_the_handler_with_its_body_intact(
     async with client(app) as c:
         response = await c.post(
             "/approve",
-            json={"device_code": "no-such-code", "user_code": "ABC-DEF"},
+            json={"user_code": "ABC-DEF"},
             headers=bearer(key_pair),
         )
 

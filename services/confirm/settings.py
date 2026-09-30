@@ -330,11 +330,6 @@ class ConfirmSettings:
     # is still an outage an operator must meet at startup rather than at the
     # first payment.
     device_keys_path: str | None = None
-    # RFC 8628 §5.2: bound `user_code` guessing. Three tolerates a user
-    # mistyping the pairing code on the app's screen; the fourth failure
-    # revokes the device code outright, which forces a fresh QR and so
-    # re-anchors the human code comparison that is the actual A2 control.
-    user_code_max_attempts: int = 3
     # The ceiling `services/confirm/body_limit.py` enforces on every request
     # body this service will read into memory. Measured before it existed:
     # `POST /device_authorization` read 9,999,989 bytes and answered 200 with
@@ -350,8 +345,8 @@ class ConfirmSettings:
     #   control but a dead one.
     # - THE CEILING THAT MATTERS is what a legitimate body actually is. The
     #   whole approval tree measures under 300 bytes; `/token` carries
-    #   `grant_type` plus a 43-character device code; `/approve` carries two
-    #   short codes. 64 KiB is ~220x the largest of those and 8x the floor,
+    #   `grant_type` plus a 43-character device code; `/approve` carries one
+    #   short code. 64 KiB is ~220x the largest of those and 8x the floor,
     #   which left room for the per-customer device signature this path owed
     #   when the bound was chosen. That signature landed on 2026-09-24 and
     #   costs 86 characters (`postern_core.auth.approval_signature`'s
@@ -634,37 +629,6 @@ class ConfirmSettings:
             app_assertion_issuer=os.environ.get("POSTERN_APP_ASSERTION_ISSUER") or None,
             app_assertion_audience=os.environ.get("POSTERN_APP_ASSERTION_AUDIENCE") or None,
             device_keys_path=os.environ.get("POSTERN_DEVICE_KEYS_PATH") or None,
-            # FLOOR OF ONE, and the trace behind it, because the obvious
-            # reading of zero is wrong in an instructive way. Measured through
-            # `create_confirm_app` on 2026-09-25: at zero a CORRECT pairing
-            # code still approves and /token still issues, because
-            # `services/confirm/device_auth.py`'s ``_record_user_code_failure``
-            # is only reached on a MISMATCH. What zero costs is the tolerance:
-            # ``attempts = existing.user_code_attempts + 1`` makes the first
-            # wrong code ``1 >= 0``, so one typo revokes the device code and
-            # the user's next attempt -- with the right code -- is answered
-            # ``invalid_grant: device code not found``. One is therefore the
-            # SMALLEST REPRESENTABLE zero-tolerance budget: ``1`` behaves
-            # identically to ``0`` and to ``-5``, so nothing below one
-            # expresses anything the value one does not already.
-            #
-            # NO CEILING, because the TTL and the rate limit already impose
-            # one. The pairing code is six characters from a 32-symbol
-            # alphabet (`postern_core.auth.device_codes`'s
-            # ``_generate_user_code``), so 1,073,741,824 codes; at the default
-            # ``rate_limit_approve`` of 60/min a device code that lives the
-            # default 900 seconds can be guessed at most ~900 times before it
-            # expires, whatever this number says.
-            user_code_max_attempts=int_from_env(
-                "POSTERN_USER_CODE_MAX_ATTEMPTS",
-                3,
-                minimum=1,
-                because=(
-                    "It is how many wrong pairing codes revoke a device code (RFC 8628 "
-                    "§5.2); one is already zero tolerance, so nothing below it means "
-                    "anything different."
-                ),
-            ),
             # A FLOOR OF ONE BYTE, and deliberately NOT the 8,192 the comment
             # on ``max_body_bytes`` derives. That derivation is of the bottom
             # of the USEFUL interval -- below `postern_core/store/audit.py`'s
