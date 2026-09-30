@@ -21,9 +21,10 @@ Today this process does four things:
 4. Serve the browser's pairing page and its QR
    (``services.confirm.verify_page``), the only HTML this repository serves.
 
-ZT-7 revocation cuts across all three: an operator who revokes a customer
-stops their challenge approvals and their device-grant token mints as well as
-their reads. Which scope reaches this service, and which two do not, is
+ZT-7 revocation reaches every path here that knows a customer: an operator
+who revokes a customer stops their challenge approvals, their pairing scans
+and approvals and their device-grant token mints as well as their reads.
+Which scope reaches this service, and which two do not, is
 `services/confirm/revocation.py`'s subject -- the summary is that the write
 path can only be keyed on the customer, so **to stop it, name the customer**.
 
