@@ -158,7 +158,7 @@ Requires the banking-app assertion, like `/approve`: it is **not** in `PUBLIC_PA
 4. Verify `qr`: a malformed or forged MAC, or a slot beyond `now + 1`, is 400 `invalid_grant` too. A correct MAC older than the window is 400 `qr_stale`.
 5. `claim_scan`, and act on its result:
    - `claimed` or `already_mine`: continue to step 6.
-   - `approved_mine`: 400 `invalid_grant`.
+   - `approved_mine`: 400 `invalid_grant` (superseded on 30 September 2026, see the dated note below).
    - `conflict_revoked`: the pairing is already revoked; 400 `scan_conflict`. The AI client's next `/token` poll finds no code, and `/verify/state` answers 404, so the page shows closed.
    - `conflict_exchanged`: 400 `scan_conflict`. Nothing is revoked, and the read token already issued to the other customer's pairing stays valid until it expires; see "Session swap" above.
    - `gone`: 400 `invalid_grant`.
@@ -166,7 +166,7 @@ Requires the banking-app assertion, like `/approve`: it is **not** in `PUBLIC_PA
    A stale token from a different customer against a scanned code answers `qr_stale`, revokes nothing and is not recorded as `scan_conflict`, because the MAC check in step 4 runs before `claim_scan`. Only a scan inside the token window reaches session-swap detection.
 6. 200 with the stored row's context, never anything from the QR: `client_id` (with `client_id_verified: false`), `scopes`, `expires_at`, and the pairing code for the app to show beside the one the user sees.
 
-**One response for everything that leaks existence.** Unknown, expired, approved and a bad MAC or future slot all answer the identical 400 `invalid_grant` body; the audit `detail` alone separates them (§7): `qr_invalid` for a bad MAC or future slot, `already_approved` for an approved code, and `user_code_not_found` for an unknown or expired one. `qr_stale` and `scan_conflict` stay distinct responses because only a genuine MAC reaches them: a MAC that verifies proves the caller held a real QR for this `user_code`, and that caller already knows the pairing exists, so the distinct answer tells it nothing new. The app needs both to show a useful message ("scan again" and "this pairing was cancelled").
+**One response for everything that leaks existence.** Unknown, expired, approved (superseded on 30 September 2026, see the dated note below) and a bad MAC or future slot all answer the identical 400 `invalid_grant` body; the audit `detail` alone separates them (§7): `qr_invalid` for a bad MAC or future slot, `already_approved` for an approved code (superseded on 30 September 2026, see the dated note below), and `user_code_not_found` for an unknown or expired one. `qr_stale` and `scan_conflict` stay distinct responses because only a genuine MAC reaches them: a MAC that verifies proves the caller held a real QR for this `user_code`, and that caller already knows the pairing exists, so the distinct answer tells it nothing new. The app needs both to show a useful message ("scan again" and "this pairing was cancelled").
 
 **Changed on 30 September 2026: a repeat scan by the pairing's own customer answers 200 and is recorded apart from the first.** Step 5's `approved_mine` no longer answers 400 `invalid_grant`: it answers step 6's 200 body, built from the stored row, for the same lost-response reason as the `/approve` note in §6, and its audit row is `outcome = 'returned'` with `detail = 'already_approved'`. So an approved code has left the identical-body set above. `already_mine` answered the 200 before this date and still does, but its row is now `returned` with `detail = 'already_scanned'` rather than NULL. Neither repeat writes to the store. The rotation token is still checked at step 4 first, so both repeats need a genuine in-window token; a stale one is `qr_stale` and a forged one `invalid_grant`. With both repeats carrying a `detail`, `tool_name = 'device_grant.scan' AND outcome = 'returned' AND detail IS NULL` counts first scans only.
 
@@ -195,7 +195,7 @@ The handoff's §7.3 steps 11 to 13 have the app's device-bound key sign the pair
 | `DETAIL_INVALID_SUBJECT` (existing) | `invalid_subject` | step 1 |
 | `DETAIL_REVOKED` (existing) | `revoked` | step 2 |
 | `DETAIL_USER_CODE_NOT_FOUND` (new) | `user_code_not_found` | step 3 unknown or expired, and step 5 `gone` |
-| `DETAIL_ALREADY_APPROVED` (existing) | `already_approved` | step 5 `approved_mine`: this customer scanned and already approved the code |
+| `DETAIL_ALREADY_APPROVED` (existing) | `already_approved` | step 5 `approved_mine`: this customer scanned and already approved the code (superseded on 30 September 2026, see the dated note below) |
 | `DETAIL_QR_INVALID` (new) | `qr_invalid` | step 4, malformed or forged MAC, or a future slot |
 | `DETAIL_QR_STALE` (new) | `qr_stale` | step 4, a genuine MAC older than the window. The direct trace of a screenshot relay. |
 | `DETAIL_SCAN_CONFLICT` (new) | `scan_conflict` | step 5, both conflict results. The trace of a code seen by two phones, and of a session swap. |
