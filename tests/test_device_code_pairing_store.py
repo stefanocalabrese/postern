@@ -283,7 +283,7 @@ class TestClaimScan:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
 
-        assert await store.claim_scan(code.device_code, ALICE) is ScanClaim.CLAIMED
+        assert await store.claim_scan(code.device_code, ALICE, scanner_ip=None) is ScanClaim.CLAIMED
 
         stored = await store.get_device_code(code.device_code)
         assert stored is not None
@@ -296,29 +296,38 @@ class TestClaimScan:
     ) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, ALICE)
+        await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
         before = await store.get_device_code(code.device_code)
 
-        assert await store.claim_scan(code.device_code, ALICE) is ScanClaim.ALREADY_MINE
+        assert (
+            await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
+            is ScanClaim.ALREADY_MINE
+        )
         assert await store.get_device_code(code.device_code) == before
 
     async def test_a_repeat_after_approval_is_approved_mine(self) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, ALICE)
+        await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
         assert await store.approve_scanned(code.device_code, ALICE) is True
         before = await store.get_device_code(code.device_code)
 
-        assert await store.claim_scan(code.device_code, ALICE) is ScanClaim.APPROVED_MINE
+        assert (
+            await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
+            is ScanClaim.APPROVED_MINE
+        )
         assert await store.get_device_code(code.device_code) == before
 
     async def test_another_customer_on_an_unexchanged_code_revokes_it(self) -> None:
         """The session-swap defence: B scanned first, A's scan ends the pairing."""
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, BOB)
+        await store.claim_scan(code.device_code, BOB, scanner_ip=None)
 
-        assert await store.claim_scan(code.device_code, ALICE) is ScanClaim.CONFLICT_REVOKED
+        assert (
+            await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
+            is ScanClaim.CONFLICT_REVOKED
+        )
 
         assert await store.get_device_code(code.device_code) is None
         assert await store.get_by_user_code(code.user_code) is None
@@ -329,26 +338,32 @@ class TestClaimScan:
     ) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, BOB)
+        await store.claim_scan(code.device_code, BOB, scanner_ip=None)
         await store.approve_scanned(code.device_code, BOB)
 
-        assert await store.claim_scan(code.device_code, ALICE) is ScanClaim.CONFLICT_REVOKED
+        assert (
+            await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
+            is ScanClaim.CONFLICT_REVOKED
+        )
         assert await store.get_device_code(code.device_code) is None
 
     async def test_another_customer_on_an_exchanged_code_leaves_it_unchanged(self) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, BOB)
+        await store.claim_scan(code.device_code, BOB, scanner_ip=None)
         await store.approve_scanned(code.device_code, BOB)
         await store.consume_device_code(code.device_code)
         before = await store.get_device_code(code.device_code)
 
-        assert await store.claim_scan(code.device_code, ALICE) is ScanClaim.CONFLICT_EXCHANGED
+        assert (
+            await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
+            is ScanClaim.CONFLICT_EXCHANGED
+        )
         assert await store.get_device_code(code.device_code) == before
 
     async def test_a_missing_code_is_gone(self) -> None:
         store = InMemoryDeviceCodeStore()
-        assert await store.claim_scan("never-existed", ALICE) is ScanClaim.GONE
+        assert await store.claim_scan("never-existed", ALICE, scanner_ip=None) is ScanClaim.GONE
 
     async def test_an_expired_code_is_gone_and_unclaimed(self) -> None:
         store = InMemoryDeviceCodeStore()
@@ -356,7 +371,7 @@ class TestClaimScan:
         past = datetime.now(UTC) - timedelta(seconds=1)
         store._codes[code.device_code] = replace(code, expires_at=past)
 
-        assert await store.claim_scan(code.device_code, ALICE) is ScanClaim.GONE
+        assert await store.claim_scan(code.device_code, ALICE, scanner_ip=None) is ScanClaim.GONE
         stored = await store.get_device_code(code.device_code)
         assert stored is not None and stored.scanned_by == ""
 
@@ -365,15 +380,15 @@ class TestClaimScan:
         code = await _create(store)
         store._codes[code.device_code] = replace(code, approved=True, customer_ref=BOB)
 
-        assert await store.claim_scan(code.device_code, ALICE) is ScanClaim.GONE
+        assert await store.claim_scan(code.device_code, ALICE, scanner_ip=None) is ScanClaim.GONE
 
     async def test_two_concurrent_first_scans_claim_once(self) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
 
         results = await asyncio.gather(
-            store.claim_scan(code.device_code, ALICE),
-            store.claim_scan(code.device_code, ALICE),
+            store.claim_scan(code.device_code, ALICE, scanner_ip=None),
+            store.claim_scan(code.device_code, ALICE, scanner_ip=None),
         )
 
         assert sorted(r.value for r in results) == ["already_mine", "claimed"]
@@ -383,7 +398,7 @@ class TestApproveScanned:
     async def test_the_scanner_approves_and_becomes_the_customer(self) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, ALICE)
+        await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
 
         assert await store.approve_scanned(code.device_code, ALICE) is True
 
@@ -405,7 +420,7 @@ class TestApproveScanned:
     async def test_a_code_another_customer_scanned_is_refused(self) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, BOB)
+        await store.claim_scan(code.device_code, BOB, scanner_ip=None)
 
         assert await store.approve_scanned(code.device_code, ALICE) is False
         stored = await store.get_device_code(code.device_code)
@@ -414,7 +429,7 @@ class TestApproveScanned:
     async def test_an_approved_code_is_refused(self) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, ALICE)
+        await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
         await store.approve_scanned(code.device_code, ALICE)
 
         assert await store.approve_scanned(code.device_code, ALICE) is False
@@ -422,7 +437,7 @@ class TestApproveScanned:
     async def test_an_expired_code_is_refused(self) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, ALICE)
+        await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
         scanned = await store.get_device_code(code.device_code)
         assert scanned is not None
         past = datetime.now(UTC) - timedelta(seconds=1)
@@ -437,7 +452,7 @@ class TestApproveScanned:
     async def test_two_concurrent_approvals_approve_exactly_once(self) -> None:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
-        await store.claim_scan(code.device_code, ALICE)
+        await store.claim_scan(code.device_code, ALICE, scanner_ip=None)
 
         won = await asyncio.gather(
             store.approve_scanned(code.device_code, ALICE),

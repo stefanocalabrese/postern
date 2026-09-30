@@ -670,8 +670,10 @@ async def test_a_claim_whose_reply_is_lost_is_withdrawn_and_recorded_as_the_stor
     code = await start(app)
     real_claim = store.claim_scan
 
-    async def claim_then_time_out(device_code: str, customer_ref: str) -> Any:
-        await real_claim(device_code, customer_ref)
+    async def claim_then_time_out(
+        device_code: str, customer_ref: str, *, scanner_ip: str | None
+    ) -> Any:
+        await real_claim(device_code, customer_ref, scanner_ip=scanner_ip)
         raise TimeoutError("reply lost after EXEC")
 
     monkeypatch.setattr(store, "claim_scan", claim_then_time_out)
@@ -693,7 +695,7 @@ async def test_a_contended_claim_withdraws_nothing(
     store: DeviceCodeStoreBase = device_store_of(app)
     code = await start(app)
 
-    async def contended(device_code: str, customer_ref: str) -> Any:
+    async def contended(device_code: str, customer_ref: str, *, scanner_ip: str | None) -> Any:
         raise DeviceCodeStoreContended("beaten on every try")
 
     monkeypatch.setattr(store, "claim_scan", contended)
@@ -771,8 +773,10 @@ async def test_a_failed_withdrawal_of_an_ambiguous_claim_says_claimed_and_the_st
     code = await start(app)
     real_claim = store.claim_scan
 
-    async def claim_then_time_out(device_code: str, customer_ref: str) -> Any:
-        await real_claim(device_code, customer_ref)
+    async def claim_then_time_out(
+        device_code: str, customer_ref: str, *, scanner_ip: str | None
+    ) -> Any:
+        await real_claim(device_code, customer_ref, scanner_ip=scanner_ip)
         raise TimeoutError("reply lost after EXEC")
 
     async def revoke_fails(device_code: str) -> None:

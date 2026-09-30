@@ -302,6 +302,11 @@ class DeviceCode:
         scanned_by: The customer whose app scanned first, from a verified
             assertion ``sub`` at ``POST /scan``. Empty until scanned.
         scanned_at: When that scan was claimed.
+        scanner_ip: The address of the ``POST /scan`` request that claimed
+            the pairing, written in the same compare-and-set as
+            ``scanned_by`` and ``scanned_at`` and never after. ``None`` until
+            scanned, and on a record the previous release wrote, which
+            recorded no scanner address. Recorded only; nothing reads it back.
 
     ``exchanged_at`` IS WHY A SPENT CODE IS STILL HERE. The alternative was
     revoking the code on a successful exchange, which is one fewer field and
@@ -342,6 +347,7 @@ class DeviceCode:
     creator_ip: str | None = None
     scanned_by: str = ""
     scanned_at: datetime | None = None
+    scanner_ip: str | None = None
 
     @property
     def user_code_display(self) -> str:
@@ -481,16 +487,24 @@ class DeviceCodeStoreBase(ABC):
         """
 
     @abstractmethod
-    async def claim_scan(self, device_code: str, customer_ref: str) -> ScanClaim:
+    async def claim_scan(
+        self, device_code: str, customer_ref: str, *, scanner_ip: str | None
+    ) -> ScanClaim:
         """Record the first scan of a code, or say why this one is not it.
 
         A COMPARE-AND-SET, modelled on ``consume_device_code``: one
         transaction reads the row, decides with ``_scan_verdict``, and writes
-        only for ``CLAIMED`` (``scanned_by``, ``scanned_at``) and
+        only for ``CLAIMED`` (``scanned_by``, ``scanned_at``, ``scanner_ip``) and
         ``CONFLICT_REVOKED`` (the whole pairing, secondaries included). Every
         other result writes nothing. The same atomicity contract as
         ``consume_device_code`` holds, for the same reason: two phones
         scanning one QR on two replicas must not both win.
+
+        ``scanner_ip`` IS REQUIRED AND NULLABLE, for the reason
+        ``postern_core.store.audit.append`` gives for its ``client_id``: a
+        default would let a future caller record "no address" for a scan that
+        had one. First scan wins: ``ALREADY_MINE`` writes nothing, so a retry
+        from another network does not move the address the claim was made from.
 
         Raises:
             DeviceCodeStoreContended: if the transaction could not settle.
@@ -800,7 +814,9 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         )
         return True
 
-    async def claim_scan(self, device_code: str, customer_ref: str) -> ScanClaim:
+    async def claim_scan(
+        self, device_code: str, customer_ref: str, *, scanner_ip: str | None
+    ) -> ScanClaim:
         """Record the first scan, or say why this one is not it.
 
         ATOMIC BY NOT YIELDING, for the reason ``consume_device_code`` gives:
@@ -813,7 +829,10 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         claim = _scan_verdict(existing, customer_ref)
         if claim is ScanClaim.CLAIMED:
             self._codes[device_code] = dataclasses.replace(
-                existing, scanned_by=customer_ref, scanned_at=datetime.now(UTC)
+                existing,
+                scanned_by=customer_ref,
+                scanned_at=datetime.now(UTC),
+                scanner_ip=scanner_ip,
             )
         elif claim is ScanClaim.CONFLICT_REVOKED:
             self._forget(device_code)
@@ -1198,7 +1217,9 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         )
         return False
 
-    async def claim_scan(self, device_code: str, customer_ref: str) -> ScanClaim:
+    async def claim_scan(
+        self, device_code: str, customer_ref: str, *, scanner_ip: str | None
+    ) -> ScanClaim:
         """Record the first scan, or say why this one is not it.
 
         ``WATCH``/``MULTI`` on the primary, the shape ``consume_device_code``
@@ -1232,7 +1253,10 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
                     claim = _scan_verdict(code, customer_ref)
                     if claim is ScanClaim.CLAIMED:
                         scanned = dataclasses.replace(
-                            code, scanned_by=customer_ref, scanned_at=datetime.now(UTC)
+                            code,
+                            scanned_by=customer_ref,
+                            scanned_at=datetime.now(UTC),
+                            scanner_ip=scanner_ip,
                         )
                         pipe.multi()
                         pipe.set(key, scanned.to_json(), keepttl=True)
@@ -1406,6 +1430,7 @@ def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
         "creator_ip": dc.creator_ip,
         "scanned_by": dc.scanned_by,
         "scanned_at": dc.scanned_at.timestamp() if dc.scanned_at else None,
+        "scanner_ip": dc.scanner_ip,
     }
 
 
@@ -1426,6 +1451,7 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
     raw_secret = data.get("qr_secret")
     qr_secret = base64.b64decode(raw_secret, validate=True) if raw_secret else b""
     raw_creator_ip = data.get("creator_ip")
+    raw_scanner_ip = data.get("scanner_ip")
     return DeviceCode(
         device_code=data["device_code"],
         user_code=data["user_code"],
@@ -1463,6 +1489,10 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
         creator_ip=str(raw_creator_ip) if raw_creator_ip is not None else None,
         scanned_by=str(data.get("scanned_by", "")),
         scanned_at=scanned_at,
+        # ABSENT MEANS NONE, and here that is the TRUE reading rather than a
+        # fail-closed default: the previous release recorded no scanner
+        # address, so there is none.
+        scanner_ip=str(raw_scanner_ip) if raw_scanner_ip is not None else None,
     )
 
 

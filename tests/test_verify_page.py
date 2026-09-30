@@ -71,7 +71,7 @@ async def pairing(app: Starlette, state: str) -> DeviceCode:
         client_id="browser-1", scopes="accounts:read", verification_uri="https://a.test/verify"
     )
     if state in ("scanned", "approved"):
-        await store.claim_scan(code.device_code, CUSTOMER)
+        await store.claim_scan(code.device_code, CUSTOMER, scanner_ip=None)
     if state == "approved":
         assert await store.approve_scanned(code.device_code, CUSTOMER) is True
     if state == "expired":

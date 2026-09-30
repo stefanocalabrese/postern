@@ -1590,6 +1590,10 @@ async def scan_callback(request: Request) -> JSONResponse:
     db: Database = request.app.state.postern_database
     store: DeviceCodeStoreBase = request.app.state.device_code_store
 
+    # COMPUTED ONCE, and handed both to the row and to the claim. Two reads
+    # could disagree if they ever diverged, and then the address the row
+    # records would not be the address the pairing was claimed from.
+    scanner_ip = pairing_client_ip(request, settings.trusted_proxy_hops)
     audit = PairingAudit(
         db=db,
         call_id=str(uuid.uuid4()),
@@ -1597,13 +1601,13 @@ async def scan_callback(request: Request) -> JSONResponse:
         started=started,
         subject=subject,
         claims=verified_claims(request),
-        client_ip_value=pairing_client_ip(request, settings.trusted_proxy_hops),
+        client_ip_value=scanner_ip,
         tool_name=SCAN_TOOL_NAME,
         route=SCAN_ROUTE,
     )
 
     try:
-        outcome = await _scan(request, audit, store=store, subject=subject)
+        outcome = await _scan(request, audit, store=store, subject=subject, scanner_ip=scanner_ip)
     except Exception as exc:
         # The shape `approve_callback` uses: an audit-write failure must not
         # replace the exception that ended the request.
@@ -1660,6 +1664,7 @@ async def _scan(
     *,
     store: DeviceCodeStoreBase,
     subject: str,
+    scanner_ip: str | None,
 ) -> _Scanned:
     """The scan itself, in section 5's order, returning what the row owes.
 
@@ -1743,7 +1748,7 @@ async def _scan(
         return _Scanned(_qr_stale_response(), DETAIL_QR_STALE)
 
     try:
-        claim = await store.claim_scan(code.device_code, customer.value)
+        claim = await store.claim_scan(code.device_code, customer.value, scanner_ip=scanner_ip)
     except DeviceCodeStoreContended:
         # DEFINITELY NOT WRITTEN: every `WATCH` was beaten, so no transaction
         # committed. Withdrawing would only end a pending pairing the customer

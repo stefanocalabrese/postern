@@ -59,7 +59,7 @@ async def scan_in_store(app: Starlette, user_code: str, customer: str) -> Device
     several tests approve the same pending code more than once.
     """
     code = await stored_code(app, user_code)
-    claim = await device_store_of(app).claim_scan(code.device_code, customer)
+    claim = await device_store_of(app).claim_scan(code.device_code, customer, scanner_ip=None)
     assert claim in (ScanClaim.CLAIMED, ScanClaim.ALREADY_MINE), claim
     return code
 
