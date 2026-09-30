@@ -81,10 +81,12 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
 from postern_core.auth.device_codes import (
     DeviceCode,
     DeviceCodeStoreBase,
+    DeviceCodeStoreContended,
     DeviceCodeStoreFull,
     create_device_code_store,
 )
@@ -1016,7 +1018,7 @@ async def approve_callback(request: Request) -> JSONResponse:
         # anywhere names who authorised it. `PairingAudit` carries the full
         # argument and what the availability cost is.
         if outcome.approved_device_code is not None:
-            await _withdraw_pairing(store, outcome.approved_device_code)
+            await _withdraw_pairing(store, outcome.approved_device_code, cause="audit")
         logger.error(
             "audit write failed for a device pairing that answered %d; "
             "failing the request because the pairing could not be recorded",
@@ -1027,8 +1029,11 @@ async def approve_callback(request: Request) -> JSONResponse:
     return outcome.response
 
 
-async def _withdraw_pairing(store: DeviceCodeStoreBase, device_code_value: str) -> None:
-    """Undo a pairing whose audit row could not be written.
+async def _withdraw_pairing(
+    store: DeviceCodeStoreBase, device_code_value: str, *, cause: Literal["audit", "store"]
+) -> None:
+    """Undo a pairing whose audit row could not be written, or whose approval
+    may have committed behind a store error.
 
     Revocation rather than an in-place undo, because the recovery the
     customer needs is a fresh QR anyway, and a fresh QR is what re-anchors the
@@ -1037,24 +1042,41 @@ async def _withdraw_pairing(store: DeviceCodeStoreBase, device_code_value: str) 
     live, and a racing poll or a racing scan could still find it in the state
     the failed request could not record.
 
+    ``cause`` says which of the two callers this is, because the ERROR line
+    below states what is left behind and the two leave different things.
+    ``"audit"`` is ``approve_callback`` after an approval whose row could not
+    be written: the code IS approved and NO row names it. ``"store"`` is
+    ``_pair`` after ``approve_scanned`` raised: the code MAY be approved, and
+    a row recording the store's exception as a refusal will follow.
+
     ITS OWN FAILURE IS SWALLOWED, deliberately and exactly once. The caller is
-    already unwinding an audit-store failure and owes the operator THAT
-    exception; replacing it with the store's would report the second problem
-    and hide the first. What is left behind in that case is the one shape this
-    control cannot close -- an approved device code with no row -- so it gets
-    an ERROR line of its own naming the code's handle, which is the same
-    handle the row would have carried had it been written.
+    already unwinding a failure and owes the operator THAT exception;
+    replacing it with the revocation's would report the second problem and
+    hide the first. What is left behind in that case is the shape this
+    control cannot close, so it gets an ERROR line of its own naming the
+    code's handle, which is the same handle the row carries or would have
+    carried.
     """
     try:
         await store.revoke_device_code(device_code_value)
     except Exception as revoke_exc:
-        logger.error(
-            "a device pairing could not be audited AND could not be withdrawn; "
-            "device code %s is approved with no audit_log row behind it: %s",
-            device_code_handle(device_code_value),
-            revoke_exc,
-            exc_info=revoke_exc,
-        )
+        if cause == "audit":
+            logger.error(
+                "a device pairing could not be audited AND could not be withdrawn; "
+                "device code %s is approved with no audit_log row behind it: %s",
+                device_code_handle(device_code_value),
+                revoke_exc,
+                exc_info=revoke_exc,
+            )
+        else:
+            logger.error(
+                "a device pairing's store write failed ambiguously AND it could not be "
+                "withdrawn; device code %s may be approved while its audit_log row "
+                "records a refusal: %s",
+                device_code_handle(device_code_value),
+                revoke_exc,
+                exc_info=revoke_exc,
+            )
 
 
 async def _pair(
@@ -1180,6 +1202,11 @@ async def _pair(
 
     try:
         approved = await store.approve_scanned(existing.device_code, customer.value)
+    except DeviceCodeStoreContended:
+        # DEFINITELY NOT WRITTEN: every `WATCH` was beaten, so no transaction
+        # committed. Withdrawing would only end a pending pairing the customer
+        # can still complete, so this one propagates untouched.
+        raise
     except Exception:
         # AN EXCEPTION HERE DOES NOT MEAN NOTHING WAS WRITTEN. On Redis the
         # reply to `EXEC` can be lost to a timeout or a dropped connection
@@ -1188,7 +1215,13 @@ async def _pair(
         # exception's type as a refusal, and a refusal row over a standing
         # approval is the fail-open shape. `_withdraw_pairing` swallows its own
         # failure, so the exception re-raised is still the store's.
-        await _withdraw_pairing(store, existing.device_code)
+        #
+        # `asyncio.CancelledError` is a `BaseException` and is NOT caught here:
+        # a client disconnecting mid-`execute()` cancels the task and skips the
+        # withdrawal. That is the same residual class as the hard process kill
+        # `PairingAudit` already names -- the process stops running this code
+        # at an arbitrary point -- and it is accepted on the same terms.
+        await _withdraw_pairing(store, existing.device_code, cause="store")
         raise
 
     if approved:

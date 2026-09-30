@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from collections.abc import AsyncGenerator, Generator
 from dataclasses import replace
@@ -53,7 +54,11 @@ from unittest.mock import patch
 import httpx2
 import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
-from postern_core.auth.device_codes import DeviceCode, DeviceCodeStoreBase
+from postern_core.auth.device_codes import (
+    DeviceCode,
+    DeviceCodeStoreBase,
+    DeviceCodeStoreContended,
+)
 from postern_core.auth.device_keys import no_enrolled_devices
 from postern_core.auth.revocation import RevocationStoreBase, RevocationStoreUnavailable
 from postern_core.store import audit as audit_store
@@ -797,6 +802,86 @@ async def test_an_approval_whose_store_write_fails_ambiguously_is_withdrawn(
     assert await store.get_device_code(code.device_code) is None
     row = await one_row(clean)
     assert row.detail == "TimeoutError"
+
+
+async def test_a_contended_approval_is_not_withdrawn(
+    app: Starlette,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``DeviceCodeStoreContended`` means the write did not happen.
+
+    Every ``WATCH`` was beaten, so the transaction never committed and there
+    is no approval to withdraw. Revoking would only end a live pending pairing
+    the customer can still complete on a retry.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+
+    async def contended(device_code: str, customer_ref: str) -> bool:
+        raise DeviceCodeStoreContended("an approval was beaten by another writer 3 times")
+
+    monkeypatch.setattr(store, "approve_scanned", contended)
+
+    resp = await approve(
+        app,
+        {"user_code": code.user_code_display},
+        bearer(key_pair),
+        as_a_server_would=True,
+    )
+
+    assert resp.status_code == 500
+    stored = await store.get_device_code(code.device_code)
+    assert stored is not None and stored.approved is False
+    row = await one_row(clean)
+    assert row.detail == "DeviceCodeStoreContended"
+
+
+async def test_a_failed_withdrawal_after_an_ambiguous_write_names_the_store_cause(
+    app: Starlette,
+    clean: Database,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The double failure on the store path, and what the ERROR line says.
+
+    The approval commits and its reply is lost, then the revocation fails
+    too. The row carries the ORIGINAL store exception, and the log line names
+    the ambiguous store write rather than an audit failure that never
+    happened: the row was written, so "no audit_log row" would be false.
+    """
+    store: DeviceCodeStoreBase = app.state.device_code_store
+    code = await issue(app)
+    real_approve = store.approve_scanned
+
+    async def approve_then_time_out(device_code: str, customer_ref: str) -> bool:
+        assert await real_approve(device_code, customer_ref) is True
+        raise TimeoutError("reply lost after EXEC")
+
+    async def revoke_fails(device_code: str) -> None:
+        raise ConnectionError("store gone")
+
+    monkeypatch.setattr(store, "approve_scanned", approve_then_time_out)
+    monkeypatch.setattr(store, "revoke_device_code", revoke_fails)
+
+    with caplog.at_level(logging.ERROR, logger="services.confirm.device_auth"):
+        resp = await approve(
+            app,
+            {"user_code": code.user_code_display},
+            bearer(key_pair),
+            as_a_server_would=True,
+        )
+
+    assert resp.status_code == 500
+    row = await one_row(clean)
+    assert row.detail == "TimeoutError"
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    withdrawal = [m for m in errors if "could not be withdrawn" in m]
+    assert len(withdrawal) == 1, errors
+    assert "may be approved" in withdrawal[0]
+    assert "could not be audited" not in withdrawal[0]
 
 
 # ---------------------------------------------------------------------------
