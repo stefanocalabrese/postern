@@ -210,10 +210,11 @@ EVERYWHERE = ("api", "confirm", "migrations")
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 65 rows since
-#: 2026-09-29: 26 strings (24 settings plus this guard's own two lists), 36
-#: numbers, 3 flags. The eight that arrived on that date are the
-#: ``POSTERN_VAULT_*`` family, below the device-code block.
+#: against it by `tests/test_settings_bounds.py` on every run. 66 rows since
+#: 2026-09-30: 27 strings (25 settings plus this guard's own two lists), 36
+#: numbers, 3 flags. The eight ``POSTERN_VAULT_*`` rows below the device-code
+#: block arrived on 2026-09-29; ``POSTERN_DEVICE_APP_LINK_URI`` arrived on
+#: 2026-09-30 with the QR page.
 INVENTORY: tuple[EnvVar, ...] = (
     EnvVar(ALLOWED_UNREAD_ENV, "string", EVERYWHERE),
     EnvVar(REQUIRED_ENV, "string", EVERYWHERE),
@@ -246,6 +247,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_DATABASE_POOL_SIZE", "number", ("api",)),
     EnvVar("POSTERN_DATABASE_POOL_TIMEOUT_SECONDS", "number", BOTH),
     EnvVar("POSTERN_DATABASE_URL", "string", EVERYWHERE),
+    EnvVar("POSTERN_DEVICE_APP_LINK_URI", "string", ("confirm",)),
     EnvVar("POSTERN_DEVICE_CODE_TTL_SECONDS", "number", ("confirm",)),
     EnvVar("POSTERN_DEVICE_KEYS_PATH", "string", ("confirm",)),
     EnvVar("POSTERN_DEVICE_POLL_INTERVAL_SECONDS", "number", ("confirm",)),

@@ -4,8 +4,13 @@ There is deliberately no read key field here, and no write key field in
 services/api/settings.py. The asymmetry is the control, and it is greppable.
 
 Device authorization (§7.3 of the handoff) adds:
-- ``device_verification_uri`` — base URI for the user verification page.
-  The QR code encodes this + ``user_code``; the mobile app deep-links to it.
+- ``device_verification_uri`` -- base URI of the browser's pairing page.
+  ``verification_uri_complete`` is this plus ``?d=`` and the pairing's display
+  handle.
+- ``device_app_link_uri`` -- the operator's universal-link / app-link base.
+  The QR on the pairing page encodes this plus ``user_code`` and a rotation
+  token, so a phone camera hands it to the bank app. Its host must differ from
+  ``device_verification_uri``'s, and ``from_env`` refuses to start otherwise.
 - ``device_code_ttl_seconds`` — lifetime of a device code (default 900 = 15
   min), refused below ``MIN_DEVICE_CODE_TTL_SECONDS`` because the Redis store
   cannot represent a shorter one (bug B1; that constant carries the working).
@@ -55,6 +60,7 @@ forbids reading its settings — so the requirement is stated in
 
 import os
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from postern_core.auth.device_codes import (
     MIN_DEVICE_CODE_TTL_SECONDS as _MIN_DEVICE_CODE_TTL_SECONDS,
@@ -185,6 +191,28 @@ def _device_code_ttl(name: str, default: int) -> int:
     return value
 
 
+def _app_link_uri(page_uri: str) -> str:
+    """Read ``POSTERN_DEVICE_APP_LINK_URI``, or refuse a host shared with the page.
+
+    A phone camera handed a URL on the page's host opens the browser page, not
+    the bank app, so the pairing could never reach ``POST /scan``. Hostnames
+    are compared after ``urlsplit`` and case-folded; a port does not make a
+    different host. The offending values are echoed, as `_device_code_ttl`
+    does, because they are an operator's own environment.
+    """
+    link = os.environ.get("POSTERN_DEVICE_APP_LINK_URI") or "https://app.postern.internal/pair"
+    page_host = (urlsplit(page_uri).hostname or "").casefold()
+    link_host = (urlsplit(link).hostname or "").casefold()
+    if link_host == page_host:
+        raise ValueError(
+            f"POSTERN_DEVICE_APP_LINK_URI ({link!r}) must not share a host with "
+            f"POSTERN_DEVICE_VERIFICATION_URI ({page_uri!r}). "
+            "A phone camera handed a URL on the page's host opens the browser page "
+            "instead of the bank app, so a pairing could never be scanned."
+        )
+    return link
+
+
 @dataclass(frozen=True)
 class ConfirmSettings:
     write_key_pem_path: str | None = None
@@ -205,6 +233,11 @@ class ConfirmSettings:
     vault_read_key_name: str = "postern-read"
     # Device authorization (§7.3): where the user goes to approve pairing.
     device_verification_uri: str = "https://auth.postern.internal/verify"
+    # The base of the app link the pairing QR encodes. A placeholder host for
+    # local work, like the field above; a deployment owes its own, with the
+    # Apple associated-domains and Android asset-links files that make a
+    # camera open the bank app. `_app_link_uri` refuses one on the page's host.
+    device_app_link_uri: str = "https://app.postern.internal/pair"
     # Floored at `MIN_DEVICE_CODE_TTL_SECONDS` when it comes from the
     # environment, which is where that constant's working lives. The field
     # default stays 900 and is the only lifetime here derived for real use.
@@ -437,6 +470,10 @@ class ConfirmSettings:
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
+        device_verification_uri = os.environ.get(
+            "POSTERN_DEVICE_VERIFICATION_URI",
+            "https://auth.postern.internal/verify",
+        )
         return cls(
             write_key_pem_path=os.environ.get("POSTERN_WRITE_KEY_PEM_PATH") or None,
             write_key_kid=os.environ.get("POSTERN_WRITE_KEY_KID", "write-1"),
@@ -446,10 +483,8 @@ class ConfirmSettings:
             write_token_issuer=os.environ.get(
                 "POSTERN_WRITE_TOKEN_ISSUER", "https://mcp-write.internal"
             ),
-            device_verification_uri=os.environ.get(
-                "POSTERN_DEVICE_VERIFICATION_URI",
-                "https://auth.postern.internal/verify",
-            ),
+            device_verification_uri=device_verification_uri,
+            device_app_link_uri=_app_link_uri(device_verification_uri),
             device_code_ttl_seconds=_device_code_ttl("POSTERN_DEVICE_CODE_TTL_SECONDS", 900),
             # FLOOR OF ONE SECOND, and no ceiling from this line -- though one
             # is derivable and is deliberately not taken here. At zero or below
