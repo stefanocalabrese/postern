@@ -243,24 +243,28 @@ class TestDeviceCodeGeneration:
         assert dc.user_code_display == "ABC"
 
     def test_verification_uri_complete_with_query(self) -> None:
-        """URI with existing query params gets &user_code=."""
+        """URI with existing query params gets &d=<display handle>."""
         dc = DeviceCode(
             device_code="test",
             user_code="ABCDEF",
             verification_uri="https://example.com/verify?foo=bar",
             expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            display_handle="h4ndle",
         )
-        assert dc.verification_uri_complete == "https://example.com/verify?foo=bar&user_code=ABCDEF"
+        assert dc.verification_uri_complete == "https://example.com/verify?foo=bar&d=h4ndle"
 
     def test_verification_uri_complete_without_query(self) -> None:
-        """URI without query params gets ?user_code=."""
+        """URI without query params gets ?d=<display handle>, and never the
+        ``user_code``: a URL keyed by a 30-bit code is an enumeration oracle."""
         dc = DeviceCode(
             device_code="test",
             user_code="ABCDEF",
             verification_uri="https://example.com/verify",
             expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            display_handle="h4ndle",
         )
-        assert dc.verification_uri_complete == "https://example.com/verify?user_code=ABCDEF"
+        assert dc.verification_uri_complete == "https://example.com/verify?d=h4ndle"
+        assert "ABCDEF" not in dc.verification_uri_complete
 
     def test_is_expired_true(self) -> None:
         dc = DeviceCode(
@@ -464,6 +468,34 @@ class TestDeviceAuthorizationEndpoint:
         assert dc is not None
         # Default scopes from the endpoint.
         assert "accounts:read" in dc.scopes
+
+    async def test_the_complete_uri_carries_the_stored_handle_and_neither_code(
+        self, app: Starlette
+    ) -> None:
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        async with _client(app) as client:
+            data = await _start_device_grant(client)
+
+        code = await store.get_device_code(data["device_code"])
+        assert code is not None
+        assert data["verification_uri_complete"] == (
+            f"{data['verification_uri']}?d={code.display_handle}"
+        )
+        assert code.user_code not in data["verification_uri_complete"]
+        assert data["device_code"] not in data["verification_uri_complete"]
+        assert data["user_code"] == code.user_code_display
+
+    async def test_the_creating_address_is_recorded_on_the_code(self, app: Starlette) -> None:
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app, client=("198.51.100.23", 4444)),
+            base_url="http://test",
+        ) as client:
+            data = await _start_device_grant(client)
+
+        code = await store.get_device_code(data["device_code"])
+        assert code is not None
+        assert code.creator_ip == "198.51.100.23"
 
 
 # ---------------------------------------------------------------------------

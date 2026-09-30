@@ -14,9 +14,13 @@ The confirm service is the right home for these because:
 2. The approval callback needs to update device code state, which lives in
    the same service as the token minting.
 
-QR data encoding: the verification URI with ``user_code`` as a query
-parameter (``verification_uri_complete``). The mobile app deep-links to this
-URI; the browser shows a QR encoding it.
+Two URIs, where there used to be one. ``verification_uri_complete`` is the
+PAGE the AI client shows its user: ``verification_uri`` plus ``?d=`` and the
+pairing's display handle, 128 random bits that key the page and nothing else.
+The QR on that page encodes the APP LINK instead: ``device_app_link_uri`` plus
+the ``user_code`` and a two-second rotation token. ``device_code`` is in
+neither, because it is the only credential ``POST /token`` asks for, and
+anything in a QR is readable over a shoulder or a screen share.
 
 Pairing code (``user_code``): 6 uppercase alphanumeric chars, displayed as
 XXX-XXX on both surfaces. ``POST /approve`` REQUIRES it and compares it, in
@@ -228,7 +232,9 @@ async def device_authorization(request: Request) -> JSONResponse:
         device_code: Opaque code for token exchange.
         user_code: Human-readable pairing code (XXX-XXX).
         verification_uri: Base URI for the verification page.
-        verification_uri_complete: Full URI with user_code (for deep-linking).
+        verification_uri_complete: The pairing page, ``verification_uri`` plus
+            ``d=`` and the display handle. Never the ``user_code`` and never
+            the ``device_code``.
         expires_in: Lifetime in seconds.
         interval: Seconds between token polls.
 
@@ -352,6 +358,12 @@ async def device_authorization(request: Request) -> JSONResponse:
             verification_uri=settings.device_verification_uri,
             expires_in=settings.device_code_ttl_seconds,
             interval=settings.device_poll_interval_seconds,
+            # RECORDED AND READ BY NOTHING YET. The creator-versus-scanner
+            # comparison that would use it is a later spec's; recording it
+            # now is what gives that spec something to compare. Under the
+            # default of zero trusted hops this is the direct peer, which
+            # behind a load balancer is the balancer's address.
+            creator_ip=pairing_client_ip(request, settings.trusted_proxy_hops),
         )
     except DeviceCodeStoreFull as exc:
         logger.warning(

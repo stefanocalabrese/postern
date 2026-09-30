@@ -354,9 +354,17 @@ class DeviceCode:
 
     @property
     def verification_uri_complete(self) -> str:
-        """Verification URI with user_code as query parameter for deep-linking."""
+        """The pairing page's URI: ``verification_uri`` plus ``d=<display_handle>``.
+
+        RFC 8628 section 3.3.1 lets the complete URI carry the ``user_code``
+        "or other information with the same function"; the display handle is
+        that other information. It is not the ``user_code`` because a URL
+        keyed by a 30-bit code on a public endpoint is an enumeration oracle,
+        and it is never the ``device_code``, the one credential ``POST
+        /token`` asks for.
+        """
         separator = "&" if "?" in self.verification_uri else "?"
-        return f"{self.verification_uri}{separator}user_code={self.user_code}"
+        return f"{self.verification_uri}{separator}d={self.display_handle}"
 
     def to_json(self) -> str:
         """Serialize to JSON string."""
