@@ -1580,7 +1580,7 @@ requires-dist = [
 dev = [
     { name = "fakeredis", specifier = ">=2.20" },
     { name = "import-linter", specifier = ">=2.15" },
-    { name = "mini-racer", specifier = ">=0.14.1" },
+    { name = "mini-racer", specifier = ">=0.14.1,<0.15" },
     { name = "mypy", specifier = ">=1.14" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=1.4" },

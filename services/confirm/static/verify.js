@@ -25,10 +25,11 @@
 //     there is no token to take down, so a 429 or a failure leaves the compare
 //     instruction alone and only reschedules; failures still count toward
 //     MAX_FAILURES.
-//   - Any answer but 200, 404 and 429, a network error, a body that does not
-//     parse, and a fetch still unanswered after FETCH_TIMEOUT_MS are all
-//     failures. MAX_FAILURES in a row stop polling and ask for a reload. Only
-//     a 200 whose body parsed resets the count; a 429 neither adds nor resets.
+//   - Any answer but 200, 404 and 429, a network error, a 200 whose body does
+//     not parse or is neither pending nor scanned, and a fetch still
+//     unanswered after FETCH_TIMEOUT_MS are all failures. MAX_FAILURES in a
+//     row stop polling and ask for a reload. Only a pending or scanned 200
+//     resets the count; a 429 neither adds nor resets.
 //   - A hidden tab does not poll. Becoming visible polls at once, which also
 //     replaces whatever token went stale while it was hidden.
 (function () {
@@ -208,18 +209,19 @@
           return null;
         }
         delay = BASE_DELAY_MS;
-        return response.json();
-      })
-      .then(function (body) {
-        if (!body) {
-          return;
-        }
-        failures = 0;
-        if (body.status === "pending") {
-          showPending(body.app_link);
-        } else if (body.status === "scanned") {
-          showScanned();
-        }
+        return response.json().then(function (body) {
+          // A 200 that is neither pending nor scanned refreshes nothing, so
+          // it is a failure: counting it is what lets a stale token come down.
+          if (body && body.status === "pending") {
+            failures = 0;
+            showPending(body.app_link);
+          } else if (body && body.status === "scanned") {
+            failures = 0;
+            showScanned();
+          } else {
+            fail();
+          }
+        });
       })
       .catch(function () {
         // A network error, the deadline's abort, or a 200 whose body did not

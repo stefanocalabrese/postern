@@ -38,7 +38,7 @@ dev = [
     "fakeredis>=2.20",
     "pyyaml>=6.0.3",
     "types-pyyaml>=6.0.12.20260906",
-    "mini-racer>=0.14.1",
+    "mini-racer>=0.14.1,<0.15",
 ]
 
 [tool.pytest.ini_options]

@@ -102,6 +102,8 @@ FAILURES: dict[str, dict[str, Any]] = {
     "network error": {"network": True},
     "malformed 200": {"status": 200, "raw": '{"status": "pend'},
     "unexpected 403": {"status": 403, "body": {"status": "closed"}},
+    "unknown status 200": {"status": 200, "body": {"status": "weird"}},
+    "null body 200": {"status": 200, "body": None},
 }
 
 
@@ -163,6 +165,8 @@ class Browser:
         page.close()
         payload = json.dumps({"body": {"attributes": page.body}, "main": page.main})
         self._racer.eval(f"__harness.load({payload})")
+        # Runs the script after the DOM is built, which is what `defer` gives;
+        # tests/test_verify_page.py asserts the page's script tag carries it.
         if "/verify.js" in page.scripts or force_script:
             self._racer.eval(VERIFY_JS.decode("utf-8"))
 
@@ -271,6 +275,7 @@ def open_page() -> Iterator[OpenPage]:
         yield open_
         for browser in opened:
             assert browser.unscripted() == 0, "the script fetched more than was scripted"
+            assert browser.remaining() == 0, "the script fetched less than was scripted"
             assert browser.real_timers() == 0
 
 
@@ -512,11 +517,35 @@ def test_five_consecutive_failures_give_up_and_leave_no_timers(
 
 def test_five_different_failures_in_a_row_give_up(open_page: OpenPage) -> None:
     browser = open_page(pending_page())
-    browser.script(*FAILURES.values())
+    kinds = ["500", "network error", "malformed 200", "unexpected 403", "unknown status 200"]
+    browser.script(*(FAILURES[kind] for kind in kinds))
 
     browser.advance(10_000)
 
     assert len(browser.fetches()) == 5
+    assert browser.text("instruction") == GAVE_UP_TEXT
+    assert browser.timers() == []
+
+
+def test_unrecognised_200s_take_a_stale_token_down_and_give_up(open_page: OpenPage) -> None:
+    """A 200 that is neither pending nor scanned refreshes nothing, so it must
+    count as a failure: otherwise a run of them keeps a token on the page past
+    the 10 s every token is guaranteed. The 429 stretches the first wait so the
+    token goes stale before the fifth failure."""
+    browser = open_page(pending_page())
+    browser.script(TOO_MANY, *[FAILURES["unknown status 200"]] * 5)
+
+    browser.advance(8000)
+    assert browser.fetch_times() == [2000, 6000, 8000]
+    assert_token_shown(browser)
+    assert browser.text("instruction") == PENDING_TEXT
+
+    browser.advance(2000)
+    assert_token_gone(browser)
+    assert browser.text("instruction") == RETRYING_TEXT, "10000 + 2000 is past 10000"
+
+    browser.advance(4000)
+    assert browser.fetch_times() == [2000, 6000, 8000, 10000, 12000, 14000]
     assert browser.text("instruction") == GAVE_UP_TEXT
     assert browser.timers() == []
 
