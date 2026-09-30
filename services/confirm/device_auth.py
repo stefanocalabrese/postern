@@ -1264,8 +1264,8 @@ async def _withdraw_pairing(
         elif cause == "cancelled":
             logger.error(
                 "a device pairing's scan claim was cancelled before its audit_log row "
-                "AND could not be withdrawn; device code %s is %s with no audit_log row "
-                "behind it (the request was cancelled): %s",
+                "was confirmed, could not be withdrawn, and device code %s may be %s "
+                "with no audit_log row behind it (the request was cancelled): %s",
                 device_code_handle(device_code_value),
                 state,
                 revoke_exc,

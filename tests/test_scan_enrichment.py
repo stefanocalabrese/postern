@@ -622,8 +622,8 @@ async def test_a_failed_withdrawal_after_a_cancellation_says_cancelled(
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     withdrawal = [m for m in errors if "could not be withdrawn" in m]
     assert len(withdrawal) == 1, errors
-    assert "was cancelled before its audit_log row" in withdrawal[0]
-    assert "is claimed with no audit_log row" in withdrawal[0]
+    assert "was cancelled before its audit_log row was confirmed" in withdrawal[0]
+    assert "may be claimed with no audit_log row behind it" in withdrawal[0]
     assert "store write failed ambiguously" not in withdrawal[0]
     assert device_code_handle(code.device_code) in withdrawal[0]
 
