@@ -155,6 +155,23 @@ from services.confirm.settings import DEFAULT_DEVICE_SCOPES, ConfirmSettings
 
 logger = logging.getLogger(__name__)
 
+#: How many successful scans per process may be waiting on the pairing network
+#: enricher at once. A scan that finds every slot taken does not wait: it
+#: records ``"unknown"`` for both matches and logs ``saturated``.
+#:
+#: A CODE CONSTANT, NOT A SETTING, because the number is a bound and not a
+#: tuning knob. It exists for a provider that is slow but cooperative: without
+#: it every successful scan during a provider stall parks a task for the whole
+#: budget, and the per-address and per-customer scan limits bound each caller,
+#: not their sum. With it at most eight scans per replica ever wait, and a
+#: provider that ignores cancellation and keeps its slots eventually holds all
+#: eight, after which every scan records ``"unknown"`` at once instead of
+#: piling on. A healthy local-database provider answers far inside the budget,
+#: so eight are exhausted only by eight scans arriving within one lookup's
+#: duration. It is no defence against a provider that never yields: that one
+#: blocks the loop before the semaphore matters.
+PAIRING_ENRICHMENT_SLOTS = 8
+
 # ---------------------------------------------------------------------------
 # Error responses — RFC 8628 §3.3 and §3.4 error codes.
 # ---------------------------------------------------------------------------

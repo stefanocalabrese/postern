@@ -68,6 +68,8 @@ See ``services.confirm.device_auth`` for device auth endpoint implementations
 and ``services.confirm.callback`` for the challenge approval handler.
 """
 
+import asyncio
+import enum
 from pathlib import Path
 
 from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -78,6 +80,8 @@ from postern_core.auth.keys import choose_key_source
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement
 from postern_core.env_inventory import enforce_known_environment
+from postern_core.modules.enrichers import load_network_enricher
+from postern_core.risk.pairing_network import NetworkEnricher
 from postern_core.store.engine import Database
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -91,7 +95,7 @@ from services.confirm.customer_rate_limit import (
     create_customer_rate_limit_store,
     customer_limits_from_settings,
 )
-from services.confirm.device_auth import device_auth_routes
+from services.confirm.device_auth import PAIRING_ENRICHMENT_SLOTS, device_auth_routes
 from services.confirm.jwks import jwks_route
 from services.confirm.minter import build_write_minter
 from services.confirm.rate_limit import (
@@ -102,6 +106,17 @@ from services.confirm.rate_limit import (
 )
 from services.confirm.settings import ConfirmSettings
 from services.confirm.verify_page import verify_page_routes
+
+
+class _FromEntryPoints(enum.Enum):
+    """The default of ``create_confirm_app``'s ``network_enricher``.
+
+    A sentinel rather than ``None``, because ``None`` is a meaningful value
+    there: "no enricher", which a test passes to build an app that records
+    the relation and no match keys whatever is installed.
+    """
+
+    LOAD = enum.auto()
 
 
 def _assertion_verifier(settings: ConfirmSettings) -> AssertionVerifier:
@@ -191,6 +206,7 @@ def create_confirm_app(
     *,
     assertion_verifier: AssertionVerifier | None = None,
     device_key_store: DeviceKeyStoreBase | None = None,
+    network_enricher: NetworkEnricher | None | _FromEntryPoints = _FromEntryPoints.LOAD,
 ) -> Starlette:
     """Assemble the write-path ASGI app with device authorization and callback endpoints.
 
@@ -219,6 +235,11 @@ def create_confirm_app(
             ``no_enrolled_devices()``. Also keyword-only with no environment
             variable behind it, so it cannot become a deployment's answer to
             the guard below.
+        network_enricher: Overrides the pairing network enricher loaded from
+            the ``postern.pairing_network_enrichers`` entry-point group.
+            ``None`` means no enricher, which is not the default: omitted, the
+            installed distributions decide. Keyword-only with no environment
+            variable behind it, like the two above.
 
     Raises:
         ValueError: if no verifier is given and the ``app_assertion_*``
@@ -228,6 +249,9 @@ def create_confirm_app(
             makes a confirm service that authenticates nobody, or that cannot
             verify an approval signature, unreachable by construction rather
             than by remembering to configure one.
+        EnricherSeamViolation: if the installed enricher set is refused by
+            ``load_network_enricher``: more than one, one that will not
+            import, or one whose ``lookup`` is not async.
     """
     # FIRST, AND AHEAD OF THE AUTHENTICATION GUARD, which is a deliberate
     # exception to the ordering the next comment states. That order exists so
@@ -279,6 +303,14 @@ def create_confirm_app(
             "same instance the read path uses, or unset POSTERN_REQUIRE_REDIS "
             "to accept per-replica state."
         )
+    )
+
+    # THE PAIRING NETWORK ENRICHER, LOADED ONCE AND BEFORE ANY KEY IS BUILT,
+    # so a refused installed set lands at composition like every other
+    # installed-distribution refusal in this repository, and a process about
+    # to refuse does not first generate an RSA key.
+    enricher = (
+        load_network_enricher() if network_enricher is _FromEntryPoints.LOAD else network_enricher
     )
 
     # --- Write key / minter (existing path) ---
@@ -496,6 +528,11 @@ def create_confirm_app(
     # resolved its store per request could be made to run without one.
     app.state.postern_customer_rate_limit_store = customer_rate_limit_store
     app.state.settings = settings
+    # Read by `services/confirm/device_auth.py` on a successful ``POST /scan``.
+    # The semaphore bounds how many scans per process wait on the enricher at
+    # once; that module's ``PAIRING_ENRICHMENT_SLOTS`` carries why eight.
+    app.state.pairing_network_enricher = enricher
+    app.state.pairing_network_slots = asyncio.Semaphore(PAIRING_ENRICHMENT_SLOTS)
 
     return app
 
