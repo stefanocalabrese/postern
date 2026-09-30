@@ -261,18 +261,34 @@ async def test_an_unknown_path_is_401_and_not_404(app: Starlette) -> None:
             assert response.status_code == 401, (path, response.status_code)
 
 
-def test_the_public_path_list_is_exactly_these_three() -> None:
-    """Adding a fourth must be a deliberate, reviewed act.
+def test_the_public_path_list_is_exactly_these_eight() -> None:
+    """Adding a ninth must be a deliberate, reviewed act.
 
     ``PUBLIC_PATHS`` is the single exemption list for the whole service. A
     change to it is a change to what the write path serves anonymously, and it
-    should never happen as a side effect of some other edit.
+    should never happen as a side effect of some other edit. The five
+    ``/verify`` entries are the browser's pairing page, and
+    ``dev-docs/decisions/0021-public-html-on-the-write-key-service.md`` is
+    where serving them here was decided.
     """
     assert PUBLIC_PATHS == {
         "/.well-known/jwks.json",
         "/device_authorization",
         "/token",
+        "/verify",
+        "/verify/qr.svg",
+        "/verify/state",
+        "/verify.js",
+        "/verify.css",
     }
+
+
+def test_every_public_path_is_a_route_with_methods(app: Starlette) -> None:
+    """A public path the route table does not serve with ``.methods`` would be
+    skipped by the table-driven tests above, which is how a ``StaticFiles``
+    mount would have slipped past both of them."""
+    served = {path for _, path in _routes(app)}
+    assert set(PUBLIC_PATHS) <= served, set(PUBLIC_PATHS) - served
 
 
 # ---------------------------------------------------------------------------

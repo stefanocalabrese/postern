@@ -1,0 +1,380 @@
+"""The five public pairing-page routes, over the assembled app.
+
+Section 4 of ``dev-docs/qr-page-spec.md``: every header on every route, the
+three rows of the page-state table, the stored values rendered instead of the
+query's, the state endpoint's bodies, the image's 404s, and the hotlink
+refusal on the image and the state. No Postgres: none of these routes reads or
+writes ``audit_log``, and the app builds without connecting.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, quote, urlsplit
+
+import httpx2
+import pytest
+from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
+from postern_core.auth.device_codes import DeviceCode
+from postern_core.auth.device_keys import no_enrolled_devices
+from starlette.applications import Starlette
+
+from services.confirm import verify_page
+from services.confirm.main import create_confirm_app
+from services.confirm.qr_token import QrVerdict, slot_at, verify_token
+from services.confirm.settings import ConfirmSettings
+from services.confirm.verify_page import (
+    CLOSED_TEXT,
+    NO_HANDLE_TEXT,
+    PAGE_CSP,
+    PENDING_TEXT,
+    SCANNED_TEXT,
+)
+from tests.device_grant_helpers import device_store_of, overwrite_in_memory
+
+SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
+CUSTOMER = "cust_7f3a"
+CLOSED_STATES = ["unknown", "expired", "approved"]
+
+
+@pytest.fixture(scope="module")
+def key_pair() -> RSAKeyPair:
+    return RSAKeyPair.generate()
+
+
+@pytest.fixture()
+def app(key_pair: RSAKeyPair) -> Starlette:
+    return create_confirm_app(
+        ConfirmSettings.for_testing(),
+        assertion_verifier=JWTVerifier(
+            public_key=key_pair.public_key, issuer="https://i.test", audience="a"
+        ),
+        device_key_store=no_enrolled_devices(),
+    )
+
+
+async def get(app: Starlette, path: str, headers: dict[str, str] | None = None) -> httpx2.Response:
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        return await client.get(path, headers=headers or {})
+
+
+async def pairing(app: Starlette, state: str) -> DeviceCode:
+    """A stored pairing in ``state``: pending, scanned, expired or approved."""
+    store = device_store_of(app)
+    code = await store.create_device_code(
+        client_id="browser-1", scopes="accounts:read", verification_uri="https://a.test/verify"
+    )
+    if state in ("scanned", "approved"):
+        await store.claim_scan(code.device_code, CUSTOMER)
+    if state == "approved":
+        assert await store.approve_scanned(code.device_code, CUSTOMER) is True
+    if state == "expired":
+        overwrite_in_memory(app, replace(code, expires_at=datetime.now(UTC) - timedelta(seconds=1)))
+    return code
+
+
+async def handle_for(app: Starlette, state: str) -> str:
+    """The ``d`` value for a pairing in ``state``; ``unknown`` names none."""
+    if state == "unknown":
+        return "no-such-handle-0000000"
+    return (await pairing(app, state)).display_handle
+
+
+def page_url(handle: str) -> str:
+    return f"/verify?d={quote(handle, safe='')}"
+
+
+# ---------------------------------------------------------------------------
+# GET /verify
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("state", ["bare", "pending", "scanned", *CLOSED_STATES])
+async def test_the_page_carries_every_header_in_every_state(app: Starlette, state: str) -> None:
+    url = "/verify" if state == "bare" else page_url(await handle_for(app, state))
+
+    resp = await get(app, url)
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert resp.headers["content-security-policy"] == PAGE_CSP
+    assert resp.headers["referrer-policy"] == "no-referrer"
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["strict-transport-security"] == "max-age=31536000"
+    assert resp.headers["x-frame-options"] == "DENY"
+
+
+def test_the_csp_is_the_specs_to_the_character() -> None:
+    assert PAGE_CSP == (
+        "default-src 'none'; img-src 'self'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    )
+
+
+async def test_a_pending_page_shows_the_code_the_qr_the_link_and_the_instruction(
+    app: Starlette,
+) -> None:
+    code = await pairing(app, "pending")
+
+    page = (await get(app, page_url(code.display_handle))).text
+
+    assert code.user_code_display in page
+    assert f'<img id="qr" src="/verify/qr.svg?d={code.display_handle}"' in page
+    assert 'id="app-link" href="https://app.postern.internal/pair?user_code=' in page
+    assert PENDING_TEXT in page
+    assert '<meta http-equiv="refresh" content="5">' in page
+    assert '<script src="/verify.js" defer></script>' in page
+    assert '<link rel="stylesheet" href="/verify.css">' in page
+    assert "<script>" not in page, "no inline script: the CSP would refuse it anyway"
+
+
+async def test_a_scanned_page_shows_the_code_and_nothing_to_scan(app: Starlette) -> None:
+    code = await pairing(app, "scanned")
+
+    page = (await get(app, page_url(code.display_handle))).text
+
+    assert code.user_code_display in page
+    assert 'id="qr"' not in page
+    assert 'id="app-link"' not in page
+    assert SCANNED_TEXT in page
+    assert '<meta http-equiv="refresh" content="5">' in page
+
+
+async def test_every_closed_page_is_the_same_page(app: Starlette) -> None:
+    """Unknown, expired and approved are indistinguishable, so the page
+    confirms nothing about an approval."""
+    pages = [(await get(app, page_url(await handle_for(app, s)))).text for s in CLOSED_STATES]
+
+    assert pages[0] == pages[1] == pages[2]
+    assert CLOSED_TEXT in pages[0]
+    assert 'id="pairing-code"' not in pages[0]
+    assert 'id="qr"' not in pages[0]
+    assert 'http-equiv="refresh"' not in pages[0]
+    assert "/verify.js" not in pages[0]
+
+
+async def test_a_bare_page_says_one_sentence_and_offers_no_form(app: Starlette) -> None:
+    page = (await get(app, "/verify")).text
+
+    assert NO_HANDLE_TEXT in page
+    assert "<form" not in page
+    assert "<input" not in page
+    assert 'http-equiv="refresh"' not in page
+
+
+async def test_the_page_renders_the_stored_values_and_not_the_query(
+    app: Starlette, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lookup is replaced by one that ignores its argument, so the only
+    way the probe string could reach the page is from the query."""
+    stored = replace(await pairing(app, "pending"), display_handle="stored-handle-00000000")
+
+    async def found_regardless(display_handle: str) -> DeviceCode:
+        return stored
+
+    monkeypatch.setattr(device_store_of(app), "get_by_display_handle", found_regardless)
+
+    page = (await get(app, "/verify?d=probe-from-the-query")).text
+
+    assert "stored-handle-00000000" in page
+    assert stored.user_code_display in page
+    assert "probe-from-the-query" not in page
+
+
+async def test_markup_in_the_query_never_reaches_the_page(app: Starlette) -> None:
+    page = (await get(app, "/verify?d=%3Cscript%3Ealert(1)%3C%2Fscript%3E")).text
+
+    assert "alert(1)" not in page
+    assert CLOSED_TEXT in page
+
+
+# ---------------------------------------------------------------------------
+# GET /verify/state
+# ---------------------------------------------------------------------------
+
+
+def assert_state_headers(resp: httpx2.Response) -> None:
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["cross-origin-resource-policy"] == "same-origin"
+
+
+async def test_a_pending_state_carries_a_current_app_link(app: Starlette) -> None:
+    code = await pairing(app, "pending")
+
+    resp = await get(app, f"/verify/state?d={code.display_handle}", SAME_ORIGIN)
+
+    assert resp.status_code == 200
+    assert_state_headers(resp)
+    body = resp.json()
+    assert set(body) == {"status", "app_link"}
+    assert body["status"] == "pending"
+    link = urlsplit(body["app_link"])
+    assert f"{link.scheme}://{link.netloc}{link.path}" == "https://app.postern.internal/pair"
+    query = parse_qs(link.query)
+    assert query["user_code"] == [code.user_code]
+    verdict = verify_token(code.qr_secret, code.user_code, query["qr"][0], slot_at(time.time()))
+    assert verdict is QrVerdict.VALID
+
+
+async def test_the_app_link_changes_from_one_slot_to_the_next(
+    app: Starlette, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = await pairing(app, "pending")
+    url = f"/verify/state?d={code.display_handle}"
+
+    monkeypatch.setattr(verify_page, "_now", lambda: 1_790_000_000.0)
+    first = (await get(app, url, SAME_ORIGIN)).json()["app_link"]
+    monkeypatch.setattr(verify_page, "_now", lambda: 1_790_000_002.0)
+    second = (await get(app, url, SAME_ORIGIN)).json()["app_link"]
+
+    assert first != second
+    assert parse_qs(urlsplit(first).query)["qr"][0].startswith("895000000.")
+    assert parse_qs(urlsplit(second).query)["qr"][0].startswith("895000001.")
+
+
+async def test_a_scanned_state_says_scanned_and_nothing_else(app: Starlette) -> None:
+    code = await pairing(app, "scanned")
+
+    resp = await get(app, f"/verify/state?d={code.display_handle}", SAME_ORIGIN)
+
+    assert resp.status_code == 200
+    assert_state_headers(resp)
+    assert resp.json() == {"status": "scanned"}
+
+
+async def test_every_closed_state_is_the_same_404(app: Starlette) -> None:
+    answers = [
+        await get(app, f"/verify/state?d={await handle_for(app, s)}", SAME_ORIGIN)
+        for s in CLOSED_STATES
+    ]
+
+    assert [r.status_code for r in answers] == [404, 404, 404]
+    assert answers[0].json() == answers[1].json() == answers[2].json() == {"status": "closed"}
+    for resp in answers:
+        assert_state_headers(resp)
+
+
+# ---------------------------------------------------------------------------
+# GET /verify/qr.svg
+# ---------------------------------------------------------------------------
+
+
+def assert_qr_headers(resp: httpx2.Response) -> None:
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["content-security-policy"] == "default-src 'none'"
+    assert resp.headers["cross-origin-resource-policy"] == "same-origin"
+
+
+async def test_a_pending_pairing_gets_an_svg(app: Starlette) -> None:
+    code = await pairing(app, "pending")
+
+    resp = await get(app, f"/verify/qr.svg?d={code.display_handle}", SAME_ORIGIN)
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/svg+xml"
+    assert_qr_headers(resp)
+    assert resp.content.startswith(b"<svg")
+    assert code.user_code.encode() not in resp.content, "the SVG is path data, not text"
+
+
+async def test_the_qr_encodes_the_app_link_for_the_current_slot(
+    app: Starlette, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = await pairing(app, "pending")
+    drawn: list[str] = []
+    real = verify_page.render_qr_svg
+
+    def spy(link: str) -> bytes:
+        drawn.append(link)
+        return real(link)
+
+    monkeypatch.setattr(verify_page, "render_qr_svg", spy)
+    monkeypatch.setattr(verify_page, "_now", lambda: 1_790_000_000.0)
+
+    await get(app, f"/verify/qr.svg?d={code.display_handle}", SAME_ORIGIN)
+    state = (await get(app, f"/verify/state?d={code.display_handle}", SAME_ORIGIN)).json()
+
+    assert drawn == [state["app_link"]]
+
+
+@pytest.mark.parametrize("state", ["scanned", *CLOSED_STATES])
+async def test_every_other_state_gets_the_same_empty_404(app: Starlette, state: str) -> None:
+    resp = await get(app, f"/verify/qr.svg?d={await handle_for(app, state)}", SAME_ORIGIN)
+
+    assert resp.status_code == 404
+    assert resp.content == b""
+    assert_qr_headers(resp)
+
+
+# ---------------------------------------------------------------------------
+# The hotlink refusal, on the image and the state.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({"Sec-Fetch-Site": "cross-site"}, id="cross-site"),
+        pytest.param({"Sec-Fetch-Site": "same-site"}, id="same-site"),
+        pytest.param({"Sec-Fetch-Site": "none"}, id="none"),
+        pytest.param({}, id="no header at all"),
+    ],
+)
+async def test_anything_but_same_origin_gets_the_closed_answer(
+    app: Starlette, headers: dict[str, str]
+) -> None:
+    code = await pairing(app, "pending")
+
+    image = await get(app, f"/verify/qr.svg?d={code.display_handle}", headers)
+    state = await get(app, f"/verify/state?d={code.display_handle}", headers)
+
+    assert image.status_code == 404
+    assert image.content == b""
+    assert_qr_headers(image)
+    assert state.status_code == 404
+    assert state.json() == {"status": "closed"}
+    assert_state_headers(state)
+
+
+async def test_the_page_itself_is_not_refused_for_a_cross_site_navigation(
+    app: Starlette,
+) -> None:
+    """The page is opened from a link in the AI client, which is exactly a
+    cross-site navigation; only the image and the state are refused."""
+    code = await pairing(app, "pending")
+
+    resp = await get(app, page_url(code.display_handle), {"Sec-Fetch-Site": "cross-site"})
+
+    assert resp.status_code == 200
+    assert code.user_code_display in resp.text
+
+
+# ---------------------------------------------------------------------------
+# GET /verify.js and /verify.css
+# ---------------------------------------------------------------------------
+
+
+async def test_the_script_is_served_as_javascript(app: Starlette) -> None:
+    resp = await get(app, "/verify.js")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/javascript")
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert "/verify/state?" in resp.text
+    assert "30000" in resp.text, "the 429 back-off ceiling"
+
+
+async def test_the_stylesheet_is_served_as_css(app: Starlette) -> None:
+    resp = await get(app, "/verify.css")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/css")
+    assert resp.headers["x-content-type-options"] == "nosniff"

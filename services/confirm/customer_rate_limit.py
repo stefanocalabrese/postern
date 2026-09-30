@@ -123,7 +123,7 @@ DEFAULT_CUSTOMER_LIMITS: dict[str, Limit] = {
 #: The outer limiter limits every path, because every path is reachable
 #: without a credential. This one can only limit a request that CARRIES A
 #: VERIFIED ASSERTION, because that is where the customer comes from; the
-#: three entries in `services/confirm/auth.py`'s ``PUBLIC_PATHS`` have no
+#: eight entries in `services/confirm/auth.py`'s ``PUBLIC_PATHS`` have no
 #: customer at the moment they are served and are the outer limiter's alone.
 #: So the rule this expresses is: every request that reached here WITH a
 #: verified subject is charged to that subject. A protected route added to
@@ -538,11 +538,11 @@ class CustomerRateLimit:
             # NO VERIFIED SUBJECT, SO NOTHING TO CHARGE, AND THIS IS NOT A
             # HOLE. Reaching here means `AppAssertionMiddleware` let the
             # request through without verifying one, which it does for
-            # exactly the three entries in its ``PUBLIC_PATHS`` -- and those
-            # three have no customer at the moment they are served, which is
+            # exactly the eight entries in its ``PUBLIC_PATHS`` -- and those
+            # eight have no customer at the moment they are served, which is
             # the premise of the device grant rather than an oversight. They
             # are the outer address-keyed limiter's alone, and it limits all
-            # three. Any other route reaching here unverified would already
+            # eight. Any other route reaching here unverified would already
             # have been a 401.
             await self.app(scope, receive, send)
             return

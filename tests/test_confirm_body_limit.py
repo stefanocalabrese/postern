@@ -624,8 +624,14 @@ async def test_an_unauthenticated_oversized_request_is_413_and_never_reaches_the
         ("/token", "application/x-www-form-urlencoded"),
         ("/device_authorization", "application/json"),
         ("/approve", "application/json"),
+        ("/scan", "application/json"),
         (PROTECTED, "application/json"),
         ("/.well-known/jwks.json", "application/json"),
+        ("/verify", "text/plain"),
+        ("/verify/qr.svg", "text/plain"),
+        ("/verify/state", "text/plain"),
+        ("/verify.js", "text/plain"),
+        ("/verify.css", "text/plain"),
     ],
 )
 async def test_every_route_is_covered_including_the_public_and_form_encoded_ones(
@@ -642,16 +648,17 @@ async def test_every_route_is_covered_including_the_public_and_form_encoded_ones
     encoded, and Starlette's accidental 1 MiB form ceiling is not a number
     this repository chose.
 
-    The JWKS route is a GET that reads no body, and is here because the limit
-    covers every method. A route added to this service tomorrow is bounded by
-    omission, the same direction ``PUBLIC_PATHS`` points for authentication.
+    The JWKS route and the five pairing-page routes are GETs that read no
+    body, and are here because the limit covers every method. A route added
+    to this service tomorrow is bounded by omission, the same direction
+    ``PUBLIC_PATHS`` points for authentication.
     """
     app = _app(key_pair, max_body_bytes=LIMIT)
     async with httpx2.AsyncClient(
         transport=httpx2.ASGITransport(app=app), base_url="http://t"
     ) as client:
         response = await client.request(
-            "GET" if path.endswith("jwks.json") else "POST",
+            "GET" if path.endswith("jwks.json") or path.startswith("/verify") else "POST",
             path,
             content=b"E" * (LIMIT + 1),
             headers={"content-type": content_type},

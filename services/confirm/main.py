@@ -25,9 +25,11 @@ their reads. Which scope reaches this service, and which two do not, is
 `services/confirm/revocation.py`'s subject -- the summary is that the write
 path can only be keyed on the customer, so **to stop it, name the customer**.
 
-Everything except ``/.well-known/jwks.json``, ``/device_authorization`` and
-``/token`` requires a verified banking-app assertion. ``services/confirm/auth.py``
-holds that middleware, the reasoning for each public path, and the audience
+Everything except ``/.well-known/jwks.json``, ``/device_authorization``,
+``/token`` and the five routes of the browser's pairing page (``/verify``,
+``/verify/qr.svg``, ``/verify/state``, ``/verify.js``, ``/verify.css``)
+requires a verified banking-app assertion. ``services/confirm/auth.py`` holds
+that middleware, the reasoning for each public path, and the audience
 requirement an operator owns. Until 2026-09-22 this app was built as
 ``Starlette(routes=routes)`` with no ``middleware=`` argument at all and
 authenticated nobody on any route.
@@ -49,6 +51,9 @@ The device authorization endpoints are:
 - ``POST /device_authorization`` — Generate device code + QR pairing data.
 - ``POST /token`` with ``grant_type=device_code`` — Exchange device code for
   tokens (polling; returns error until mobile app approves).
+- ``GET /verify``, ``/verify/qr.svg``, ``/verify/state``, ``/verify.js``,
+  ``/verify.css`` -- the browser's pairing page, its QR, its state, its script
+  and its stylesheet (``services.confirm.verify_page``).
 - ``POST /scan`` -- Mobile app scan of the pairing QR.
 - ``POST /approve`` — Mobile app approval callback.
 
@@ -93,6 +98,7 @@ from services.confirm.rate_limit import (
     limits_from_settings,
 )
 from services.confirm.settings import ConfirmSettings
+from services.confirm.verify_page import verify_page_routes
 
 
 def _assertion_verifier(settings: ConfirmSettings) -> AssertionVerifier:
@@ -362,6 +368,7 @@ def create_confirm_app(
             settings=settings,
             read_minter=read_minter,
         )
+        + verify_page_routes()
         + callback_routes()
     )
 

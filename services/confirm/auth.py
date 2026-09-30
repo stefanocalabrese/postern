@@ -100,11 +100,41 @@ ASSERTION_STATE_KEY = "postern_app_assertion"
 #:     was deleted from this endpoint's response (audit finding C-01), the
 #:     most it can yield is the read token for the customer who approved that
 #:     exact code on their own phone.
+#: THE FIVE BELOW ARE THE PAIRING PAGE, added 2026-09-30, and all five are
+#: the BROWSER again: it opened ``verification_uri_complete`` and holds no
+#: assertion. None sets a cookie or reads one, and every other path on this
+#: service authenticates with a bearer assertion and never a cookie, so a
+#: page served here has no ambient credential to borrow.
+#: ``dev-docs/decisions/0021-public-html-on-the-write-key-service.md`` is why
+#: this service and not ``services/api`` serves them.
+#:
+#: ``/verify``
+#:     The page a browser opens from ``verification_uri_complete``; the
+#:     browser holds no assertion. It shows only what the stored row says.
+#:
+#: ``/verify/qr.svg``
+#:     The image the page embeds. Refused unless ``Sec-Fetch-Site`` is
+#:     ``same-origin``, so another site cannot embed it.
+#:
+#: ``/verify/state``
+#:     The status the page's script polls, refused the same way.
+#:
+#: ``/verify.js``
+#:     The page's only script, same-origin so the page's CSP needs no inline
+#:     script.
+#:
+#: ``/verify.css``
+#:     The page's only stylesheet, so ``style-src 'self'`` has a target.
 PUBLIC_PATHS = frozenset(
     {
         "/.well-known/jwks.json",
         "/device_authorization",
         "/token",
+        "/verify",
+        "/verify/qr.svg",
+        "/verify/state",
+        "/verify.js",
+        "/verify.css",
     }
 )
 
