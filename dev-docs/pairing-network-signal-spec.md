@@ -2,6 +2,7 @@
 
 **Date:** 30 September 2026
 **Status:** specification. The design was approved by capo on 30 September 2026; this document specifies it and decides the points that approval left open. Nothing here is built.
+**Reviewed by:** a review on 30 September 2026, folded in below. Two of its decisions were capo's: keep `details.proxy_hops`, and unwrap IPv4-mapped addresses before classifying.
 **Against:** `services/confirm/device_auth.py`, `services/confirm/audit.py` and `packages/postern-core/src/postern_core/auth/device_codes.py` at `31103cf`.
 **Follows:** `dev-docs/qr-page-spec.md`, whose "What this does not fix" names this signal as the next spec and whose §1 added `creator_ip` to the pairing so that this one would have something to compare.
 
@@ -71,19 +72,23 @@ A new module, `packages/postern-core/src/postern_core/risk/pairing_network.py`. 
 | `same_ip` | Both addresses parse and are equal as `ipaddress` objects. |
 | `same_prefix` | Both parse, are the same family, are not equal, and share a /24 (IPv4) or a /48 (IPv6). |
 | `different` | Both parse and neither of the above holds. **Mixed families are always `different`.** |
-| `unknown` | Either address is `None`, or either fails `ipaddress.ip_address`. |
+| `unknown` | Either address is `None`, either fails `ipaddress.ip_address`, or either lies in the NAT64 well-known prefix `64:ff9b::/96` after normalisation. |
 
 **`classify(creator_ip: str | None, scanner_ip: str | None) -> NetworkRelation`**, total over its inputs: it never raises. An unparsable string is `unknown`, not an exception, because `creator_ip` is read back out of a store and a corrupted value must not fail a scan.
 
 The prefixes are the approved /24 and /48, computed with `ipaddress.ip_network(f"{addr}/{bits}", strict=False)`. They are deliberately not `packages/postern-core/src/postern_core/net.py::ip_bucket`'s /64: that function answers "which rate-limit counter does this address spend", this one answers "could these two requests plausibly be the same site". A /48 is the allocation commonly given to one end site; a /64 is one link inside it, and a laptop on Ethernet and a phone on Wi-Fi in the same house can be on two.
 
-**IPv4-mapped IPv6 addresses are compared as IPv6.** `client_ip` canonicalises `::FFFF:1.2.3.4` to `::ffff:1.2.3.4` (measured on the project's CPython 3.12.13: the result has `version == 6`), and does not unwrap it. Under the approved rule, that address against `1.2.3.4` is mixed families and therefore `different`. This is the conservative reading and it is recorded under "Discrepancies".
+**Normalisation, before any row of the table is tested.** Each parsed address whose `ipv4_mapped` attribute is not `None` is replaced by that IPv4 address. Then any address in `64:ff9b::/96` makes the relation `unknown`.
+
+Both rules exist because the literal reading is wrong, not merely imprecise. `client_ip` canonicalises `::FFFF:1.2.3.4` to `::ffff:1.2.3.4` and does not unwrap it (measured on the project's CPython 3.12.13: `version == 6`). Every IPv4-mapped address has 80 zero bits before its `ffff`, so every one of them falls in `::/48`: measured, `::ffff:1.2.3.4` and `::ffff:9.9.9.9` both give `ip_network(..., strict=False) == ::/48`. Left mapped, any two unrelated IPv4 clients reaching a dual-stack socket would classify as `same_prefix`, the benign-looking answer, which is the one direction this signal must not err in. Unwrapped, a mapped address and its own IPv4 form are `same_ip`, and two unrelated ones are compared at /24 as IPv4 should be.
+
+A NAT64 address (RFC 6052's well-known prefix) embeds an IPv4 destination in its low 32 bits, but `ipv4_mapped` is `None` for it (measured), and as a client address it names the NAT64 gateway, not a subscriber. Its /48 is shared by every client behind every such gateway, so it has no truthful classification here and is `unknown`.
 
 **`NetworkFacts`**, a frozen dataclass with `asn: int | None` and `country: str | None`: what an enricher knows about one address.
 
 **`MatchResult`**, a tri-state: `True`, `False` or the string `"unknown"`. §5 gives the JSON.
 
-**`compare_facts(creator: NetworkFacts | None, scanner: NetworkFacts | None) -> tuple[MatchResult, MatchResult]`** returns `(asn_match, country_match)`. For each field: `True` when both sides carry a value and the values are equal, `False` when both carry a value and they differ, `"unknown"` otherwise (either side `None`, or either field `None`). Country codes are compared after `str.upper()`.
+**`compare_facts(creator: NetworkFacts | None, scanner: NetworkFacts | None) -> tuple[MatchResult, MatchResult]`** returns `(asn_match, country_match)`. For each field: `True` when both sides carry a value and the values are equal, `False` when both carry a value and they differ, `"unknown"` otherwise (either side `None`, or either field `None`). Country codes are compared after `str.upper()`. For `same_ip` the host passes the one answer as both arguments, so the same rule yields `True` for a returned field and `"unknown"` for a missing one.
 
 **`pairing_network_signal(relation, proxy_hops, asn_match=None, country_match=None) -> RiskSignal`**, which builds the one `packages/postern-core/src/postern_core/risk/types.py::RiskSignal` §5 serializes. Match arguments of `None` mean "no enricher installed" and omit the keys; §5 says why absent differs from `"unknown"`.
 
@@ -100,6 +105,8 @@ One method. `None` means "no data for this address", which is the normal answer 
 
 **Async, not sync, decided here.** `/scan` runs on the event loop that serves every other request on the replica. A synchronous lookup that blocks (a cold disk read, a DNS resolution, an HTTP call someone wrote with a blocking client) would stall every request in that process for its duration, and moving it to `asyncio.to_thread` bounds the wait but not the work: a thread cannot be cancelled, so a hung provider accumulates threads until the default executor is exhausted. An async method can be cancelled at the budget. A provider backed by a local database file implements `async def lookup` and returns without awaiting anything; the cost of async to that provider is one keyword.
 
+**What the budget cannot stop, stated plainly.** `asyncio.timeout` cancels a coroutine only at an `await` that yields to the loop. A provider whose `lookup` never yields (a CPU-bound loop, or blocking I/O such as a synchronous HTTP client or `socket.getaddrinfo` called inside `async def`) holds the event loop for its whole duration, and every request on that replica, every route and not only `/scan`, waits behind it. The budget fires only after the provider returns, and by then the damage is done. Nothing in this process can prevent it short of a subprocess, which this spec does not build. So the provider contract is: **all I/O goes through async clients, and any lookup that does real work in memory must be bounded by the provider to well under the budget.** A read from a memory-mapped local database file is inside that contract; a synchronous network call is not. The same text goes into the §6 documentation.
+
 **Discovery**, by entry point, following decision 0018 and the loaders it describes (`packages/postern-core/src/postern_core/modules/read.py::load_read_modules` and `packages/postern-core/src/postern_core/modules/write.py::load_write_modules`):
 
 - Group `postern.pairing_network_enrichers`. The value resolves to an **instance** satisfying the Protocol, as a module's entry point resolves to its `MODULE` instance rather than to a class.
@@ -115,21 +122,26 @@ One method. `None` means "no data for this address", which is the normal answer 
 |---|---|---|---|
 | `pairing_enricher_timeout_seconds` | `POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS` | `0.25` | above 0 and at most 1.0 |
 
-Declared like every other confirm setting: a `services/confirm/settings.py::ConfirmSettings` field, read in `ConfirmSettings.from_env` through `packages/postern-core/src/postern_core/config.py::float_from_env` with `minimum=0, exclusive=True`, and an `EnvVar("POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS", "number", ("confirm",))` entry in `packages/postern-core/src/postern_core/env_inventory.py`. `float_from_env` has no upper bound, so `from_env` refuses a value above 1.0 itself with a `ValueError`, as it refuses an out-of-range device-code TTL. The ceiling exists because the budget is added to a successful scan's latency while the customer holds their phone, and because it widens the window between a committed claim and its audit row (§4). The default of 250 ms is a choice, not a measurement: no provider exists to measure.
+Declared like every other confirm setting: a `services/confirm/settings.py::ConfirmSettings` field, read in `ConfirmSettings.from_env` through `packages/postern-core/src/postern_core/config.py::float_from_env` with `minimum=0, exclusive=True` and the required `because=` sentence, "It bounds how long a successful pairing scan waits for the network enricher; at zero no lookup could ever complete.", and an `EnvVar("POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS", "number", ("confirm",))` entry in `packages/postern-core/src/postern_core/env_inventory.py`. `float_from_env` has no upper bound, so `from_env` refuses a value above 1.0 itself with a `ValueError`, as it refuses an out-of-range device-code TTL. The ceiling exists because the budget is added to a successful scan's latency while the customer holds their phone, and because it widens the window between a committed claim and its audit row (§4). The default of 250 ms is a choice, not a measurement: no provider exists to measure.
 
-**Failure is never a refused scan.** Every outcome other than two completed lookups is `"unknown"` for both matches:
+**A concurrency cap, per process.** An `asyncio.Semaphore` with **8** slots, created once in `create_confirm_app` beside the enricher, bounds how many scans are enriching at once. One slot covers one scan's lookups (at most two). A scan that finds every slot taken does not wait: it records `"unknown"` for both matches and logs one `WARNING`. The check is `semaphore.locked()` followed by `async with semaphore` with no `await` between them, so on one event loop it cannot race.
+
+Eight is a code constant, not a setting, and the reasoning is the bound it gives. The cap exists for a provider that is slow but cooperative. Without it, every successful scan during a provider stall parks a task for the full budget, with no limit across callers: the per-address and per-customer scan limits bound each caller, not their sum. With it, at most 8 scans per replica are ever waiting on the provider, and a provider that ignores cancellation and keeps its slots eventually holds all 8, after which every scan records `"unknown"` at once instead of piling on. A healthy local-database provider answers far inside the budget, so 8 slots are exhausted only by 8 scans arriving within one lookup's duration, well above what pairing traffic produces. It is no defence against a non-yielding provider: that one blocks the loop before the semaphore matters.
+
+**Failure is never a refused scan.** Every outcome other than completed lookups is `"unknown"` for both matches:
 
 - the budget expires (both lookups are cancelled; one that finished alone is discarded, because a comparison needs both sides);
+- the concurrency cap is saturated;
 - either lookup raises any `Exception`;
 - either lookup returns something that is not `NetworkFacts` or `None`.
 
 A field that fails validation becomes `None` for that field only: `asn` must be an `int` that is not a `bool` and lies in 0 to 4294967295, and `country` must be two ASCII letters. Anything else from the provider is discarded, never stored and never logged.
 
-Each failure writes one `WARNING` log line naming the exception's type or "timeout", and never either address. The volume is bounded by the scan limits already in front of the route (`rate_limit_scan`, 60 a minute per address, and `customer_rate_limit_scan`, 10 a minute per customer): at most two lookups per successful scan.
+Each failure writes one `WARNING` log line carrying only `type(exc).__name__`, or the literal `timeout` or `saturated`. No `exc_info`, no exception message and no traceback: a provider's message can quote the address it was asked about. Never either address. The volume is bounded by the scan limits already in front of the route (`rate_limit_scan`, 60 a minute per address, and `customer_rate_limit_scan`, 10 a minute per customer): at most two lookups per successful scan.
 
-`asyncio.CancelledError` from the request itself is not caught, as `services/confirm/device_auth.py::_scan` already does not catch it around `claim_scan`. A provider that suppresses cancellation defeats the budget; the host cannot bound it further without a thread, and that is a provider bug this spec names rather than engineers around.
+Cancellation of the request itself (an `asyncio.CancelledError` from a client disconnect or a shutdown, not from the budget) is not converted to `"unknown"`. §4 handles it, because after a `CLAIMED` result it leaves a committed claim behind. A provider that suppresses cancellation defeats the budget and keeps its semaphore slot; the cap above is what stops that from compounding.
 
-**Lookups are skipped where they cannot change the answer.** When the relation is `unknown`, one address is missing, so both matches are `"unknown"` without a lookup. When it is `same_ip`, both matches are `True` without a lookup: one address has one ASN and one country, and asking twice would only measure the provider's consistency. Only `same_prefix` and `different` spend the budget.
+**How many lookups each relation spends.** When the relation is `unknown`, both matches are `"unknown"` and no lookup is made: there is no pair to compare. When it is `same_ip`, **one** lookup is made, for that one address, and a match is `True` only for a field the provider returned; a field returned as `None`, a `None` answer, a timeout, a saturated cap or an error leaves that match `"unknown"`. Recording `True` without asking would assert a fact about the network that nobody observed. `same_prefix` and `different` make two lookups, concurrently, under the rules above.
 
 **Trust.** An enricher runs inside `services/confirm`, which holds the write signing key, and it is handed every creator and scanner address. Decision 0018's "What a malicious module can do" applies without softening: installing one is as consequential as merging a commit into this repository. Two consequences an operator owns:
 
@@ -146,11 +158,13 @@ In `services/confirm/device_auth.py::_scan`:
 
 1. `claim_scan` is called with `scanner_ip=` that address.
 2. On `CLAIMED` or `ALREADY_MINE`, and on no other result, the signal is built: `classify(code.creator_ip, scanner_ip)`, then enrichment under §3's rules, then `pairing_network_signal`. `code` is the row `_lookup_by_user_code` returned before the claim; `creator_ip` is written once, at creation, and never changed, so the pre-claim row is the right one to read it from.
-3. The serialized signal is returned on `_Scanned`, in a new field, and `scan_callback` hands it to the audit writer for the success row.
+3. The signal is serialized by a new function, `signal_to_json(signal) -> dict[str, Any]`, added to `postern_core.risk.types` beside `RiskSignal`, returned on `_Scanned` in a new field, and handed by `scan_callback` to the audit writer for the success row. The function lives in `postern_core` because `.importlinter` forbids `services.confirm` from importing `services.api`, where the read path's serialization is written inline in `services/api/middleware/audit.py::AuditMiddleware`. That inline code is unchanged by this spec; a test pins that both produce the same four keys (Testing).
 
 On `ALREADY_MINE` the relation compares the creator with **this** request's address, not with the stored `scanner_ip`. The row then describes the request it records: the address beside it in `arguments` is the one the relation was computed from.
 
-**The signal step must not raise.** `scan_callback`'s exception branch records a refusal and withdraws nothing, and its comment states why that is safe: "nothing after a successful claim can raise". A raise from enrichment would break that premise and leave a claimed pairing recorded as refused. §3's rule that every lookup failure becomes `"unknown"` is what keeps the premise true; `classify` and `compare_facts` are total. A test pins it (Testing).
+**The signal step must not raise an `Exception`.** `scan_callback`'s exception branch records a refusal and withdraws nothing, and its comment states why that is safe: "nothing after a successful claim can raise". A raise from enrichment would break that premise and leave a claimed pairing recorded as refused. §3's rule that every lookup failure becomes `"unknown"` is what keeps the premise true; `classify` and `compare_facts` are total. A test pins it (Testing).
+
+**Cancellation after `CLAIMED` withdraws the claim and re-raises.** A `BaseException` that is not an `Exception` (in practice `asyncio.CancelledError` from a client disconnect or a shutdown, arriving while enrichment is awaited) would otherwise leave a committed claim with no audit row at all, because `scan_callback`'s branch catches `Exception` only. That is the fail-open shape `PairingAudit`'s docstring rejects: a claim that decides who may approve, with no row saying who made it. So after a `CLAIMED` result the enrichment step runs inside a `BaseException` handler that calls `_withdraw_pairing` with `state="claimed"` and a new cause, `"cancelled"` (its `cause` parameter is `Literal["audit", "store"]` today and is widened by one value), and then re-raises the original exception unchanged. `_withdraw_pairing` swallows its own failure, so what propagates is still the cancellation. A task cancelled once can still await inside its handler; a second cancellation during the withdrawal is the residual, the same one `_pair` accepts around `approve_scanned`. After `ALREADY_MINE` there is nothing to withdraw: the claim was made, and recorded or withdrawn, by an earlier request.
 
 **The window this adds.** Between the committed claim and the audit row, the claimed pairing exists un-audited for up to the enrichment budget longer than today. The fail-closed withdrawal in `scan_callback` is unchanged and still covers an audit write that fails after it.
 
@@ -202,7 +216,10 @@ On `ALREADY_MINE` the relation compares the creator with **this** request's addr
 
 ### 6. Documentation
 
-`POSTERN_CONFIRM_TRUSTED_PROXY_HOPS`'s row in `docs/user-guide/getting-started.md` gains one sentence: the pairing network signal compares addresses taken through this setting, so under the default both are the load balancer's and the recorded relation means nothing. The new timeout setting gets a row beside it. `docs/user-guide/components/confirm-service.md` gains a short paragraph describing the signal, its JSON shape, the enricher entry-point group and the trust statement from §3.
+`POSTERN_CONFIRM_TRUSTED_PROXY_HOPS`'s row in `docs/user-guide/getting-started.md` gains one sentence: the pairing network signal compares addresses taken through this setting, so under the default both are the load balancer's and the recorded relation means nothing. The new timeout setting gets a row beside it. `docs/user-guide/components/confirm-service.md` gains a short paragraph describing the signal, its JSON shape, the enricher entry-point group and the trust statement from §3, and two warnings:
+
+- **An enricher must do all I/O through async clients.** A `lookup` that never yields, or that calls blocking I/O inside `async def`, blocks every request on the replica, and the time budget cannot stop it (§3).
+- **Over-counting trusted hops is worse than under-counting.** With `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS` larger than the number of proxies that really append to `X-Forwarded-For`, `client_ip` reads an entry the caller wrote. In both phishing forms the creator of the pairing is the attacker, so the attacker then chooses `creator_ip` and can forge the most benign-looking row available: `same_ip` if they have learned the victim's address (a tracking image in the lure email is enough), or `same_prefix` for a guessed carrier range. Under-counting only makes both addresses the proxy's, which `proxy_hops` already marks as noise; over-counting produces rows that look trustworthy and were written by the attacker.
 
 Two code comments become false when this lands and are rewritten with it: the `DeviceCode` docstring's "nothing reads it yet" on `creator_ip`, and the "RECORDED AND READ BY NOTHING YET" comment in `device_authorization`.
 
@@ -214,8 +231,8 @@ Each was found by reading the code against the approved design. Where the two di
 
 1. **There is no client-address column on `audit_log`.** The design says "the row already carries the client address column". It carries the address as the key `client_ip` inside the `arguments` JSONB, and only when the address is not `None` (`services/confirm/audit.py::_arguments`). The conclusion survives, since the scanner's address is on the row, but a query must read `arguments->>'client_ip'`. This spec adds no column.
 2. **The `risk_signals` column comment and its only writer disagree about the object shape.** The comment on `AuditEntry` names three keys (`code`, `severity`, `details`); `AuditMiddleware` writes four, adding `description`. This spec follows the writer, so that one query shape reads both services' rows.
-3. **`IpAnomalyDetector` has no ASN data to reuse.** Its module docstring lists "ASN change" as a detected class, but `evaluate` has no such check, `packages/postern-core/src/postern_core/risk/ip_anomaly.py::_suspicious_asn_detected` returns `False` unconditionally with the comment "No ASN enrichment yet", and `IpTracker` carries no ASN field. The enricher seam here would be the first ASN source in the repository. Wiring it into the read path's detector is out of scope.
-4. **IPv4-mapped IPv6 addresses.** The design says mixed families are `different` and does not mention mapped addresses. `client_ip` returns `::ffff:a.b.c.d` as an IPv6 address, so such an address against its own IPv4 form is `different` under the literal rule. Taken literally here, because the conservative direction for a signal that may later relax a check is to under-claim sameness. Unwrapping with `ipv4_mapped` before classifying is a one-line change if capo prefers it.
+3. **`IpAnomalyDetector` has no ASN data to reuse.** Its module docstring lists "ASN change" as a detected class. `evaluate` does call `packages/postern-core/src/postern_core/risk/ip_anomaly.py::_suspicious_asn_detected`, but that method returns `False` unconditionally with the comment "No ASN enrichment yet"; no ASN-change check exists at all, and `IpTracker` carries no ASN field. The enricher seam here would be the first ASN source in the repository. Wiring it into the read path's detector is out of scope.
+4. **IPv4-mapped IPv6 addresses. Closed.** The design says mixed families are `different` and does not mention mapped addresses. The first draft of this spec read that literally and called it conservative. Review measured that every mapped address lies in `::/48`, so the literal reading classifies unrelated IPv4 clients as `same_prefix`, the least conservative answer available. Capo decided to unwrap; §2 specifies it, with NAT64 addresses as `unknown`.
 5. **`claim_scan`'s signature changes.** The design adds a field but does not say how the address reaches the store. It must reach it through `claim_scan`, since that is the only transaction that writes `scanned_by`, and every existing caller and test double of `claim_scan` changes with it.
 
 ## Decisions made here
@@ -225,8 +242,11 @@ The brief left these open, and each is decided above:
 - `scanner_ip` is written on `CLAIMED` only (§1).
 - Lookup is async, with one shared budget of 250 ms, configurable up to 1.0 s (§3).
 - No addresses, ASN numbers or country codes in the JSON; the creator's address is kept only on the pairing for its lifetime (§5).
-- `severity` is always `LOW`; `details.proxy_hops` is recorded on every row (§5).
-- Lookups are skipped for `unknown` and `same_ip` (§3).
+- `severity` is always `LOW`; `details.proxy_hops` is recorded on every row (§5), kept by capo in review.
+- No lookup for `unknown`, one for `same_ip`, two otherwise (§3).
+- A per-process cap of 8 concurrently enriching scans, as a code constant (§3).
+- Cancellation after `CLAIMED` withdraws the claim and re-raises (§4).
+- IPv4-mapped addresses are unwrapped and NAT64 addresses are `unknown` (§2), decided by capo in review.
 - The loader lives in `postern_core.modules`, the classifier in `postern_core.risk` (§3).
 
 ---
@@ -235,12 +255,16 @@ The brief left these open, and each is decided above:
 
 Test-first throughout. What must exist when this lands:
 
-- **Classifier**, table-driven: equal IPv4 and equal IPv6 (`same_ip`); two IPv4 addresses in one /24 and in adjacent /24s; two IPv6 addresses in one /48 and in adjacent /48s, including two in different /64s of one /48 (`same_prefix`, the case `ip_bucket` would split); IPv4 against IPv6 and a mapped address against its IPv4 form (`different`); `None` on either side, both `None`, and an unparsable string on either side (`unknown`); that `classify` raises for no input in the table.
+- **Classifier**, table-driven: equal IPv4 and equal IPv6 (`same_ip`); two IPv4 addresses in one /24 and in adjacent /24s; two IPv6 addresses in one /48 and in adjacent /48s, including two in different /64s of one /48 (`same_prefix`, the case `ip_bucket` would split); IPv4 against IPv6 (`different`); a mapped address against its own IPv4 form (`same_ip`); two mapped addresses of unrelated IPv4 hosts in different /24s (`different`, the case the literal reading got wrong) and two in one /24 (`same_prefix`); a NAT64 address on either side (`unknown`); `None` on either side, both `None`, and an unparsable string on either side (`unknown`); that `classify` raises for no input in the table.
 - **`compare_facts`**: every combination of present, `None` and field-`None` on both sides, for both fields; country compared case-insensitively.
 - **Signal JSON**: the exact object for each relation with an enricher and without; the match keys absent without one; no address, ASN number or country code in the serialized output for any input (asserted by searching the JSON text for the inputs).
 - **Store, on both backends** (Redis against the container `make ci` already runs): `CLAIMED` sets `scanner_ip` together with `scanned_by` and `scanned_at`; `ALREADY_MINE`, `APPROVED_MINE`, both conflicts and `GONE` leave it unchanged; a `None` address is stored as `None`; round-trip serialization; a record without the key deserializes with `None`; `claim_scan` without `scanner_ip` is a `TypeError`.
 - **Loader**, with fake distributions the way `tests/test_module_seam.py` builds them: none installed gives `None`; one gives it; two refuse with both names; one that fails to import refuses; one whose `lookup` is synchronous refuses; `create_confirm_app` refuses at composition for each refusal.
-- **Enrichment in `/scan`**: a provider that raises, one that sleeps past the budget, one that returns a wrong type, and one that returns an out-of-range ASN or a three-letter country, each producing `"unknown"` with a 200 response and one log line containing neither address; a provider that suppresses nothing and answers within budget producing `true` and `false`; no lookup made for `same_ip` or `unknown` (a provider that fails the test if called).
+- **Enrichment in `/scan`**: a provider that raises, one that sleeps past the budget, one that returns a wrong type, and one that returns an out-of-range ASN or a three-letter country, each producing `"unknown"` with a 200 response and one log line containing neither address; a provider that answers within budget producing `true` and `false`; no lookup made for `unknown` (a provider that fails the test if called); exactly one lookup for `same_ip`, producing `true` for fields returned and `"unknown"` for a field returned as `None`, and both `"unknown"` when the provider returns `None`; with all 8 slots held by a provider blocked on an event the test controls, a ninth scan records `"unknown"` without waiting and logs `saturated`; no log line carries `exc_info`, a message or either address, checked with a provider whose exception message contains the address.
+- **Cancellation**: a request cancelled while enrichment is awaited after `CLAIMED` leaves no pairing in the store and re-raises `CancelledError`; the same after `ALREADY_MINE` leaves the pairing claimed.
+- **`signal_to_json`**: its keys equal the four keys `AuditMiddleware` writes for a read-path signal, for the same `RiskSignal`.
+- **Over-counted hops**, pinned as documented behaviour rather than prevented: with `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS=2` behind one real proxy, a creator request carrying a caller-written `X-Forwarded-For` entry equal to the scanner's address produces a `same_ip` row. The test's docstring states that this is the forgery §6 warns about.
+- **A non-yielding provider** is a documented limitation, not a test: a test cannot assert that the loop was blocked without being flaky, and nothing in this spec prevents it.
 - **`/scan` rows**, over ASGI with `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS` set and `X-Forwarded-For` supplied, because the in-process client has no peer and under zero hops both addresses are `None`: a `CLAIMED` success row and an `ALREADY_MINE` row each carrying the one-element array with the right relation and `proxy_hops`; the `ALREADY_MINE` row's relation computed from its own request's address; every refusal row, `scan_conflict` included, with `risk_signals` NULL; `/approve` and `/token` rows still NULL; the 200 body identical across all four relations and with or without an enricher.
 - **The premise in §4**: an enricher whose `lookup` raises during a `CLAIMED` scan leaves the pairing claimed and the row `returned`, never refused.
 - **Settings**: the timeout's default, its env_inventory entry, and refusals at 0, a negative value, `nan`, `inf` and 1.01.
@@ -249,7 +273,7 @@ Existing tests that change: every call of `claim_scan`, which at `31103cf` appea
 
 ## Size
 
-Four production files changed and two added. Roughly 200 lines of production code: the classifier, facts and signal builder about 90, the loader about 60, store changes about 15, handler and audit writer about 35, settings about 20. Roughly 500 to 700 lines of tests.
+Four production files changed and two added. Roughly 250 lines of production code: the classifier with normalisation, facts, signal builder and `signal_to_json` about 110, the loader about 60, store changes about 15, handler (enrichment, cap, cancellation withdrawal) and audit writer about 50, settings about 20. Roughly 500 to 700 lines of tests.
 
 ## Owed outside this repository
 
@@ -262,5 +286,4 @@ Four production files changed and two added. Roughly 200 lines of production cod
 ## Open questions, for the policy spec
 
 - Whether the page's address (`GET /verify`) is a better comparison than the creator's for hosted AI clients, where the creator is the vendor.
-- Whether mapped IPv4 addresses should be unwrapped before classifying (Discrepancy 4).
 - Whether a row should flag a private or loopback address on either side, which is the usual trace of a misconfigured hop count.
