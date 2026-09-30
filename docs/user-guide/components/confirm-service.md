@@ -79,43 +79,70 @@ Implements RFC 8628 Device Authorization Grant with QR pairing codes.
 |--------|------|------|-------------|
 | `POST` | `/device_authorization` | public | Generate device code + user_code (pairing code) |
 | `POST` | `/token` | public | Exchange device code for a read token (polling; error until approved) |
-| `POST` | `/approve` | **app assertion** | Banking app approval callback |
+| `GET` | `/verify` | public | The browser's pairing page: pairing code, QR, app link |
+| `GET` | `/verify/qr.svg` | public, same-origin only | The QR the page embeds, rotated every two seconds |
+| `GET` | `/verify/state` | public, same-origin only | What the page's script polls: pending, scanned, or 404 |
+| `GET` | `/verify.js`, `/verify.css` | public | The page's only script and stylesheet |
+| `POST` | `/scan` | **app assertion** | Banking app scan of the QR; the first customer to scan holds the pairing |
+| `POST` | `/approve` | **app assertion** | Banking app approval callback, for the customer who scanned |
 
-`/device_authorization` and `/token` are public because the caller is the
-**browser**, which holds no credential — that is the premise of RFC 8628, not an
-oversight. The `device_code` (43 characters from `secrets.token_urlsafe(32)`) is
-the authority at `/token`. Both are listed in `PUBLIC_PATHS` in
+`/device_authorization`, `/token` and the five `/verify` routes are public
+because the caller is the **browser**, which holds no credential — that is the
+premise of RFC 8628, not an oversight. The `device_code` (43 characters from
+`secrets.token_urlsafe(32)`) is the authority at `/token` and never appears in
+the page, the QR or the page URL. All eight are listed in `PUBLIC_PATHS` in
 [`services/confirm/auth.py`](../../../services/confirm/auth.py); every other
-route on this service is denied by default.
+route on this service is denied by default. Decision record 0021 is why the page
+is served here rather than by `services/api`.
 
 ### Flow
 
 ```
 1. Browser → POST /device_authorization
-   ← device_code + user_code (XXX-XXX format) + verification_uri
+   ← device_code + user_code (XXX-XXX) + verification_uri
+     + verification_uri_complete = verification_uri?d=<display handle>
 
-2. QR code encodes: verification_uri + user_code
-   User scans with mobile app → bank app shows pairing code
+2. Browser opens verification_uri_complete (GET /verify?d=...)
+   The page shows the pairing code and a QR encoding the app link:
+     POSTERN_DEVICE_APP_LINK_URI?user_code=<code>&qr=<slot>.<mac>
+   The QR's token rotates every two seconds.
 
-3. Mobile app → POST /approve
+3. Mobile app scans → POST /scan
      Authorization: Bearer <assertion from the operator's app backend>
-     { "device_code": "...", "user_code": "ABC-DEF" }
-   ← 200 OK
+     { "user_code": "ABC-DEF", "qr": "<slot>.<mac>" }
+   ← 200 { client_id, client_id_verified: false, scopes, expires_at, user_code }
+
+4. User compares the pairing codes and verifies identity → POST /approve
+     Authorization: Bearer <assertion>
+     { "user_code": "ABC-DEF" }
+   ← 200 { "status": "approved" }
 ```
 
 The customer is the assertion's verified `sub`. There is NO body field naming the
-customer; `user_code` is required and compared in constant time.
+customer, and `/approve` refuses a body that still carries `device_code`
+(`400 invalid_request`). A pairing can be approved only by the customer whose app
+scanned it first; a second customer's scan of a pairing that has not been
+exchanged revokes it (`400 scan_conflict`).
 
 ```
-4. Browser → POST /token (grant_type=device_code, device_code=...)
+5. Browser → POST /token (grant_type=device_code, device_code=...)
    ← 400 authorization_pending (until approved)
    ← 200 { access_token, token_type, expires_in } (after approval)
 ```
 
-`/approve` returns **401** for a missing or unverifiable assertion, **403** if the
-assertion's `sub` is not a `cust_...` reference, and **400** `invalid_user_code`
-for a wrong pairing code. Three wrong pairing codes revoke the device code
-(`POSTERN_USER_CODE_MAX_ATTEMPTS`, default 3) per RFC 8628 §5.2.
+`/scan` and `/approve` return **401** for a missing or unverifiable assertion and
+**403** if the assertion's `sub` is not a `cust_...` reference or the customer is
+revoked. Every refusal that could reveal whether a pairing exists -- unknown,
+expired, unscanned, scanned by someone else, already approved, a forged rotation
+token -- is the same **400** `invalid_grant`; `/scan` answers `qr_stale` for a
+genuine token more than ten seconds old and `scan_conflict` as above. The
+distinction lives in each request's `audit_log.detail`.
+
+A store error at `/scan` or `/approve` that may have committed the write (a lost
+reply from Redis) withdraws the pairing before the error is returned, so the
+refusal recorded for the call never sits over a live claim or approval; the
+recovery is a fresh QR. A store write that definitely did not happen is not
+withdrawn.
 
 ### Device Code Model (`packages/postern-core/src/postern_core/auth/device_codes.py`)
 
@@ -124,7 +151,7 @@ for a wrong pairing code. Three wrong pairing codes revoke the device code
 class DeviceCode:
     device_code: str          # Opaque 40+ char code (secrets.token_urlsafe(32))
     user_code: str            # 6-char alphanumeric pairing code (no ambiguous chars)
-    verification_uri: str     # URI for mobile deep-linking
+    verification_uri: str     # Base URI of the browser's pairing page
     expires_at: datetime      # UTC expiry (default 900s = 15 min)
     interval: int             # Seconds between token polls (default 5)
     client_id: str            # OAuth client ID, caller-supplied, NEVER an identity
@@ -132,7 +159,12 @@ class DeviceCode:
     approved: bool            # Whether mobile app has approved
     approved_at: datetime | None  # Approval timestamp
     customer_ref: str         # Verified assertion `sub`, empty until approved
-    user_code_attempts: int   # Failed pairing-code comparisons at /approve
+    exchanged_at: datetime | None  # When /token spent it
+    display_handle: str       # 128 random bits; keys the page, useless at /token
+    qr_secret: bytes          # Per-pairing HMAC key for the QR's rotation token
+    creator_ip: str | None    # Where /device_authorization came from
+    scanned_by: str           # Customer whose app scanned first, empty until scanned
+    scanned_at: datetime | None  # When
 ```
 
 `customer_ref` used to be `client_id`, reused for two purposes. That overload was

@@ -170,10 +170,12 @@ it in this shape. What makes it acceptable rather than merely tolerable:
   the actual defence against a relayed QR. The recovery path is the control
   path.
 - **This repository already chose this trade twice.** A single mistyped pairing
-  code at the attempt-budget floor revokes the device code
-  (`_record_user_code_failure`), and an audit write that fails after an approval
-  withdraws the pairing outright (`_withdraw_pairing`), both on the reasoning
-  that "the recovery the customer needs is a fresh QR anyway". A lost token
+  code at the attempt-budget floor revoked the device code
+  (`_record_user_code_failure`, removed on 30 September 2026 with the attempt
+  budget, when the pairing code became the lookup key), and an audit write that
+  fails after an approval withdraws the pairing outright (`_withdraw_pairing`),
+  both on the reasoning that "the recovery the customer needs is a fresh QR
+  anyway". A lost token
   response is a milder event than either and now gets the same answer.
 - **The alternative is not a better customer experience, it is a worse
   attacker experience.** Every shape that helps the lost response helps a

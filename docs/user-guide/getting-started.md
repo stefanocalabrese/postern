@@ -122,7 +122,6 @@ the service refuses and names this variable as the one you meant.
 | `POSTERN_APP_ASSERTION_JWKS_URI` | **Yes** | - | JWKS of the operator's banking-app backend, used to verify inbound assertions |
 | `POSTERN_APP_ASSERTION_ISSUER` | **Yes** | - | Expected `iss` on inbound app assertions |
 | `POSTERN_APP_ASSERTION_AUDIENCE` | **Yes** | - | Expected `aud` on inbound app assertions. Must **not** equal the API service's `POSTERN_AUDIENCE` |
-| `POSTERN_USER_CODE_MAX_ATTEMPTS` | No | `3` | Wrong pairing codes at `/approve` before the device code is revoked (RFC 8628 §5.2). **At least 1**, which is already zero tolerance: one typo then revokes the code |
 | `POSTERN_WRITE_KEY_PEM_PATH` | No | - | Path to the PEM file for signing internal write tokens |
 | `POSTERN_WRITE_KEY_KID` | No | `write-1` | Key ID published in the write JWKS |
 | `POSTERN_WRITE_TOKEN_ISSUER` | No | `https://mcp-write.internal` | `iss` claim on internal write tokens |
