@@ -127,7 +127,8 @@ the service refuses and names this variable as the one you meant.
 | `POSTERN_WRITE_KEY_KID` | No | `write-1` | Key ID published in the write JWKS |
 | `POSTERN_WRITE_TOKEN_ISSUER` | No | `https://mcp-write.internal` | `iss` claim on internal write tokens |
 | `POSTERN_CONFIRM_MAX_BODY_BYTES` | No | `65536` (64 KiB) | Maximum request body size in bytes on the write path, separate from the API service's `POSTERN_MAX_BODY_BYTES`. **At least 1** |
-| `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS` | No | `0` | Proxies in front of this service that append to `X-Forwarded-For`. **Zero or greater**; zero trusts the header for nothing and uses the socket peer |
+| `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS` | No | `0` | Proxies in front of this service that append to `X-Forwarded-For`. **Zero or greater**; zero trusts the header for nothing and uses the socket peer. The pairing network signal compares addresses taken through this setting, so under the default both are the load balancer's and the recorded relation means nothing |
+| `POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS` | No | `0.25` | How long a successful `/scan` waits for an installed pairing network enricher before recording `"unknown"`. **Above 0 and at most 1.0**; the budget is added to the scan's latency. Unused when no enricher is installed |
 | `POSTERN_MAX_DEVICE_CODES` | No | `10000` | Device codes the store will hold before refusing new pairings. **At least 1**; at zero the cap is met by an empty store |
 | `POSTERN_MAX_SCOPES_LENGTH` | No | `512` | Ceiling on the `scopes` string at `/device_authorization`. **At least 42**, the length of the default this endpoint substitutes when a caller sends none |
 | `POSTERN_MAX_CLIENT_ID_LENGTH` | No | `256` | Ceiling on the `client_id` string. **At least 1**; `client_id` is required and non-empty |

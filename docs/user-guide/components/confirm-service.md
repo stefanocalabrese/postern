@@ -179,6 +179,63 @@ lost `EXEC` reply can hide a committed write. If that revoke also fails, an
 ERROR line names the pairing's handle and says it may be claimed or approved
 while its audit row records a refusal. The recovery either way is a fresh QR.
 
+### Pairing network signal
+
+Every successful `/scan`, the first scan and the same customer's repeat before
+approving, records where the pairing was created against where it was scanned.
+The creator's address is the one `/device_authorization` recorded on the device
+code; the scanner's is the `/scan` request's own, also written on the code by
+the claim. Both are taken through `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS`. The
+row's `risk_signals` column carries one object, and no address, ASN number or
+country code:
+
+```json
+[{"code": "PAIRING_NETWORK", "severity": "LOW",
+  "description": "pairing creator and scanner network relation: different",
+  "details": {"relation": "different", "proxy_hops": 2,
+              "asn_match": false, "country_match": true}}]
+```
+
+`relation` is `same_ip`, `same_prefix` (one IPv4 /24 or one IPv6 /48),
+`different` or `unknown`. `proxy_hops` is the hop count when the row was
+written; `0` marks a row that compares a load balancer with itself. The two
+match keys are `true`, `false` or `"unknown"`, and are absent when no enricher
+is installed. It refuses nothing and changes no response, and `different` is
+the normal case for a laptop on home Wi-Fi paired with a phone on mobile data.
+Refusal rows and the approver's repeat after approving keep `risk_signals` NULL.
+
+An enricher supplies ASN and country facts. None ships here. A distribution
+declares one in the entry-point group `postern.pairing_network_enrichers`,
+resolving to an instance with an `async def lookup(self, ip)` that returns
+`NetworkFacts(asn, country)` or `None`. The service refuses to start with more
+than one installed, or with one whose `lookup` is not async. Lookups share one
+time budget (`POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS`) and at most 8
+scans per process enrich at once; a timeout, a full cap, an exception or an
+answer of the wrong type records `"unknown"` for both matches, and one WARNING
+line that names neither address. An `asn` outside 0 to 4294967295 or a
+`country` that is not two ASCII letters is dropped alone: that field's match is
+`"unknown"` and the other is still compared.
+
+An enricher runs inside the service that holds the write signing key and sees
+every creator and scanner address. Installing one is as consequential as
+merging a commit into this repository. A provider that calls an HTTP API needs
+an egress exception, which ZT-8's default-deny egress exists to refuse, and
+sends customers' addresses to a third party. It must read its own configuration
+under its own prefix, because the service refuses unknown `POSTERN_` variables.
+
+- **An enricher must do all I/O through async clients.** A `lookup` that never
+  yields, or that calls blocking I/O inside `async def`, blocks every request
+  on the replica, and the time budget cannot stop it.
+- **Over-counting trusted hops is worse than under-counting.** With
+  `POSTERN_CONFIRM_TRUSTED_PROXY_HOPS` larger than the number of proxies that
+  really append to `X-Forwarded-For`, the address is read from an entry the
+  caller wrote. In both phishing forms the pairing's creator is the attacker, so
+  the attacker then chooses the creator's address and can forge the most
+  benign-looking row available: `same_ip` if they have learned the victim's
+  address (a tracking image in the lure email is enough), or `same_prefix` for a
+  guessed carrier range. Under-counting only makes both addresses the proxy's,
+  which `proxy_hops` already marks as noise.
+
 ### Device Code Model (`packages/postern-core/src/postern_core/auth/device_codes.py`)
 
 ```python
@@ -200,6 +257,7 @@ class DeviceCode:
     creator_ip: str | None    # Where /device_authorization came from
     scanned_by: str           # Customer whose app scanned first, empty until scanned
     scanned_at: datetime | None  # When
+    scanner_ip: str | None    # Where the claiming /scan came from, set only by the claim
 ```
 
 `customer_ref` used to be `client_id`, reused for two purposes. That overload was

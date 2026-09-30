@@ -1120,8 +1120,10 @@ def pairing_client_ip(request: Request, trusted_proxy_hops: int) -> str | None:
     needs, nor an IBAN's letter-letter-digit-digit opener.
 
     ``None`` on this deployment's default of zero trusted hops whenever the
-    transport has no peer, which is every in-process ASGI test client. That is
-    a missing field on the row and not an error: the alternative is trusting a
+    transport has no peer. ``httpx2.ASGITransport`` is not such a transport: its
+    ``client`` defaults to ``('127.0.0.1', 123)``, so an in-process test client
+    has a peer and this returns ``127.0.0.1`` for it. A missing peer is a
+    missing field on the row and not an error: the alternative is trusting a
     header the caller writes, which is the defect the zero default exists for.
     """
     peer = request.client
