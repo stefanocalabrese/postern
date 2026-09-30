@@ -35,7 +35,6 @@ operator knob would be a way to widen it without reading this.
 from __future__ import annotations
 
 import base64
-import binascii
 import enum
 import hashlib
 import hmac
@@ -59,8 +58,10 @@ MAC_BYTES = 16
 USER_CODE_BYTES = 6
 
 #: The slot as it may appear in a token: ASCII digits only, at most 19 of them
-#: so the value always fits the eight bytes the MAC input reserves for it.
-_SLOT_TEXT = re.compile(r"[0-9]{1,19}")
+#: so the value always fits the eight bytes the MAC input reserves for it, and
+#: no leading zero unless the slot is exactly ``0``: ``token_for`` never writes
+#: one, so a zero-prefixed spelling is a second text for the same token.
+_SLOT_TEXT = re.compile(r"0|[1-9][0-9]{0,18}")
 
 #: The MAC as it may appear: exactly the unpadded base64url of 16 bytes.
 _MAC_TEXT = re.compile(r"[A-Za-z0-9_-]{22}")
@@ -112,6 +113,14 @@ def verify_token(qr_secret: bytes, user_code: str, token: str, now_slot: int) ->
     empty ``qr_secret`` -- a record written before this module existed --
     verifies nothing, so such a pairing is unscannable rather than scannable
     with the empty key.
+
+    A token has exactly one accepted spelling, the one ``token_for`` writes.
+    The MAC is compared as text, against ``mac_for`` recomputed for the
+    presented slot, and not as decoded bytes: the last of its 22 characters
+    carries 2 significant bits and a decoder ignores the other 4, so a byte
+    comparison would accept 16 spellings of one MAC. The slot refuses a
+    leading zero for the same reason. Anything that later logs, dedupes or
+    rate-limits by token string can therefore not be evaded by re-spelling.
     """
     if not qr_secret:
         return QrVerdict.INVALID
@@ -122,11 +131,10 @@ def verify_token(qr_secret: bytes, user_code: str, token: str, now_slot: int) ->
     if slot > now_slot + SLOTS_FORWARD:
         return QrVerdict.INVALID
     try:
-        presented = base64.urlsafe_b64decode(mac_text + "==")
-        expected = _digest(qr_secret, user_code, slot)
-    except (binascii.Error, ValueError):
+        expected = mac_for(qr_secret, user_code, slot)
+    except ValueError:
         return QrVerdict.INVALID
-    if not hmac.compare_digest(presented, expected):
+    if not hmac.compare_digest(mac_text.encode("ascii"), expected.encode("ascii")):
         return QrVerdict.INVALID
     if slot < now_slot - SLOTS_BACK:
         return QrVerdict.STALE

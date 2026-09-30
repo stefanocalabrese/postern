@@ -159,3 +159,38 @@ def test_an_empty_secret_verifies_nothing() -> None:
 def test_a_stored_user_code_of_the_wrong_shape_is_invalid_not_an_exception() -> None:
     token = token_for(SECRET, USER_CODE, NOW)
     assert verify_token(SECRET, "ABC", token, NOW) is QrVerdict.INVALID
+
+
+_B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def test_a_sibling_final_mac_character_is_invalid() -> None:
+    """The last of 22 characters carries 2 significant bits; the other 4 are
+    ignored by a decoder. Every spelling of the same 16 bytes but one must be
+    refused, so a token has exactly one accepted text."""
+    slot, mac = token_for(SECRET, USER_CODE, NOW).split(".")
+    genuine = _B64URL.index(mac[-1])
+    siblings = [c for i, c in enumerate(_B64URL) if i >> 4 == genuine >> 4 and i != genuine]
+    assert len(siblings) == 15
+    for sibling in siblings:
+        forged = f"{slot}.{mac[:-1]}{sibling}"
+        assert verify_token(SECRET, USER_CODE, forged, NOW) is QrVerdict.INVALID
+
+
+@pytest.mark.parametrize("slot", [NOW, NOW - 1, 7])
+def test_a_slot_with_a_leading_zero_is_invalid(slot: int) -> None:
+    mac = mac_for(SECRET, USER_CODE, slot)
+    assert verify_token(SECRET, USER_CODE, f"0{slot}.{mac}", NOW) is QrVerdict.INVALID
+    assert verify_token(SECRET, USER_CODE, f"000{slot}.{mac}", NOW) is QrVerdict.INVALID
+
+
+def test_a_slot_of_exactly_zero_still_parses() -> None:
+    token = token_for(SECRET, USER_CODE, 0)
+    assert token.startswith("0.")
+    assert verify_token(SECRET, USER_CODE, token, 0) is QrVerdict.VALID
+    assert verify_token(SECRET, USER_CODE, token, 100) is QrVerdict.STALE
+
+
+def test_a_padded_zero_slot_is_invalid() -> None:
+    mac = mac_for(SECRET, USER_CODE, 0)
+    assert verify_token(SECRET, USER_CODE, f"00.{mac}", 0) is QrVerdict.INVALID
