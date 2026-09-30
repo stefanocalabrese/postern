@@ -35,6 +35,8 @@ it does not hold the key. That is an infrastructure property, not a code-review 
 | [Session Store](components/session-store.md) | In-memory and Redis backends, ContextVar pattern |
 | [Masking](components/masking.md) | PAN/IBAN redaction layers, FreeText type, scan budgets |
 | [Audit System](components/audit.md) | Two-row pattern, fail-closed writes, CHECK constraints |
+| [Mobile App Pairing Contract](../integration/mobile-app-pairing-contract.md) | For the mobile team: the app link, `POST /scan`, the confirmation screen and `POST /approve` |
+| [Operator App-Link Setup](../integration/operator-app-link-setup.md) | Choosing the app-link host, association files, proxy hops, rate limits and Redis for pairing |
 | [Writing a Module](writing-a-module.md) | Adding tools through entry points: the two halves, what the host gives you, and what a module can break |
 | [Glossary](glossary.md) | Key terms and concepts across the platform |
 
