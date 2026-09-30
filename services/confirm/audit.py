@@ -182,6 +182,7 @@ __all__ = [
     "UNRESOLVED_TOOL_NAME",
     "ApprovalAudit",
     "DETAIL_ALREADY_APPROVED",
+    "DETAIL_ALREADY_SCANNED",
     "DETAIL_ALREADY_TERMINAL",
     "DETAIL_CHALLENGE_NOT_FOUND",
     "DETAIL_CHALLENGE_NOT_OWNED",
@@ -1018,14 +1019,15 @@ DETAIL_DEVICE_CODE_SPENT = "device_code_spent"
 #: request: at ``POST /approve`` when the code is already approved, and at
 #: ``POST /scan`` through ``ScanClaim.APPROVED_MINE``.
 #:
-#: ``RETURNED`` ON BOTH ROUTES SINCE 2026-09-30. On each it is the one
-#: ``detail`` a ``returned`` row carries: the approver's retry, typically
+#: ``RETURNED`` ON BOTH ROUTES SINCE 2026-09-30. On ``POST /approve`` it is
+#: the one ``detail`` a ``returned`` row carries, and on ``POST /scan`` one of
+#: the two, with ``DETAIL_ALREADY_SCANNED``: the approver's retry, typically
 #: after a lost 200, is answered with the 200 the first request got (on
 #: ``POST /scan`` the stored pairing's context, reached only with a genuine
 #: in-window rotation token), because the approval it follows stands and only
 #: the customer who scanned and approved the code can reach this answer.
 #: ``returned`` because the request succeeded; a non-NULL ``detail`` so this
-#: repeat is never counted with the NULL rows of a first approval or a scan.
+#: repeat is never counted with the NULL rows of a first approval or a first scan.
 #: It writes nothing to the store. On ``POST /approve`` it can still be a refusal
 #: (``outcome='raised'``), for a code approved for another customer.
 #:
@@ -1037,6 +1039,18 @@ DETAIL_DEVICE_CODE_SPENT = "device_code_spent"
 #: approved code's identity at all; another customer's attempt is
 #: ``DETAIL_SCANNED_BY_OTHER``.
 DETAIL_ALREADY_APPROVED = "already_approved"
+#: A repeat scan by the customer who already scanned the code and has not
+#: approved it yet: ``POST /scan`` through ``ScanClaim.ALREADY_MINE``,
+#: normally a retry after a lost response inside the rotation-token window.
+#:
+#: SINCE 2026-09-30. Until then this exit wrote the same ``returned`` row
+#: with a NULL ``detail`` that a first scan writes, so ``tool_name =
+#: 'device_grant.scan' AND outcome = 'returned' AND detail IS NULL`` counted
+#: retries as scans. It is still ``returned``, because the request is answered
+#: with the first scan's 200, and the non-NULL ``detail`` is what keeps that
+#: filter at exactly one row per pairing first scanned. The repeat claims
+#: nothing and writes nothing to the store.
+DETAIL_ALREADY_SCANNED = "already_scanned"
 #: A wrong pairing code with attempts left, from the per-code attempt budget.
 #:
 #: HISTORICAL SINCE 2026-09-30, like the literal below: the budget went when
@@ -1397,15 +1411,18 @@ class PairingAudit:
         """Record that this pairing was granted."""
         await self._write(OUTCOME_RETURNED, None)
 
-    async def approved_again(self) -> None:
-        """Record the approver's repeat of an approval that already stands.
+    async def approved_again(self, detail: str = DETAIL_ALREADY_APPROVED) -> None:
+        """Record a repeat that is answered with the first request's 200.
 
         ``returned``, because the request is answered with the same 200 the
-        first one was, and ``DETAIL_ALREADY_APPROVED`` rather than NULL, so the
-        table never counts a retry as a second pairing granted. The
-        ``DETAIL_ALREADY_APPROVED`` comment carries the reasoning.
+        first one was, and a non-NULL ``detail`` rather than NULL, so the
+        table never counts a retry as a second pairing granted or a second
+        first scan. ``DETAIL_ALREADY_APPROVED`` by default, for the approver's
+        repeat on either route; ``POST /scan`` passes
+        ``DETAIL_ALREADY_SCANNED`` for a repeat before approving. Each
+        literal's comment carries the reasoning.
         """
-        await self._write(OUTCOME_RETURNED, DETAIL_ALREADY_APPROVED)
+        await self._write(OUTCOME_RETURNED, detail)
 
     # No caller since 2026-09-30; the pending session-token change uses it again.
     async def minted(self) -> None:

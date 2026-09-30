@@ -170,7 +170,7 @@ Content-Type: application/json
 | 503 | `rate_limit_store_unavailable` | The shared per-customer counter cannot be reached. Carries `Retry-After`. | "Temporarily unavailable." |
 | 500 | none: `text/plain`, `Internal Server Error` | The revocation store could not answer, the audit row could not be written, or the device-code store failed. No exception handler is registered, so this is Starlette's default body. | "Something went wrong. Start again from your AI client." See section 7 on why a retry rarely helps. |
 
-**Repeating a successful scan.** A second `/scan` by the same customer with a token still inside its window returns the same 200 body and changes nothing. After the window, the same request answers `qr_stale`, even though the pairing is still claimed by this customer. Once scanned, the page removes the QR, so there is no fresh token to fetch. An app that loses the `/scan` response and cannot retry inside the window has no way back to the confirmation context; the recovery is a new pairing from the AI client. The spec (`dev-docs/qr-page-spec.md`, "Out of scope") records this as deliberate.
+**Repeating a successful scan.** A second `/scan` by the same customer with a token still inside its window returns the same 200 body and changes nothing (recorded, since 30 September 2026, as `returned` with `detail` `already_scanned`, so only a first scan has a NULL `detail`). After the window, the same request answers `qr_stale`, even though the pairing is still claimed by this customer. Once scanned, the page removes the QR, so there is no fresh token to fetch. An app that loses the `/scan` response and cannot retry inside the window has no way back to the confirmation context; the recovery is a new pairing from the AI client. The spec (`dev-docs/qr-page-spec.md`, "Out of scope") records this as deliberate.
 
 **Repeating a scan after approving.** Since 30 September 2026, a `/scan` by the customer who already scanned and approved the pairing, with a token still inside its window and before `expires_at`, returns the same 200 body as the first scan, built from the stored pairing, and changes nothing on the server (recorded as `returned` with `detail` `already_approved`). Before that date it answered `invalid_grant`. The token is checked first, so outside the window the answer is still `qr_stale`, and a forged or malformed token is still `invalid_grant`. Another customer's scan of an approved code is still `scan_conflict`.
 
@@ -282,7 +282,7 @@ Both endpoints write one `audit_log` row per recorded call through `services/con
 | `tool_name` | `device_grant.scan` or `device_grant.approve` |
 | `customer_ref` | The assertion's `sub` (NULL with a reason when it is not a customer reference) |
 | `client_id` | The assertion's `client_id` claim, else `azp`, else NULL |
-| `outcome`, `detail` | `returned` with NULL detail on success; `returned` with `already_approved` for the approver's repeated `/approve` or `/scan`; `raised` with a detail on refusal |
+| `outcome`, `detail` | `returned` with NULL detail on success; `returned` with `already_approved` for the approver's repeated `/approve` or `/scan`; `returned` with `already_scanned` for a repeated `/scan` before approving; `raised` with a detail on refusal |
 | `at`, `duration_ms` | Arrival time and handling time |
 | `arguments.route` | `/scan` or `/approve` |
 | `arguments.device_code_handle` | 16 hex characters of SHA-256 of the pairing's device code, never the code |

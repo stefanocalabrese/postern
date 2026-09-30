@@ -42,6 +42,7 @@ from starlette.applications import Starlette
 
 from services.confirm.audit import (
     DETAIL_ALREADY_APPROVED,
+    DETAIL_ALREADY_SCANNED,
     DETAIL_INVALID_SUBJECT,
     DETAIL_QR_INVALID,
     DETAIL_QR_STALE,
@@ -222,7 +223,38 @@ async def test_a_retried_scan_by_the_same_customer_answers_the_same(
 
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json()
-    assert [r.outcome for r in await rows(clean)] == [OUTCOME_RETURNED, OUTCOME_RETURNED]
+    assert [(r.outcome, r.detail) for r in await rows(clean)] == [
+        (OUTCOME_RETURNED, None),
+        (OUTCOME_RETURNED, DETAIL_ALREADY_SCANNED),
+    ]
+
+
+async def test_only_the_first_scan_of_a_pairing_has_a_null_detail(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    """A scan, a repeat before approving and a repeat after approving give
+    exactly one ``device_grant.scan`` row that is ``returned`` with NULL
+    ``detail``, so that filter counts first scans only."""
+    code = await start(app)
+    assert (await scan(app, key_pair, ALICE, code)).status_code == 200
+    assert (await scan(app, key_pair, ALICE, code)).status_code == 200
+    approved = await post(
+        app,
+        "/approve",
+        json_body={"user_code": code.user_code_display},
+        headers=bearer(key_pair, ALICE),
+    )
+    assert approved.status_code == 200, approved.text
+    assert (await scan(app, key_pair, ALICE, code)).status_code == 200
+
+    scan_rows = [r for r in await rows(clean) if r.tool_name == SCAN_TOOL_NAME]
+    assert [(r.outcome, r.detail) for r in scan_rows] == [
+        (OUTCOME_RETURNED, None),
+        (OUTCOME_RETURNED, DETAIL_ALREADY_SCANNED),
+        (OUTCOME_RETURNED, DETAIL_ALREADY_APPROVED),
+    ]
+    first_scans = [r for r in scan_rows if r.outcome == OUTCOME_RETURNED and r.detail is None]
+    assert len(first_scans) == 1
 
 
 # ---------------------------------------------------------------------------

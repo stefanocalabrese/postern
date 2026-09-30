@@ -123,6 +123,7 @@ from starlette.routing import Route
 
 from services.confirm.audit import (
     DETAIL_ALREADY_APPROVED,
+    DETAIL_ALREADY_SCANNED,
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
     DETAIL_ISSUANCE_DISABLED,
@@ -1543,9 +1544,11 @@ class _Scanned:
     #: A ``claim_scan`` that raises never reaches this field: ``_scan``
     #: withdraws that claim itself before the exception propagates.
     claimed_device_code: str | None = None
-    #: The approver's repeat scan of a pairing it already approved, answered
-    #: with the first scan's 200 and recorded by ``PairingAudit.approved_again``.
-    repeated: bool = False
+    #: The ``detail`` of a repeat scan by the customer who already holds the
+    #: pairing, answered with the first scan's 200 and recorded by
+    #: ``PairingAudit.approved_again``: ``DETAIL_ALREADY_SCANNED`` before
+    #: approving, ``DETAIL_ALREADY_APPROVED`` after. ``None`` on every other exit.
+    repeat_detail: str | None = None
 
 
 async def scan_callback(request: Request) -> JSONResponse:
@@ -1627,8 +1630,8 @@ async def scan_callback(request: Request) -> JSONResponse:
         return outcome.response
 
     try:
-        if outcome.repeated:
-            await audit.approved_again()
+        if outcome.repeat_detail is not None:
+            await audit.approved_again(outcome.repeat_detail)
         elif outcome.detail is None:
             await audit.approved()
         else:
@@ -1680,6 +1683,11 @@ async def _scan(
     ``returned`` with ``already_approved`` for a pairing that no longer
     stands. The window is small and it grants nothing: nothing is written to
     the store, and ``POST /token`` issues nothing for a revoked code.
+
+    ``ALREADY_MINE``, the same customer's repeat before approving, answered
+    the same 200 before this date and still does; since 2026-09-30 its row is
+    ``returned`` with ``DETAIL_ALREADY_SCANNED`` instead of NULL, so the NULL
+    rows count first scans only.
     """
     try:
         customer = CustomerRef(value=subject)
@@ -1753,9 +1761,9 @@ async def _scan(
     if claim is ScanClaim.CLAIMED:
         return _Scanned(_scan_context_response(code), claimed_device_code=code.device_code)
     if claim is ScanClaim.ALREADY_MINE:
-        return _Scanned(_scan_context_response(code))
+        return _Scanned(_scan_context_response(code), repeat_detail=DETAIL_ALREADY_SCANNED)
     if claim is ScanClaim.APPROVED_MINE:
-        return _Scanned(_scan_context_response(code), repeated=True)
+        return _Scanned(_scan_context_response(code), repeat_detail=DETAIL_ALREADY_APPROVED)
     if claim is ScanClaim.CONFLICT_REVOKED or claim is ScanClaim.CONFLICT_EXCHANGED:
         # A LOG LINE AS WELL AS THE ROW, because this is the event an operator
         # may want to alert on at the edge. The handle, never the code.

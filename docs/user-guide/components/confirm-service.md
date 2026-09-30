@@ -156,15 +156,21 @@ change; until it lands, a completed pairing yields nothing the browser can use.
 `/scan` and `/approve` return **401** for a missing or unverifiable assertion and
 **403** if the assertion's `sub` is not a `cust_...` reference or the customer is
 revoked. Every refusal that could reveal whether a pairing exists -- unknown,
-expired, unscanned, scanned by someone else, already approved, a forged rotation
-token -- is the same **400** `invalid_grant`; `/scan` answers `qr_stale` for a
+expired, unscanned, scanned by someone else, approved for someone else on
+`/approve`, a forged rotation token -- is the same **400** `invalid_grant`;
+`/scan` answers `qr_stale` for a
 genuine token that has aged out (a token is accepted until 12 seconds after the start of its two-second slot, so 10 to 12 seconds after the page showed it) and `scan_conflict` as above. The
-distinction lives in each request's `audit_log.detail`. One exception on
-`/approve` since 30 September 2026: the customer who scanned and approved a code,
-repeating the approval before it expires, gets the same `200 {"status":
-"approved"}` again, so an app whose first response was lost can tell that its
-approval stands. Nothing is written to the store, and the row is `returned` with
-`detail` `already_approved`. Anyone else sending that code still gets the 400.
+distinction lives in each request's `audit_log.detail`. The exceptions, since
+30 September 2026, are the pairing's own customer repeating a request that
+succeeded. On `/approve`, the customer who scanned and approved a code, repeating
+the approval before it expires, gets the same `200 {"status": "approved"}` again,
+so an app whose first response was lost can tell that its approval stands. On
+`/scan`, that customer's repeat with a current rotation token gets the first
+scan's 200 body again, before approving and after. Nothing is written to the
+store by any repeat. The row is `returned` with `detail` `already_approved` for
+a repeat after approving and `already_scanned` for a repeat scan before it, so
+a NULL `detail` marks only a first scan or a first approval. Another customer's
+scan of that code gets `scan_conflict`, and their `/approve` gets the 400.
 
 Any store exception from the claim at `/scan` or the approval at `/approve`,
 other than the contention error (every `WATCH` beaten, so nothing committed),

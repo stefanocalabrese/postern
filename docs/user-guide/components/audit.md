@@ -121,10 +121,13 @@ nobody and writes nothing. Each endpoint has its own `tool_name`, all under
 ends any of the three is recorded as `raised` under its class name.
 
 - `POST /scan` (the app claiming a pairing from the QR): `returned` with a NULL
-  `detail` for a first scan and for the same customer's repeat before approving;
-  `returned` with `already_approved` for the approver's repeat after approving, which
-  is answered with the first scan's 200 body and writes nothing to the store (since
-  30 September 2026; it was `raised` with `already_approved` before); `raised` with
+  `detail` for a first scan only, so `WHERE tool_name = 'device_grant.scan' AND
+  outcome = 'returned' AND detail IS NULL` counts one row per pairing first scanned;
+  `returned` with `already_scanned` for the same customer's repeat before approving
+  (NULL before 30 September 2026); `returned` with `already_approved` for the
+  approver's repeat after approving (`raised` before 30 September 2026). Both
+  repeats are answered with the first scan's 200 body and write nothing to the
+  store. `raised` with
   `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale` or
   `scan_conflict` (a second customer scanned).
 - `POST /approve` (the app confirming a pairing): `returned` with a NULL `detail` for
