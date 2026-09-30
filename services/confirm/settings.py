@@ -168,6 +168,38 @@ def _assertion_max_lifetime(value: int) -> int:
     return value
 
 
+#: The most a successful pairing scan may wait for the network enricher.
+#:
+#: A CEILING, which ``float_from_env`` cannot state, so ``from_env`` refuses a
+#: larger value itself through ``_pairing_enricher_timeout``. It exists for
+#: two reasons: the budget is added to a successful scan's latency while the
+#: customer holds their phone, and it widens the window between a committed
+#: claim and its ``audit_log`` row.
+MAX_PAIRING_ENRICHER_TIMEOUT_SECONDS = 1.0
+
+_PAIRING_ENRICHER_TIMEOUT_BECAUSE = (
+    "It bounds how long a successful pairing scan waits for the network enricher; "
+    "at zero no lookup could ever complete."
+)
+
+
+def _pairing_enricher_timeout(value: float) -> float:
+    """Refuse an enricher budget above ``MAX_PAIRING_ENRICHER_TIMEOUT_SECONDS``.
+
+    ``float_from_env`` states a floor and no ceiling, so ``from_env`` reads the
+    variable through it with ``minimum=0, exclusive=True`` and passes the
+    result here for the upper bound, the shape ``_assertion_max_lifetime``
+    already has.
+    """
+    if value > MAX_PAIRING_ENRICHER_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS must be at most "
+            f"{MAX_PAIRING_ENRICHER_TIMEOUT_SECONDS}, got {value}. "
+            f"{_PAIRING_ENRICHER_TIMEOUT_BECAUSE}"
+        )
+    return value
+
+
 #: Re-exported from `postern_core.auth.device_codes`, which is where the
 #: floor's derivation now lives, because the arithmetic that creates it lives
 #: there too (``_set_code``) and because a SECOND variable reaches that same
@@ -500,6 +532,11 @@ class ConfirmSettings:
     # number of proxies. `.importlinter` forbids this module from reading the
     # other service's settings to find out, so an operator sets each.
     trusted_proxy_hops: int = 0
+    # How long, in seconds, a successful ``POST /scan`` waits for the pairing
+    # network enricher's two lookups before recording ``"unknown"``. Above 0
+    # and at most `MAX_PAIRING_ENRICHER_TIMEOUT_SECONDS`. 250 ms is a choice,
+    # not a measurement: no provider ships here to measure.
+    pairing_enricher_timeout_seconds: float = 0.25
     # The ceiling on how many device codes the store will hold, enforced by
     # `postern_core.auth.device_codes`. Its ``DEFAULT_MAX_DEVICE_CODES``
     # carries the measurement and the derivation of the number.
@@ -800,6 +837,15 @@ class ConfirmSettings:
                     "X-Forwarded-For; zero is the default and already means 'trust the "
                     "header for nothing', so there is nothing below it left to express."
                 ),
+            ),
+            pairing_enricher_timeout_seconds=_pairing_enricher_timeout(
+                float_from_env(
+                    "POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS",
+                    0.25,
+                    minimum=0,
+                    exclusive=True,
+                    because=_PAIRING_ENRICHER_TIMEOUT_BECAUSE,
+                )
             ),
             # FLOOR OF ONE. Measured on 2026-09-25: at zero
             # ``InMemoryDeviceCodeStore``'s ``len(self._codes) >=
