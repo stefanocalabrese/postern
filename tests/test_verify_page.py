@@ -13,6 +13,7 @@ import re
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx2
@@ -356,6 +357,81 @@ async def test_the_page_itself_is_not_refused_for_a_cross_site_navigation(
 
     assert resp.status_code == 200
     assert code.user_code_display in resp.text
+
+
+HOSTILE_HANDLE = '"><script>x</script>'
+HOSTILE_CODE = "<b>ABC"
+
+
+async def _hostile(app: Starlette, state: str) -> DeviceCode:
+    """A stored pairing whose handle and code carry markup.
+
+    The render function is called directly by the callers: no route would
+    find a handle like this, and the point is that a stored value is escaped
+    on its own merits, not that the alphabet happens to keep markup out.
+    """
+    code = await pairing(app, state)
+    return replace(code, display_handle=HOSTILE_HANDLE, user_code=HOSTILE_CODE)
+
+
+@pytest.mark.parametrize("state", ["pending", "scanned"])
+async def test_stored_markup_in_the_handle_and_code_is_escaped(
+    app: Starlette, state: Literal["pending", "scanned"]
+) -> None:
+    """The handle lands in ``data-handle`` and, while pending, in the image
+    ``src``; the code lands in the pairing paragraph and in the app link."""
+    code = await _hostile(app, state)
+    link = verify_page.app_link(ConfirmSettings.for_testing(), code, time.time())
+
+    page = verify_page.render_page(state, code, link if state == "pending" else None)
+
+    assert "<script>x" not in page
+    assert HOSTILE_HANDLE not in page
+    assert '"><script' not in page
+    assert "<b>" not in page
+    assert "&quot;&gt;&lt;script&gt;x&lt;/script&gt;" in page
+    assert "&lt;b&gt;-ABC" in page
+    assert page.count("<script") == 1, "only the page's own /verify.js tag"
+
+
+async def test_a_pending_pages_image_and_link_escape_stored_markup(app: Starlette) -> None:
+    code = await _hostile(app, "pending")
+    link = verify_page.app_link(ConfirmSettings.for_testing(), code, time.time())
+
+    page = verify_page.render_page("pending", code, link)
+
+    assert f'src="/verify/qr.svg?d={quote(HOSTILE_HANDLE, safe="")}"' in page
+    assert "user_code=%3Cb%3EABC" in page
+
+
+NOSCRIPT_REFRESH = '<noscript><meta http-equiv="refresh" content="5"></noscript>'
+
+
+@pytest.mark.parametrize("state", ["pending", "scanned"])
+async def test_a_live_page_carries_the_five_second_noscript_refresh(
+    app: Starlette, state: str
+) -> None:
+    resp = await get(app, page_url(await handle_for(app, state)))
+
+    assert resp.text.count(NOSCRIPT_REFRESH) == 1
+
+
+@pytest.mark.parametrize("state", CLOSED_STATES)
+async def test_a_closed_page_carries_no_refresh(app: Starlette, state: str) -> None:
+    resp = await get(app, page_url(await handle_for(app, state)))
+
+    assert NOSCRIPT_REFRESH not in resp.text
+    assert "http-equiv" not in resp.text
+
+
+async def test_the_script_names_exactly_the_two_endpoints(app: Starlette) -> None:
+    """Every absolute path the script can request. A third URL would be a
+    route the page reaches that the spec's hotlink and audit rules never saw."""
+    script = (await get(app, "/verify.js")).text
+
+    paths = set(re.findall(r"[\"\'](/[A-Za-z0-9_./-]+)", script))
+    assert paths == {"/verify/state", "/verify/qr.svg"}
+    assert not re.search(r"https?://", script)
 
 
 # ---------------------------------------------------------------------------

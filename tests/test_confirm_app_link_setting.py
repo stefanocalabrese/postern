@@ -36,6 +36,11 @@ def test_from_env_takes_the_same_default() -> None:
     assert ConfirmSettings.from_env().device_app_link_uri == DEFAULT_LINK
 
 
+def test_an_empty_variable_falls_back_to_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(LINK, "")
+    assert ConfirmSettings.from_env().device_app_link_uri == DEFAULT_LINK
+
+
 def test_from_env_reads_the_variable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(LINK, "https://pair.bank.test/app")
     assert ConfirmSettings.from_env().device_app_link_uri == "https://pair.bank.test/app"

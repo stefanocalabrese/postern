@@ -467,6 +467,23 @@ class TestBothCompositionRootsCallIt:
         with pytest.raises(RuntimeError, match="POSTERN_REQUIRE_REDDIS"):
             _confirm(key_pair)
 
+    def test_the_removed_attempt_budget_refuses_the_write_path(
+        self, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``POSTERN_USER_CODE_MAX_ATTEMPTS`` left with the attempt budget it
+        set (spec section 9). An operator still setting it believes a limit is
+        armed that no longer exists, so it is a name nothing reads."""
+        monkeypatch.setenv("POSTERN_USER_CODE_MAX_ATTEMPTS", "5")
+        with pytest.raises(RuntimeError, match="POSTERN_USER_CODE_MAX_ATTEMPTS"):
+            _confirm(key_pair)
+
+    def test_the_removed_attempt_budget_refuses_the_read_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("POSTERN_USER_CODE_MAX_ATTEMPTS", "5")
+        with pytest.raises(RuntimeError, match="POSTERN_USER_CODE_MAX_ATTEMPTS"):
+            create_app(Settings.for_testing())
+
     def test_both_build_on_a_clean_environment(
         self, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch
     ) -> None:

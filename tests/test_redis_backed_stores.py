@@ -794,6 +794,28 @@ async def test_a_conflict_on_an_unexchanged_code_revokes_all_of_it(stores: Redis
     assert await store._redis.zscore(store._index_key(), code.device_code) is None
 
 
+async def test_two_customers_scanning_one_fresh_code_settle_to_one_claim_and_a_revocation(
+    stores: RedisStores,
+) -> None:
+    """The session-swap race across two replicas: whichever lands second sees
+    the first's scan and revokes the pairing, so exactly one claims and the
+    other gets the conflict, in either order, and the code is gone."""
+    first = stores.device_codes()
+    second = stores.device_codes()
+    code = await _create(first)
+
+    outcomes = await asyncio.gather(
+        first.claim_scan(code.device_code, OWNER),
+        second.claim_scan(code.device_code, OTHER),
+    )
+
+    assert sorted(outcome.value for outcome in outcomes) == [
+        ScanClaim.CLAIMED.value,
+        ScanClaim.CONFLICT_REVOKED.value,
+    ]
+    assert await first._redis.exists(first._key(code.device_code)) == 0
+
+
 async def test_a_conflict_on_an_exchanged_code_writes_nothing(stores: RedisStores) -> None:
     store = stores.device_codes()
     code = await _create(store)
