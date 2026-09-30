@@ -49,6 +49,7 @@ The device authorization endpoints are:
 - ``POST /device_authorization`` — Generate device code + QR pairing data.
 - ``POST /token`` with ``grant_type=device_code`` — Exchange device code for
   tokens (polling; returns error until mobile app approves).
+- ``POST /scan`` -- Mobile app scan of the pairing QR.
 - ``POST /approve`` — Mobile app approval callback.
 
 The verification challenge endpoint is:

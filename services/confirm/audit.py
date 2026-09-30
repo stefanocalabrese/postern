@@ -175,6 +175,8 @@ __all__ = [
     "OUTCOME_RETURNED",
     "PAIRING_ROUTE",
     "PAIRING_TOOL_NAME",
+    "SCAN_ROUTE",
+    "SCAN_TOOL_NAME",
     "TOKEN_ROUTE",
     "TOKEN_TOOL_NAME",
     "UNRESOLVED_TOOL_NAME",
@@ -192,8 +194,11 @@ __all__ = [
     "DETAIL_MALFORMED_BODY",
     "DETAIL_MISSING_SIGNATURE",
     "DETAIL_NOT_SCANNED",
+    "DETAIL_QR_INVALID",
+    "DETAIL_QR_STALE",
     "DETAIL_REVOKED",
     "DETAIL_SCANNED_BY_OTHER",
+    "DETAIL_SCAN_CONFLICT",
     "DETAIL_SIGNATURE_INVALID",
     "DETAIL_SIGNATURE_MALFORMED",
     "DETAIL_STORED_IDENTITY_MALFORMED",
@@ -869,6 +874,19 @@ TOKEN_TOOL_NAME = "device_grant.token"  # noqa: S105
 #: The route, in ``arguments`` for the reason ``PAIRING_ROUTE`` is there.
 TOKEN_ROUTE = "/token"  # noqa: S105
 
+#: What ``tool_name`` carries on a ``POST /scan`` row.
+#:
+#: ITS OWN LITERAL, for the reason ``TOKEN_TOOL_NAME`` has one: "which
+#: pairings were scanned" and "which were approved" differ exactly when a scan
+#: conflicts or a code is scanned and abandoned, and one literal would hide
+#: both. Under ``device_grant.*`` like the other two, so
+#: ``WHERE tool_name LIKE 'device_grant.%'`` still returns the whole flow, and
+#: none of the five registered MCP tools.
+SCAN_TOOL_NAME = "device_grant.scan"
+
+#: The route, in ``arguments`` for the reason ``PAIRING_ROUTE`` is there.
+SCAN_ROUTE = "/scan"
+
 #: The stored ``customer_ref`` on an approved device code will not parse as a
 #: ``CustomerRef``.
 #:
@@ -937,6 +955,21 @@ DETAIL_NOT_SCANNED = "not_scanned"
 #: same ``invalid_grant`` every other refusal gets; this literal is where an
 #: operator sees one customer trying to approve a pairing another one holds.
 DETAIL_SCANNED_BY_OTHER = "scanned_by_other"
+#: ``POST /scan`` with a rotation token that is malformed, forged, for another
+#: pairing, or for a slot ahead of the server's window. Answered with the same
+#: ``invalid_grant`` as an unknown code, because nothing about it proves the
+#: caller ever held a real QR.
+DETAIL_QR_INVALID = "qr_invalid"
+#: ``POST /scan`` with a genuine token older than the window. The direct trace
+#: of a screenshot relay, and the one refusal here answered with its own
+#: ``qr_stale``: a MAC that verifies proves the caller held a real QR for this
+#: pairing, so telling them to scan again leaks nothing they did not know.
+DETAIL_QR_STALE = "qr_stale"
+#: ``POST /scan`` by a second customer inside the token window, whether the
+#: pairing was revoked by it (``ScanClaim.CONFLICT_REVOKED``) or had already
+#: been exchanged (``ScanClaim.CONFLICT_EXCHANGED``). The trace of one QR seen
+#: by two phones, and of a session swap attempted in either order.
+DETAIL_SCAN_CONFLICT = "scan_conflict"
 #: A second exchange of a code the first one spent, at ``POST /token``. The
 #: replay signal, and the highest-value row this table can hold about the
 #: device grant: the code was approved by a verified assertion, so something
@@ -961,7 +994,8 @@ DETAIL_SCANNED_BY_OTHER = "scanned_by_other"
 #: that trade.
 DETAIL_DEVICE_CODE_SPENT = "device_code_spent"
 #: A repeat approval by the customer who scanned the code, normally a retried
-#: request, at ``POST /approve`` when the code is already approved.
+#: request: at ``POST /approve`` when the code is already approved, and at
+#: ``POST /scan`` through ``ScanClaim.APPROVED_MINE``.
 #:
 #: REWRITTEN ON 2026-09-30, because the rationale it carried stopped being
 #: possible. It used to be a caller holding an assertion of their own swapping
@@ -1055,12 +1089,13 @@ def pairing_client_ip(request: Request, trusted_proxy_hops: int) -> str | None:
 class PairingAudit:
     """One ``audit_log`` row per recorded device-grant request.
 
-    TWO ENDPOINTS, ONE WRITER. ``POST /approve`` pairs a client and
-    ``POST /token`` mints the read token that pairing authorises; both write
-    through this class, which is why ``tool_name`` and ``route`` are
-    constructor arguments. ``POST /device_authorization``, the third endpoint
-    of the grant, writes nothing at all -- see the rule below and that
-    handler's own docstring.
+    THREE ENDPOINTS, ONE WRITER. ``POST /scan`` claims a pairing for the
+    customer whose app scanned it, ``POST /approve`` pairs the client, and
+    ``POST /token`` mints the read token that pairing authorises; all three
+    write through this class, which is why ``tool_name`` and ``route`` are
+    constructor arguments. ``POST /device_authorization``, where the grant
+    begins, writes nothing at all -- see the rule below and that handler's
+    own docstring.
 
     ONE ROW, NOT THE READ PATH'S TWO, and the reason is that the second row's
     reason is absent on both. ``ApprovalAudit`` writes an entry row because the

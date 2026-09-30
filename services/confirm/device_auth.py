@@ -4,6 +4,8 @@ Endpoints:
 - ``POST /device_authorization`` — Generate device code + QR pairing data.
 - ``POST /token`` with ``grant_type=device_code`` — Exchange device code for
   tokens (polling; returns error until mobile app approves).
+- ``POST /scan`` -- Mobile app scan of the QR (binds the pairing to the first
+  customer who presents a current rotation token).
 - ``POST /approve`` — Mobile app approval callback (marks device code as
   approved).
 
@@ -29,20 +31,22 @@ customer scanned it first (``postern_core.auth.device_codes`` records which
 half of the A2 control that is and which half only the operator's app can
 perform).
 
-WHO IS AUTHENTICATED, AND WHO IS NOT. ``POST /approve`` is the banking app,
-and it must present a bearer assertion the operator's app backend minted;
-``services/confirm/auth.py`` verifies it and this module takes the customer
-from the verified ``sub``. ``POST /device_authorization`` and ``POST /token``
-are the BROWSER, which by the device grant's premise holds no credential at
-all, and they are named in that module's ``PUBLIC_PATHS`` with the reason.
+WHO IS AUTHENTICATED, AND WHO IS NOT. ``POST /scan`` and ``POST /approve``
+are the banking app, which must present a bearer assertion the operator's app
+backend minted; ``services/confirm/auth.py`` verifies it and this module
+takes the customer from the verified ``sub``. ``POST /device_authorization``
+and ``POST /token`` are the BROWSER, which by the device grant's premise
+holds no credential at all, and they are named in that module's
+``PUBLIC_PATHS`` with the reason.
 
-WHO CAN BE CUT, AND WHERE (ZT-7). Both endpoints that know a customer refuse a
-revoked one: ``POST /approve`` on the assertion's ``sub``, before the device
-code is touched, and ``POST /token`` on the ``customer_ref`` stored on the
-device code, before the read token is minted. Nothing is keyed on
-``DeviceCode.client_id`` -- the browser supplies it unauthenticated at
-``POST /device_authorization``, so a kill switch enforced on it would be
-theatre. ``services/confirm/revocation.py`` holds the full argument.
+WHO CAN BE CUT, AND WHERE (ZT-7). All three endpoints that know a customer
+refuse a revoked one: ``POST /scan`` and ``POST /approve`` on the assertion's
+``sub``, before the device code is touched, and ``POST /token`` on the
+``customer_ref`` stored on the device code, before the read token is minted.
+Nothing is keyed on ``DeviceCode.client_id`` -- the browser supplies it
+unauthenticated at ``POST /device_authorization``, so a kill switch enforced
+on it would be theatre. ``services/confirm/revocation.py`` holds the full
+argument.
 
 WHAT THIS MODULE NO LONGER DOES. It used to take the customer identity from
 ``/approve``'s request body (``subject_value``) and it used to return a
@@ -88,6 +92,7 @@ from postern_core.auth.device_codes import (
     DeviceCodeStoreBase,
     DeviceCodeStoreContended,
     DeviceCodeStoreFull,
+    ScanClaim,
     create_device_code_store,
 )
 from postern_core.auth.internal_jwt import InternalTokenMinter
@@ -104,10 +109,15 @@ from services.confirm.audit import (
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
     DETAIL_NOT_SCANNED,
+    DETAIL_QR_INVALID,
+    DETAIL_QR_STALE,
     DETAIL_REVOKED,
+    DETAIL_SCAN_CONFLICT,
     DETAIL_SCANNED_BY_OTHER,
     DETAIL_STORED_IDENTITY_MALFORMED,
     DETAIL_USER_CODE_NOT_FOUND,
+    SCAN_ROUTE,
+    SCAN_TOOL_NAME,
     TOKEN_ROUTE,
     TOKEN_TOOL_NAME,
     PairingAudit,
@@ -115,6 +125,7 @@ from services.confirm.audit import (
     pairing_client_ip,
 )
 from services.confirm.auth import unauthenticated_response, verified_claims, verified_subject
+from services.confirm.qr_token import QrVerdict, slot_at, verify_token
 from services.confirm.revocation import (
     customer_revoked,
     log_refusal,
@@ -1280,6 +1291,257 @@ async def _approve_refusal_detail(
 
 
 # ---------------------------------------------------------------------------
+# Scan -- POST /scan.
+#
+# Called by the operator's banking app the moment it reads the QR, before the
+# user has compared anything. It is the step that binds a pairing to ONE
+# customer: the first customer to present a current rotation token for a
+# pairing becomes its ``scanned_by``, and ``POST /approve`` approves for that
+# customer and nobody else. ``dev-docs/qr-page-spec.md`` section 5 is the
+# contract; the decisions below are the ones that section leaves to code.
+#
+# The app sends ``user_code`` and ``qr``, both read from the app link the QR
+# encodes, and nothing that names a customer: that comes from the verified
+# assertion's ``sub``, as on every other assertion-authenticated path.
+
+
+def _qr_stale_response() -> JSONResponse:
+    """A genuine rotation token that has aged out of the window.
+
+    DISTINCT FROM ``_unpairable_response`` on purpose, and safe to be: only a
+    MAC that verifies reaches it, and a caller holding one already knows the
+    pairing exists. The app needs the difference to say "scan again".
+    """
+    return _error(400, "qr_stale", "the QR code has changed; scan the one on screen now")
+
+
+def _scan_conflict_response() -> JSONResponse:
+    """A second customer's scan of a pairing another customer holds.
+
+    Distinct for the reason ``_qr_stale_response`` gives, and the app needs it
+    to say "this pairing was cancelled". Reached only past a verifying MAC.
+    """
+    return _error(400, "scan_conflict", "this pairing was scanned by another device")
+
+
+def _scan_context_response(code: DeviceCode) -> JSONResponse:
+    """What the app shows beside the pairing code the user reads off the page.
+
+    EVERY VALUE COMES FROM THE STORED ROW and none from the QR or the body, so
+    a tampered QR cannot change what the confirmation screen says.
+    ``client_id_verified`` is ``False`` on every answer because nothing on
+    this path verifies it: the browser supplied ``client_id``, unauthenticated,
+    at ``POST /device_authorization``, and until CIMD verification exists the
+    app must not present it as an identity.
+    """
+    return JSONResponse(
+        status_code=200,
+        content={
+            "client_id": code.client_id,
+            "client_id_verified": False,
+            "scopes": code.scopes,
+            "expires_at": code.expires_at.isoformat(),
+            "user_code": code.user_code_display,
+        },
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Scanned:
+    """What ``_scan`` decided, and what the caller owes ``audit_log`` for it.
+
+    The shape of ``_Pairing``, one endpoint over, for the same reasons.
+    """
+
+    response: JSONResponse
+    detail: str | None = None
+    recorded: bool = True
+    #: The device code this exit CLAIMED, so the caller can withdraw the claim
+    #: if the row cannot be written. ``None`` on every other exit, including a
+    #: repeat by the same customer: that claim was recorded when it was made.
+    claimed_device_code: str | None = None
+
+
+async def scan_callback(request: Request) -> JSONResponse:
+    """The banking app's scan of a pairing QR, and its audit row.
+
+    Requires a verified app assertion (``services/confirm/auth.py``); it is
+    not in ``PUBLIC_PATHS``. The customer is the assertion's ``sub``.
+
+    Request body:
+        user_code: From the app link the QR encodes, ``XXX-XXX`` or bare.
+        qr: The rotation token from the same link, ``<slot>.<mac>``.
+
+    Response (200): the stored pairing's context; see ``_scan_context_response``.
+    Response (400): ``invalid_request`` for a malformed body; ``qr_stale``;
+        ``scan_conflict``; and the one ``invalid_grant`` body of
+        ``_unpairable_response`` for an unknown or expired code, an approved
+        one, and a malformed, forged or future rotation token.
+    Response (401): no verified assertion.
+    Response (403): ``invalid_subject`` or ``access_revoked`` (ZT-7).
+
+    ONE ROW PER RECORDED CALL, through ``PairingAudit`` with
+    ``SCAN_TOOL_NAME`` and ``SCAN_ROUTE``, fail-closed per decision 0006: a
+    claim whose row cannot be written is withdrawn exactly as
+    ``_withdraw_pairing`` withdraws an unrecorded approval. The malformed-body
+    exits write nothing, by ``PairingAudit``'s rule, as on ``POST /approve``.
+    """
+    at = datetime.now(UTC)
+    started = time.monotonic()
+
+    subject = verified_subject(request)
+    if subject is None:
+        # Unreachable through the assembled app, and no row: the backstop
+        # `approve_callback` keeps, for the reason it gives.
+        return unauthenticated_response()
+
+    settings: ConfirmSettings = request.app.state.settings
+    db: Database = request.app.state.postern_database
+    store: DeviceCodeStoreBase = request.app.state.device_code_store
+
+    audit = PairingAudit(
+        db=db,
+        call_id=str(uuid.uuid4()),
+        at=at,
+        started=started,
+        subject=subject,
+        claims=verified_claims(request),
+        client_ip_value=pairing_client_ip(request, settings.trusted_proxy_hops),
+        tool_name=SCAN_TOOL_NAME,
+        route=SCAN_ROUTE,
+    )
+
+    try:
+        outcome = await _scan(request, audit, store=store, subject=subject)
+    except Exception as exc:
+        # The shape `approve_callback` uses: an audit-write failure must not
+        # replace the exception that ended the request. Nothing was claimed
+        # on a path that raises -- `claim_scan` either commits and returns or
+        # raises having written nothing -- so there is nothing to withdraw.
+        try:
+            await audit.refused(type(exc).__name__)
+        except Exception as audit_exc:
+            logger.error(
+                "audit write failed for a device pairing scan after it raised %s: %s",
+                type(exc).__name__,
+                audit_exc,
+                exc_info=audit_exc,
+            )
+            raise exc from audit_exc
+        raise
+
+    if not outcome.recorded:
+        return outcome.response
+
+    try:
+        if outcome.detail is None:
+            await audit.approved()
+        else:
+            await audit.refused(outcome.detail)
+    except Exception as audit_exc:
+        # FAIL CLOSED BY WITHDRAWING THE CLAIM, for the reason
+        # `approve_callback` withdraws an approval: a claim nobody recorded
+        # would still decide who may approve, and no row would say who made it.
+        if outcome.claimed_device_code is not None:
+            await _withdraw_pairing(store, outcome.claimed_device_code, cause="audit")
+        logger.error(
+            "audit write failed for a device pairing scan that answered %d; "
+            "failing the request because the scan could not be recorded",
+            outcome.response.status_code,
+            exc_info=audit_exc,
+        )
+        raise
+    return outcome.response
+
+
+async def _scan(
+    request: Request,
+    audit: PairingAudit,
+    *,
+    store: DeviceCodeStoreBase,
+    subject: str,
+) -> _Scanned:
+    """The scan itself, in section 5's order, returning what the row owes.
+
+    THE MAC IS CHECKED BEFORE THE CLAIM, and that order is what keeps session
+    swap detection honest. A stale token from a second customer answers
+    ``qr_stale`` and revokes nothing, because only a caller inside the token
+    window -- one who could have been standing at the screen -- reaches
+    ``claim_scan`` at all.
+    """
+    try:
+        customer = CustomerRef(value=subject)
+    except ValidationError:
+        # As at `POST /approve`: a genuine assertion with a non-conforming
+        # `sub`, never echoed or logged, recorded as an absence.
+        logger.warning("device scan: assertion subject is not a customer reference")
+        return _Scanned(
+            _error(403, "invalid_subject", "assertion subject is not a customer reference"),
+            DETAIL_INVALID_SUBJECT,
+        )
+
+    # ZT-7 before anything is read, as at `POST /approve`, and with the same
+    # consequences: `RevocationStoreUnavailable` propagates to a 500 recorded
+    # under the exception's type, and the row names no pairing.
+    if await customer_revoked(request, customer.value):
+        log_refusal("a device pairing scan")
+        return _Scanned(
+            revoked_response("this customer's access has been revoked"),
+            DETAIL_REVOKED,
+        )
+
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _Scanned(_error(400, "invalid_request", "body must be JSON"), recorded=False)
+    if not isinstance(body, dict):
+        return _Scanned(
+            _error(400, "invalid_request", "body must be a JSON object"), recorded=False
+        )
+
+    user_code_value = body.get("user_code", "")
+    qr_value = body.get("qr", "")
+    if not isinstance(user_code_value, str) or not isinstance(qr_value, str):
+        return _Scanned(
+            _error(400, "invalid_request", "user_code and qr must be strings"), recorded=False
+        )
+    if not user_code_value or not qr_value:
+        return _Scanned(
+            _error(400, "invalid_request", "user_code and qr are required"), recorded=False
+        )
+
+    code = await _lookup_by_user_code(store, user_code_value)
+    if code is None:
+        return _Scanned(_unpairable_response(), DETAIL_USER_CODE_NOT_FOUND)
+
+    audit.names(device_code=code.device_code, paired_client_id=code.client_id)
+
+    verdict = verify_token(code.qr_secret, code.user_code, qr_value, slot_at(time.time()))
+    if verdict is QrVerdict.INVALID:
+        return _Scanned(_unpairable_response(), DETAIL_QR_INVALID)
+    if verdict is QrVerdict.STALE:
+        return _Scanned(_qr_stale_response(), DETAIL_QR_STALE)
+
+    claim = await store.claim_scan(code.device_code, customer.value)
+    if claim is ScanClaim.CLAIMED:
+        return _Scanned(_scan_context_response(code), claimed_device_code=code.device_code)
+    if claim is ScanClaim.ALREADY_MINE:
+        return _Scanned(_scan_context_response(code))
+    if claim is ScanClaim.APPROVED_MINE:
+        return _Scanned(_unpairable_response(), DETAIL_ALREADY_APPROVED)
+    if claim is ScanClaim.CONFLICT_REVOKED or claim is ScanClaim.CONFLICT_EXCHANGED:
+        # A LOG LINE AS WELL AS THE ROW, because this is the event an operator
+        # may want to alert on at the edge. The handle, never the code.
+        logger.warning(
+            "device scan: pairing %s scanned by a second customer (%s)",
+            device_code_handle(code.device_code),
+            claim.value,
+        )
+        return _Scanned(_scan_conflict_response(), DETAIL_SCAN_CONFLICT)
+    return _Scanned(_unpairable_response(), DETAIL_USER_CODE_NOT_FOUND)
+
+
+# ---------------------------------------------------------------------------
 # Route assembly.
 # ---------------------------------------------------------------------------
 
@@ -1313,6 +1575,11 @@ def device_auth_routes(
         Route(
             "/token",
             token_endpoint,
+            methods=["POST"],
+        ),
+        Route(
+            "/scan",
+            scan_callback,
             methods=["POST"],
         ),
         Route(
