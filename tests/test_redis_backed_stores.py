@@ -686,6 +686,32 @@ async def test_a_code_the_server_never_held_cannot_be_claimed(stores: RedisStore
 
 
 # ---------------------------------------------------------------------------
+# The pairing half: handle, secret, secondary keys, and the two compare-and-set
+# writes. `tests/test_device_code_pairing_store.py` holds the in-memory side.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_pairing_fields_cross_to_a_second_connection(stores: RedisStores) -> None:
+    """The QR secret is bytes in the process and base64 on the wire, and a
+    second replica must read back the same 32 bytes or no token it verifies
+    will match the image the first replica drew."""
+    writer = stores.device_codes()
+    reader = stores.device_codes()
+    code = await _create(writer, creator_ip="203.0.113.9")
+
+    seen = await reader.get_device_code(code.device_code)
+
+    assert seen is not None
+    assert seen.display_handle == code.display_handle
+    assert len(seen.display_handle) == 22
+    assert seen.qr_secret == code.qr_secret
+    assert len(seen.qr_secret) == 32
+    assert seen.creator_ip == "203.0.113.9"
+    assert seen.scanned_by == ""
+    assert seen.scanned_at is None
+
+
+# ---------------------------------------------------------------------------
 # The session store: the two clocks, and a TTL the server enforces.
 # ---------------------------------------------------------------------------
 

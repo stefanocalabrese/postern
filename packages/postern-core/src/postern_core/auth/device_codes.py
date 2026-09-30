@@ -56,13 +56,14 @@ backend; without it, the in-memory store is used.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import heapq
 import json as _json
 import os
 import secrets
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from datetime import UTC as _UTC
 from typing import Any
@@ -230,6 +231,20 @@ class DeviceCode:
             while it is still redeemable. Written only by
             ``consume_device_code`` below, which is the atomic claim the mint
             sits behind, and never cleared.
+        display_handle: 128 random bits, base64url. Keys the browser's
+            pairing page, its QR image and its state endpoint, and is useless
+            at ``POST /token``. Empty on a record written before it existed,
+            which no page can then find.
+        qr_secret: 32 random bytes, the per-pairing HMAC key for the QR's
+            rotation token (``services/confirm/qr_token.py``). Never leaves
+            the store and never appears in ``repr``. Empty on an older
+            record, which is therefore unscannable -- the safe direction.
+        creator_ip: The address ``POST /device_authorization`` came from.
+            Recorded for the creator-versus-scanner comparison a later spec
+            owns; nothing reads it yet.
+        scanned_by: The customer whose app scanned first, from a verified
+            assertion ``sub`` at ``POST /scan``. Empty until scanned.
+        scanned_at: When that scan was claimed.
 
     ``exchanged_at`` IS WHY A SPENT CODE IS STILL HERE. The alternative was
     revoking the code on a successful exchange, which is one fewer field and
@@ -266,6 +281,11 @@ class DeviceCode:
     customer_ref: str = ""
     user_code_attempts: int = 0
     exchanged_at: datetime | None = None
+    display_handle: str = ""
+    qr_secret: bytes = field(default=b"", repr=False)
+    creator_ip: str | None = None
+    scanned_by: str = ""
+    scanned_at: datetime | None = None
 
     @property
     def user_code_display(self) -> str:
@@ -329,8 +349,12 @@ class DeviceCodeStoreBase(ABC):
         verification_uri: str,
         expires_in: int = 900,
         interval: int = 5,
+        creator_ip: str | None = None,
     ) -> DeviceCode:
         """Create a new device code session and return it.
+
+        The code carries a fresh ``display_handle`` and ``qr_secret`` and the
+        ``creator_ip`` it was given, and is unscanned.
 
         Every backend must first drop what has expired and then refuse with
         `DeviceCodeStoreFull` if it still holds ``max_codes``. Sweeping first
@@ -406,6 +430,25 @@ def _generate_user_code() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(6))
 
 
+#: Random bytes behind a display handle: 128 bits, 22 base64url characters.
+DISPLAY_HANDLE_BYTES = 16
+
+#: Random bytes in a pairing's QR secret, the HMAC-SHA256 key of its rotation
+#: token. 32 is SHA-256's output size; RFC 2104 section 3 discourages a key
+#: shorter than that.
+QR_SECRET_BYTES = 32
+
+
+def _generate_display_handle() -> str:
+    """Generate the value that keys the browser's pairing page."""
+    return secrets.token_urlsafe(DISPLAY_HANDLE_BYTES)
+
+
+def _generate_qr_secret() -> bytes:
+    """Generate a pairing's rotation-token key."""
+    return secrets.token_bytes(QR_SECRET_BYTES)
+
+
 class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
     """In-memory store mapping ``device_code`` → ``DeviceCode``.
 
@@ -473,6 +516,7 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         verification_uri: str,
         expires_in: int = 900,
         interval: int = 5,
+        creator_ip: str | None = None,
     ) -> DeviceCode:
         """Create a new device code session and return it.
 
@@ -494,6 +538,9 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
             interval=interval,
             client_id=client_id,
             scopes=scopes,
+            display_handle=_generate_display_handle(),
+            qr_secret=_generate_qr_secret(),
+            creator_ip=creator_ip,
         )
         self._codes[device_code] = code
         heapq.heappush(self._expiry, (expires_at.timestamp(), device_code))
@@ -695,6 +742,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         verification_uri: str,
         expires_in: int | None = None,
         interval: int = 5,
+        creator_ip: str | None = None,
     ) -> DeviceCode:
         """Create a new device code session and return it.
 
@@ -733,6 +781,9 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             interval=interval,
             client_id=client_id,
             scopes=scopes,
+            display_handle=_generate_display_handle(),
+            qr_secret=_generate_qr_secret(),
+            creator_ip=creator_ip,
         )
         await self._set_code(device_code, code)
         return code
@@ -919,6 +970,14 @@ def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
         "customer_ref": dc.customer_ref,
         "user_code_attempts": dc.user_code_attempts,
         "exchanged_at": dc.exchanged_at.timestamp() if dc.exchanged_at else None,
+        "display_handle": dc.display_handle,
+        # Standard base64 so the JSON stays text. ``None`` rather than ``""``
+        # for an absent secret, so a reader of the stored value can tell "no
+        # secret" from a secret that happens to encode short.
+        "qr_secret": base64.b64encode(dc.qr_secret).decode("ascii") if dc.qr_secret else None,
+        "creator_ip": dc.creator_ip,
+        "scanned_by": dc.scanned_by,
+        "scanned_at": dc.scanned_at.timestamp() if dc.scanned_at else None,
     }
 
 
@@ -930,6 +989,15 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
     exchanged_at = None
     if data.get("exchanged_at") is not None:
         exchanged_at = datetime.fromtimestamp(data["exchanged_at"], tz=_UTC)
+    scanned_at = None
+    if data.get("scanned_at") is not None:
+        scanned_at = datetime.fromtimestamp(data["scanned_at"], tz=_UTC)
+    # ``validate=True`` so a stored value that is not base64 raises
+    # ``binascii.Error``, a ``ValueError``, which every caller already treats
+    # as a corrupt record, rather than decoding to a different key.
+    raw_secret = data.get("qr_secret")
+    qr_secret = base64.b64decode(raw_secret, validate=True) if raw_secret else b""
+    raw_creator_ip = data.get("creator_ip")
     return DeviceCode(
         device_code=data["device_code"],
         user_code=data["user_code"],
@@ -955,6 +1023,16 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
         # above defaults to empty so an old record mints nothing, while an old
         # record here stays redeemable for the rest of its 900-second life.
         exchanged_at=exchanged_at,
+        # ALL FIVE DEFAULT TO ABSENT, and for the pairing that is the
+        # fail-closed direction: a record the previous release wrote has no
+        # handle, so no page finds it, and no secret, so no rotation token
+        # verifies against it. It cannot be scanned and so cannot be approved;
+        # with a 900-second lifetime none outlives a deploy by long.
+        display_handle=str(data.get("display_handle", "")),
+        qr_secret=qr_secret,
+        creator_ip=str(raw_creator_ip) if raw_creator_ip is not None else None,
+        scanned_by=str(data.get("scanned_by", "")),
+        scanned_at=scanned_at,
     )
 
 
