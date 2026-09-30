@@ -74,7 +74,7 @@ Modified:
 | `tests/test_device_grant.py`, `tests/test_pairing_audit.py`, `tests/test_zt7_confirm_revocation.py`, `tests/test_redis_backed_stores.py`, `tests/test_confirm_auth.py`, `tests/test_confirm_rate_limit.py`, `tests/test_confirm_customer_rate_limit.py`, `tests/test_confirm_body_limit.py`, `tests/test_settings_bounds.py` | Rewritten to the new contract, as each task says. |
 | `docs/user-guide/getting-started.md`, `docs/user-guide/components/confirm-service.md`, `docs/user-guide/components/session-store.md`, `dev-docs/decisions/0012-device-code-single-use.md` | The four documents the spec names as going stale. |
 
-`CLAUDE.md` is not edited by this plan. The spec does not ask for it.
+`CLAUDE.md` is edited in Task 13 only, and only where this work makes a statement false. The user asked for that task when approving the plan; the spec does not cover it. Task 13 also adds the new variables' rows to `docs/user-guide/getting-started.md`.
 
 ---
 
@@ -6472,7 +6472,7 @@ git commit -m "test(confirm): drive the whole QR pairing end to end" -m "Co-Auth
 
 ### Task 12: Decision record 0021, and the four documents the spec names as stale
 
-Spec section 3's last paragraph (decision record 0021) and the Testing section's list of documents that describe removed symbols or settings. `make citations` checks only anchored citations, so nothing but this task catches these. `CLAUDE.md` is not touched; see "Concerns" at the end of this plan.
+Spec section 3's last paragraph (decision record 0021) and the Testing section's list of documents that describe removed symbols or settings. `make citations` checks only anchored citations, so nothing but this task catches these. `CLAUDE.md`, and the new variables in `docs/user-guide/getting-started.md`, are Task 13's.
 
 **Files:**
 - Create: `dev-docs/decisions/0021-public-html-on-the-write-key-service.md`
@@ -6773,6 +6773,133 @@ git commit -m "docs: record public HTML on the write-key service and retire the 
 
 ---
 
+### Task 13: `CLAUDE.md` and `docs/user-guide/getting-started.md`
+
+Added after the plan was approved, at the user's request. It changes only the `CLAUDE.md` statements that Tasks 1 to 12 make false, and adds the eight new variables to the confirm table in `docs/user-guide/getting-started.md`. Every fact below was checked against a copy of the tree with Tasks 1 to 12 applied, on 30 September 2026:
+- `grep -rln "HTMLResponse\|text/html" services stub packages` finds only `services/confirm/verify_page.py`.
+- The four paths that check ZT-7 revocation are `/scan`, `/approve`, `/token` and the challenge callback.
+- `make ci` exited 0 on 3126 tests, none failed and none skipped, in 198.19 and 201.97 seconds.
+
+There is no test to write for documentation. The checks are Step 3's `make citations` and Step 4's `make ci`.
+
+**Files:**
+- Modify: `CLAUDE.md` (five sentence fragments in "Repository state"; nothing else)
+- Modify: `docs/user-guide/getting-started.md` (eight new rows in the "Confirm Service" table)
+
+- [ ] **Step 1: `CLAUDE.md`, only the statements this work makes false**
+
+Each edit is a fragment inside one long paragraph line. Replace exactly the old fragment with the new one and leave the rest of the line as it is.
+
+1a. Test count, first paragraph of "Repository state". Old:
+
+```
+`make ci` exits 0 on 2877 tests, none failed and none skipped, in 182 to 189 seconds with Docker up (three runs, measured 27 September 2026).
+```
+
+New:
+
+```
+`make ci` exits 0 on 3126 tests, none failed and none skipped, in 198 to 202 seconds with Docker up (two runs, measured 30 September 2026 after the QR page and scan work).
+```
+
+1b. Same paragraph. Old: `is inside that 2877 like every other file.` New: `is inside that 3126 like every other file.`
+
+Before 1a and 1b, run `make ci` on your own tree after Task 12. If the count is not 3126, stop: a task diverged from this plan, and that has to be found before the count is written down.
+
+1c. The `services/confirm` paragraph, the device grant's endpoints. Old:
+
+```
+it holds the RFC 8628 device grant (`POST /device_authorization`, `POST /token`, `POST /approve`) and the challenge approval callback
+```
+
+New:
+
+```
+it holds the RFC 8628 device grant (`POST /device_authorization`, `POST /token`, `POST /scan`, `POST /approve`, and the browser's pairing page at `GET /verify` with `/verify/qr.svg`, `/verify/state`, `/verify.js` and `/verify.css`) and the challenge approval callback
+```
+
+1d. Same paragraph, `PUBLIC_PATHS` and `/approve`. Old:
+
+```
+only `/.well-known/jwks.json`, `/device_authorization` and `/token` are in `PUBLIC_PATHS`, so `/approve` and the challenge callback both require a verified banking-app assertion;
+```
+
+New:
+
+```
+only `/.well-known/jwks.json`, `/device_authorization`, `/token` and the five `/verify` routes are in `PUBLIC_PATHS` (decision record 0021 is why the page is served here), so `/scan`, `/approve` and the challenge callback all require a verified banking-app assertion; `/approve` takes the pairing's `user_code` and nothing else that names it, and approves only for the customer whose app scanned it first at `/scan`, by compare-and-set in the device-code store;
+```
+
+1e. Same paragraph, the revocation count. Old: `a ZT-7 revocation check refuses a revoked customer on all three paths that know one;` New: `a ZT-7 revocation check refuses a revoked customer on all four paths that know one;`
+
+1f. The "What does not" paragraph. Old:
+
+```
+Also absent: the QR page (`POST /device_authorization` returns a `verification_uri_complete` for a browser to encode; no HTML is served anywhere in this repo), and a payments producer.
+```
+
+New:
+
+```
+Also absent: a payments producer. The QR page is not absent any more: since 30 September 2026 `verification_uri_complete` opens `GET /verify` on `services/confirm`, which is the only HTML this repository serves.
+```
+
+Nothing else in `CLAUDE.md` changes. The Architecture table still puts the QR page on `services/api`, and it stays that way: the paragraph above it says to read that table as the target, and the `services/confirm` paragraph already records where the device grant actually lives.
+
+Run: `git diff --stat CLAUDE.md`
+Expected: `1 file changed, 3 insertions(+), 3 deletions(-)`. The six fragments sit on three lines: the "Repository state" paragraph, the `services/confirm` paragraph and the "What does not" paragraph.
+
+- [ ] **Step 2: `docs/user-guide/getting-started.md`, the new variables**
+
+All edits are in the "Confirm Service (`services/confirm/settings.py`)" table.
+
+2a. Directly after the row `| `POSTERN_CONFIRM_RATE_LIMIT_CHALLENGE_APPROVE` | No | `60` | As above, for the challenge approval callback |` and before the `POSTERN_CONFIRM_RATE_LIMIT_DEFAULT` row, insert:
+
+```markdown
+| `POSTERN_CONFIRM_RATE_LIMIT_SCAN` | No | `60` | As above, for `/scan`. Raise it for the same reason as `/approve`'s |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY` | No | `60` | As above, for the pairing page `/verify`: page loads plus the 12 a minute its noscript refresh adds |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY_QR` | No | `300` | As above, for `/verify/qr.svg`, which the page reloads every two seconds: 30 a minute per open tab, so 300 is ten tabs behind one address |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY_STATE` | No | `300` | As above, for `/verify/state`, which the page polls every two seconds |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY_JS` | No | `60` | As above, for `/verify.js`, loaded once per page |
+| `POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS` | No | `60` | As above, for `/verify.css`, loaded once per page |
+```
+
+2b. Directly after the `POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_CHALLENGE_APPROVE` row, insert:
+
+```markdown
+| `POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN` | No | `10` | As above, for `/scan`, which precedes every pairing approval once. **At least 1** |
+```
+
+2c. Directly after the `POSTERN_DEVICE_VERIFICATION_URI` row, insert the one variable a deployment must set:
+
+```markdown
+| `POSTERN_DEVICE_APP_LINK_URI` | **Yes, in any deployment** | `https://app.postern.internal/pair` | Base of the universal link / app link the pairing QR encodes, as `?user_code=...&qr=...`. The default is a local placeholder: a deployment must set its own host and publish the Apple associated-domains and Android asset-links files for it, or a phone camera will not open the bank app. **Refused at startup** when its host equals `POSTERN_DEVICE_VERIFICATION_URI`'s host (case-insensitive, port ignored) |
+```
+
+Its Required column reads **Yes, in any deployment** and not a bare **Yes**, because the service starts without it: the default is a `.internal` placeholder that serves local work and opens no real app.
+
+Run: `grep -c "POSTERN_CONFIRM_RATE_LIMIT_VERIFY\|POSTERN_CONFIRM_RATE_LIMIT_SCAN\|POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN\|POSTERN_DEVICE_APP_LINK_URI" docs/user-guide/getting-started.md`
+Expected: `8`.
+
+- [ ] **Step 3: Citations**
+
+Run: `make citations`
+Expected: exit 0 and no problem lines. Measured on the copy of the tree with Tasks 1 to 13 applied and this plan file present, the line was `citations: 448 anchored resolved (224 node-id, 224 possessive; 40 into site-packages), 89 bare grandfathered (baseline 91)`. The resolved count moves if any tracked file has gained or lost citations since.
+
+- [ ] **Step 4: The gate**
+
+Run: `make ci`
+Expected: exit 0, `3126 passed`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add CLAUDE.md docs/user-guide/getting-started.md
+git commit -m "docs: bring CLAUDE.md and getting-started up to date with the QR pairing" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
 ## Spec coverage
 
 Every section of `dev-docs/qr-page-spec.md` and every item of its Testing section, and the task that implements or tests it.
@@ -6831,6 +6958,7 @@ Every section of `dev-docs/qr-page-spec.md` and every item of its Testing sectio
 | Testing: end to end over ASGI | 11 |
 | Testing: existing tests that pin old behaviour, and the ~65 `/approve` bodies | 5, 6, 7, 8, 10 |
 | Docs that go stale | 12 |
+| Added at approval: `CLAUDE.md` statements this work makes false, and the new variables in `docs/user-guide/getting-started.md` | 13 |
 
 ## Spec discrepancies found while planning
 
@@ -6854,8 +6982,8 @@ Each is a point where the spec and the code at `5eb0500` disagree, or where the 
 
 ## Concerns for the reviewer
 
-- **`CLAUDE.md` goes stale and this plan does not edit it**, as instructed. After Task 10 it still says the QR page is absent, that no HTML is served anywhere, and that only `/.well-known/jwks.json`, `/device_authorization` and `/token` are in `PUBLIC_PATHS`; after Task 8 its description of `/approve` is also out of date. Somebody has to decide to update it.
-- **`docs/user-guide/getting-started.md` will not list the eight new variables**, including `POSTERN_DEVICE_APP_LINK_URI`, which a real deployment must set (the default host is a `.internal` placeholder). The spec lists that document only for the removed variable, so Task 12 only removes. An operator reading the table alone would not learn the new one exists.
+- **`CLAUDE.md` is stale between Task 8 and Task 13.** Task 13 fixes it at the end, and each intermediate commit is still green, because nothing checks that file's prose.
+- **`POSTERN_DEVICE_VERIFICATION_URI`'s row in `docs/user-guide/getting-started.md` still says "(QR code target)".** After Task 10 the QR encodes the app link, not the page URI. Task 13 was scoped to adding rows, so it leaves that phrase alone.
 - **Two docstrings run ahead of their code by one or two commits**: `_unpairable_response` (Task 8) mentions `POST /scan` (Task 9), and `verify_page.py` and the `PUBLIC_PATHS` comment (Task 10) name decision record 0021 (Task 12). Neither is an anchored citation, so no gate fails in between.
 - **Task 11 has no red step.** It exercises code Tasks 1 to 10 built, so it passes on first run by construction.
 - **The flow completes only in tests** until the mobile team builds the app's `/scan` call and confirmation screen and the operator publishes the universal-link and app-link files for `POSTERN_DEVICE_APP_LINK_URI`'s host. Both are in the spec's "Owed outside this repository".
