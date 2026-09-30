@@ -2,7 +2,7 @@
 
 **Date:** 30 September 2026, revised the same day after a security review, a re-review, and the landing of the issuance hotfix
 **Status:** specification. The seven decisions it specifies were approved by the user on 30 September 2026, and three more were taken after the security review: the refresh family lives **1 hour**, not 12; removing the read key from `services/confirm` is approved; and this spec is written against the issuance hotfix below. Nothing here is built.
-**Against:** `origin/main` at `60161bf`, which carries the issuance hotfix (`e76ed4f` and `60161bf`), read in code for this revision. Every statement below about "today's `/token`" means that state. Statements about the code before `e76ed4f` say "before the hotfix".
+**Against:** `origin/main` at `79edf65`, which carries the issuance hotfix (`e76ed4f` and `60161bf`) and the repeat-approval fix (`d0674e5`), read in code for this revision. Every statement below about "today's `/token`" means that state. Statements about the code before `e76ed4f` say "before the hotfix".
 **Reviewed by:** a security review on 30 September 2026, folded in below.
 
 ---
