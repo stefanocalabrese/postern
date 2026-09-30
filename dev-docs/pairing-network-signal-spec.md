@@ -3,7 +3,7 @@
 **Date:** 30 September 2026
 **Status:** specification. The design was approved by capo on 30 September 2026; this document specifies it and decides the points that approval left open. Nothing here is built.
 **Reviewed by:** a review on 30 September 2026, folded in below. Two of its decisions were capo's: keep `details.proxy_hops`, and unwrap IPv4-mapped addresses before classifying.
-**Against:** `services/confirm/device_auth.py`, `services/confirm/audit.py` and `packages/postern-core/src/postern_core/auth/device_codes.py` at `31103cf`.
+**Against:** `services/confirm/device_auth.py`, `services/confirm/audit.py` and `packages/postern-core/src/postern_core/auth/device_codes.py` at `79edf65` (first written against `31103cf`).
 **Follows:** `dev-docs/qr-page-spec.md`, whose "What this does not fix" names this signal as the next spec and whose §1 added `creator_ip` to the pairing so that this one would have something to compare.
 
 ---
@@ -59,7 +59,7 @@ It is serialized exactly as `creator_ip` is, in `_device_code_to_dict` and `_dev
 
 `_scan_verdict` in the same file is unchanged: the address plays no part in which `ScanClaim` a row earns.
 
-**Retention of both addresses on the pairing.** `creator_ip` and `scanner_ip` live on the device-code row and nowhere else, and that row lives until its TTL (`device_code_ttl_seconds`, 900 seconds by default), or until it is revoked (a `conflict_revoked` scan, or `_withdraw_pairing` in `services/confirm/device_auth.py`). A successful exchange at `/token` does not remove it. So an investigator has the creator's address for at most the pairing's lifetime. After that, the audit row's relation is the durable record, and the creator's address is gone. See §4 for why this spec keeps it that way.
+**Retention of both addresses on the pairing.** `creator_ip` and `scanner_ip` live on the device-code row and nowhere else, and that row lives until its TTL (`device_code_ttl_seconds`, 900 seconds by default), or until it is revoked (a `conflict_revoked` scan, or `_withdraw_pairing` in `services/confirm/device_auth.py`). `/token` does not remove it either: since `e76ed4f` it refuses issuance with a 503 and leaves the code unspent, and when issuance returns, `consume_device_code` keeps the row rather than deleting it. So an investigator has the creator's address for at most the pairing's lifetime. After that, the audit row's relation is the durable record, and the creator's address is gone. See §4 for why this spec keeps it that way.
 
 ### 2. The classifier: `postern_core.risk.pairing_network`
 
