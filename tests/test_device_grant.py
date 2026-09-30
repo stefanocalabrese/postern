@@ -638,6 +638,66 @@ class TestTokenExchangeEndpoint:
         assert resp3.status_code == 400
         assert resp3.json()["error"] == "authorization_pending"
 
+    async def test_unknown_device_codes_leave_no_poll_time(self, app: Starlette) -> None:
+        """``POST /token`` is public: a code the store does not hold must not
+        create an entry in the per-code poll-time map."""
+        async with _client(app) as client:
+            for i in range(1000):
+                resp = await client.post(
+                    "/token",
+                    data={"grant_type": "device_code", "device_code": f"unknown-{i}"},
+                )
+                assert resp.status_code in (400, 429)
+        assert not getattr(app.state, "_poll_times", {})
+
+    async def test_poll_times_older_than_the_code_ttl_are_dropped(self, app: Starlette) -> None:
+        """An entry for a code last polled more than ``device_code_ttl_seconds``
+        ago is gone after a later poll of any live code; a recent one stays."""
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        ttl = app.state.settings.device_code_ttl_seconds
+        now = datetime.now(UTC)
+        app.state._poll_times = {
+            "stale": now - timedelta(seconds=ttl + 1),
+            "recent": now - timedelta(seconds=ttl - 60),
+        }
+        code = await store.create_device_code(
+            client_id="cust_123",
+            scopes="accounts:read",
+            verification_uri="https://auth.example.com/verify",
+        )
+        async with _client(app) as client:
+            resp = await client.post(
+                "/token",
+                data={"grant_type": "device_code", "device_code": code.device_code},
+            )
+        assert resp.json()["error"] == "authorization_pending"
+        assert set(app.state._poll_times) == {"recent", code.device_code}
+
+    async def test_expired_code_drops_its_poll_time(self, app: Starlette) -> None:
+        """Once the store reports a code expired, its entry is removed."""
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        code = await store.create_device_code(
+            client_id="cust_123",
+            scopes="accounts:read",
+            verification_uri="https://auth.example.com/verify",
+        )
+        async with _client(app) as client:
+            first = await client.post(
+                "/token",
+                data={"grant_type": "device_code", "device_code": code.device_code},
+            )
+            assert first.json()["error"] == "authorization_pending"
+            assert code.device_code in app.state._poll_times
+            store._codes[code.device_code] = dataclasses.replace(
+                code, expires_at=datetime.now(UTC) - timedelta(seconds=1)
+            )
+            second = await client.post(
+                "/token",
+                data={"grant_type": "device_code", "device_code": code.device_code},
+            )
+        assert second.json()["error"] == "expired_token"
+        assert code.device_code not in app.state._poll_times
+
 
 # ---------------------------------------------------------------------------
 # Approval callback.

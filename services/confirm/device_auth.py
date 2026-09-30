@@ -84,7 +84,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from postern_core.auth.device_codes import (
@@ -416,6 +416,25 @@ async def device_authorization(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _poll_times(request: Request) -> dict[str, datetime]:
+    """Per-device-code time of the last pending poll, for RFC 8628 ``slow_down``.
+
+    Keyed by the raw device code and never leaves the process: not logged,
+    not serialised. Only codes the store holds are ever recorded, and entries
+    are swept once older than ``device_code_ttl_seconds`` (see
+    ``token_endpoint``), so the map is bounded by the live-code population.
+    """
+    poll_times: dict[str, datetime] | None = getattr(request.app.state, "_poll_times", None)
+    if poll_times is None:
+        poll_times = {}
+        request.app.state._poll_times = poll_times
+    return poll_times
+
+
+def _drop_poll_time(request: Request, device_code_value: str) -> None:
+    _poll_times(request).pop(device_code_value, None)
+
+
 async def token_endpoint(request: Request) -> JSONResponse:
     """Spend a device code for one read token, and record the mint.
 
@@ -550,15 +569,14 @@ async def token_endpoint(request: Request) -> JSONResponse:
         # even for a code that HAD been approved, and it is the ordinary end of
         # every abandoned pairing rather than an event.
         await store.revoke_device_code(device_code_value)
+        _drop_poll_time(request, device_code_value)
         return _error(400, "expired_token", "device code has expired")
 
     # RFC 8628 §3.4 — "slow_down": client is polling faster than the
     # ``interval`` parameter. Only enforced while authorization is pending;
     # once approved the client should get tokens immediately.
     if not code.approved:
-        poll_times: dict[str, datetime] = getattr(request.app.state, "_poll_times", {})
-        if not poll_times:
-            request.app.state._poll_times = poll_times
+        poll_times = _poll_times(request)
         last_poll = poll_times.get(device_code_value)
         if last_poll is not None:
             elapsed = (datetime.now(UTC) - last_poll).total_seconds()
@@ -568,8 +586,21 @@ async def token_endpoint(request: Request) -> JSONResponse:
                     "slow_down",
                     f"Poll again in {int(settings.device_poll_interval_seconds - elapsed)}s",
                 )
-        # Record this poll time.
-        poll_times[device_code_value] = datetime.now(UTC)
+        # Record this poll time. Pop first so the dict stays ordered by last
+        # poll, then sweep from the front: nothing outlives the code's TTL,
+        # and the sweep is amortised O(1) per poll.
+        now = datetime.now(UTC)
+        poll_times.pop(device_code_value, None)
+        poll_times[device_code_value] = now
+        horizon = now - timedelta(seconds=settings.device_code_ttl_seconds)
+        while True:
+            oldest = next(iter(poll_times))
+            if poll_times[oldest] >= horizon:
+                break
+            del poll_times[oldest]
+    else:
+        # Approved: the interval no longer applies, so the entry is dead.
+        _drop_poll_time(request, device_code_value)
 
     if not code.approved:
         return _error(400, "authorization_pending", "waiting for user approval on mobile app")
