@@ -25,9 +25,9 @@ read. Measured on 2026-09-27 against planted shapes: ``raw =
 os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
 numeric rule completely, and it is the way a careless numeric read is most
 likely to be written. So the third rule keys on the one thing every spelling
-shares, the variable's NAME at the read site. The swept tree names 72
+shares, the variable's NAME at the read site. The swept tree names 73
 ``POSTERN_*`` variables in two disjoint populations: 27 read directly, all of
-them strings, and 45 handed to a reader, which are `BOUNDED`'s 38,
+them strings, and 46 handed to a reader, which are `BOUNDED`'s 39,
 `STORE_BOUNDED`'s 2, `VAULT_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
 nothing is in neither, and `TestEveryEnvironmentReadNamesAnInventoriedVariable`
 re-derives that from the tree on every run rather than trusting these numbers.
@@ -284,6 +284,16 @@ BOUNDED: tuple[Bounded, ...] = (
         0,
         ("-1",),
         ("0", "1", "4"),
+    ),
+    # The only row here with a CEILING as well as a floor: 3601 is refused.
+    # `services/confirm/settings.py` carries why the ceiling is 3600.
+    Bounded(
+        "POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS",
+        "app_assertion_max_lifetime_seconds",
+        "confirm",
+        300,
+        ("0", "-1", "3601", "86400"),
+        ("1", "300", "3600"),
     ),
     Bounded(
         "POSTERN_MAX_DEVICE_CODES",
@@ -2069,12 +2079,12 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
     numeric read. A rule keyed on the CONSUMER can always be evaded by one
     assignment, because the consumer can be arbitrarily far from the read.
 
-    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 72 distinct
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 73 distinct
     ``POSTERN_*`` variables across the swept roots, in two disjoint
     populations. 27 are read directly, and all 27 are strings -- a URL, a
     path, a key id, an issuer, an audience, a key prefix, and the guard's own
-    two comma-separated lists of names. 45 are handed to a reader as its ``name``
-    argument, and those are the 38 in `BOUNDED`, the 2 in `STORE_BOUNDED`, the
+    two comma-separated lists of names. 46 are handed to a reader as its ``name``
+    argument, and those are the 39 in `BOUNDED`, the 2 in `STORE_BOUNDED`, the
     2 in `VAULT_BOUNDED` and the 3 in `FLAGS`. Nothing is in both and nothing is in neither, which
     `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
     re-derives on every run.
@@ -2176,7 +2186,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         # accepting one that arms nothing -- the defect it exists for,
         # reintroduced inside the control itself.
         assert direct | through == set(KNOWN_ENV)
-        assert len(KNOWN_ENV) == 72
+        assert len(KNOWN_ENV) == 73
 
     def test_the_counts_the_docstrings_quote(self) -> None:
         """Every number the prose in this file states, re-derived.
@@ -2185,15 +2195,15 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         confidently as one that is right. A variable added anywhere fails here,
         which is the line that sends the author to the sentences.
         """
-        assert len(KNOWN_ENV) == 72
+        assert len(KNOWN_ENV) == 73
         assert len(READ_AS_STRING) == 27
         assert len(FLAGS) == 3
-        assert len(BOUNDED_NAMES) == 38
+        assert len(BOUNDED_NAMES) == 39
         assert len(STORE_BOUNDED_NAMES) == 2
         assert len(VAULT_BOUNDED_NAMES) == 2
-        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 45
+        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 46
         assert len(names_read_by("api")) == 38
-        assert len(names_read_by("confirm")) == 56
+        assert len(names_read_by("confirm")) == 57
         assert len(names_read_by("migrations")) == 3
 
     def test_each_rows_services_are_the_roots_that_actually_read_it(self) -> None:

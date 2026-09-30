@@ -56,12 +56,21 @@ signature is wrong" and walk the difference. ``JWTVerifier.load_access_token``
 already collapses every one of those into ``None``, so this is the shape the
 verifier hands up rather than a shape this module went out of its way to
 flatten.
+
+AN ASSERTION MUST EXPIRE, and the verifier does not make it. fastmcp 4.0.3
+checks ``exp`` only when present and never reads ``iat``, so until
+2026-09-30 an assertion minted without ``exp`` authorised money movement
+forever. ``_lifetime_refusal`` now refuses one with no numeric ``exp``, one
+whose ``exp`` is further ahead than ``POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS``
+allows, and one whose ``iat`` is in the future, each with the same 401.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol
+import math
+import time
+from typing import Any, Protocol, TypeGuard
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -74,6 +83,23 @@ logger = logging.getLogger(__name__)
 #: ``HTTPConnection.state`` is a view over ``scope["state"]``, so middleware
 #: and handler agree on one dict without either importing the other.
 ASSERTION_STATE_KEY = "postern_app_assertion"
+
+#: How far this process's clock may lag the app backend's before an
+#: assertion's ``iat`` counts as "in the future", and how far past
+#: ``POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS`` its ``exp`` may sit for
+#: the same reason. Both clocks are servers', the minter is the operator's app
+#: backend and not the phone, and NTP keeps two servers well inside one
+#: second, so 30 seconds is slack for a drifting host rather than a normal
+#: operating margin. It is also the most extra life a future-dated assertion
+#: can buy: an attacker holding the app backend's key could mint one a few
+#: seconds ahead, never an hour ahead.
+ASSERTION_CLOCK_SKEW_SECONDS = 30
+
+#: The field default of ``ConfirmSettings.app_assertion_max_lifetime_seconds``
+#: and the ceiling ``from_env`` refuses above. `services/confirm/settings.py`
+#: carries why each number is what it is.
+DEFAULT_ASSERTION_MAX_LIFETIME_SECONDS = 300
+MAX_ASSERTION_MAX_LIFETIME_SECONDS = 3600
 
 #: The only paths served without an app assertion. Everything else is denied
 #: by default. Each entry owes a reason:
@@ -223,6 +249,59 @@ def _bearer(scope: Scope) -> str | None:
     return None
 
 
+def _is_time(value: Any) -> TypeGuard[int | float]:
+    """A JSON number that can be a NumericDate (RFC 7519 §2).
+
+    ``bool`` is excluded by name because it is an ``int`` subclass: ``True``
+    would otherwise pass as the second after the epoch. NaN and the
+    infinities are excluded because every comparison against NaN is false,
+    which would let one through the checks below that are written as "refuse
+    if greater than".
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    return math.isfinite(value)
+
+
+def _lifetime_refusal(claims: dict[str, Any], *, now: float, max_lifetime: int) -> str | None:
+    """Why this verified assertion must still be refused, or ``None``.
+
+    ``JWTVerifier.load_access_token`` in fastmcp 4.0.3 checks ``exp`` only
+    when the claim is present (``if exp is not None and exp < time.time()``)
+    and never reads ``iat`` or ``nbf``. An assertion minted without ``exp``
+    therefore verified forever, and this assertion is what authorises
+    ``POST /scan``, ``POST /approve`` and the challenge approval callback.
+    The checks sit here, after the verifier, rather than in a subclass of it,
+    so ``services/api`` and this service keep checking tokens through one
+    unmodified implementation.
+
+    Three refusals. The returned string goes into the log line and never a
+    claim value, which is the shape every other refusal here logs:
+
+    - ``exp`` absent or not a number.
+    - ``exp`` more than ``max_lifetime`` plus ``ASSERTION_CLOCK_SKEW_SECONDS``
+      ahead of now. The verifier has already refused one in the past. Without
+      ``iat`` required, "lifetime" can only be measured as time left, so this
+      bounds how long a token captured this second stays usable.
+    - ``iat`` present and either not a number or more than
+      ``ASSERTION_CLOCK_SKEW_SECONDS`` ahead of now. Absent ``iat`` is
+      accepted: RFC 7519 makes it optional and ``exp`` already bounds the
+      token's remaining life.
+
+    ``nbf`` is not checked here.
+    """
+    exp = claims.get("exp")
+    if not _is_time(exp):
+        return "assertion carries no numeric exp"
+    if exp - now > max_lifetime + ASSERTION_CLOCK_SKEW_SECONDS:
+        return "assertion exp is beyond the maximum lifetime"
+    if "iat" in claims:
+        iat = claims["iat"]
+        if not _is_time(iat) or iat - now > ASSERTION_CLOCK_SKEW_SECONDS:
+            return "assertion iat is not a number or is in the future"
+    return None
+
+
 class AppAssertionMiddleware:
     """Default-deny bearer verification for the write path.
 
@@ -238,9 +317,21 @@ class AppAssertionMiddleware:
     the expired path before it would ever have consulted a caller's identity.
     """
 
-    def __init__(self, app: ASGIApp, *, verifier: AssertionVerifier) -> None:
+    def __init__(
+        self, app: ASGIApp, *, verifier: AssertionVerifier, max_lifetime_seconds: int
+    ) -> None:
+        # Required rather than defaulted, so a caller that forgets it fails at
+        # assembly instead of silently getting a lifetime nobody configured.
+        # `ConfirmSettings.from_env` bounds the value an operator can set;
+        # this refuses the one a caller in code could still pass.
+        if not 1 <= max_lifetime_seconds <= MAX_ASSERTION_MAX_LIFETIME_SECONDS:
+            raise ValueError(
+                f"max_lifetime_seconds must be between 1 and "
+                f"{MAX_ASSERTION_MAX_LIFETIME_SECONDS}, got {max_lifetime_seconds}"
+            )
         self.app = app
         self.verifier = verifier
+        self.max_lifetime_seconds = max_lifetime_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -275,10 +366,17 @@ class AppAssertionMiddleware:
             await _unauthenticated()(scope, receive, send)
             return
 
+        claims = dict(verified.claims or {})
+        refusal = _lifetime_refusal(claims, now=time.time(), max_lifetime=self.max_lifetime_seconds)
+        if refusal is not None:
+            logger.warning("confirm: %s rejected, %s", path, refusal)
+            await _unauthenticated()(scope, receive, send)
+            return
+
         state = scope.setdefault("state", {})
         state[ASSERTION_STATE_KEY] = AppAssertion(
             subject=verified.subject,
-            claims=dict(verified.claims or {}),
+            claims=claims,
         )
         await self.app(scope, receive, send)
 

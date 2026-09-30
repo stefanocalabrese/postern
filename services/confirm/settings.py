@@ -71,6 +71,11 @@ from postern_core.auth.device_codes import (
 from postern_core.auth.vault import VaultSettings, vault_from_env
 from postern_core.config import float_from_env, int_from_env
 
+from services.confirm.auth import (
+    DEFAULT_ASSERTION_MAX_LIFETIME_SECONDS,
+    MAX_ASSERTION_MAX_LIFETIME_SECONDS,
+)
+
 #: The scope string ``POST /device_authorization`` substitutes when the caller
 #: sends none. It lives here rather than inline in
 #: `services/confirm/device_auth.py` because ``max_scopes_length`` below is
@@ -137,6 +142,30 @@ def _positive_int(name: str, default: int) -> int:
         minimum=1,
         because=("It is a per-minute request count; there is no value that disables the limit."),
     )
+
+
+_ASSERTION_MAX_LIFETIME_BECAUSE = (
+    f"It is how many seconds ahead an app assertion's exp may sit, from 1 to "
+    f"{MAX_ASSERTION_MAX_LIFETIME_SECONDS}; the assertion authorises /scan, /approve "
+    "and the challenge approval callback, and there is no value that lets it never expire."
+)
+
+
+def _assertion_max_lifetime(value: int) -> int:
+    """Refuse a maximum assertion lifetime above ``MAX_ASSERTION_MAX_LIFETIME_SECONDS``.
+
+    ``int_from_env`` states a floor and no ceiling, so ``from_env`` reads the
+    variable through it with ``minimum=1`` and passes the result here for the
+    upper bound. The message names the variable and echoes the value, the way
+    that helper's refusals do.
+    """
+    if value > MAX_ASSERTION_MAX_LIFETIME_SECONDS:
+        raise ValueError(
+            f"POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS must be at most "
+            f"{MAX_ASSERTION_MAX_LIFETIME_SECONDS}, got {value}. "
+            f"{_ASSERTION_MAX_LIFETIME_BECAUSE}"
+        )
+    return value
 
 
 #: Re-exported from `postern_core.auth.device_codes`, which is where the
@@ -369,6 +398,21 @@ class ConfirmSettings:
     app_assertion_jwks_uri: str | None = None
     app_assertion_issuer: str | None = None
     app_assertion_audience: str | None = None
+    # How far ahead of now an app assertion's `exp` may sit, in seconds.
+    # `services/confirm/auth.py`'s `_lifetime_refusal` enforces it, plus
+    # `ASSERTION_CLOCK_SKEW_SECONDS`, and refuses an assertion with no `exp`.
+    #
+    # 300 BY DEFAULT. The assertion is minted by the app backend for one
+    # request from the phone, so a lifetime only needs to cover mint, network
+    # and a retry; five minutes is that with room. It is also the window in
+    # which an assertion captured from the phone or a log authorises
+    # `/scan`, `/approve` and the challenge callback for its `sub`.
+    #
+    # 3600 AS A CEILING, refused above at startup. An hour is the lifetime
+    # OAuth deployments commonly give an access token, and past it an
+    # assertion outlives any session the app could be said to hold, so the
+    # bound stops meaning "short-lived" and becomes only "not forever".
+    app_assertion_max_lifetime_seconds: int = DEFAULT_ASSERTION_MAX_LIFETIME_SECONDS
     # Enrolled device public keys, the input to the approval signature check
     # (`services/confirm/device_signature.py`). A path rather than a
     # connection string, and a field here rather than an environment variable
@@ -685,6 +729,14 @@ class ConfirmSettings:
             app_assertion_jwks_uri=os.environ.get("POSTERN_APP_ASSERTION_JWKS_URI") or None,
             app_assertion_issuer=os.environ.get("POSTERN_APP_ASSERTION_ISSUER") or None,
             app_assertion_audience=os.environ.get("POSTERN_APP_ASSERTION_AUDIENCE") or None,
+            app_assertion_max_lifetime_seconds=_assertion_max_lifetime(
+                int_from_env(
+                    "POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS",
+                    DEFAULT_ASSERTION_MAX_LIFETIME_SECONDS,
+                    minimum=1,
+                    because=_ASSERTION_MAX_LIFETIME_BECAUSE,
+                )
+            ),
             device_keys_path=os.environ.get("POSTERN_DEVICE_KEYS_PATH") or None,
             # A FLOOR OF ONE BYTE, and deliberately NOT the 8,192 the comment
             # on ``max_body_bytes`` derives. That derivation is of the bottom

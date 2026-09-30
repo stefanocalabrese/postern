@@ -122,6 +122,7 @@ the service refuses and names this variable as the one you meant.
 | `POSTERN_APP_ASSERTION_JWKS_URI` | **Yes** | - | JWKS of the operator's banking-app backend, used to verify inbound assertions |
 | `POSTERN_APP_ASSERTION_ISSUER` | **Yes** | - | Expected `iss` on inbound app assertions |
 | `POSTERN_APP_ASSERTION_AUDIENCE` | **Yes** | - | Expected `aud` on inbound app assertions. Must **not** equal the API service's `POSTERN_AUDIENCE` |
+| `POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS` | No | `300` | How far ahead of now an app assertion's `exp` may sit, plus 30 seconds of clock skew. **From 1 to 3600**. An assertion with no `exp`, or with an `iat` more than 30 seconds in the future, is refused with the same 401 regardless of this value |
 | `POSTERN_WRITE_KEY_PEM_PATH` | No | - | Path to the PEM file for signing internal write tokens |
 | `POSTERN_WRITE_KEY_KID` | No | `write-1` | Key ID published in the write JWKS |
 | `POSTERN_WRITE_TOKEN_ISSUER` | No | `https://mcp-write.internal` | `iss` claim on internal write tokens |

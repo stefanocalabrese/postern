@@ -210,12 +210,13 @@ EVERYWHERE = ("api", "confirm", "migrations")
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 72 rows since
-#: 2026-09-30: 27 strings (25 settings plus this guard's own two lists), 42
+#: against it by `tests/test_settings_bounds.py` on every run. 73 rows since
+#: 2026-09-30: 27 strings (25 settings plus this guard's own two lists), 43
 #: numbers, 3 flags. The eight ``POSTERN_VAULT_*`` rows below the device-code
 #: block arrived on 2026-09-29; ``POSTERN_DEVICE_APP_LINK_URI`` and the seven
 #: QR-page rate limits arrived on 2026-09-30, the day
-#: ``POSTERN_USER_CODE_MAX_ATTEMPTS`` left with the attempt budget it set.
+#: ``POSTERN_USER_CODE_MAX_ATTEMPTS`` left with the attempt budget it set, and
+#: ``POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS`` arrived later that day.
 INVENTORY: tuple[EnvVar, ...] = (
     EnvVar(ALLOWED_UNREAD_ENV, "string", EVERYWHERE),
     EnvVar(REQUIRED_ENV, "string", EVERYWHERE),
@@ -229,6 +230,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_BACKEND_READ_TIMEOUT_SECONDS", "number", ("api",)),
     EnvVar("POSTERN_BACKEND_WRITE_TIMEOUT_SECONDS", "number", ("api",)),
     EnvVar("POSTERN_CACHE_TTL_SECONDS", "number", ("api",)),
+    EnvVar("POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_APPROVE", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_CHALLENGE_APPROVE", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN", "number", ("confirm",)),

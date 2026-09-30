@@ -126,7 +126,9 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
     app: tuple[Starlette, RSAKeyPair], clean: Database, api_jwks: dict[str, Any]
 ) -> None:
     confirm, key_pair = app
-    assertion = key_pair.create_token(subject=CUSTOMER, issuer=ISSUER, audience=AUDIENCE)
+    assertion = key_pair.create_token(
+        subject=CUSTOMER, issuer=ISSUER, audience=AUDIENCE, expires_in_seconds=60
+    )
     phone_headers = {"Authorization": f"Bearer {assertion}"}
     transport = httpx2.ASGITransport(app=confirm)
 

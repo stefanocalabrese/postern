@@ -221,6 +221,7 @@ def bearer(key_pair: RSAKeyPair, subject: str, **claims: Any) -> dict[str, str]:
         issuer=ISSUER,
         audience=AUDIENCE,
         additional_claims=claims or None,
+        expires_in_seconds=60,
     )
     return {"Authorization": f"Bearer {token}"}
 

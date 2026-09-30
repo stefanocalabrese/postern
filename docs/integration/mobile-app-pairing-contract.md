@@ -73,14 +73,15 @@ What the installed verifier (fastmcp 4.0.3) does with the token, read from its s
 
 - **Algorithm:** `RS256` only. The confirm service does not pass an algorithm, and the verifier's default is `RS256`; an assertion signed with anything else is refused.
 - **`kid`:** required in the header whenever the JWKS holds more than one usable key. With exactly one key it may be omitted. The JWKS is cached for one hour and refetched when a `kid` is not in the cache.
-- **`exp`:** checked when present. **The verifier does not require it**, so an assertion minted without `exp` never expires. The app backend must set a short `exp`; this service will not catch its absence. `nbf` and `iat` are not checked.
+- **`exp`:** **required**, as a JSON number. The verifier checks it only when present, so since 30 September 2026 `services/confirm/auth.py::AppAssertionMiddleware` refuses, after the verifier accepts the token, an assertion with no numeric `exp`, and one whose `exp` is more than `POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS` (default 300, at most 3600) plus 30 seconds of clock skew ahead of the server's clock. An `exp` already past is refused by the verifier. Mint each assertion for one request, with `exp` a minute or two ahead.
+- **`iat`:** optional. If present it must be a JSON number no more than 30 seconds ahead of the server's clock, or the assertion is refused. `nbf` is not checked.
 - **`crit`:** a token with critical header parameters the verifier does not support is refused.
 - **`sub`:** required, and the only source of the customer's identity on this service. It must match `^cust[:_][A-Za-z0-9]{1,60}$` (`postern_core.identity`'s `CustomerRef`). A verified assertion whose `sub` does not match gets 403 `invalid_subject`, not 401.
 - **`client_id` or `azp`:** optional. If present, the first of the two is written to `audit_log.client_id` on the pairing row (section 9). No decision is made on it.
 
 **The audience must differ from the API service's.** `services/api` defaults its customer-token audience to `"postern"`. If the two services trusted the same issuer and audience, a token an AI client holds for reading balances would also authenticate here. Nothing in either service can detect that collision; it is the operator's configuration to get right.
 
-Every failure (no header, wrong scheme, bad signature, wrong issuer, wrong audience, expired, no `sub`, JWKS fetch error) produces the same 401:
+Every failure (no header, wrong scheme, bad signature, wrong issuer, wrong audience, expired, no `exp`, `exp` too far ahead, `iat` in the future, no `sub`, JWKS fetch error) produces the same 401:
 
 ```
 HTTP/1.1 401 Unauthorized

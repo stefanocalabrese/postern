@@ -433,7 +433,11 @@ def create_confirm_app(
             # below. `services/confirm/body_limit.py` carries the rest,
             # including why a request it refuses writes no `audit_log` row.
             Middleware(BodySizeLimit, max_body_bytes=settings.max_body_bytes),
-            Middleware(AppAssertionMiddleware, verifier=verifier),
+            Middleware(
+                AppAssertionMiddleware,
+                verifier=verifier,
+                max_lifetime_seconds=settings.app_assertion_max_lifetime_seconds,
+            ),
             # LAST, AND THEREFORE INNERMOST -- the first middleware a request
             # meets is entry zero, so this is the last one before routing.
             # It has to be behind `AppAssertionMiddleware`, because the

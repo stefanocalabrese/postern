@@ -17,16 +17,22 @@ being correct.
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import re
+import time
 from typing import Any
 
 import httpx2
 import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
+from joserfc import jwt as jose_jwt
+from joserfc.jwk import RSAKey
 from postern_core.auth.device_keys import no_enrolled_devices
 from starlette.applications import Starlette
 
 from services.confirm.auth import (
+    ASSERTION_CLOCK_SKEW_SECONDS,
     ASSERTION_STATE_KEY,
     PUBLIC_PATHS,
     AppAssertion,
@@ -86,9 +92,48 @@ def client(app: Starlette) -> httpx2.AsyncClient:
 
 
 def bearer(key_pair: RSAKeyPair, subject: str = CUSTOMER, **kwargs: Any) -> dict[str, str]:
+    """A valid assertion unless ``kwargs`` says otherwise.
+
+    ``expires_in_seconds`` defaults to 60 because ``RSAKeyPair.create_token``
+    defaults it to 3600, which is past the confirm service's ceiling on how
+    far ahead an assertion's ``exp`` may sit, and would be refused.
+    """
     kwargs.setdefault("issuer", ISSUER)
     kwargs.setdefault("audience", AUDIENCE)
+    kwargs.setdefault("expires_in_seconds", 60)
     return {"Authorization": f"Bearer {key_pair.create_token(subject=subject, **kwargs)}"}
+
+
+def raw_bearer(key_pair: RSAKeyPair, claims: dict[str, Any]) -> dict[str, str]:
+    """Sign exactly ``claims``, with nothing added.
+
+    ``RSAKeyPair.create_token`` always writes ``iat`` and ``exp``, so it cannot
+    mint the assertion this service has to refuse: one with no ``exp`` at all.
+    """
+    key = RSAKey.import_key(key_pair.private_key.get_secret_value())
+    token = jose_jwt.encode({"alg": "RS256"}, claims, key, algorithms=["RS256"])
+    return {"Authorization": f"Bearer {token}"}
+
+
+def claims_now(**overrides: Any) -> dict[str, Any]:
+    """The claims of a valid assertion minted this second, with ``overrides``.
+
+    An override of ``None`` deletes the claim rather than setting it null.
+    """
+    now = int(time.time())
+    claims: dict[str, Any] = {
+        "sub": CUSTOMER,
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "iat": now,
+        "exp": now + 60,
+    }
+    for name, value in overrides.items():
+        if value is None:
+            claims.pop(name, None)
+        else:
+            claims[name] = value
+    return claims
 
 
 # ---------------------------------------------------------------------------
@@ -305,18 +350,23 @@ def _bad_headers(key_pair: RSAKeyPair) -> dict[str, dict[str, str]]:
         "empty credential": {"Authorization": "Bearer"},
         "blank credential": {"Authorization": "Bearer   "},
         "wrong scheme": {"Authorization": "Basic Y3VzdDpwdw=="},
-        "no scheme": {"Authorization": key_pair.create_token(subject=CUSTOMER)},
+        "no scheme": {
+            "Authorization": key_pair.create_token(
+                subject=CUSTOMER, issuer=ISSUER, audience=AUDIENCE, expires_in_seconds=60
+            )
+        },
         "malformed jwt": {"Authorization": "Bearer not.a.jwt"},
         "garbage": {"Authorization": "Bearer " + "A" * 400},
         "wrong issuer": bearer(key_pair, issuer="https://evil.invalid"),
         "wrong audience": bearer(key_pair, audience="postern"),
         "no audience": bearer(key_pair, audience=None),
         "expired": bearer(key_pair, expires_in_seconds=-30),
-        "signed by another key": {
-            "Authorization": (
-                f"Bearer {other.create_token(subject=CUSTOMER, issuer=ISSUER, audience=AUDIENCE)}"
-            )
-        },
+        "signed by another key": bearer(other),
+        "no exp": raw_bearer(key_pair, claims_now(exp=None)),
+        "exp beyond the maximum lifetime": bearer(key_pair, expires_in_seconds=3600),
+        "iat in the future": raw_bearer(
+            key_pair, claims_now(iat=int(time.time()) + 10 * ASSERTION_CLOCK_SKEW_SECONDS)
+        ),
     }
 
 
@@ -358,7 +408,9 @@ async def test_a_token_with_no_subject_is_refused(app: Starlette, key_pair: RSAK
     from that value; ``None`` or empty has to stop here rather than arrive at
     a handler as a falsy customer.
     """
-    token = key_pair.create_token(subject="", issuer=ISSUER, audience=AUDIENCE)
+    token = key_pair.create_token(
+        subject="", issuer=ISSUER, audience=AUDIENCE, expires_in_seconds=60
+    )
     async with client(app) as c:
         response = await c.post(
             PROTECTED, json={"signature": "x"}, headers={"Authorization": f"Bearer {token}"}
@@ -494,6 +546,116 @@ async def test_non_http_scopes_pass_through() -> None:
     async def send(message: Any) -> None:  # pragma: no cover - never awaited
         raise AssertionError("send must not be touched for a lifespan scope")
 
-    middleware = AppAssertionMiddleware(inner, verifier=_NeverCalled())
+    middleware = AppAssertionMiddleware(inner, verifier=_NeverCalled(), max_lifetime_seconds=300)
     await middleware({"type": "lifespan"}, receive, send)
     assert seen == ["lifespan"]
+
+
+# ---------------------------------------------------------------------------
+# 5. An assertion must expire, soon, and must not be minted in the future.
+# ---------------------------------------------------------------------------
+#
+# fastmcp 4.0.3's ``JWTVerifier.load_access_token`` checks ``exp`` only when
+# the claim is present and never reads ``iat`` or ``nbf``. So an assertion
+# minted without ``exp`` stayed good forever at ``POST /scan``,
+# ``POST /approve`` and the challenge approval callback. These pin the check
+# ``AppAssertionMiddleware`` makes after the verifier has accepted a token.
+
+
+async def _status(app: Starlette, headers: dict[str, str]) -> int:
+    """POST ``/approve`` with a well-formed body and return the status.
+
+    401 is the middleware refusing. 400 ``invalid_grant`` is the handler
+    looking the code up and not finding it, which only happens past the
+    middleware, so it stands for "the assertion was accepted".
+    """
+    async with client(app) as c:
+        response = await c.post("/approve", json={"user_code": "ABC-DEF"}, headers=headers)
+    return response.status_code
+
+
+def _app_with_max_lifetime(key_pair: RSAKeyPair, seconds: int) -> Starlette:
+    verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
+    return create_confirm_app(
+        dataclasses.replace(
+            ConfirmSettings.for_testing(), app_assertion_max_lifetime_seconds=seconds
+        ),
+        assertion_verifier=verifier,
+        device_key_store=no_enrolled_devices(),
+    )
+
+
+async def test_an_assertion_with_no_exp_is_refused(app: Starlette, key_pair: RSAKeyPair) -> None:
+    """The verifier accepts it; the middleware must not."""
+    assert await _status(app, raw_bearer(key_pair, claims_now(exp=None))) == 401
+
+
+async def test_an_assertion_with_a_boolean_exp_is_refused(
+    app: Starlette, key_pair: RSAKeyPair
+) -> None:
+    """``True`` is an ``int`` to Python and ``1`` to the verifier's comparison.
+
+    The verifier reads it as a timestamp in 1970 and refuses it as expired, so
+    this is pinned for the middleware's own type check rather than because the
+    verifier lets it through today.
+    """
+    assert await _status(app, raw_bearer(key_pair, claims_now(exp=True))) == 401
+
+
+async def test_an_exp_beyond_the_default_maximum_lifetime_is_refused(
+    app: Starlette, key_pair: RSAKeyPair
+) -> None:
+    """``create_token``'s own default of 3600 seconds is past the 300-second default."""
+    assert await _status(app, bearer(key_pair, expires_in_seconds=3600)) == 401
+
+
+async def test_an_iat_in_the_future_beyond_the_skew_is_refused(
+    app: Starlette, key_pair: RSAKeyPair
+) -> None:
+    future = int(time.time()) + ASSERTION_CLOCK_SKEW_SECONDS + 60
+    assert await _status(app, raw_bearer(key_pair, claims_now(iat=future))) == 401
+
+
+async def test_an_iat_that_is_not_a_number_is_refused(app: Starlette, key_pair: RSAKeyPair) -> None:
+    """Present and unreadable is not the same as absent."""
+    assert await _status(app, raw_bearer(key_pair, claims_now(iat="now"))) == 401
+
+
+async def test_a_short_lived_assertion_passes(app: Starlette, key_pair: RSAKeyPair) -> None:
+    assert await _status(app, bearer(key_pair, expires_in_seconds=60)) == 400
+
+
+async def test_an_assertion_with_no_iat_but_a_short_exp_passes(
+    app: Starlette, key_pair: RSAKeyPair
+) -> None:
+    """``iat`` is checked only when present; ``exp`` is the claim that is required."""
+    assert await _status(app, raw_bearer(key_pair, claims_now(iat=None))) == 400
+
+
+async def test_an_iat_inside_the_skew_passes(app: Starlette, key_pair: RSAKeyPair) -> None:
+    """A backend clock a few seconds ahead of this one is not an attack."""
+    now = int(time.time())
+    claims = claims_now(iat=now + ASSERTION_CLOCK_SKEW_SECONDS // 2, exp=now + 60)
+    assert await _status(app, raw_bearer(key_pair, claims)) == 400
+
+
+async def test_the_configured_maximum_lifetime_is_the_one_enforced(
+    key_pair: RSAKeyPair,
+) -> None:
+    """The setting reaches the middleware: at 60 seconds, 30 passes and 150 does not."""
+    app = _app_with_max_lifetime(key_pair, 60)
+    assert await _status(app, bearer(key_pair, expires_in_seconds=30)) == 400
+    too_far = 60 + ASSERTION_CLOCK_SKEW_SECONDS + 60
+    assert await _status(app, bearer(key_pair, expires_in_seconds=too_far)) == 401
+
+
+async def test_a_lifetime_refusal_logs_the_path_and_no_claim(
+    app: Starlette, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same log shape as the other refusals: the path, never a claim value."""
+    with caplog.at_level(logging.WARNING, logger="services.confirm.auth"):
+        assert await _status(app, raw_bearer(key_pair, claims_now(exp=None))) == 401
+    messages = [r.getMessage() for r in caplog.records if r.name == "services.confirm.auth"]
+    assert messages, "the refusal was not logged"
+    assert all(m.startswith("confirm: /approve rejected,") for m in messages), messages
+    assert all(CUSTOMER not in m for m in messages), messages

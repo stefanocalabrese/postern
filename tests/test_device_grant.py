@@ -152,7 +152,7 @@ def bearer(
     *,
     issuer: str = ISSUER,
     audience: str = AUDIENCE,
-    expires_in_seconds: int = 3600,
+    expires_in_seconds: int = 60,
 ) -> dict[str, str]:
     """An ``Authorization: Bearer`` header carrying a token signed by ``key_pair``."""
     token = key_pair.create_token(

@@ -102,7 +102,9 @@ async def clean(database: Database) -> AsyncIterator[Database]:
 
 
 def bearer(key_pair: RSAKeyPair, subject: str) -> dict[str, str]:
-    token = key_pair.create_token(subject=subject, issuer=ISSUER, audience=AUDIENCE)
+    token = key_pair.create_token(
+        subject=subject, issuer=ISSUER, audience=AUDIENCE, expires_in_seconds=60
+    )
     return {"Authorization": f"Bearer {token}"}
 
 

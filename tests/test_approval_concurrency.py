@@ -233,7 +233,9 @@ def read_barrier() -> Generator[None, None, None]:
 
 def bearer(key_pair: RSAKeyPair, subject: str) -> dict[str, str]:
     """A verified-assertion ``Authorization`` header for ``subject``."""
-    token = key_pair.create_token(subject=subject, issuer=ISSUER, audience=AUDIENCE)
+    token = key_pair.create_token(
+        subject=subject, issuer=ISSUER, audience=AUDIENCE, expires_in_seconds=60
+    )
     return {"Authorization": f"Bearer {token}"}
 
 

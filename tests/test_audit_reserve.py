@@ -823,7 +823,7 @@ def _confirm_app(settings: ConfirmSettings, key_pair: RSAKeyPair, customer: str)
 
 def confirm_bearer(key_pair: RSAKeyPair, customer: str) -> dict[str, str]:
     token = key_pair.create_token(
-        subject=customer, issuer=CONFIRM_ISSUER, audience=CONFIRM_AUDIENCE
+        subject=customer, issuer=CONFIRM_ISSUER, audience=CONFIRM_AUDIENCE, expires_in_seconds=60
     )
     return {"Authorization": f"Bearer {token}"}
 
