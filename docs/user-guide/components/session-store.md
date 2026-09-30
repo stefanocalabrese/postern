@@ -238,7 +238,10 @@ There is no whole-row write. `consume_device_code`, `claim_scan` and
 `await` between read and write in memory -- because a snapshot read before one of
 them and written back after it would silently undo it. On the Redis backend the two lookups are
 secondary keys created with `SET NX EX`, deleted on revoke and left in place by
-consume; the in-memory backend keeps them in dicts.
+consume; the in-memory backend keeps them in dicts. A secondary key is deleted
+only while it still names the code being revoked, through a one-line Lua
+compare-and-delete sent with `EVAL`, so the Redis you point `POSTERN_REDIS_URL` at
+must allow scripting: a managed Redis with `EVAL` disabled fails every revoke.
 
 Factory: `create_device_code_store()` picks the backend based on `POSTERN_REDIS_URL`.
 
