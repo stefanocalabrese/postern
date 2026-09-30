@@ -54,12 +54,12 @@ A separate subdomain, for example `app.bank.example` next to `auth.bank.example`
 
 Two consequences that follow from this repository and not from the platforms:
 
-- Handoff §7.3 requires universal links or app links, not a custom scheme: "`bankapp://` can be claimed by any installed app, a hijack vector in precisely the flow where it matters most". `_app_link_uri` enforces the `https` half of that.
+- Handoff §7.3 requires universal links or app links, not a custom scheme, because a custom scheme such as `bankapp://` can be claimed by any installed app, which the handoff calls a hijack vector in exactly this flow. `_app_link_uri` enforces the `https` half of that.
 - The page and the app link are on different hosts on purpose, so the association files go on the app-link host only. Do not associate the pairing page's host with the app.
 
 ## 4. When the app is not installed
 
-The operating system then opens the app link in a browser, at your host, with `user_code` and `qr` in the query string. Nothing in this repository serves that path. Handoff §7.3's fallback is "app store, then web SCA flow"; this repository implements neither, so what the page says is yours to decide. At minimum it should tell the user to install the bank app and start the pairing again.
+The operating system then opens the app link in a browser, at your host, with `user_code` and `qr` in the query string. Nothing in this repository serves that path. Handoff §7.3's fallback is the app store first and a web SCA flow after it; this repository implements neither, so what the page says is yours to decide. At minimum it should tell the user to install the bank app and start the pairing again.
 
 What is safe and unsafe about the parameters arriving there, from the code:
 
@@ -93,7 +93,7 @@ How it resolves (`postern_core.net`'s `client_ip`):
 
 - `0`: the TCP peer. Behind a load balancer that is the balancer, so every client shares one rate-limit bucket and every audit row carries the balancer's address.
 - `N` greater than 0: the `N`th entry from the right of `X-Forwarded-For`. Behind exactly one proxy that appends the client's address, `1`.
-- If the header is missing or has fewer than `N` entries, or the chosen entry does not parse as an IP, the request is attributed to nobody: it is recorded with no address and rate-limited in one shared bucket, `-`. A value set too high therefore puts all traffic in that bucket, and refusals start in the first minute.
+- If the header is missing or has fewer than `N` entries, or the chosen entry does not parse as an IP, the request is attributed to nobody: it is recorded with no address and rate-limited in one shared bucket, `-`. A value set too high therefore puts all traffic in that bucket, and every client then shares one bucket's limit.
 
 ## 7. Rate-limit variables
 

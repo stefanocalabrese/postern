@@ -143,7 +143,7 @@ Content-Type: application/json
 
 | Field | What it is | What the app must do with it |
 |---|---|---|
-| `client_id` | The string the AI client sent, unauthenticated, when it started the pairing. At most 256 characters by default (`POSTERN_MAX_CLIENT_ID_LENGTH`), otherwise unconstrained. | Show it as text, escaped, never as markup or a link. It is attacker-chosen: anyone can start a pairing that says "Claude" or "Your bank". |
+| `client_id` | Caller-supplied: the string the AI client sent, unauthenticated, when it started the pairing. It must be non-empty and at most 256 characters by default (`POSTERN_MAX_CLIENT_ID_LENGTH`), and is otherwise unconstrained. | Show it as text, escaped, never as markup or a link. It is attacker-chosen: anyone can start a pairing that says "Claude" or "Your bank". |
 | `client_id_verified` | Always `false`. Nothing on this path verifies the client's identity; CIMD verification would, and is not built. | Label the client name as unverified on the screen (section 5). If a later server version ever returns `true`, that will be a contract change announced separately; until then treat any value as `false`. |
 | `scopes` | A single space-separated string, as the AI client requested it. The server checks only that it is a string of at most 512 characters (`POSTERN_MAX_SCOPES_LENGTH`); it does not check the values against a list. The default, when the client asked for nothing, is `accounts:read transactions:read cards:read`. | Show the scopes. How to render a scope the app does not recognise is not specified by the server. See the note below the table. |
 | `expires_at` | When the pairing expires, ISO 8601 with a UTC offset, possibly with fractional seconds. Set at creation, `POSTERN_DEVICE_CODE_TTL_SECONDS` after it (default 900 seconds). | Show the remaining time, and do not call `/approve` after it. |
@@ -243,7 +243,7 @@ Every request counts, including refused ones. One pairing costs one `/scan` and 
 Retry guidance:
 
 - **400: never retry automatically.** Every 400 on these paths is a final answer about this request or this pairing. `qr_stale` is recovered by a new scan by the user, not by resending the same token.
-- **429 and 503: honour `Retry-After`** (seconds). By then the 10-to-12-second `qr` window has passed, so a `/scan` retry after a 429 will answer `qr_stale`; tell the user to scan again instead of retrying silently.
+- **429 and 503: honour `Retry-After`** (seconds). `Retry-After` is the seconds left in a fixed 60-second window, so it can be anything from 1 to 60, and a `/scan` retry after a 429 will usually answer `qr_stale` because the 10-to-12-second `qr` window has passed; tell the user to scan again instead of retrying silently.
 - **401:** fetch a fresh assertion and retry once.
 - **500:** the server may have withdrawn the pairing (it does so whenever a store write might have committed without its audit row). A retried `/scan` then answers `invalid_grant`. One retry is harmless; if it does not succeed, send the user back to the AI client.
 
@@ -287,7 +287,7 @@ Both endpoints write one `audit_log` row per recorded call through `services/con
 
 Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale`, `already_approved`, `scan_conflict`. On `/approve`: `invalid_subject`, `revoked`, `user_code_not_found`, `not_scanned`, `scanned_by_other`, `already_approved`. An exception is recorded under its class name.
 
-**Not recorded, on purpose:** the `user_code`, the `qr` token, the scopes, and any request the server refused on shape alone (malformed body, 401, 413, 429, 503), which leave a log line and no row.
+**Not recorded, on purpose:** the `user_code`, the `qr` token, the scopes, and any request the server refused before reaching a pairing. A malformed body (400 `invalid_request`) leaves no row and no log line. A 401, 413, 429 or 503 leaves a log line and no row.
 
 **What the app need not duplicate:** that a scan or an approval happened, for which customer, which pairing, from which address, and why it was refused.
 
