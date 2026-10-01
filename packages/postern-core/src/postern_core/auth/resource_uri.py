@@ -55,6 +55,10 @@ _DEFAULT_PORTS = {"https": 443, "http": 80}
 #: The highest TCP port; 0 is refused separately.
 _MAX_PORT = 65535
 
+#: A port needs at most five digits; longer text is refused before ``int()``, which
+#: raises ``ValueError`` past 4300 digits, so zero padding cannot smuggle a length in.
+_MAX_PORT_CHARS = 5
+
 
 def is_plain_ascii_uri_text(value: str) -> bool:
     """Whether ``value`` is pure ASCII with no control character, space, backslash or ``%00``.
@@ -107,6 +111,8 @@ def normalize_resource(value: str) -> str | None:
     if not raw_host or ";" in raw_host or "%" in raw_host:
         return None
     if raw_port and not raw_port.isdigit():
+        return None
+    if len(raw_port) > _MAX_PORT_CHARS:
         return None
     port = int(raw_port) if raw_port else None
     if port is not None and not 0 < port <= _MAX_PORT:

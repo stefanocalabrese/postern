@@ -157,3 +157,26 @@ def test_ipv6_and_trailing_dot_spellings_are_not_canonicalised(value: str, other
     """Two spellings of one host compare unequal: closed, never merged."""
     assert normalize_resource(value) is not None
     assert normalize_resource(value) != normalize_resource(other)
+
+
+@pytest.mark.parametrize(
+    "port",
+    ["1" * 5000, "0" * 4999 + "443", "000443", "0" * 6, "065535"],
+    ids=["5000-digits", "5000-zero-padded", "six-chars-padded", "six-zeros", "six-chars-max"],
+)
+def test_an_oversized_port_is_none_and_never_raises(port: str) -> None:
+    value = f"https://mcp.example:{port}/mcp"
+    assert normalize_resource(value) is None
+    assert is_normal_https_resource(value) is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("https://mcp.example:00443/mcp", "https://mcp.example/mcp"),
+        ("https://mcp.example:65535/mcp", "https://mcp.example:65535/mcp"),
+        ("https://mcp.example:8443/mcp", "https://mcp.example:8443/mcp"),
+    ],
+)
+def test_a_port_of_at_most_five_characters_is_still_accepted(value: str, expected: str) -> None:
+    assert normalize_resource(value) == expected
