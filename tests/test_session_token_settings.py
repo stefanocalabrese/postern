@@ -81,6 +81,13 @@ def test_a_deployable_configuration_passes() -> None:
         "auth.bank.example",
         "https://auth.bank.example?x=1",
         "https://auth.bank.example#x",
+        "https://auth.bank.\u212aey.example",
+        "https://auth.bank.exa\tmple",
+        "https://auth.bank.example\n",
+        " https://auth.bank.example",
+        "https://auth.bank.example ",
+        "https://auth.bank.example\x00",
+        "https://auth.bank.example\\x",
     ],
 )
 def test_an_issuer_that_is_not_an_https_url_is_refused(issuer: str) -> None:

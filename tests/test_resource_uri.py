@@ -73,3 +73,87 @@ def test_a_value_that_cannot_name_a_resource_is_none(value: str) -> None:
 )
 def test_is_normal_https_resource(value: str, expected: bool) -> None:
     assert is_normal_https_resource(value) is expected
+
+
+# One resource has exactly one normal form, and two resources never share one.
+# Each probe below either merged with a different value or kept a part RFC 9110
+# forbids, before 1 October 2026.
+
+COLLISION_PAIRS = [
+    # U+212A KELVIN SIGN lower-cases to ASCII "k" under str.lower().
+    ("https://mcp.Key.example/mcp", "https://mcp.key.example/mcp"),
+    # urlsplit strips tab, CR and LF anywhere and whitespace at the start.
+    ("https://mcp.exa\tmple/mcp", "https://mcp.example/mcp"),
+    ("https://mcp.example/m\ncp", "https://mcp.example/mcp"),
+    ("https://mcp.example/m\rcp", "https://mcp.example/mcp"),
+    (" https://mcp.example/mcp", "https://mcp.example/mcp"),
+    # An IPvFuture literal lost its brackets.
+    ("https://[v1.mcp.example]/mcp", "https://v1.mcp.example/mcp"),
+]
+
+
+@pytest.mark.parametrize(("value", "other"), COLLISION_PAIRS)
+def test_two_different_values_never_share_a_normal_form(value: str, other: str) -> None:
+    normal = normalize_resource(value)
+    assert normal is None or normal != normalize_resource(other)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://mcp.Key.example/mcp",
+        "https://mcp.éxample/mcp",
+        "https://mcp.example/café",
+        "https://[v1.mcp.example]/mcp",
+        "https://mcp.example:0/mcp",
+        "https://mcp;x.example/mcp",
+        "https://mcp%2eexample/mcp",
+        "https://mcp.example/mcp%00",
+        "https://mcp.example\\mcp",
+        "https://mcp.example/m cp",
+        "https://mcp.example/mcp ",
+        " https://mcp.example/mcp",
+    ],
+)
+def test_a_non_ascii_or_ambiguous_value_is_none(value: str) -> None:
+    assert normalize_resource(value) is None
+    assert is_normal_https_resource(value) is False
+
+
+@pytest.mark.parametrize("char", [chr(c) for c in range(0x20)] + ["\x7f"])
+@pytest.mark.parametrize(
+    "template",
+    ["https://mcp.exa{c}mple/mcp", "https://mcp.example/m{c}cp", "{c}https://mcp.example/mcp"],
+)
+def test_every_control_character_is_none(char: str, template: str) -> None:
+    value = template.format(c=char)
+    assert normalize_resource(value) is None
+    assert is_normal_https_resource(value) is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://user:pw@mcp.example/mcp",
+        "https://user@mcp.example/mcp",
+        "https://@mcp.example/mcp",
+        "https://mcp.example@evil.example/mcp",
+    ],
+)
+def test_userinfo_is_none(value: str) -> None:
+    """RFC 9110 section 4.2.4: a sender MUST NOT generate userinfo in an https URI."""
+    assert normalize_resource(value) is None
+    assert is_normal_https_resource(value) is False
+
+
+@pytest.mark.parametrize(
+    ("value", "other"),
+    [
+        ("https://[2001:db8:0::1]/mcp", "https://[2001:db8::1]/mcp"),
+        ("https://mcp.example./mcp", "https://mcp.example/mcp"),
+    ],
+)
+def test_ipv6_and_trailing_dot_spellings_are_not_canonicalised(value: str, other: str) -> None:
+    """Two spellings of one host compare unequal: closed, never merged."""
+    assert normalize_resource(value) is not None
+    assert normalize_resource(value) != normalize_resource(other)

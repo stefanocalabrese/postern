@@ -69,7 +69,7 @@ from urllib.parse import urlsplit
 from postern_core.auth.device_codes import (
     MIN_DEVICE_CODE_TTL_SECONDS as _MIN_DEVICE_CODE_TTL_SECONDS,
 )
-from postern_core.auth.resource_uri import is_normal_https_resource
+from postern_core.auth.resource_uri import is_normal_https_resource, is_plain_ascii_uri_text
 from postern_core.auth.vault import VaultSettings, vault_from_env
 from postern_core.config import bool_from_env, float_from_env, int_from_env
 
@@ -1066,8 +1066,9 @@ def check_session_token_settings(settings: ConfirmSettings) -> None:
 
     ``ValueError`` naming the offending values, for each of:
 
-    - ``session_token_issuer`` that is not ``https`` with a hostname, or that
-      carries a query or a fragment;
+    - ``session_token_issuer`` that is not ``https`` with a hostname, that
+      carries a query or a fragment, or that fails
+      `postern_core.auth.resource_uri`'s ``is_plain_ascii_uri_text``;
     - ``session_token_issuer`` equal to ``write_token_issuer`` or to
       ``app_assertion_issuer``: one issuer string per token type;
     - ``session_token_audience`` that is not an absolute ``https`` URI with a
@@ -1084,11 +1085,21 @@ def check_session_token_settings(settings: ConfirmSettings) -> None:
     is another deployment, and a mismatch fails closed at the api.
     """
     issuer = settings.session_token_issuer
-    parts = urlsplit(issuer)
-    if parts.scheme != "https" or not parts.hostname or "?" in issuer or "#" in issuer:
+    # The raw-string check runs first: urlsplit deletes tab, CR and LF and
+    # strips leading whitespace, so it would judge a different string.
+    plain = is_plain_ascii_uri_text(issuer)
+    parts = urlsplit(issuer) if plain else None
+    if (
+        parts is None
+        or parts.scheme != "https"
+        or not parts.hostname
+        or "?" in issuer
+        or "#" in issuer
+    ):
         raise ValueError(
             f"POSTERN_SESSION_TOKEN_ISSUER ({issuer!r}) must be an https URL with a hostname "
-            "and no query or fragment. It is the iss of every access token POST /token issues."
+            "and no query or fragment, in pure ASCII with no control character, space, "
+            "backslash or %00. It is the iss of every access token POST /token issues."
         )
     for name, other in (
         ("POSTERN_WRITE_TOKEN_ISSUER", settings.write_token_issuer),
