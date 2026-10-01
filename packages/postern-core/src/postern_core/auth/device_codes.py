@@ -77,7 +77,7 @@ from datetime import UTC, datetime, timedelta
 from datetime import UTC as _UTC
 from typing import Any
 
-from postern_core.config import int_arg_or_env
+from postern_core.config import int_arg_or_env, redis_url_from_env
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -961,7 +961,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
     ) -> None:
         import redis.asyncio as redis
 
-        self._url = url or os.environ.get("POSTERN_REDIS_URL", "redis://localhost:6379/0")
+        self._url = url or redis_url_from_env() or "redis://localhost:6379/0"
         # ``default_ttl or int(os.environ.get(...))`` until 2026-09-25. It
         # crashed on ``POSTERN_REDIS_DEVICE_CODE_TTL=`` with a message naming
         # neither the variable nor this class, took zero and negatives without
@@ -1549,7 +1549,7 @@ def create_device_code_store(
 
         store = create_device_code_store()  # auto-selects backend
     """
-    redis_url = os.environ.get("POSTERN_REDIS_URL")
+    redis_url = redis_url_from_env()
     if redis_url:
         logger.info("Using Redis device code store (url=%s)", redis_url)
         return RedisDeviceCodeStore(url=redis_url, max_codes=max_codes)

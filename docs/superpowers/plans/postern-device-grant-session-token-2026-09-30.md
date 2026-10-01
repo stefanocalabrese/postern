@@ -10060,7 +10060,7 @@ In `services/confirm/main.py`, replace:
 ```python
     deployment-wide contract not met.
     """
-    if os.environ.get("POSTERN_REDIS_URL"):
+    if redis_url_from_env():
         return
     if settings.allow_process_local_sessions:
 ```
@@ -10072,10 +10072,14 @@ with:
 
     Returns whether sessions are process local, which a recall records.
     """
-    if os.environ.get("POSTERN_REDIS_URL"):
+    if redis_url_from_env():
         return False
     if settings.allow_process_local_sessions:
 ```
+
+Amended 1 October 2026: Task 5's review follow-ups changed the condition twice, first to
+`os.environ.get("POSTERN_REDIS_URL", "").strip()` and then to the one reader
+`postern_core.config.redis_url_from_env()`, so the old and new text above name that call.
 
 In `services/confirm/main.py`, replace:
 

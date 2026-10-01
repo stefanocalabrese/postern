@@ -83,6 +83,7 @@ __all__ = [
     "float_from_env",
     "int_arg_or_env",
     "int_from_env",
+    "redis_url_from_env",
 ]
 
 #: The smallest TTL any Redis-backed store in this repository can represent.
@@ -427,6 +428,25 @@ def bool_from_env(name: str, default: bool, *, because: str) -> bool:
     )
 
 
+def redis_url_from_env() -> str | None:
+    """The one read of ``POSTERN_REDIS_URL``: stripped, with blank meaning unset.
+
+    Eight call sites read this variable before this existed, with three
+    behaviours: ``os.environ.get(...)`` alone treats ``" "`` as a URL and
+    builds a Redis store aimed at one space, ``.strip()`` at two sites did not
+    reach the other six, and an empty string was unset everywhere. The
+    convention of this module's header is that an empty string means unset, and
+    a whitespace-only value is an empty one that an ``env_file`` line or a
+    templated task definition can produce. Every store factory, both startup
+    refusals and the revocation CLI call this and nothing else.
+
+    Returns:
+        The URL with surrounding whitespace removed, or ``None`` when the
+        variable is unset, empty or whitespace only.
+    """
+    return os.environ.get(REDIS_URL_ENV, "").strip() or None
+
+
 def enforce_redis_requirement(*, consequence: str) -> None:
     """Raise when the operator demanded shared state and named no Redis.
 
@@ -485,6 +505,6 @@ def enforce_redis_requirement(*, consequence: str) -> None:
     )
     if not required:
         return
-    if os.environ.get(REDIS_URL_ENV, "").strip():
+    if redis_url_from_env():
         return
     raise RuntimeError(_REQUIRE_REDIS_PREFIX + consequence)

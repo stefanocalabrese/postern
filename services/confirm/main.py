@@ -71,7 +71,6 @@ and ``services.confirm.callback`` for the challenge approval handler.
 import asyncio
 import enum
 import logging
-import os
 from pathlib import Path
 
 from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -81,7 +80,7 @@ from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import choose_key_source
 from postern_core.auth.refresh_sessions import create_refresh_session_store
 from postern_core.auth.revocation import create_revocation_store
-from postern_core.config import enforce_redis_requirement
+from postern_core.config import enforce_redis_requirement, redis_url_from_env
 from postern_core.env_inventory import enforce_known_environment
 from postern_core.modules.enrichers import load_network_enricher
 from postern_core.risk.pairing_network import NetworkEnricher
@@ -228,7 +227,7 @@ def _refuse_process_local_sessions(settings: ConfirmSettings) -> None:
     `postern_core.config.enforce_redis_requirement` chose for a
     deployment-wide contract not met.
     """
-    if os.environ.get("POSTERN_REDIS_URL", "").strip():
+    if redis_url_from_env():
         return
     if settings.allow_process_local_sessions:
         logger.warning(

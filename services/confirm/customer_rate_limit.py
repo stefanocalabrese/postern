@@ -56,6 +56,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from postern_core.config import redis_url_from_env
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
@@ -377,7 +378,7 @@ class RedisCustomerRateLimitStore(CustomerRateLimitStoreBase):
     def __init__(self, url: str | None = None, key_prefix: str | None = None) -> None:
         import redis.asyncio as redis
 
-        self._url = url or os.environ.get("POSTERN_REDIS_URL", "redis://localhost:6379/0")
+        self._url = url or redis_url_from_env() or "redis://localhost:6379/0"
         self._prefix = key_prefix or os.environ.get("POSTERN_REDIS_KEY_PREFIX", "postern:")
         self._redis: Any = redis.from_url(  # type: ignore[no-untyped-call]
             self._url,
@@ -455,7 +456,7 @@ def create_customer_rate_limit_store() -> CustomerRateLimitStoreBase:
     them at two instances satisfies every check in this repository and gives
     the read path one revocation list and the write path another.
     """
-    redis_url = os.environ.get("POSTERN_REDIS_URL")
+    redis_url = redis_url_from_env()
     if redis_url:
         logger.info("Using Redis per-customer rate limit counters")
         return RedisCustomerRateLimitStore(url=redis_url)

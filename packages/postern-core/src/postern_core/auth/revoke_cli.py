@@ -58,12 +58,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from collections.abc import Sequence
 from typing import TextIO
 
 from postern_core.auth.revocation import RevocationStoreBase, create_revocation_store
+from postern_core.config import redis_url_from_env
 
 _NO_REDIS_WARNING = (
     "POSTERN_REDIS_URL is not set, so this wrote to an in-process store that "
@@ -189,7 +189,7 @@ def main(
     args = _parser().parse_args(argv)
     owned = store is None
     code = asyncio.run(_main_async(args, store, out))
-    if owned and not os.environ.get("POSTERN_REDIS_URL"):
+    if owned and not redis_url_from_env():
         print(_NO_REDIS_WARNING, file=err)
         return 1
     return code

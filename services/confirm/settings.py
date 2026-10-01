@@ -64,6 +64,7 @@ forbids reading its settings — so the requirement is stated in
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from postern_core.auth.device_codes import (
@@ -1086,6 +1087,66 @@ class ConfirmSettings:
         )
 
 
+def _refuse_shared_session_key(settings: ConfirmSettings) -> None:
+    """Refuse a SESSION key that is the read key or the write key.
+
+    The three keys are kept apart by what each one is trusted for, and that
+    holds only while they are three keys: a session token signed by the write
+    key would verify wherever write tokens do. Nothing else enforces it, so a
+    configuration that names one Vault key, one PEM file or one ``kid`` twice
+    is refused here, and ``ValueError`` names both variables. Paths compare as
+    resolved absolute paths, so ``/k/./a/../x.pem`` collides with
+    ``/k/x.pem``; an unset path collides with nothing.
+    """
+    pairs: list[tuple[str, str | None, str, str | None]] = [
+        (
+            "POSTERN_VAULT_SESSION_KEY_NAME",
+            settings.vault_session_key_name,
+            "POSTERN_VAULT_READ_KEY_NAME",
+            settings.vault_read_key_name,
+        ),
+        (
+            "POSTERN_VAULT_SESSION_KEY_NAME",
+            settings.vault_session_key_name,
+            "POSTERN_VAULT_WRITE_KEY_NAME",
+            settings.vault_write_key_name,
+        ),
+        (
+            "POSTERN_SESSION_KEY_KID",
+            settings.session_key_kid,
+            "POSTERN_READ_KEY_KID",
+            settings.read_key_kid,
+        ),
+        (
+            "POSTERN_SESSION_KEY_KID",
+            settings.session_key_kid,
+            "POSTERN_WRITE_KEY_KID",
+            settings.write_key_kid,
+        ),
+    ]
+    for session_var, session_value, other_var, other_value in pairs:
+        if session_value == other_value:
+            raise ValueError(
+                f"{session_var} and {other_var} are both {session_value!r}. The session key "
+                "must be a different key from the read and the write key, or a token of one "
+                "kind would verify as another."
+            )
+    session_path = settings.session_key_pem_path
+    if session_path is None:
+        return
+    resolved = Path(session_path).expanduser().resolve()
+    for other_var, other_path in (
+        ("POSTERN_READ_KEY_PEM_PATH", settings.read_key_pem_path),
+        ("POSTERN_WRITE_KEY_PEM_PATH", settings.write_key_pem_path),
+    ):
+        if other_path is not None and Path(other_path).expanduser().resolve() == resolved:
+            raise ValueError(
+                f"POSTERN_SESSION_KEY_PEM_PATH ({session_path!r}) and {other_var} "
+                f"({other_path!r}) are the same file. The session key must be a different "
+                "key from the read and the write key."
+            )
+
+
 def check_session_token_settings(settings: ConfirmSettings) -> None:
     """Refuse a session-token configuration no deployment may run, or return.
 
@@ -1100,6 +1161,8 @@ def check_session_token_settings(settings: ConfirmSettings) -> None:
       host, already in `postern_core.auth.resource_uri`'s normal form, unless
       ``allow_non_uri_audience`` is set, in which case a warning naming the
       flag is logged instead;
+    - a session Vault key name, PEM path or ``kid`` equal to the read key's or
+      the write key's (``_refuse_shared_session_key``);
     - ``session_token_audience`` equal to ``app_assertion_audience``, the
       rule this module's docstring argues from the other side.
 
@@ -1136,6 +1199,7 @@ def check_session_token_settings(settings: ConfirmSettings) -> None:
                 "Each token type carries its own issuer, so no verifier can mistake one for "
                 "another."
             )
+    _refuse_shared_session_key(settings)
     audience = settings.session_token_audience
     if not is_normal_https_resource(audience):
         if not settings.allow_non_uri_audience:

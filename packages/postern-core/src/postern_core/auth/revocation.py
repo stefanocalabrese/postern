@@ -173,6 +173,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from postern_core.config import redis_url_from_env
+
 logger = logging.getLogger(__name__)
 
 #: The slack ``CUSTOMER_REVOKED_AT_TTL_SECONDS`` keeps beyond the longest
@@ -664,7 +666,7 @@ class RedisRevocationStore(RevocationStoreBase):
     def __init__(self, url: str | None = None, key_prefix: str | None = None) -> None:
         import redis.asyncio as redis
 
-        self._url = url or os.environ.get("POSTERN_REDIS_URL", "redis://localhost:6379/0")
+        self._url = url or redis_url_from_env() or "redis://localhost:6379/0"
         self._prefix = key_prefix or os.environ.get("POSTERN_REDIS_KEY_PREFIX", "postern:")
         self._redis: Any = redis.from_url(  # type: ignore[no-untyped-call]
             self._url,
@@ -839,7 +841,7 @@ def create_revocation_store() -> RevocationStoreBase:
     environment variable configures all three and no deployment ends up with
     a shared session store beside a per-replica revocation list.
     """
-    redis_url = os.environ.get("POSTERN_REDIS_URL")
+    redis_url = redis_url_from_env()
     if redis_url:
         logger.info("Using Redis revocation store")
         return RedisRevocationStore(url=redis_url)

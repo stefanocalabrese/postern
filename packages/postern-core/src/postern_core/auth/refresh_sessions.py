@@ -64,6 +64,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from postern_core.config import redis_url_from_env
+
 logger = logging.getLogger(__name__)
 
 #: How long a family lives from its exchange. Absolute: rotation does not move
@@ -500,7 +502,7 @@ class RedisRefreshSessionStore(RefreshSessionStoreBase):
     ) -> None:
         import redis.asyncio as redis
 
-        self._url = url or os.environ.get("POSTERN_REDIS_URL", "redis://localhost:6379/0")
+        self._url = url or redis_url_from_env() or "redis://localhost:6379/0"
         self._prefix = key_prefix or os.environ.get("POSTERN_REDIS_KEY_PREFIX", "postern:")
         self._max_sessions = max_sessions
         self._redis: Any = redis.from_url(  # type: ignore[no-untyped-call]
@@ -636,7 +638,7 @@ def create_refresh_session_store(
     The same choice `postern_core.auth.device_codes.create_device_code_store`
     makes, on the same variable, so one URL points every store at one Redis.
     """
-    redis_url = os.environ.get("POSTERN_REDIS_URL")
+    redis_url = redis_url_from_env()
     if redis_url:
         logger.info("Using Redis refresh session store")
         return RedisRefreshSessionStore(url=redis_url, max_sessions=max_sessions)
