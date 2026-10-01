@@ -949,7 +949,9 @@ class ChallengeRecord(Base):
 
     ``created_at`` / ``expires_at``
         Timestamps for challenge lifecycle. ``expires_at`` is a hard deadline;
-        challenges expire at 2–5 minutes depending on tier.
+        challenges expire at 2–5 minutes depending on tier. Both are stamped
+        by the database clock (``now()``) in ``create_challenge``, and expiry
+        is judged against ``now()`` too, never against the Python clock.
 
     ``confirming_device``
         Device identifier once the user approves (NULL until then).
