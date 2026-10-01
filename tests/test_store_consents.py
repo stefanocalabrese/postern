@@ -8,10 +8,13 @@ each other's rows regardless of execution order.
 """
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+import pytest
 from postern_core.identity import CustomerRef
 from postern_core.store import consents
 from postern_core.store.models import ConsentRecord
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 CUST = CustomerRef(value="cust_7f3a")
@@ -77,3 +80,32 @@ async def test_rollback_isolation_row_from_other_test_is_not_visible(session: As
     would mean the rollback did nothing.
     """
     assert await consents.granted_domains(session, CUST) == set()
+
+
+# One clock: expiry is judged by the database's now() in the statement, so a
+# Python process whose clock is wrong cannot change the decision.
+
+_SKEWS = [timedelta(minutes=10), timedelta(minutes=-10)]
+
+
+def _skew_python_clock(monkeypatch: pytest.MonkeyPatch, offset: timedelta) -> None:
+    class _SkewedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> "_SkewedDatetime":
+            real = datetime.now(tz)
+            return cls.fromtimestamp((real + offset).timestamp(), tz)
+
+    # raising=False: the module is meant to stop reading the Python clock.
+    monkeypatch.setattr(consents, "datetime", _SkewedDatetime, raising=False)
+
+
+@pytest.mark.parametrize("offset", _SKEWS, ids=["python-ahead", "python-behind"])
+async def test_expiry_is_judged_on_the_database_clock(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, offset: timedelta
+) -> None:
+    db_now = (await session.execute(select(func.now()))).scalar_one()
+    await _grant(session, CUST.value, "cards", expires_at=db_now + timedelta(minutes=5))
+    await _grant(session, CUST.value, "payments", expires_at=db_now - timedelta(minutes=5))
+    _skew_python_clock(monkeypatch, offset)
+
+    assert await consents.granted_domains(session, CUST) == {"cards"}

@@ -99,8 +99,17 @@ async def create_challenge(
     # ``datetime.now(UTC)`` here and comparing against ``now()`` there made two
     # clocks decide one deadline, and a host and a container whose clocks
     # differ by more than the TTL disagree about whether a fresh challenge has
-    # already expired. ``now()`` is the transaction's start, the same instant
-    # the expiry predicates see inside one transaction.
+    # already expired.
+    #
+    # ``statement_timestamp()`` and not ``now()`` for the stamp: ``now()`` is
+    # frozen at the transaction's first statement, so a transaction that has
+    # been open for a while would take that time out of a 30-second tier-0
+    # TTL before the row exists. The expiry predicates keep ``now()``: it is
+    # one instant per transaction, so a caller that runs a transition and then
+    # reads the row back to classify a refusal sees one verdict. The two
+    # differ by the age of the transaction, always in the direction that
+    # leaves a just-created challenge unexpired, so the choices do not
+    # conflict.
     record = ChallengeRecord(
         challenge_id=challenge_id,
         customer_ref=customer_ref,
@@ -108,8 +117,8 @@ async def create_challenge(
         payload=payload,
         tier=tier_int,
         status="pending",
-        created_at=func.now(),
-        expires_at=func.now() + timedelta(seconds=ttl),
+        created_at=func.statement_timestamp(),
+        expires_at=func.statement_timestamp() + timedelta(seconds=ttl),
     )
     session.add(record)
     await session.flush()

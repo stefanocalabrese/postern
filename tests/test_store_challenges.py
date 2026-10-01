@@ -703,3 +703,26 @@ async def test_a_challenge_past_its_deadline_is_expired_whatever_the_python_cloc
     _skew_python_clock(monkeypatch, offset)
 
     assert await challenges.get_active_challenge(session, "chal_skew_past") is None
+
+
+async def test_the_ttl_counts_from_the_insert_not_from_the_transaction_start(
+    session: AsyncSession,
+) -> None:
+    """``now()`` is frozen at the transaction's first statement, so stamping
+    with it lets a slow transaction eat a short TTL before the row exists.
+    Tier 0 has 30 seconds; a transaction that has been open for a few of them
+    must still hand the challenge its whole window."""
+    transaction_start = await _db_now(session)
+    await asyncio.sleep(1.5)
+
+    record = await challenges.create_challenge(
+        session,
+        challenge_id="chal_slow_tx",
+        customer_ref="cust_7f3a",
+        tool_name="payments.create_payment",
+        payload={},
+        tier=VerificationTier.SESSION_ONLY,
+    )
+
+    assert record.expires_at - record.created_at == timedelta(seconds=30)
+    assert record.created_at >= transaction_start + timedelta(seconds=1)
