@@ -77,33 +77,35 @@ async def test_the_write_jwks_never_contains_a_read_key(settings: ConfirmSetting
 def test_the_confirm_settings_have_no_read_key_field() -> None:
     """The asymmetry is the point and it should be greppable.
 
-    The only ``read_*`` fields are for the device-grant exception
-    (both read and write keys needed to mint tokens atomically).
-
-    ``vault_read_key_name`` JOINED THAT LIST ON 29 SEPTEMBER 2026 and is the
-    same exception in the same place: the transit key whose name it carries is
-    the one this service asks Vault to sign the browser's read token with,
-    during the one atomic step that also mints the write token. Adding it here
-    is a widening, so it is worth saying what did NOT widen -- the api
-    service's settings gained `vault_read_key_name` and nothing named a write
-    key, `postern_core.auth.vault.VaultSettings` names no key at all, and
-    `postern_core.auth.keys.choose_key_source` takes one key and returns one
-    source. The list below is a list of FIELDS; what stops a read process
-    signing a payment is the Vault policy on the token each service holds,
-    measured in `tests/test_vault_live.py`.
+    Until the layer-1 session token four ``read_*`` fields were allowed here,
+    the device-grant exception: ``POST /token`` minted the browser a read
+    token. It issues a session token signed by the SESSION key now, so the
+    allowed set is empty and no process holds READ and WRITE together. What
+    stops a process signing with a key it does not name is still the Vault
+    policy on its token, measured in `tests/test_vault_live.py`.
     """
     import dataclasses
 
     names = {f.name for f in dataclasses.fields(ConfirmSettings)}
-    allowed_read_fields = {
-        "read_key_pem_path",
-        "read_key_kid",
-        "read_token_issuer",
-        "vault_read_key_name",
-    }
     read_fields = {n for n in names if "read" in n}
-    extra = read_fields - allowed_read_fields
-    assert not extra, f"Unexpected read fields: {extra}"
+    assert read_fields == set(), f"Unexpected read fields: {read_fields}"
+
+
+async def test_the_confirm_app_builds_and_serves_holding_no_read_key(
+    settings: ConfirmSettings,
+) -> None:
+    """The composition root builds no read key source and no read minter.
+
+    It still starts and serves both of its key sets: the write set at
+    ``/.well-known/jwks.json`` and the session set at ``/session/jwks.json``.
+    """
+    app = create_confirm_app(settings, device_key_store=no_enrolled_devices())
+    assert not hasattr(app.state, "postern_read_key_source")
+    assert not hasattr(app.state, "read_minter")
+    for path in ("/.well-known/jwks.json", "/session/jwks.json"):
+        response = await get(app, path)
+        assert response.status_code == 200, path
+        assert not any(e["kid"].startswith("read") for e in response.json()["keys"]), path
 
 
 def test_the_api_settings_name_no_write_key() -> None:
@@ -111,8 +113,8 @@ def test_the_api_settings_name_no_write_key() -> None:
 
     `services/api/settings.py` must carry no field naming a write key, a write
     kid, a write issuer or a write PEM. This is the direction that matters:
-    the confirm service holding a read key is a recorded exception, and the api
-    service holding anything write-shaped is the defect.
+    the confirm service has held no read key since the layer-1 session token,
+    and the api service holding anything write-shaped is the defect.
     """
     import dataclasses
 
@@ -121,6 +123,20 @@ def test_the_api_settings_name_no_write_key() -> None:
     write_fields = {f.name for f in dataclasses.fields(Settings) if "write" in f.name}
     # `backend_write_timeout_seconds` is a socket phase, not a key.
     assert write_fields == {"backend_write_timeout_seconds"}
+
+
+def test_the_api_settings_name_no_session_key() -> None:
+    """The api verifies session tokens and never signs one.
+
+    ``services/api`` reads the session key's PUBLIC half from confirm's
+    ``/session/jwks.json`` through ``POSTERN_JWKS_URI``; a settings field
+    naming the session key itself would be the first step to holding it.
+    """
+    import dataclasses
+
+    from services.api.settings import Settings
+
+    assert {f.name for f in dataclasses.fields(Settings) if "session_key" in f.name} == set()
 
 
 def test_a_write_token_is_rejected_by_the_read_key_set(settings: ConfirmSettings) -> None:

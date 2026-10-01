@@ -455,7 +455,6 @@ class TestTheCompositionRoots:
             device_keys_path="/dev/null",
             vault=_credentialled(vault, vault.write_token),
             vault_write_key_name=WRITE_KEY,
-            vault_read_key_name=READ_KEY,
         )
         minter, key_source = build_write_minter(settings)
         token = minter.mint(

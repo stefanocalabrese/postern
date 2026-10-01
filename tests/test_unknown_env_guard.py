@@ -128,6 +128,28 @@ class TestTheThreePopulations:
         assert classify_environment("confirm").unread == ("POSTERN_REQUIRE_PEM_KEY",)
         assert classify_environment("api").unread == ()
 
+    def test_the_read_key_variables_are_api_only_since_the_session_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The layer-1 session token took the read key out of `services/confirm`.
+
+        A confirm environment still carrying the four read-key variables is
+        warned that it configures nothing there, and never refused: the same
+        file may still feed the api, which reads all four.
+        """
+        read_key_variables = (
+            "POSTERN_READ_KEY_KID",
+            "POSTERN_READ_KEY_PEM_PATH",
+            "POSTERN_READ_TOKEN_ISSUER",
+            "POSTERN_VAULT_READ_KEY_NAME",
+        )
+        for name in read_key_variables:
+            monkeypatch.setenv(name, "x")
+        confirm = classify_environment("confirm")
+        assert confirm.unknown == ()
+        assert confirm.unread == read_key_variables
+        assert classify_environment("api").unread == ()
+
     def test_a_name_neither_service_reads_is_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """POPULATION 3, the one worth refusing on."""
         monkeypatch.setenv("POSTERN_REQUIRE_REDDIS", "1")

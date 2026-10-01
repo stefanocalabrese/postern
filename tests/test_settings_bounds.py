@@ -2239,7 +2239,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         assert len(VAULT_BOUNDED_NAMES) == 2
         assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 51
         assert len(names_read_by("api")) == 38
-        assert len(names_read_by("confirm")) == 67
+        assert len(names_read_by("confirm")) == 63
         assert len(names_read_by("migrations")) == 3
 
     def test_each_rows_services_are_the_roots_that_actually_read_it(self) -> None:

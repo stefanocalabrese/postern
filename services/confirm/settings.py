@@ -19,12 +19,15 @@ Device authorization (§7.3 of the handoff) adds:
   cannot represent a shorter one (bug B1; that constant carries the working).
 - ``device_poll_interval_seconds`` — minimum seconds between token polls (default 5).
 
-The confirm service also needs a READ key to mint read tokens during device
-code exchange (the browser receives the read token after the user approves).
-This is a deliberate exception: the device grant flow mints both read and
-write tokens in one atomic step, so it needs both keys. The separation is
-preserved at startup — no code path hands one process both keys for general
-use; the device grant is a controlled exception.
+The confirm service holds NO READ KEY. Until the layer-1 session token it
+held one, as a recorded exception, because ``POST /token`` minted the
+browser a read token with it -- a layer-2 token the accounts backend accepts,
+which handoff §7.1 keeps apart from layer 1. The device grant now issues a
+session token signed by a third key, SESSION (the ``session_*`` fields
+below), which signs nothing else and is published at ``/session/jwks.json``.
+So no process holds READ and WRITE together: ``services/api`` holds READ,
+this service holds WRITE and SESSION, and the device grant's read-key
+exception is gone. ``tests/test_confirm_service.py`` pins the field list.
 
 Approval callback (§6.3, §8.3) adds:
 - ``backend_base_url`` — base URL for backend write endpoints (payments.svc,
@@ -390,18 +393,16 @@ class ConfirmSettings:
     write_key_kid: str = "write-1"
     write_token_issuer: str = "https://mcp-write.internal"  # noqa: S105
     # VAULT TRANSIT. `vault` is the same six values `services/api/settings.py`
-    # reads, from the same `vault_from_env`, because there is one Vault. The
-    # two KEY NAMES are read here and not there, and this is the service that
-    # has both -- the device grant exception this file's module docstring
-    # already records. What keeps the split real under Vault is not this
-    # dataclass: it is the policy on the Vault token each SERVICE holds. The
-    # api service's token has `update` on `transit/sign/<read key>` and
-    # nothing on the write key, so a compromised read process cannot sign a
-    # payment token even knowing its name -- measured against Vault 1.20.4 in
+    # reads, from the same `vault_from_env`, because there is one Vault. This
+    # service names two transit keys, the write key here and the session key
+    # below, and names no read key. What keeps the split real under Vault is
+    # not this dataclass: it is the policy on the Vault token each SERVICE
+    # holds. The api service's token has `update` on `transit/sign/<read key>`
+    # and nothing on the write or session key, and this service's token has
+    # nothing on the read key -- measured against Vault 1.20.4 in
     # `tests/test_vault_live.py`.
     vault: VaultSettings | None = None
     vault_write_key_name: str = "postern-write"
-    vault_read_key_name: str = "postern-read"
     # Device authorization (§7.3): where the user goes to approve pairing.
     device_verification_uri: str = "https://auth.postern.internal/verify"
     # The base of the app link the pairing QR encodes. A placeholder host for
@@ -414,10 +415,6 @@ class ConfirmSettings:
     # default stays 900 and is the only lifetime here derived for real use.
     device_code_ttl_seconds: int = 900
     device_poll_interval_seconds: int = 5
-    # Read key for device grant token exchange (both read + write needed here).
-    read_key_pem_path: str | None = None
-    read_key_kid: str = "read-1"
-    read_token_issuer: str = "https://mcp-read.internal"  # noqa: S105
     # Approval callback (§6.3, §8.3): backend write endpoints + challenges DB.
     backend_base_url: str = "https://backend.internal"  # noqa: S105
     database_url: str = "postgresql+asyncpg://postern:postern@localhost:5432/postern"
@@ -505,8 +502,8 @@ class ConfirmSettings:
     # connection string, and a field here rather than an environment variable
     # read inside a factory the way `create_revocation_store` and
     # `create_device_code_store` read `POSTERN_REDIS_URL`: this is key
-    # material the operator renders, so it follows `read_key_pem_path` and
-    # `write_key_pem_path` above, and `postern_core.auth.device_keys` records
+    # material the operator renders, so it follows `write_key_pem_path`
+    # above, and `postern_core.auth.device_keys` records
     # at length why enrolment data must not share the cache's variable.
     #
     # REQUIRED, with no default, exactly like the three assertion fields:
@@ -725,10 +722,6 @@ class ConfirmSettings:
                 "POSTERN_VAULT_WRITE_KEY_NAME", "postern-write"
             ).strip()
             or "postern-write",
-            vault_read_key_name=os.environ.get(
-                "POSTERN_VAULT_READ_KEY_NAME", "postern-read"
-            ).strip()
-            or "postern-read",
             write_token_issuer=os.environ.get(
                 "POSTERN_WRITE_TOKEN_ISSUER", "https://mcp-write.internal"
             ),
@@ -757,11 +750,6 @@ class ConfirmSettings:
                     "zero the slow_down throttle never fires, and there is no value that "
                     "disables it."
                 ),
-            ),
-            read_key_pem_path=os.environ.get("POSTERN_READ_KEY_PEM_PATH") or None,
-            read_key_kid=os.environ.get("POSTERN_READ_KEY_KID", "read-1"),
-            read_token_issuer=os.environ.get(
-                "POSTERN_READ_TOKEN_ISSUER", "https://mcp-read.internal"
             ),
             backend_base_url=os.environ.get("POSTERN_BACKEND_BASE_URL", "https://backend.internal"),
             database_url=os.environ.get(
@@ -1095,39 +1083,31 @@ class ConfirmSettings:
 
 
 def _refuse_shared_session_key(settings: ConfirmSettings) -> None:
-    """Refuse a SESSION key NAMED as the read key or the write key.
+    """Refuse a SESSION key NAMED as the write key.
 
     THE CHEAP EARLY ERROR, and not the whole control: it compares names, kids
     and resolved paths, so a copied PEM, a hardlink or a case-different path
     passes it. ``services.confirm.session_token.refuse_shared_key_material``
-    compares the key material itself, once the three sources are built.
+    compares the key material itself, once both sources are built.
 
-    The three keys are kept apart by what each one is trusted for, and that
-    holds only while they are three keys: a session token signed by the write
+    The keys are kept apart by what each one is trusted for, and that holds
+    only while they are different keys: a session token signed by the write
     key would verify wherever write tokens do. Nothing else enforces it, so a
     configuration that names one Vault key, one PEM file or one ``kid`` twice
     is refused here, and ``ValueError`` names both variables. Paths compare as
     resolved absolute paths, so ``/k/./a/../x.pem`` collides with
     ``/k/x.pem``; an unset path collides with nothing.
+
+    The read key is not compared: this service has named none since the
+    layer-1 session token, and the api's read key is another deployment's
+    configuration, which this process cannot read.
     """
     pairs: list[tuple[str, str | None, str, str | None]] = [
         (
             "POSTERN_VAULT_SESSION_KEY_NAME",
             settings.vault_session_key_name.strip(),
-            "POSTERN_VAULT_READ_KEY_NAME",
-            settings.vault_read_key_name.strip(),
-        ),
-        (
-            "POSTERN_VAULT_SESSION_KEY_NAME",
-            settings.vault_session_key_name.strip(),
             "POSTERN_VAULT_WRITE_KEY_NAME",
             settings.vault_write_key_name.strip(),
-        ),
-        (
-            "POSTERN_SESSION_KEY_KID",
-            settings.session_key_kid,
-            "POSTERN_READ_KEY_KID",
-            settings.read_key_kid,
         ),
         (
             "POSTERN_SESSION_KEY_KID",
@@ -1140,23 +1120,20 @@ def _refuse_shared_session_key(settings: ConfirmSettings) -> None:
         if session_value == other_value:
             raise ValueError(
                 f"{session_var} and {other_var} are both {session_value!r}. The session key "
-                "must be a different key from the read and the write key, or a token of one "
-                "kind would verify as another."
+                "must be a different key from the write key, or a token of one kind would "
+                "verify as another."
             )
     session_path = settings.session_key_pem_path
     if session_path is None:
         return
     resolved = Path(session_path).expanduser().resolve()
-    for other_var, other_path in (
-        ("POSTERN_READ_KEY_PEM_PATH", settings.read_key_pem_path),
-        ("POSTERN_WRITE_KEY_PEM_PATH", settings.write_key_pem_path),
-    ):
-        if other_path is not None and Path(other_path).expanduser().resolve() == resolved:
-            raise ValueError(
-                f"POSTERN_SESSION_KEY_PEM_PATH ({session_path!r}) and {other_var} "
-                f"({other_path!r}) are the same file. The session key must be a different "
-                "key from the read and the write key."
-            )
+    write_path = settings.write_key_pem_path
+    if write_path is not None and Path(write_path).expanduser().resolve() == resolved:
+        raise ValueError(
+            f"POSTERN_SESSION_KEY_PEM_PATH ({session_path!r}) and POSTERN_WRITE_KEY_PEM_PATH "
+            f"({write_path!r}) are the same file. The session key must be a different "
+            "key from the write key."
+        )
 
 
 def check_session_token_settings(settings: ConfirmSettings) -> None:
@@ -1173,8 +1150,8 @@ def check_session_token_settings(settings: ConfirmSettings) -> None:
       host, already in `postern_core.auth.resource_uri`'s normal form, unless
       ``allow_non_uri_audience`` is set, in which case a warning naming the
       flag is logged instead;
-    - a session Vault key name, PEM path or ``kid`` equal to the read key's or
-      the write key's (``_refuse_shared_session_key``);
+    - a session Vault key name, PEM path or ``kid`` equal to the write key's
+      (``_refuse_shared_session_key``);
     - ``session_token_audience`` equal to ``app_assertion_audience``, the
       rule this module's docstring argues from the other side.
 

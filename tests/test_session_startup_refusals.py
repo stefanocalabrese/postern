@@ -153,21 +153,9 @@ class TestTheSessionKeyIsKeptSeparateByRefusal:
         [
             (
                 "vault_session_key_name",
-                "vault_read_key_name",
-                "POSTERN_VAULT_SESSION_KEY_NAME",
-                "POSTERN_VAULT_READ_KEY_NAME",
-            ),
-            (
-                "vault_session_key_name",
                 "vault_write_key_name",
                 "POSTERN_VAULT_SESSION_KEY_NAME",
                 "POSTERN_VAULT_WRITE_KEY_NAME",
-            ),
-            (
-                "session_key_kid",
-                "read_key_kid",
-                "POSTERN_SESSION_KEY_KID",
-                "POSTERN_READ_KEY_KID",
             ),
             (
                 "session_key_kid",
@@ -191,42 +179,27 @@ class TestTheSessionKeyIsKeptSeparateByRefusal:
         assert session_var in str(raised.value)
         assert other_var in str(raised.value)
 
-    @pytest.mark.parametrize(
-        ("other_field", "other_var"),
-        [
-            ("read_key_pem_path", "POSTERN_READ_KEY_PEM_PATH"),
-            ("write_key_pem_path", "POSTERN_WRITE_KEY_PEM_PATH"),
-        ],
-    )
-    def test_a_shared_pem_path_refuses_even_spelled_differently(
-        self, key_pair: RSAKeyPair, other_field: str, other_var: str
-    ) -> None:
+    def test_a_shared_pem_path_refuses_even_spelled_differently(self, key_pair: RSAKeyPair) -> None:
         with pytest.raises(ValueError) as raised:
             _confirm(
                 key_pair,
                 session_key_pem_path="/run/keys/./a/../key.pem",
-                **{other_field: "/run/keys/key.pem"},
+                write_key_pem_path="/run/keys/key.pem",
             )
         assert "POSTERN_SESSION_KEY_PEM_PATH" in str(raised.value)
-        assert other_var in str(raised.value)
+        assert "POSTERN_WRITE_KEY_PEM_PATH" in str(raised.value)
 
     def test_unset_paths_never_collide(self, key_pair: RSAKeyPair) -> None:
-        app = _confirm(
-            key_pair,
-            session_key_pem_path=None,
-            read_key_pem_path=None,
-            write_key_pem_path=None,
-        )
+        app = _confirm(key_pair, session_key_pem_path=None, write_key_pem_path=None)
         assert app is not None
 
     def test_distinct_names_paths_and_kids_pass_the_check(self) -> None:
-        """Unit level: starting an app would try to load the three PEM files."""
+        """Unit level: starting an app would try to load the two PEM files."""
         from services.confirm.settings import check_session_token_settings
 
         settings = dataclasses.replace(
             ConfirmSettings.for_testing(),
             session_key_pem_path="/run/keys/session.pem",
-            read_key_pem_path="/run/keys/read.pem",
             write_key_pem_path="/run/keys/write.pem",
         )
         check_session_token_settings(settings)
@@ -235,7 +208,19 @@ class TestTheSessionKeyIsKeptSeparateByRefusal:
         from services.confirm.settings import check_session_token_settings
 
         settings = dataclasses.replace(
-            ConfirmSettings.for_testing(), vault_session_key_name="postern-read"
+            ConfirmSettings.for_testing(), vault_session_key_name="postern-write"
         )
-        with pytest.raises(ValueError, match="POSTERN_VAULT_READ_KEY_NAME"):
+        with pytest.raises(ValueError, match="POSTERN_VAULT_WRITE_KEY_NAME"):
             check_session_token_settings(settings)
+
+    def test_the_refusal_names_no_read_key(self) -> None:
+        """This service holds no read key, so no refusal may name one."""
+        from services.confirm.settings import check_session_token_settings
+
+        settings = dataclasses.replace(
+            ConfirmSettings.for_testing(), session_key_kid="shared", write_key_kid="shared"
+        )
+        with pytest.raises(ValueError) as raised:
+            check_session_token_settings(settings)
+        assert "READ" not in str(raised.value)
+        assert "read" not in str(raised.value)

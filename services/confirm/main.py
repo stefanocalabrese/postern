@@ -12,9 +12,10 @@ Today this process does four things:
    reach the key this module holds.
 2. Handle RFC 8628 device authorization (§7.3 of the handoff): generate
    device codes, accept banking app approvals, and exchange device codes for
-   a read token. The read key here is a controlled exception to the key-split
-   architecture; the write key is NOT used on this path at all since audit
-   finding C-01 removed the write token from the ``/token`` response.
+   a layer-1 session, signed by a third key (SESSION) published at
+   ``/session/jwks.json``. This service holds no read key; the write key is
+   NOT used on this path at all since audit finding C-01 removed the write
+   token from the ``/token`` response.
 3. Handle verification challenge approvals (§6.3, §8.3): receive approvals
    from the banking app, mark challenges approved in Postgres, and execute
    backend write endpoints server-side.
@@ -76,8 +77,6 @@ from pathlib import Path
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.auth.device_codes import create_device_code_store
 from postern_core.auth.device_keys import DeviceKeyStoreBase, FileDeviceKeyStore
-from postern_core.auth.internal_jwt import InternalTokenMinter
-from postern_core.auth.keys import choose_key_source
 from postern_core.auth.refresh_sessions import create_refresh_session_store
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement, redis_url_from_env
@@ -271,9 +270,8 @@ def create_confirm_app(
 ) -> Starlette:
     """Assemble the write-path ASGI app with device authorization and callback endpoints.
 
-    Builds both read and write minters. The read key path is a controlled
-    exception to the architecture's key-split rule — see ``ConfirmSettings``
-    docstring.
+    Builds the write and session minters and no read minter: no process
+    holds READ and WRITE together (``ConfirmSettings``' docstring).
 
     Also creates a database connection for the challenges table, wires the
     approval callback routes, and puts ``AppAssertionMiddleware`` in front of
@@ -399,33 +397,13 @@ def create_confirm_app(
     # the read key and not `InternalTokenMinter`.
     session_minter, session_key_source = build_session_minter(settings)
 
-    # --- Read key / minter (device grant exception) ---
-    #
-    # THE ONE PROCESS IN THIS REPOSITORY THAT HOLDS TWO KEYS, and it is a
-    # recorded exception rather than a leak: the device grant mints the
-    # browser's read token in the same atomic step as the write one, so this
-    # service needs both. `services/confirm/settings.py`'s module docstring is
-    # where that is argued. Note what it is NOT: two calls to the same
-    # one-key-in, one-source-out function, which is all
-    # `choose_key_source` can do. There is still no object anywhere that
-    # hands a process both.
-    read_key_source = choose_key_source(
-        role="READ (device grant)",
-        kid=settings.read_key_kid,
-        vault=settings.vault,
-        vault_key_name=settings.vault_read_key_name,
-        pem_path=settings.read_key_pem_path,
-        pem_env_var="POSTERN_READ_KEY_PEM_PATH",
-    )
-    read_minter = InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
-    # KEY SEPARATION BY MATERIAL, not by name or path: the three sources are
-    # built, so compare the public keys they publish. The read entry goes when
-    # the read key leaves this service (Task 9); the write entry stays.
+    # KEY SEPARATION BY MATERIAL, not by name or path: both sources are built,
+    # so compare the public keys they publish. This service holds no read key
+    # since the layer-1 session token, so the write key is the only other one.
     refuse_shared_key_material(
         session=session_key_source,
         others=[
             ("POSTERN_WRITE_KEY_PEM_PATH or POSTERN_VAULT_WRITE_KEY_NAME", write_key_source),
-            ("POSTERN_READ_KEY_PEM_PATH or POSTERN_VAULT_READ_KEY_NAME", read_key_source),
         ],
         session_variable="POSTERN_SESSION_KEY_PEM_PATH or POSTERN_VAULT_SESSION_KEY_NAME",
     )
@@ -604,9 +582,7 @@ def create_confirm_app(
     # Expose key sources on ``app.state`` for external consumers.
     app.state.postern_write_key_source = write_key_source
     app.state.postern_session_key_source = session_key_source
-    app.state.postern_read_key_source = read_key_source
     # Expose minters and store for the device auth routes.
-    app.state.read_minter = read_minter
     app.state.write_minter = _write_minter
     app.state.session_minter = session_minter
     app.state.device_code_store = device_code_store

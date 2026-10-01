@@ -274,9 +274,12 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_MAX_DEVICE_CODES", "number", ("confirm",)),
     EnvVar("POSTERN_MAX_REFRESH_SESSIONS", "number", ("confirm",)),
     EnvVar("POSTERN_MAX_SCOPES_LENGTH", "number", ("confirm",)),
-    EnvVar("POSTERN_READ_KEY_KID", "string", BOTH),
-    EnvVar("POSTERN_READ_KEY_PEM_PATH", "string", BOTH),
-    EnvVar("POSTERN_READ_TOKEN_ISSUER", "string", BOTH),
+    # ("api",) ONLY SINCE THE LAYER-1 SESSION TOKEN, which took the read key
+    # out of `services/confirm`. A confirm environment still setting one gets
+    # the "set but not read" warning, not a refusal.
+    EnvVar("POSTERN_READ_KEY_KID", "string", ("api",)),
+    EnvVar("POSTERN_READ_KEY_PEM_PATH", "string", ("api",)),
+    EnvVar("POSTERN_READ_TOKEN_ISSUER", "string", ("api",)),
     EnvVar("POSTERN_REDIS_DEVICE_CODE_TTL", "number", BOTH),
     EnvVar("POSTERN_REDIS_KEY_PREFIX", "string", BOTH),
     EnvVar("POSTERN_REDIS_SESSION_TTL", "number", BOTH),
@@ -300,10 +303,11 @@ INVENTORY: tuple[EnvVar, ...] = (
     # POSTERN_VAULT_WRITE_KEY_NAME on the read path is reported as a variable
     # that service does not read -- which is the correct answer, because a
     # process that cannot name the write key also holds no policy to sign with
-    # it.
+    # it. The read key's name is read by `api` alone, and the session key's by
+    # `confirm` alone, since the layer-1 session token.
     EnvVar("POSTERN_VAULT_ADDR", "string", BOTH),
     EnvVar("POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS", "number", BOTH),
-    EnvVar("POSTERN_VAULT_READ_KEY_NAME", "string", BOTH),
+    EnvVar("POSTERN_VAULT_READ_KEY_NAME", "string", ("api",)),
     EnvVar("POSTERN_VAULT_SESSION_KEY_NAME", "string", ("confirm",)),
     EnvVar("POSTERN_VAULT_TIMEOUT_SECONDS", "number", BOTH),
     EnvVar("POSTERN_VAULT_TOKEN", "string", BOTH),

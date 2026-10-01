@@ -55,10 +55,10 @@ def warn_ephemeral_signing_key(*, role: str, kid: str, pem_env_var: str) -> None
     fall-through; since `choose_key_source` below absorbed all three there is
     ONE call site, still immediately after the fall-through and still with the
     key already constructed. `services/api/main.py::_read_key_source`,
-    `services/confirm/minter.py::_write_key_source` and
-    `services/confirm/main.py::create_confirm_app` all reach it through that
-    one function now, so a fourth key added anywhere gets this warning without
-    anyone remembering to add it -- which is most of why the three copies were
+    `services/confirm/minter.py::_write_key_source` and the session key's
+    ``build_session_minter`` in `services/confirm/session_token.py` all reach it
+    through that one function now, so a key added anywhere gets this warning
+    without anyone remembering to add it -- which is most of why the copies were
     worth collapsing.
 
     UNCONDITIONAL, deliberately. It asks nothing about the deployment,
@@ -186,10 +186,13 @@ def choose_key_source(
     """The one decision all three signing keys in this codebase make.
 
     Three call sites, one per key: `services/api/main.py`'s READ key,
-    `services/confirm/minter.py`'s WRITE key, and `services/confirm/main.py`'s
-    READ key for the device grant. Each passes its own key's configuration and
-    gets back one source. It was three copies of an if/else until Vault landed
-    and each would have grown a third branch; `postern_core/config.py`'s
+    `services/confirm/minter.py`'s WRITE key, and the SESSION key in
+    `services/confirm/session_token.py`, which signs the layer-1 access token.
+    Until the session token the third was a READ key for the device grant in
+    `services/confirm/main.py`, and no process holds READ and WRITE together
+    any more. Each passes its own key's configuration and gets back one source.
+    It was three copies of an if/else until Vault landed and each would have
+    grown a third branch; `postern_core/config.py`'s
     docstring carries the general form of the argument for why a decision both
     services must make identically lives in the library they both import.
 
@@ -201,7 +204,8 @@ def choose_key_source(
     measured the cost of on the JWKS side.
 
     Args:
-        role: ``"READ"`` or ``"WRITE"``, for the ephemeral-key warning only.
+        role: ``"READ"``, ``"WRITE"`` or ``"SESSION"``, for the ephemeral-key
+            warning only.
         kid: The configured key id. Under Vault it is a PREFIX and the
             published kid carries the version; `postern_core.auth.vault` says
             why.

@@ -1,10 +1,13 @@
-"""The session key is refused when it shares key MATERIAL with the read or write key.
+"""The session key is refused when it shares key MATERIAL with the write key.
 
 ``_refuse_shared_session_key`` compares names, kids and PEM paths, which a copied
 file, a hardlink or a case-different path on a case-insensitive filesystem all
 pass. ``refuse_shared_key_material`` compares the PUBLIC keys each source
 publishes, by RFC 7638 thumbprint, so it also covers a Vault transit key, whose
 public half arrives over the network and has no path at all.
+
+Since the layer-1 session token this service holds no read key, so the write
+key is the only one there is to compare against.
 """
 
 from __future__ import annotations
@@ -60,30 +63,28 @@ class TestFilesWithTheSameKey:
     def test_a_copied_file_at_another_path_is_refused(
         self, key_pair: RSAKeyPair, tmp_path: Path
     ) -> None:
-        _pem(tmp_path / "read.pem")
-        (tmp_path / "session.pem").write_bytes((tmp_path / "read.pem").read_bytes())
         _pem(tmp_path / "write.pem")
+        (tmp_path / "session.pem").write_bytes((tmp_path / "write.pem").read_bytes())
         with pytest.raises(ValueError) as raised:
             _app(
                 key_pair,
-                read_key_pem_path=str(tmp_path / "read.pem"),
                 write_key_pem_path=str(tmp_path / "write.pem"),
                 session_key_pem_path=str(tmp_path / "session.pem"),
             )
         message = str(raised.value)
         assert "POSTERN_SESSION_KEY_PEM_PATH" in message
-        assert "POSTERN_READ_KEY_PEM_PATH" in message
+        assert "POSTERN_WRITE_KEY_PEM_PATH" in message
         assert "MATERIAL" in message
         assert "PRIVATE" not in message
+        # This service holds no read key, so the refusal names none.
+        assert "read" not in message.lower()
 
     def test_a_hardlink_is_refused(self, key_pair: RSAKeyPair, tmp_path: Path) -> None:
         _pem(tmp_path / "write.pem")
         os.link(tmp_path / "write.pem", tmp_path / "session.pem")
-        _pem(tmp_path / "read.pem")
         with pytest.raises(ValueError, match="POSTERN_WRITE_KEY_PEM_PATH"):
             _app(
                 key_pair,
-                read_key_pem_path=str(tmp_path / "read.pem"),
                 write_key_pem_path=str(tmp_path / "write.pem"),
                 session_key_pem_path=str(tmp_path / "session.pem"),
             )
@@ -93,43 +94,40 @@ class TestFilesWithTheSameKey:
     ) -> None:
         """Honest on both kinds of filesystem, and never skipped.
 
-        CASE-INSENSITIVE (macOS's default APFS, Windows): ``READ.pem`` names
-        the file written as ``read.pem``, so the session path is a different
+        CASE-INSENSITIVE (macOS's default APFS, Windows): ``WRITE.pem`` names
+        the file written as ``write.pem``, so the session path is a different
         string for the SAME file. The path comparison in
         ``check_session_token_settings`` resolves paths but does not fold
         case, so it passes; what refuses is the key-material check.
 
-        CASE-SENSITIVE (Linux ext4, the CI image): ``READ.pem`` does not exist
+        CASE-SENSITIVE (Linux ext4, the CI image): ``WRITE.pem`` does not exist
         until written, so it is written as a COPY with a case-different name,
         and the same key-material check is what refuses it. The assertion is
         the same on both: the message is the material one, not the path one.
         """
-        _pem(tmp_path / "read.pem")
         _pem(tmp_path / "write.pem")
-        other_case = tmp_path / "READ.pem"
+        other_case = tmp_path / "WRITE.pem"
         case_insensitive = other_case.exists()
         if not case_insensitive:
-            other_case.write_bytes((tmp_path / "read.pem").read_bytes())
-        assert str(other_case) != str(tmp_path / "read.pem")
-        assert other_case.samefile(tmp_path / "read.pem") is case_insensitive
+            other_case.write_bytes((tmp_path / "write.pem").read_bytes())
+        assert str(other_case) != str(tmp_path / "write.pem")
+        assert other_case.samefile(tmp_path / "write.pem") is case_insensitive
         with pytest.raises(ValueError) as raised:
             _app(
                 key_pair,
-                read_key_pem_path=str(tmp_path / "read.pem"),
                 write_key_pem_path=str(tmp_path / "write.pem"),
                 session_key_pem_path=str(other_case),
             )
         message = str(raised.value)
         assert "MATERIAL" in message
         assert "POSTERN_SESSION_KEY_PEM_PATH" in message
-        assert "POSTERN_READ_KEY_PEM_PATH" in message
+        assert "POSTERN_WRITE_KEY_PEM_PATH" in message
 
-    def test_three_different_keys_start(self, key_pair: RSAKeyPair, tmp_path: Path) -> None:
-        for name in ("read", "write", "session"):
+    def test_two_different_keys_start(self, key_pair: RSAKeyPair, tmp_path: Path) -> None:
+        for name in ("write", "session"):
             _pem(tmp_path / f"{name}.pem")
         app = _app(
             key_pair,
-            read_key_pem_path=str(tmp_path / "read.pem"),
             write_key_pem_path=str(tmp_path / "write.pem"),
             session_key_pem_path=str(tmp_path / "session.pem"),
         )
@@ -145,25 +143,24 @@ class TestTheComparisonItself:
     def test_the_same_public_key_under_another_kid_is_refused(self) -> None:
         shared = RSAKey.generate_key(2048, parameters={"kid": "session-1"})
         other = RSAKey.import_key(
-            shared.as_pem(private=True), parameters={"kid": "postern-read-v3"}
+            shared.as_pem(private=True), parameters={"kid": "postern-write-v3"}
         )
         with pytest.raises(ValueError) as raised:
             refuse_shared_key_material(
                 session=_Source(shared),
-                others=[("POSTERN_VAULT_READ_KEY_NAME", _Source(RSAKey.generate_key(2048), other))],
+                others=[
+                    ("POSTERN_VAULT_WRITE_KEY_NAME", _Source(RSAKey.generate_key(2048), other))
+                ],
                 session_variable="POSTERN_VAULT_SESSION_KEY_NAME",
             )
         assert "POSTERN_VAULT_SESSION_KEY_NAME" in str(raised.value)
-        assert "POSTERN_VAULT_READ_KEY_NAME" in str(raised.value)
+        assert "POSTERN_VAULT_WRITE_KEY_NAME" in str(raised.value)
         assert "MATERIAL" in str(raised.value)
 
     def test_disjoint_sets_pass(self) -> None:
         refuse_shared_key_material(
             session=_Source(RSAKey.generate_key(2048)),
-            others=[
-                ("POSTERN_VAULT_READ_KEY_NAME", _Source(RSAKey.generate_key(2048))),
-                ("POSTERN_VAULT_WRITE_KEY_NAME", _Source(RSAKey.generate_key(2048))),
-            ],
+            others=[("POSTERN_VAULT_WRITE_KEY_NAME", _Source(RSAKey.generate_key(2048)))],
             session_variable="POSTERN_VAULT_SESSION_KEY_NAME",
         )
 
@@ -230,7 +227,7 @@ class TestNonRsaKeys:
         with pytest.raises(ValueError, match="MATERIAL"):
             refuse_shared_key_material(
                 session=_Source(shared),
-                others=[("POSTERN_READ_KEY_PEM_PATH", _Mixed())],
+                others=[("POSTERN_WRITE_KEY_PEM_PATH", _Mixed())],
                 session_variable="POSTERN_SESSION_KEY_PEM_PATH",
             )
 
@@ -254,12 +251,13 @@ class TestASessionKeyWithNoThumbprint:
         with pytest.raises(ValueError) as raised:
             refuse_shared_key_material(
                 session=self._Publishes(jwks),
-                others=[("POSTERN_READ_KEY_PEM_PATH", _Source(RSAKey.generate_key(2048)))],
+                others=[("POSTERN_WRITE_KEY_PEM_PATH", _Source(RSAKey.generate_key(2048)))],
                 session_variable="POSTERN_SESSION_KEY_PEM_PATH",
             )
         message = str(raised.value)
         assert "POSTERN_SESSION_KEY_PEM_PATH" in message
         assert "could not be fingerprinted" in message
+        assert "read" not in message.lower()
 
     def test_it_is_refused_even_with_nothing_to_compare_against(self) -> None:
         with pytest.raises(ValueError, match="could not be fingerprinted"):
@@ -274,22 +272,17 @@ class TestVaultKeyNamesAreStripped:
     def test_a_trailing_space_does_not_make_two_names_different(self) -> None:
         settings = dataclasses.replace(
             ConfirmSettings.for_testing(),
-            vault_session_key_name="postern-read ",
-            vault_read_key_name="postern-read",
+            vault_session_key_name="postern-write ",
+            vault_write_key_name="postern-write",
         )
-        with pytest.raises(ValueError, match="POSTERN_VAULT_READ_KEY_NAME"):
+        with pytest.raises(ValueError, match="POSTERN_VAULT_WRITE_KEY_NAME"):
             check_session_token_settings(settings)
 
-    def test_from_env_strips_the_three_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_from_env_strips_the_two_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for var, value in (
-            ("POSTERN_VAULT_READ_KEY_NAME", " r "),
             ("POSTERN_VAULT_WRITE_KEY_NAME", " w "),
             ("POSTERN_VAULT_SESSION_KEY_NAME", " s "),
         ):
             monkeypatch.setenv(var, value)
         settings = ConfirmSettings.from_env()
-        assert (
-            settings.vault_read_key_name,
-            settings.vault_write_key_name,
-            settings.vault_session_key_name,
-        ) == ("r", "w", "s")
+        assert (settings.vault_write_key_name, settings.vault_session_key_name) == ("w", "s")

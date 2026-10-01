@@ -162,12 +162,14 @@ def refuse_shared_key_material(
     others: Iterable[tuple[str, PublishesJwks]],
     session_variable: str,
 ) -> None:
-    """Refuse a session key whose PUBLIC half is also the read or write key's.
+    """Refuse a session key whose PUBLIC half is also the write key's.
 
     Compares what each source publishes, so it holds for a copied PEM, a
     hardlink, a case-different path and a Vault transit key alike, none of
     which the path and name checks in ``check_session_token_settings`` can see.
-    ``others`` pairs each other key's variable name with its source.
+    ``others`` pairs each other key's variable name with its source; since
+    the layer-1 session token this service holds no read key, so its one
+    caller passes the write key alone.
     ``ValueError`` names both variables and carries no key bytes.
 
     A session source whose own set yields NO thumbprint (an unsupported
@@ -179,14 +181,14 @@ def refuse_shared_key_material(
         raise ValueError(
             f"{session_variable}: the session key's public key could not be fingerprinted "
             "(no RSA, EC or OKP key with its RFC 7638 members in what it publishes), so it "
-            "cannot be shown to differ from the read and the write key. Refusing to start."
+            "cannot be shown to differ from the write key. Refusing to start."
         )
     for variable, source in others:
         if mine & jwk_thumbprints(source.public_jwks()):
             raise ValueError(
                 f"{session_variable} and {variable} resolve to the same key MATERIAL. The "
-                "session key must be a different key from the read and the write key; a "
-                "copied file, a hardlink or one Vault key under two names is still one key."
+                "session key must be a different key from the write key; a copied file, "
+                "a hardlink or one Vault key under two names is still one key."
             )
 
 
