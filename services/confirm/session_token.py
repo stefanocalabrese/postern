@@ -126,16 +126,30 @@ class PublishesJwks(Protocol):
     def public_jwks(self) -> Any: ...
 
 
-def jwk_thumbprints(jwks: Mapping[str, Any]) -> set[str]:
-    """The RFC 7638 SHA-256 thumbprint of every RSA key in a JWKS.
+#: RFC 7638 section 3.2's required members per ``kty`` (RFC 8037 section 2
+#: for ``OKP``). The thumbprint is over these alone.
+THUMBPRINT_MEMBERS: Mapping[str, tuple[str, ...]] = {
+    "RSA": ("e", "kty", "n"),
+    "EC": ("crv", "kty", "x", "y"),
+    "OKP": ("crv", "kty", "x"),
+}
 
-    Over ``e``, ``kty`` and ``n`` only, so the ``kid``, ``use`` and every
-    private member are ignored: two sources publishing one key under two kids
-    give one thumbprint.
+
+def jwk_thumbprints(jwks: Mapping[str, Any]) -> set[str]:
+    """The RFC 7638 SHA-256 thumbprint of every RSA, EC and OKP key in a JWKS.
+
+    Over the ``kty``'s required members only, so the ``kid``, ``use`` and
+    every private member are ignored: two sources publishing one key under
+    two kids give one thumbprint. A key of another ``kty``, or missing a
+    required member, is skipped: it cannot be the same key as one that has
+    them, and a source publishing it must not crash the startup check.
     """
     thumbprints: set[str] = set()
     for jwk in jwks.get("keys", []):
-        required = {"e": jwk["e"], "kty": jwk["kty"], "n": jwk["n"]}
+        members = THUMBPRINT_MEMBERS.get(jwk.get("kty", ""))
+        if members is None or any(member not in jwk for member in members):
+            continue
+        required = {member: jwk[member] for member in members}
         canonical = json.dumps(required, separators=(",", ":"), sort_keys=True)
         digest = hashlib.sha256(canonical.encode()).digest()
         thumbprints.add(base64.urlsafe_b64encode(digest).rstrip(b"=").decode())

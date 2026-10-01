@@ -88,6 +88,42 @@ class TestFilesWithTheSameKey:
                 session_key_pem_path=str(tmp_path / "session.pem"),
             )
 
+    def test_a_case_different_path_is_refused_by_the_key_material(
+        self, key_pair: RSAKeyPair, tmp_path: Path
+    ) -> None:
+        """Honest on both kinds of filesystem, and never skipped.
+
+        CASE-INSENSITIVE (macOS's default APFS, Windows): ``READ.pem`` names
+        the file written as ``read.pem``, so the session path is a different
+        string for the SAME file. The path comparison in
+        ``check_session_token_settings`` resolves paths but does not fold
+        case, so it passes; what refuses is the key-material check.
+
+        CASE-SENSITIVE (Linux ext4, the CI image): ``READ.pem`` does not exist
+        until written, so it is written as a COPY with a case-different name,
+        and the same key-material check is what refuses it. The assertion is
+        the same on both: the message is the material one, not the path one.
+        """
+        _pem(tmp_path / "read.pem")
+        _pem(tmp_path / "write.pem")
+        other_case = tmp_path / "READ.pem"
+        case_insensitive = other_case.exists()
+        if not case_insensitive:
+            other_case.write_bytes((tmp_path / "read.pem").read_bytes())
+        assert str(other_case) != str(tmp_path / "read.pem")
+        assert other_case.samefile(tmp_path / "read.pem") is case_insensitive
+        with pytest.raises(ValueError) as raised:
+            _app(
+                key_pair,
+                read_key_pem_path=str(tmp_path / "read.pem"),
+                write_key_pem_path=str(tmp_path / "write.pem"),
+                session_key_pem_path=str(other_case),
+            )
+        message = str(raised.value)
+        assert "MATERIAL" in message
+        assert "POSTERN_SESSION_KEY_PEM_PATH" in message
+        assert "POSTERN_READ_KEY_PEM_PATH" in message
+
     def test_three_different_keys_start(self, key_pair: RSAKeyPair, tmp_path: Path) -> None:
         for name in ("read", "write", "session"):
             _pem(tmp_path / f"{name}.pem")
@@ -137,6 +173,66 @@ class TestTheComparisonItself:
         assert jwk_thumbprints(KeySet([key]).as_dict()) == jwk_thumbprints(
             KeySet([again]).as_dict()
         )
+
+
+class TestNonRsaKeys:
+    """RFC 7638 section 3.2's required members per ``kty``; anything else is skipped."""
+
+    EC = {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+        "kid": "ec-1",
+    }
+    OKP = {"kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}
+
+    def test_ec_and_okp_keys_are_thumbprinted_on_their_required_members(self) -> None:
+        ec_again = {**self.EC, "kid": "another", "use": "sig", "d": "private"}
+        assert jwk_thumbprints({"keys": [self.EC]}) == jwk_thumbprints({"keys": [ec_again]})
+        assert len(jwk_thumbprints({"keys": [self.EC, self.OKP]})) == 2
+
+    def test_the_rfc_7638_example_thumbprint(self) -> None:
+        """RFC 7638 section 3.1's RSA example, whose thumbprint the RFC prints."""
+        n = (
+            "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECP"
+            "ebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2Qvz"
+            "qY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu"
+            "0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
+        )
+        assert jwk_thumbprints({"keys": [{"kty": "RSA", "e": "AQAB", "n": n}]}) == {
+            "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+        }
+
+    def test_an_unknown_kty_or_a_missing_member_is_skipped(self) -> None:
+        assert (
+            jwk_thumbprints(
+                {
+                    "keys": [
+                        {"kty": "oct", "k": "c2VjcmV0"},
+                        {"kty": "PQC", "pub": "x"},
+                        {"x": "no kty"},
+                        {"kty": "EC", "crv": "P-256", "x": "only x"},
+                        {"kty": "RSA", "n": "no e"},
+                    ]
+                }
+            )
+            == set()
+        )
+
+    def test_a_session_source_beside_an_ec_key_still_compares(self) -> None:
+        shared = RSAKey.generate_key(2048)
+
+        class _Mixed:
+            def public_jwks(self) -> Any:
+                return {"keys": [TestNonRsaKeys.EC, shared.as_dict(private=False)]}
+
+        with pytest.raises(ValueError, match="MATERIAL"):
+            refuse_shared_key_material(
+                session=_Source(shared),
+                others=[("POSTERN_READ_KEY_PEM_PATH", _Mixed())],
+                session_variable="POSTERN_SESSION_KEY_PEM_PATH",
+            )
 
 
 class TestVaultKeyNamesAreStripped:
