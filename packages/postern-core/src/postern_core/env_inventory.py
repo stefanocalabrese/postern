@@ -210,17 +210,20 @@ EVERYWHERE = ("api", "confirm", "migrations")
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 74 rows since
-#: 2026-09-30: 27 strings (25 settings plus this guard's own two lists), 44
-#: numbers, 3 flags. The eight ``POSTERN_VAULT_*`` rows below the device-code
+#: against it by `tests/test_settings_bounds.py` on every run. 83 rows since
+#: 2026-09-30: 32 strings (30 settings plus this guard's own two lists), 46
+#: numbers, 5 flags. The eight ``POSTERN_VAULT_*`` rows below the device-code
 #: block arrived on 2026-09-29; ``POSTERN_DEVICE_APP_LINK_URI`` and the seven
 #: QR-page rate limits arrived on 2026-09-30, the day
 #: ``POSTERN_USER_CODE_MAX_ATTEMPTS`` left with the attempt budget it set, and
 #: ``POSTERN_CONFIRM_ASSERTION_MAX_LIFETIME_SECONDS`` arrived later that day,
-#: and ``POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS`` after it.
+#: and ``POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS`` after it. The nine
+#: session-token rows arrived with the layer-1 session token.
 INVENTORY: tuple[EnvVar, ...] = (
     EnvVar(ALLOWED_UNREAD_ENV, "string", EVERYWHERE),
     EnvVar(REQUIRED_ENV, "string", EVERYWHERE),
+    EnvVar("POSTERN_ALLOW_NON_URI_AUDIENCE", "flag", ("confirm",)),
+    EnvVar("POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS", "flag", ("confirm",)),
     EnvVar("POSTERN_APP_ASSERTION_AUDIENCE", "string", ("confirm",)),
     EnvVar("POSTERN_APP_ASSERTION_ISSUER", "string", ("confirm",)),
     EnvVar("POSTERN_APP_ASSERTION_JWKS_URI", "string", ("confirm",)),
@@ -245,6 +248,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_DEFAULT", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_DEVICE_AUTHORIZATION", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_SCAN", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_RATE_LIMIT_SESSION_JWKS", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_TOKEN", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_VERIFY", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS", "number", ("confirm",)),
@@ -268,6 +272,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_MAX_BODY_BYTES", "number", ("api",)),
     EnvVar("POSTERN_MAX_CLIENT_ID_LENGTH", "number", ("confirm",)),
     EnvVar("POSTERN_MAX_DEVICE_CODES", "number", ("confirm",)),
+    EnvVar("POSTERN_MAX_REFRESH_SESSIONS", "number", ("confirm",)),
     EnvVar("POSTERN_MAX_SCOPES_LENGTH", "number", ("confirm",)),
     EnvVar("POSTERN_READ_KEY_KID", "string", BOTH),
     EnvVar("POSTERN_READ_KEY_PEM_PATH", "string", BOTH),
@@ -279,6 +284,10 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_REQUEST_DEADLINE_SECONDS", "number", ("api",)),
     EnvVar("POSTERN_REQUIRE_PEM_KEY", "flag", ("api",)),
     EnvVar("POSTERN_REQUIRE_REDIS", "flag", BOTH),
+    EnvVar("POSTERN_SESSION_KEY_KID", "string", ("confirm",)),
+    EnvVar("POSTERN_SESSION_KEY_PEM_PATH", "string", ("confirm",)),
+    EnvVar("POSTERN_SESSION_TOKEN_AUDIENCE", "string", ("confirm",)),
+    EnvVar("POSTERN_SESSION_TOKEN_ISSUER", "string", ("confirm",)),
     EnvVar("POSTERN_STRICT_HEADERS", "flag", ("api",)),
     EnvVar("POSTERN_TOKEN_ISSUER", "string", ("api",)),
     EnvVar("POSTERN_TRUSTED_PROXY_HOPS", "number", ("api",)),
@@ -295,6 +304,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_VAULT_ADDR", "string", BOTH),
     EnvVar("POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS", "number", BOTH),
     EnvVar("POSTERN_VAULT_READ_KEY_NAME", "string", BOTH),
+    EnvVar("POSTERN_VAULT_SESSION_KEY_NAME", "string", ("confirm",)),
     EnvVar("POSTERN_VAULT_TIMEOUT_SECONDS", "number", BOTH),
     EnvVar("POSTERN_VAULT_TOKEN", "string", BOTH),
     EnvVar("POSTERN_VAULT_TOKEN_PATH", "string", BOTH),

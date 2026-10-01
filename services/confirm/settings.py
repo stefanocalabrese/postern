@@ -61,6 +61,7 @@ forbids reading its settings — so the requirement is stated in
 ``services/confirm/auth.py``'s docstring and enforced only by an operator.
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -68,13 +69,16 @@ from urllib.parse import urlsplit
 from postern_core.auth.device_codes import (
     MIN_DEVICE_CODE_TTL_SECONDS as _MIN_DEVICE_CODE_TTL_SECONDS,
 )
+from postern_core.auth.resource_uri import is_normal_https_resource
 from postern_core.auth.vault import VaultSettings, vault_from_env
-from postern_core.config import float_from_env, int_from_env
+from postern_core.config import bool_from_env, float_from_env, int_from_env
 
 from services.confirm.auth import (
     DEFAULT_ASSERTION_MAX_LIFETIME_SECONDS,
     MAX_ASSERTION_MAX_LIFETIME_SECONDS,
 )
+
+logger = logging.getLogger(__name__)
 
 #: The scope string ``POST /device_authorization`` substitutes when the caller
 #: sends none. It lives here rather than inline in
@@ -638,6 +642,38 @@ class ConfirmSettings:
     rate_limit_verify_js: int = 60
     rate_limit_verify_css: int = 60
     customer_rate_limit_scan: int = 10
+    # THE LAYER-1 SESSION TOKEN (dev-docs/device-grant-session-token-spec.md
+    # section 2). A THIRD signing key, which signs the access token
+    # ``POST /token`` issues and nothing else, published at
+    # ``/session/jwks.json``. The kid, PEM path and transit key name follow
+    # the write key's three fields above and reach the same
+    # `choose_key_source`, so the Vault, PEM and generated branches and the
+    # refusal of both at once are inherited rather than restated.
+    session_key_pem_path: str | None = None
+    session_key_kid: str = "session-1"
+    vault_session_key_name: str = "postern-session"
+    # The ``iss`` of every access token: this service's public issuer URL.
+    # `check_session_token_settings` refuses one that is not ``https`` with a
+    # host, or that equals another issuer this process knows.
+    session_token_issuer: str = "https://auth.postern.internal"  # noqa: S105
+    # The ``aud`` of every access token: the MCP server's resource URI, which
+    # must equal ``services/api``'s ``POSTERN_AUDIENCE``. The DEFAULT IS A
+    # LOCAL-ONLY VALUE that `check_session_token_settings` refuses unless
+    # ``allow_non_uri_audience`` is set, because RFC 8707 section 2 requires
+    # an absolute URI.
+    session_token_audience: str = "postern"  # noqa: S105
+    # Two development flags, both off by default, because a default is what a
+    # hand-built settings object gets and these defaults are the ones a
+    # deployment may run. `ConfirmSettings.for_testing` sets both.
+    allow_non_uri_audience: bool = False
+    allow_process_local_sessions: bool = False
+    # The ceiling on live refresh-token families: ``max_device_codes`` times
+    # the lifetime ratio (3,600 s against 900 s), so a store in which every
+    # live device code were exchanged as fast as codes can exist still fits.
+    max_refresh_sessions: int = 40_000
+    # Per-address requests a minute to ``/session/jwks.json``, fetched by
+    # every ``services/api`` worker process on a cache miss.
+    rate_limit_session_jwks: int = 300
 
     def __post_init__(self) -> None:
         # The pairing URIs are checked however the settings are built, because
@@ -920,6 +956,41 @@ class ConfirmSettings:
             rate_limit_verify_js=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_JS", 60),
             rate_limit_verify_css=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS", 60),
             customer_rate_limit_scan=_positive_int("POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN", 10),
+            session_key_pem_path=os.environ.get("POSTERN_SESSION_KEY_PEM_PATH") or None,
+            session_key_kid=os.environ.get("POSTERN_SESSION_KEY_KID", "session-1"),
+            vault_session_key_name=os.environ.get(
+                "POSTERN_VAULT_SESSION_KEY_NAME", "postern-session"
+            ),
+            session_token_issuer=os.environ.get(
+                "POSTERN_SESSION_TOKEN_ISSUER", "https://auth.postern.internal"
+            ),
+            session_token_audience=os.environ.get("POSTERN_SESSION_TOKEN_AUDIENCE", "postern"),
+            allow_non_uri_audience=bool_from_env(
+                "POSTERN_ALLOW_NON_URI_AUDIENCE",
+                False,
+                because=(
+                    "It lets a local stack run with an access-token audience that is not "
+                    "an absolute https URI, which RFC 8707 section 2 requires."
+                ),
+            ),
+            allow_process_local_sessions=bool_from_env(
+                "POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS",
+                False,
+                because=(
+                    "It lets the device grant run without POSTERN_REDIS_URL, so refresh "
+                    "families and recalls live in this process and nowhere else."
+                ),
+            ),
+            max_refresh_sessions=int_from_env(
+                "POSTERN_MAX_REFRESH_SESSIONS",
+                40_000,
+                minimum=1,
+                because=(
+                    "It is how many refresh-token families the store will hold; at zero "
+                    "the cap is met by an empty store and every exchange is refused."
+                ),
+            ),
+            rate_limit_session_jwks=_positive_int("POSTERN_CONFIRM_RATE_LIMIT_SESSION_JWKS", 300),
         )
 
     @classmethod
@@ -983,4 +1054,70 @@ class ConfirmSettings:
             app_assertion_issuer="https://app.postern-local-dev.invalid",
             app_assertion_audience="postern-confirm",
             database_url=os.environ.get("POSTERN_DATABASE_URL") or cls.database_url,
+            # Both development flags, and only here: the audience default,
+            # ``postern``, is not a URI, and a test process has no shared Redis.
+            allow_non_uri_audience=True,
+            allow_process_local_sessions=True,
+        )
+
+
+def check_session_token_settings(settings: ConfirmSettings) -> None:
+    """Refuse a session-token configuration no deployment may run, or return.
+
+    ``ValueError`` naming the offending values, for each of:
+
+    - ``session_token_issuer`` that is not ``https`` with a hostname, or that
+      carries a query or a fragment;
+    - ``session_token_issuer`` equal to ``write_token_issuer`` or to
+      ``app_assertion_issuer``: one issuer string per token type;
+    - ``session_token_audience`` that is not an absolute ``https`` URI with a
+      host, already in `postern_core.auth.resource_uri`'s normal form, unless
+      ``allow_non_uri_audience`` is set, in which case a warning naming the
+      flag is logged instead;
+    - ``session_token_audience`` equal to ``app_assertion_audience``, the
+      rule this module's docstring argues from the other side.
+
+    CALLED BY ``create_confirm_app``, NOT BY ``__post_init__``, so a settings
+    object built by hand is refused where a deployment would be, at startup,
+    and a test that builds one without building an app is unaffected.
+    Equality with the api's ``POSTERN_AUDIENCE`` cannot be checked here: that
+    is another deployment, and a mismatch fails closed at the api.
+    """
+    issuer = settings.session_token_issuer
+    parts = urlsplit(issuer)
+    if parts.scheme != "https" or not parts.hostname or "?" in issuer or "#" in issuer:
+        raise ValueError(
+            f"POSTERN_SESSION_TOKEN_ISSUER ({issuer!r}) must be an https URL with a hostname "
+            "and no query or fragment. It is the iss of every access token POST /token issues."
+        )
+    for name, other in (
+        ("POSTERN_WRITE_TOKEN_ISSUER", settings.write_token_issuer),
+        ("POSTERN_APP_ASSERTION_ISSUER", settings.app_assertion_issuer),
+    ):
+        if issuer == other:
+            raise ValueError(
+                f"POSTERN_SESSION_TOKEN_ISSUER ({issuer!r}) must differ from {name} ({other!r}). "
+                "Each token type carries its own issuer, so no verifier can mistake one for "
+                "another."
+            )
+    audience = settings.session_token_audience
+    if not is_normal_https_resource(audience):
+        if not settings.allow_non_uri_audience:
+            raise ValueError(
+                f"POSTERN_SESSION_TOKEN_AUDIENCE ({audience!r}) must be the MCP server's "
+                "resource URI: an absolute https URI with a host and no fragment (RFC 8707 "
+                "section 2), with a lower-case scheme and host, no default port and a "
+                "non-empty path. Set it to the same value as services/api's POSTERN_AUDIENCE, "
+                "or set POSTERN_ALLOW_NON_URI_AUDIENCE for a local stack."
+            )
+        logger.warning(
+            "POSTERN_ALLOW_NON_URI_AUDIENCE is set: access tokens carry the audience %r, "
+            "which is not an absolute https URI. No deployment may run this way.",
+            audience,
+        )
+    if audience == settings.app_assertion_audience:
+        raise ValueError(
+            f"POSTERN_SESSION_TOKEN_AUDIENCE ({audience!r}) must differ from "
+            "POSTERN_APP_ASSERTION_AUDIENCE: a token good enough to reach the MCP server "
+            "must not be good enough to approve a payment."
         )

@@ -25,10 +25,10 @@ read. Measured on 2026-09-27 against planted shapes: ``raw =
 os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
 numeric rule completely, and it is the way a careless numeric read is most
 likely to be written. So the third rule keys on the one thing every spelling
-shares, the variable's NAME at the read site. The swept tree names 74
-``POSTERN_*`` variables in two disjoint populations: 27 read directly, all of
-them strings, and 47 handed to a reader, which are `BOUNDED`'s 40,
-`STORE_BOUNDED`'s 2, `VAULT_BOUNDED`'s 2 and `FLAGS`' 3. Nothing is in both,
+shares, the variable's NAME at the read site. The swept tree names 83
+``POSTERN_*`` variables in two disjoint populations: 32 read directly, all of
+them strings, and 51 handed to a reader, which are `BOUNDED`'s 42,
+`STORE_BOUNDED`'s 2, `VAULT_BOUNDED`'s 2 and `FLAGS`' 5. Nothing is in both,
 nothing is in neither, and `TestEveryEnvironmentReadNamesAnInventoriedVariable`
 re-derives that from the tree on every run rather than trusting these numbers.
 
@@ -315,6 +315,14 @@ BOUNDED: tuple[Bounded, ...] = (
         ("1", "10000"),
     ),
     Bounded(
+        "POSTERN_MAX_REFRESH_SESSIONS",
+        "max_refresh_sessions",
+        "confirm",
+        40_000,
+        ("0", "-1"),
+        ("1", "40000"),
+    ),
+    Bounded(
         "POSTERN_MAX_SCOPES_LENGTH",
         "max_scopes_length",
         "confirm",
@@ -492,6 +500,14 @@ BOUNDED: tuple[Bounded, ...] = (
         ("1",),
     ),
     Bounded(
+        "POSTERN_CONFIRM_RATE_LIMIT_SESSION_JWKS",
+        "rate_limit_session_jwks",
+        "confirm",
+        300,
+        ("0", "-1"),
+        ("1",),
+    ),
+    Bounded(
         "POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN",
         "customer_rate_limit_scan",
         "confirm",
@@ -588,6 +604,15 @@ class TestEveryNumericSettingIsInTheInventory:
             # `vault_from_env` does, once, for both services.
             "POSTERN_VAULT_READ_KEY_NAME",
             "POSTERN_VAULT_WRITE_KEY_NAME",
+            # The layer-1 session token's key, issuer and audience, and its two
+            # development flags: strings and flags, with no range to leave.
+            "POSTERN_SESSION_KEY_PEM_PATH",
+            "POSTERN_SESSION_KEY_KID",
+            "POSTERN_VAULT_SESSION_KEY_NAME",
+            "POSTERN_SESSION_TOKEN_ISSUER",
+            "POSTERN_SESSION_TOKEN_AUDIENCE",
+            "POSTERN_ALLOW_NON_URI_AUDIENCE",
+            "POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS",
         }
         source = inspect.getsource(cls.from_env.__func__)  # type: ignore[attr-defined]
         tree = ast.parse(inspect.cleandoc(source))
@@ -1395,7 +1420,7 @@ READ_AS_STRING: frozenset[str] = frozenset(
     entry.name for entry in INVENTORY if entry.kind == "string"
 )
 
-#: The three flags, each read through `postern_core/config.py`'s `bool_from_env`.
+#: The five flags, each read through `postern_core/config.py`'s `bool_from_env`.
 #:
 #: They carry no bound and so no `Bounded` record: what `bool_from_env` enforces
 #: is an ACCEPTING SET, the same one for every flag, pinned in
@@ -2090,13 +2115,13 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
     numeric read. A rule keyed on the CONSUMER can always be evaded by one
     assignment, because the consumer can be arbitrarily far from the read.
 
-    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 74 distinct
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 83 distinct
     ``POSTERN_*`` variables across the swept roots, in two disjoint
-    populations. 27 are read directly, and all 27 are strings -- a URL, a
+    populations. 32 are read directly, and all 32 are strings -- a URL, a
     path, a key id, an issuer, an audience, a key prefix, and the guard's own
-    two comma-separated lists of names. 47 are handed to a reader as its ``name``
-    argument, and those are the 40 in `BOUNDED`, the 2 in `STORE_BOUNDED`, the
-    2 in `VAULT_BOUNDED` and the 3 in `FLAGS`. Nothing is in both and nothing is in neither, which
+    two comma-separated lists of names. 51 are handed to a reader as its ``name``
+    argument, and those are the 42 in `BOUNDED`, the 2 in `STORE_BOUNDED`, the
+    2 in `VAULT_BOUNDED` and the 5 in `FLAGS`. Nothing is in both and nothing is in neither, which
     `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
     re-derives on every run.
 
@@ -2180,7 +2205,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
 
     def test_the_two_inventories_are_the_whole_tree(self) -> None:
-        """74 variables, 27 read directly and 47 through a reader, disjoint."""
+        """83 variables, 32 read directly and 51 through a reader, disjoint."""
         direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
         through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
         assert direct & through == set(), (
@@ -2197,7 +2222,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         # accepting one that arms nothing -- the defect it exists for,
         # reintroduced inside the control itself.
         assert direct | through == set(KNOWN_ENV)
-        assert len(KNOWN_ENV) == 74
+        assert len(KNOWN_ENV) == 83
 
     def test_the_counts_the_docstrings_quote(self) -> None:
         """Every number the prose in this file states, re-derived.
@@ -2206,15 +2231,15 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         confidently as one that is right. A variable added anywhere fails here,
         which is the line that sends the author to the sentences.
         """
-        assert len(KNOWN_ENV) == 74
-        assert len(READ_AS_STRING) == 27
-        assert len(FLAGS) == 3
-        assert len(BOUNDED_NAMES) == 40
+        assert len(KNOWN_ENV) == 83
+        assert len(READ_AS_STRING) == 32
+        assert len(FLAGS) == 5
+        assert len(BOUNDED_NAMES) == 42
         assert len(STORE_BOUNDED_NAMES) == 2
         assert len(VAULT_BOUNDED_NAMES) == 2
-        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 47
+        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 51
         assert len(names_read_by("api")) == 38
-        assert len(names_read_by("confirm")) == 58
+        assert len(names_read_by("confirm")) == 67
         assert len(names_read_by("migrations")) == 3
 
     def test_each_rows_services_are_the_roots_that_actually_read_it(self) -> None:
