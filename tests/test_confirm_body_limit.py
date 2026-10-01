@@ -529,7 +529,8 @@ def _app(key_pair: RSAKeyPair, **kwargs: Any) -> Starlette:
         app_assertion_issuer="https://app.postern-local-dev.invalid",
         app_assertion_audience=AUDIENCE,
         # The two development flags `ConfirmSettings.for_testing` sets: this
-        # settings object is built by hand, so it gets the safe defaults.
+        # settings object is built by hand, so without these two flags it gets the
+        # safe defaults and refuses to start.
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
         **kwargs,
@@ -602,7 +603,8 @@ async def test_an_unauthenticated_oversized_request_is_413_and_never_reaches_the
         app_assertion_audience=AUDIENCE,
         max_body_bytes=LIMIT,
         # The two development flags `ConfirmSettings.for_testing` sets: this
-        # settings object is built by hand, so it gets the safe defaults.
+        # settings object is built by hand, so without these two flags it gets the
+        # safe defaults and refuses to start.
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
     )
@@ -744,7 +746,8 @@ def settings(pg_url: str) -> ConfirmSettings:
         backend_base_url="https://backend.test",
         database_url=pg_url,
         # The two development flags `ConfirmSettings.for_testing` sets: this
-        # settings object is built by hand, so it gets the safe defaults.
+        # settings object is built by hand, so without these two flags it gets the
+        # safe defaults and refuses to start.
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
     )
@@ -951,7 +954,8 @@ async def test_an_oversized_body_writes_no_row_at_all(
         database_url=settings.database_url,
         max_body_bytes=LIMIT,
         # The two development flags `ConfirmSettings.for_testing` sets: this
-        # settings object is built by hand, so it gets the safe defaults.
+        # settings object is built by hand, so without these two flags it gets the
+        # safe defaults and refuses to start.
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
     )

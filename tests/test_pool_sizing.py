@@ -213,7 +213,8 @@ def confirm_app(
         database_max_overflow=max_overflow,
         database_pool_timeout_seconds=pool_timeout_seconds,
         # The two development flags `ConfirmSettings.for_testing` sets: this
-        # settings object is built by hand, so it gets the safe defaults.
+        # settings object is built by hand, so without these two flags it gets the
+        # safe defaults and refuses to start.
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
     )

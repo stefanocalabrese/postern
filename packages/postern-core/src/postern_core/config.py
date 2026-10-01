@@ -485,6 +485,6 @@ def enforce_redis_requirement(*, consequence: str) -> None:
     )
     if not required:
         return
-    if os.environ.get(REDIS_URL_ENV):
+    if os.environ.get(REDIS_URL_ENV, "").strip():
         return
     raise RuntimeError(_REQUIRE_REDIS_PREFIX + consequence)

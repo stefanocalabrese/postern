@@ -52,12 +52,22 @@ class TestSharedStateIsRequired:
         assert "POSTERN_REDIS_URL" in message
         assert "POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS" in message
 
-    def test_an_empty_url_counts_as_absent(
-        self, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("blank", ["", " ", " \t\n"])
+    def test_a_blank_url_counts_as_absent(
+        self, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch, blank: str
     ) -> None:
-        monkeypatch.setenv("POSTERN_REDIS_URL", "")
-        with pytest.raises(RuntimeError):
+        monkeypatch.setenv("POSTERN_REDIS_URL", blank)
+        with pytest.raises(RuntimeError, match="POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS"):
             _confirm(key_pair, allow_process_local_sessions=False)
+
+    @pytest.mark.parametrize("blank", ["", " "])
+    def test_a_blank_url_does_not_satisfy_the_require_redis_guard(
+        self, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch, blank: str
+    ) -> None:
+        monkeypatch.setenv("POSTERN_REDIS_URL", blank)
+        monkeypatch.setenv("POSTERN_REQUIRE_REDIS", "1")
+        with pytest.raises(RuntimeError, match="POSTERN_REQUIRE_REDIS is set"):
+            _confirm(key_pair, allow_process_local_sessions=True)
 
     def test_the_flag_starts_and_warns(
         self, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
@@ -65,6 +75,8 @@ class TestSharedStateIsRequired:
         with caplog.at_level(logging.WARNING, logger="services.confirm.main"):
             assert _confirm(key_pair, allow_process_local_sessions=True) is not None
         assert "POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS is set" in caplog.text
+        warnings = [r for r in caplog.records if "ALLOW_PROCESS_LOCAL_SESSIONS is set" in r.message]
+        assert len(warnings) == 1
 
     def test_a_redis_url_starts_without_the_flag_and_without_the_warning(
         self,
@@ -94,6 +106,18 @@ class TestTheSessionSettingsAreCheckedAtStartup:
     def test_an_issuer_shared_with_the_write_token_refuses(self, key_pair: RSAKeyPair) -> None:
         with pytest.raises(ValueError, match="POSTERN_WRITE_TOKEN_ISSUER"):
             _confirm(key_pair, session_token_issuer="https://mcp-write.internal")  # noqa: S106
+
+    def test_an_issuer_shared_with_the_app_assertion_refuses(self, key_pair: RSAKeyPair) -> None:
+        with pytest.raises(ValueError, match="POSTERN_APP_ASSERTION_ISSUER"):
+            _confirm(
+                key_pair,
+                app_assertion_issuer="https://app.shared.invalid",
+                session_token_issuer="https://app.shared.invalid",  # noqa: S106
+            )
+
+    def test_an_audience_shared_with_the_app_assertion_refuses(self, key_pair: RSAKeyPair) -> None:
+        with pytest.raises(ValueError, match="POSTERN_APP_ASSERTION_AUDIENCE"):
+            _confirm(key_pair, session_token_audience=AUDIENCE)  # noqa: S106
 
     def test_a_hand_built_settings_object_is_refused_twice_over(self, key_pair: RSAKeyPair) -> None:
         """The dataclass defaults are the safe values: no Redis URL and a

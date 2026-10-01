@@ -92,7 +92,8 @@ def settings(pg_url: str) -> ConfirmSettings:
         backend_base_url="https://backend.test",
         database_url=pg_url,
         # The two development flags `ConfirmSettings.for_testing` sets: this
-        # settings object is built by hand, so it gets the safe defaults.
+        # settings object is built by hand, so without these two flags it gets the
+        # safe defaults and refuses to start.
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
     )
@@ -708,7 +709,8 @@ def test_the_configured_path_is_what_builds_the_store(
         database_url=settings.database_url,
         device_keys_path=str(document),
         # The two development flags `ConfirmSettings.for_testing` sets: this
-        # settings object is built by hand, so it gets the safe defaults.
+        # settings object is built by hand, so without these two flags it gets the
+        # safe defaults and refuses to start.
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
     )

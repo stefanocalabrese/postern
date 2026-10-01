@@ -157,7 +157,8 @@ def _settings(omitted: str | None = None) -> ConfirmSettings:
         app_assertion_issuer=v["app_assertion_issuer"],
         app_assertion_audience=v["app_assertion_audience"],
         # The two development flags `ConfirmSettings.for_testing` sets: this
-        # settings object is built by hand, so it gets the safe defaults.
+        # settings object is built by hand, so without these two flags it gets the
+        # safe defaults and refuses to start.
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
     )

@@ -223,7 +223,7 @@ def _refuse_process_local_sessions(settings: ConfirmSettings) -> None:
     `postern_core.config.enforce_redis_requirement` chose for a
     deployment-wide contract not met.
     """
-    if os.environ.get("POSTERN_REDIS_URL"):
+    if os.environ.get("POSTERN_REDIS_URL", "").strip():
         return
     if settings.allow_process_local_sessions:
         logger.warning(
