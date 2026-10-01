@@ -889,6 +889,13 @@ SCAN_TOOL_NAME = "device_grant.scan"
 #: The route, in ``arguments`` for the reason ``PAIRING_ROUTE`` is there.
 SCAN_ROUTE = "/scan"
 
+#: What ``tool_name`` carries on a ``POST /token`` row for
+#: ``grant_type=refresh_token``, written only once the caller has shown a
+#: refresh token the family issued. Its own literal, so "sessions issued" and
+#: "refreshes issued" are two predicates on ``tool_name`` and never a
+#: ``detail`` filter; ``route`` stays ``TOKEN_ROUTE``.
+REFRESH_TOOL_NAME = "device_grant.refresh"
+
 #: The stored ``customer_ref`` on an approved device code will not parse as a
 #: ``CustomerRef``.
 #:
@@ -1077,6 +1084,33 @@ DETAIL_USER_CODE_MISMATCH = "user_code_mismatch"
 #: The wrong pairing code that spent the last attempt and revoked the device
 #: code. Historical since 2026-09-30; see the literal above.
 DETAIL_USER_CODE_BUDGET_EXHAUSTED = "user_code_budget_exhausted"
+
+# THE REFRESH GRANT'S REFUSALS, spec section 6. Every one is written only past
+# the proof of possession (a presented refresh token whose hash the family
+# holds), so a caller who has merely seen an access token, and therefore the
+# family id, cannot drive an INSERT against a named customer. An unknown hash
+# under a real family id has no literal because it has no row.
+
+#: A retained (already rotated) refresh token was presented: two parties hold
+#: one family. The family is revoked in the same transaction that noticed, and
+#: every live access token of it goes on the ZT-7 list.
+DETAIL_REFRESH_REUSED = "refresh_reused"
+#: The family was already revoked (by reuse, by a recall at ``POST /scan``, or
+#: as issued before a customer revocation); its live access tokens are
+#: re-asserted on the ZT-7 list, which is what makes a failed write converge.
+DETAIL_SESSION_REVOKED = "session_revoked"
+#: The family is past its absolute one-hour lifetime.
+DETAIL_SESSION_EXPIRED = "session_expired"
+#: The family has rotated ``MAX_GENERATIONS`` times; the customer re-pairs.
+DETAIL_SESSION_GENERATIONS_EXHAUSTED = "session_generations_exhausted"
+#: A ``client_id`` parameter that is not byte-equal to the pairing's. It
+#: authenticates nothing, both being caller-supplied: a transplant signal.
+DETAIL_CLIENT_ID_MISMATCH = "client_id_mismatch"
+#: A requested ``scope`` wider than the family's (RFC 6749 section 6).
+DETAIL_SCOPE_EXCEEDED = "scope_exceeded"
+#: The family was created at or before a customer revocation, whether or not
+#: that revocation has since been restored; the family is revoked for good.
+DETAIL_ISSUED_BEFORE_REVOCATION = "issued_before_revocation"
 
 
 def device_code_handle(device_code: str) -> str:

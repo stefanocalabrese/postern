@@ -1,0 +1,522 @@
+"""``POST /token`` with ``grant_type=refresh_token`` (spec section 6).
+
+Every branch, through the assembled confirm app: the shape checks and the
+lookup that write nothing; the proof of possession, before which nothing is
+recorded and after which every exit writes one ``device_grant.refresh`` row;
+reuse detection, revocation re-assertion and its convergence; the generation
+and lifetime limits; the ``client_id`` transplant signal; scope
+canonicalization and narrowing; and the four ZT-7 checks, including a family
+issued before a since-restored customer revocation.
+"""
+
+from __future__ import annotations
+
+import base64
+import dataclasses
+import json
+import logging
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx2
+import pytest
+from fastmcp.server.auth.providers.jwt import RSAKeyPair
+from postern_core.auth.refresh_sessions import (
+    MAX_GENERATIONS,
+    InMemoryRefreshSessionStore,
+    RefreshSession,
+    RefreshSessionStoreContended,
+    new_refresh_token,
+)
+from postern_core.auth.revocation import InMemoryRevocationStore, RevocationStoreUnavailable
+from postern_core.store.engine import Database
+from postern_core.store.models import OUTCOME_RAISED, OUTCOME_RETURNED, AuditEntry
+from sqlalchemy import select
+from starlette.applications import Starlette
+
+from services.confirm.audit import (
+    DETAIL_CLIENT_ID_MISMATCH,
+    DETAIL_ISSUED_BEFORE_REVOCATION,
+    DETAIL_REFRESH_REUSED,
+    DETAIL_REVOKED,
+    DETAIL_SCOPE_EXCEEDED,
+    DETAIL_SESSION_EXPIRED,
+    DETAIL_SESSION_GENERATIONS_EXHAUSTED,
+    DETAIL_SESSION_REVOKED,
+    REFRESH_TOOL_NAME,
+    TOKEN_ROUTE,
+)
+from tests.device_grant_helpers import session_claims
+from tests.fixtures.append_only_bypass import (
+    delete_audit_rows_by_bypassing_the_append_only_triggers,
+)
+from tests.test_token_session_issuance import CUSTOMER, RESOURCE, _app, _approved, _exchange
+
+SCOPES = "accounts:read cards:read transactions:read"
+
+
+@pytest.fixture(scope="module")
+def key_pair() -> RSAKeyPair:
+    return RSAKeyPair.generate()
+
+
+@pytest.fixture()
+async def clean(database: Database) -> AsyncIterator[Database]:
+    async with database.sessionmaker() as s:
+        await delete_audit_rows_by_bypassing_the_append_only_triggers(s)
+        await s.commit()
+    yield database
+
+
+@pytest.fixture()
+def app(key_pair: RSAKeyPair, pg_url: str) -> Starlette:
+    return _app(key_pair, pg_url)
+
+
+async def _session(app: Starlette, key_pair: RSAKeyPair) -> dict[str, Any]:
+    """A pairing exchanged for a session; the parsed 200 body."""
+    device = await _approved(app, key_pair, scopes=SCOPES)
+    response = await _exchange(app, device["device_code"])
+    session_claims(response, app)
+    body: dict[str, Any] = response.json()
+    return body
+
+
+async def _refresh(app: Starlette, refresh_token: str | None, **extra: str) -> httpx2.Response:
+    data = {"grant_type": "refresh_token", **extra}
+    if refresh_token is not None:
+        data["refresh_token"] = refresh_token
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as client:
+        return await client.post("/token", data=data)
+
+
+async def _rows(db: Database) -> list[AuditEntry]:
+    async with db.sessionmaker() as s:
+        result = await s.execute(
+            select(AuditEntry)
+            .where(AuditEntry.tool_name == REFRESH_TOOL_NAME)
+            .order_by(AuditEntry.id)
+        )
+        return list(result.scalars())
+
+
+def _sid(body: dict[str, Any]) -> str:
+    return str(body["refresh_token"].split(".")[1])
+
+
+def _jti(body: dict[str, Any]) -> str:
+    """The ``jti`` of the access token in a session body, read without verifying."""
+    payload = body["access_token"].split(".")[1]
+    return str(json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["jti"])
+
+
+async def _family(app: Starlette, body: dict[str, Any]) -> RefreshSession:
+    sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+    return sessions._sessions[_sid(body)]
+
+
+def _refused(response: httpx2.Response) -> None:
+    assert response.status_code == 400, response.text
+    assert response.json() == {
+        "error": "invalid_grant",
+        "error_description": "refresh token cannot be redeemed",
+    }
+
+
+class TestARefreshThatSucceeds:
+    async def test_it_rotates_and_issues_a_fresh_access_token_in_the_same_family(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        response = await _refresh(app, first["refresh_token"])
+        claims = session_claims(response, app)
+        body = response.json()
+        assert body["refresh_token"] != first["refresh_token"]
+        assert _sid(body) == _sid(first)
+        assert claims["sid"] == _sid(first)
+        assert claims["scope"] == SCOPES
+        family = await _family(app, body)
+        assert family.generation == 1
+        assert len(family.access_tokens) == 2
+
+        (row,) = await _rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RETURNED, None)
+        assert row.customer_ref == CUSTOMER
+        assert row.arguments["route"] == TOKEN_ROUTE
+        assert row.arguments["session_id"] == _sid(first)
+        assert row.arguments["paired_client_id"] == "claude-code"
+        assert "device_code_handle" not in row.arguments
+        for token in (first["refresh_token"], body["refresh_token"], body["access_token"]):
+            assert token not in str(row.arguments)
+
+    async def test_a_matching_client_id_and_resource_are_accepted(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        response = await _refresh(
+            app, first["refresh_token"], client_id="claude-code", resource=RESOURCE
+        )
+        session_claims(response, app)
+
+
+class TestNothingIsRecordedBeforeTheProof:
+    async def test_a_missing_token_is_invalid_request(
+        self, app: Starlette, clean: Database
+    ) -> None:
+        response = await _refresh(app, None)
+        assert response.status_code == 400
+        assert response.json()["error"] == "invalid_request"
+        assert response.headers["cache-control"] == "no-store"
+        assert await _rows(clean) == []
+
+    @pytest.mark.parametrize(
+        "value", ["garbage", "prt1.short.value", "prt2." + "a" * 22 + "." + "b" * 43]
+    )
+    async def test_a_malformed_token_is_invalid_grant(
+        self, app: Starlette, clean: Database, value: str
+    ) -> None:
+        _refused(await _refresh(app, value))
+        assert await _rows(clean) == []
+
+    async def test_an_unknown_family_is_invalid_grant(
+        self, app: Starlette, clean: Database
+    ) -> None:
+        _refused(await _refresh(app, new_refresh_token("A" * 22)))
+        assert await _rows(clean) == []
+
+    async def test_an_unserved_resource_is_invalid_target(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        response = await _refresh(app, first["refresh_token"], resource="https://other.test/mcp")
+        assert response.json()["error"] == "invalid_target"
+        assert await _rows(clean) == []
+
+    async def test_an_unknown_hash_under_a_real_family_writes_nothing_and_logs_once(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        first = await _session(app, key_pair)
+        forged = new_refresh_token(_sid(first))
+        with caplog.at_level(logging.WARNING, logger="services.confirm.device_auth"):
+            _refused(await _refresh(app, forged))
+            _refused(await _refresh(app, new_refresh_token(_sid(first))))
+        assert await _rows(clean) == []
+        lines = [r for r in caplog.records if "never issued" in r.getMessage()]
+        assert len(lines) == 1
+        assert _sid(first) in lines[0].getMessage()
+        assert forged not in caplog.text
+        family = await _family(app, first)
+        assert family.revoked_at is None and family.generation == 0
+
+    async def test_an_unknown_hash_under_a_revoked_family_reveals_and_reasserts_nothing(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        await sessions.revoke(_sid(first), reason="recall")
+        response = await _refresh(app, new_refresh_token(_sid(first)))
+        _refused(response)
+        assert "retry-after" not in response.headers
+        assert await _rows(clean) == []
+        revocations: InMemoryRevocationStore = app.state.postern_revocation_store
+        assert not await revocations.is_revoked({"jti": _jti(first)})
+
+
+class TestReuse:
+    async def test_a_retained_token_revokes_the_family_and_lists_every_live_jti(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        first = await _session(app, key_pair)
+        second = (await _refresh(app, first["refresh_token"])).json()
+        with caplog.at_level(logging.WARNING, logger="services.confirm.device_auth"):
+            _refused(await _refresh(app, first["refresh_token"]))
+        family = await _family(app, first)
+        assert family.revoked_reason == "reuse"
+        assert "is revoked" in caplog.text and family.device_code_handle in caplog.text
+        revocations: InMemoryRevocationStore = app.state.postern_revocation_store
+        for jti, _ in family.access_tokens:
+            assert await revocations.is_revoked({"jti": jti})
+
+        _refused(await _refresh(app, second["refresh_token"]))
+        assert [r.detail for r in await _rows(clean)] == [
+            None,
+            DETAIL_REFRESH_REUSED,
+            DETAIL_SESSION_REVOKED,
+        ]
+
+    async def test_a_failed_zt7_write_at_reuse_converges_on_the_next_presentation(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        second = (await _refresh(app, first["refresh_token"])).json()
+        revocations: InMemoryRevocationStore = app.state.postern_revocation_store
+        real = revocations.revoke_session
+
+        async def down(*, jti: str) -> None:
+            raise RevocationStoreUnavailable("simulated outage")
+
+        monkeypatch.setattr(revocations, "revoke_session", down)
+        outage = await _refresh(app, first["refresh_token"])
+        assert outage.status_code == 503
+        assert outage.headers["retry-after"] == str(app.state.settings.device_poll_interval_seconds)
+        family = await _family(app, first)
+        assert family.revoked_at is not None
+        jtis = [jti for jti, _ in family.access_tokens]
+        assert not await revocations.is_revoked({"jti": jtis[0]})
+
+        monkeypatch.setattr(revocations, "revoke_session", real)
+        _refused(await _refresh(app, second["refresh_token"]))
+        for jti in jtis:
+            assert await revocations.is_revoked({"jti": jti})
+        assert [r.detail for r in await _rows(clean)] == [
+            None,
+            "RevocationStoreUnavailable",
+            DETAIL_SESSION_REVOKED,
+        ]
+
+
+class TestTheFamilysLimits:
+    async def test_exhausted_generations(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        sid = _sid(first)
+        sessions._sessions[sid] = dataclasses.replace(
+            sessions._sessions[sid], generation=MAX_GENERATIONS
+        )
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert [r.detail for r in await _rows(clean)] == [DETAIL_SESSION_GENERATIONS_EXHAUSTED]
+
+    async def test_a_family_past_its_lifetime(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The store's ``get`` filters an expired family (answered with no
+        row); this reaches the handler's own check, which a family expiring
+        between the lookup and the classification meets."""
+        first = await _session(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        sid = _sid(first)
+        past = datetime.now(UTC) - timedelta(seconds=1)
+        expired = dataclasses.replace(sessions._sessions[sid], expires_at=past)
+        sessions._sessions[sid] = expired
+
+        async def unfiltered(wanted: str) -> RefreshSession | None:
+            return sessions._sessions.get(wanted)
+
+        monkeypatch.setattr(sessions, "get", unfiltered)
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert [r.detail for r in await _rows(clean)] == [DETAIL_SESSION_EXPIRED]
+
+    async def test_an_expired_family_is_unknown_to_the_lookup(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        sid = _sid(first)
+        sessions._sessions[sid] = dataclasses.replace(
+            sessions._sessions[sid], expires_at=datetime.now(UTC) - timedelta(seconds=1)
+        )
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert await _rows(clean) == []
+
+    async def test_a_client_id_that_is_not_the_pairings(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        _refused(await _refresh(app, first["refresh_token"], client_id="claude-code2"))
+        assert [r.detail for r in await _rows(clean)] == [DETAIL_CLIENT_ID_MISMATCH]
+        assert (await _family(app, first)).generation == 0
+
+
+class TestScope:
+    @pytest.mark.parametrize("scope", ["", "   "])
+    async def test_empty_is_the_original_grant(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database, scope: str
+    ) -> None:
+        first = await _session(app, key_pair)
+        response = await _refresh(app, first["refresh_token"], scope=scope)
+        assert session_claims(response, app)["scope"] == SCOPES
+
+    async def test_duplicates_and_order_are_canonicalized_and_narrowing_narrows_this_token_only(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        narrowed = await _refresh(
+            app, first["refresh_token"], scope="cards:read accounts:read cards:read"
+        )
+        assert session_claims(narrowed, app)["scope"] == "accounts:read cards:read"
+        assert (await _family(app, first)).scopes == SCOPES
+        again = await _refresh(app, narrowed.json()["refresh_token"])
+        assert session_claims(again, app)["scope"] == SCOPES
+
+    async def test_a_wider_scope_is_invalid_scope(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        response = await _refresh(app, first["refresh_token"], scope="accounts:read payments:write")
+        assert response.status_code == 400
+        assert response.json()["error"] == "invalid_scope"
+        assert [r.detail for r in await _rows(clean)] == [DETAIL_SCOPE_EXCEEDED]
+
+
+class TestZt7:
+    async def _refused_as_revoked(
+        self, app: Starlette, body: dict[str, Any], clean: Database
+    ) -> None:
+        _refused(await _refresh(app, body["refresh_token"]))
+        (row,) = await _rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, DETAIL_REVOKED)
+        family = await _family(app, body)
+        assert family.generation == 0
+        assert family.revoked_at is None, "the first two checks do not revoke the family"
+
+    async def test_a_revoked_customer(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        await app.state.postern_revocation_store.revoke_customer_client(
+            customer_ref=CUSTOMER, client_id="some-other-client"
+        )
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        store._revoked_at.clear()
+        await self._refused_as_revoked(app, first, clean)
+
+    async def test_the_kill_switch(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        await app.state.postern_revocation_store.kill_switch(client_id="claude-code")
+        await self._refused_as_revoked(app, first, clean)
+
+    async def test_a_live_access_tokens_jti(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        await app.state.postern_revocation_store.revoke_session(jti=_jti(first))
+        await self._refused_as_revoked(app, first, clean)
+
+    async def test_a_family_created_before_a_since_restored_revocation_is_refused_and_revoked(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.revoke_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+        await store.restore_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+        _refused(await _refresh(app, first["refresh_token"]))
+        family = await _family(app, first)
+        assert family.revoked_reason == "issued_before_revocation"
+        assert [r.detail for r in await _rows(clean)] == [DETAIL_ISSUED_BEFORE_REVOCATION]
+
+    @pytest.mark.parametrize(("offset_ms", "refused"), [(700, True), (0, True), (-1, False)])
+    async def test_milliseconds_decide_at_the_edge(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        offset_ms: int,
+        refused: bool,
+    ) -> None:
+        """A family created at .200 and a revocation at .900 of the same second
+        is refused: whole seconds would have compared 0 against 0.2."""
+        first = await _session(app, key_pair)
+        family = await _family(app, first)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        store._revoked_at[CUSTOMER] = (family.created_ms + offset_ms, 2**62)
+        response = await _refresh(app, first["refresh_token"])
+        if refused:
+            _refused(response)
+        else:
+            session_claims(response, app)
+
+    async def test_an_outage_answers_503_and_rotates_nothing(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+
+        async def down(customer_ref: str) -> bool:
+            raise RevocationStoreUnavailable("simulated outage")
+
+        monkeypatch.setattr(store, "is_customer_revoked", down)
+        response = await _refresh(app, first["refresh_token"])
+        assert response.status_code == 503
+        assert response.json()["error"] == "temporarily_unavailable"
+        assert response.headers["retry-after"] == str(
+            app.state.settings.device_poll_interval_seconds
+        )
+        assert response.headers["cache-control"] == "no-store"
+        assert (await _family(app, first)).generation == 0
+        assert [r.detail for r in await _rows(clean)] == ["RevocationStoreUnavailable"]
+
+
+class TestTheRotationItself:
+    async def test_a_contended_rotation_propagates_and_is_recorded(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def contended(*args: Any, **kwargs: Any) -> Any:
+            raise RefreshSessionStoreContended("beaten three times")
+
+        monkeypatch.setattr(sessions, "rotate", contended)
+        response = await _refresh(app, first["refresh_token"])
+        assert response.status_code == 500
+        assert [r.detail for r in await _rows(clean)] == ["RefreshSessionStoreContended"]
+
+    async def test_a_concurrent_winner_turns_this_refresh_into_reuse(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Another replica rotates between this one's classification and its
+        compare-and-set: the transaction sees a retained hash and revokes."""
+        first = await _session(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        real_rotate = sessions.rotate
+
+        async def raced(sid: str, **kwargs: Any) -> Any:
+            await real_rotate(
+                sid,
+                presented_hash=kwargs["presented_hash"],
+                new_hash="f" * 64,
+                access_jti="winner",
+                access_expires_at=datetime.now(UTC) + timedelta(minutes=10),
+            )
+            return await real_rotate(sid, **kwargs)
+
+        monkeypatch.setattr(sessions, "rotate", raced)
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert (await _family(app, first)).revoked_reason == "reuse"
+        assert [r.detail for r in await _rows(clean)] == [DETAIL_REFRESH_REUSED]

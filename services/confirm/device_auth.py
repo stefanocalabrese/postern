@@ -92,10 +92,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hmac
 import json
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -108,17 +110,20 @@ from postern_core.auth.device_codes import (
     create_device_code_store,
 )
 from postern_core.auth.refresh_sessions import (
+    MAX_GENERATIONS,
     RefreshSession,
     RefreshSessionStoreBase,
     RefreshSessionStoreFull,
+    Rotation,
     canonical_scope,
     hash_refresh_token,
     ms_of,
     new_refresh_token,
     new_sid,
+    sid_of,
 )
 from postern_core.auth.resource_uri import normalize_resource
-from postern_core.auth.revocation import RevocationStoreUnavailable
+from postern_core.auth.revocation import RevocationStoreBase, RevocationStoreUnavailable
 from postern_core.identity import CustomerRef
 from postern_core.risk.pairing_network import (
     MatchResult,
@@ -143,16 +148,24 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from services.confirm.audit import (
     DETAIL_ALREADY_APPROVED,
     DETAIL_ALREADY_SCANNED,
+    DETAIL_CLIENT_ID_MISMATCH,
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
+    DETAIL_ISSUED_BEFORE_REVOCATION,
     DETAIL_NOT_SCANNED,
     DETAIL_QR_INVALID,
     DETAIL_QR_STALE,
+    DETAIL_REFRESH_REUSED,
     DETAIL_REVOKED,
     DETAIL_SCAN_CONFLICT,
     DETAIL_SCANNED_BY_OTHER,
+    DETAIL_SCOPE_EXCEEDED,
+    DETAIL_SESSION_EXPIRED,
+    DETAIL_SESSION_GENERATIONS_EXHAUSTED,
+    DETAIL_SESSION_REVOKED,
     DETAIL_STORED_IDENTITY_MALFORMED,
     DETAIL_USER_CODE_NOT_FOUND,
+    REFRESH_TOOL_NAME,
     SCAN_ROUTE,
     SCAN_TOOL_NAME,
     TOKEN_ROUTE,
@@ -167,6 +180,7 @@ from services.confirm.revocation import (
     customer_revoked,
     customer_revoked_since,
     log_refusal,
+    revocation_store,
     revoked_response,
     store_unavailable_response,
 )
@@ -256,6 +270,11 @@ class TokenResponseHeaders:
 #: (written on Redis's), in milliseconds. It errs toward refusal: a customer
 #: whose approval lands within two seconds after a revocation re-pairs.
 APPROVAL_CLOCK_TOLERANCE_MS = 2_000
+
+#: How often one family's unknown-hash presentations may reach the log, per
+#: process, and how many families the limiter remembers (oldest evicted).
+UNKNOWN_REFRESH_LOG_INTERVAL_SECONDS = 60
+UNKNOWN_REFRESH_LOG_ENTRIES = 4_096
 
 # ---------------------------------------------------------------------------
 # Error responses — RFC 8628 §3.3 and §3.4 error codes.
@@ -747,9 +766,16 @@ async def _token_response(request: Request) -> JSONResponse:
         else str(grant_type_raw)
     )
 
+    if grant_type == "refresh_token":
+        return await _refresh_grant(request, form, at=at, started=started)
     if grant_type != "device_code":
-        # Not a device code request — let the 404 handler deal with it.
-        return _error(404, "unsupported_grant_type", "only device_code grant is supported")
+        # Neither grant this endpoint serves. A 404, where RFC 6749 section
+        # 5.2's error responses are 400; kept as it was (spec, Discrepancies).
+        return _error(
+            404,
+            "unsupported_grant_type",
+            "only the device_code and refresh_token grants are supported",
+        )
 
     device_code_raw = form.get("device_code", "")
     device_code_value: str = (
@@ -1097,6 +1123,336 @@ async def _exchange(
         ),
         None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Token endpoint -- POST /token with grant_type=refresh_token.
+# ---------------------------------------------------------------------------
+
+
+def _form_value(form: Any, name: str) -> str | None:
+    """A form field as a string, ``None`` when absent. A file part is read."""
+    raw = form.get(name)
+    if raw is None:
+        return None
+    return raw.file.read().decode() if hasattr(raw, "file") else str(raw)
+
+
+def _unrefreshable_response() -> JSONResponse:
+    """The one ``invalid_grant`` every refused refresh gets.
+
+    RFC 6749 section 5.2's code for a grant that is "invalid, expired,
+    revoked ... or was issued to another client". One body for every reason,
+    for the reason `_unredeemable_response` gives: the distinction belongs in
+    ``audit_log.detail``, where the caller cannot read it.
+    """
+    return _error(400, "invalid_grant", "refresh token cannot be redeemed")
+
+
+def _log_unknown_refresh(request: Request, sid: str) -> None:
+    """One warning per family per `UNKNOWN_REFRESH_LOG_INTERVAL_SECONDS`, per process.
+
+    A presented value whose ``sid`` names a real family and whose hash the
+    family never issued. It proves nothing (the ``sid`` is in every access
+    token), so it writes no row; the log line is rate-limited so the same
+    caller cannot flood the log instead. The ``sid`` is logged, never the
+    presented value.
+    """
+    seen: OrderedDict[str, float] | None = getattr(request.app.state, "_unknown_refresh_log", None)
+    if seen is None:
+        seen = OrderedDict()
+        request.app.state._unknown_refresh_log = seen
+    now = time.monotonic()
+    last = seen.get(sid)
+    if last is not None and now - last < UNKNOWN_REFRESH_LOG_INTERVAL_SECONDS:
+        return
+    seen.pop(sid, None)
+    seen[sid] = now
+    while len(seen) > UNKNOWN_REFRESH_LOG_ENTRIES:
+        seen.popitem(last=False)
+    logger.warning(
+        "refresh grant: a refresh token this family never issued was presented for family %s",
+        sid,
+    )
+
+
+async def _reassert(store: RevocationStoreBase, jtis: tuple[str, ...]) -> None:
+    """Put every live access token of a revoked family on the ZT-7 list.
+
+    An idempotent set add per ``jti``. Re-running it on every presentation of
+    a revoked family is what makes a failed write at reuse or recall converge.
+    """
+    for jti in jtis:
+        await store.revoke_session(jti=jti)
+
+
+async def _refresh_grant(
+    request: Request, form: Any, *, at: datetime, started: float
+) -> JSONResponse:
+    """``grant_type=refresh_token``, spec section 6 steps 1 to 3 and the row.
+
+    The shape checks and the lookup write nothing. From the proof of
+    possession on -- the presented token's hash is the family's current one
+    or a retained one -- every exit writes exactly one row, through
+    ``PairingAudit`` with ``REFRESH_TOOL_NAME``, naming the family's customer
+    and ``session_id``.
+    """
+    settings: ConfirmSettings = request.app.state.settings
+    presented = _form_value(form, "refresh_token")
+    if not presented:
+        return _error(400, "invalid_request", "refresh_token is required")
+    unserved = _resource_refusal(form, settings)
+    if unserved is not None:
+        return unserved
+    sid = sid_of(presented)
+    if sid is None:
+        return _unrefreshable_response()
+    sessions: RefreshSessionStoreBase = request.app.state.refresh_session_store
+    family = await sessions.get(sid)
+    if family is None:
+        return _unrefreshable_response()
+
+    # STEP 3: PROOF OF POSSESSION BEFORE ANYTHING IS RECORDED.
+    presented_hash = hash_refresh_token(presented)
+    retained = presented_hash in family.retained_hashes
+    if not retained and not hmac.compare_digest(family.current_hash, presented_hash):
+        _log_unknown_refresh(request, sid)
+        return _unrefreshable_response()
+
+    db: Database = request.app.state.postern_database
+    audit = PairingAudit(
+        db=db,
+        call_id=str(uuid.uuid4()),
+        at=at,
+        started=started,
+        subject=family.customer_ref,
+        claims={},
+        client_ip_value=pairing_client_ip(request, settings.trusted_proxy_hops),
+        tool_name=REFRESH_TOOL_NAME,
+        route=TOKEN_ROUTE,
+    )
+    audit.names(session_id=sid, paired_client_id=family.client_id)
+    try:
+        response, detail = await _refresh(
+            request, form=form, family=family, presented_hash=presented_hash, retained=retained
+        )
+    except Exception as exc:
+        try:
+            await audit.refused(type(exc).__name__)
+        except Exception as audit_exc:
+            logger.error(
+                "audit write failed for a session refresh after it raised %s: %s",
+                type(exc).__name__,
+                audit_exc,
+                exc_info=audit_exc,
+            )
+            raise exc from audit_exc
+        raise
+    # COMMITTED BEFORE THE RESPONSE, for the reason `_token_response` gives.
+    try:
+        if detail is None:
+            await audit.minted()
+        else:
+            await audit.refused(detail)
+    except Exception as audit_exc:
+        logger.error(
+            "audit write failed for a session refresh that answered %d; failing the request",
+            response.status_code,
+            exc_info=audit_exc,
+        )
+        raise
+    return response
+
+
+async def _refresh(
+    request: Request,
+    *,
+    form: Any,
+    family: RefreshSession,
+    presented_hash: str,
+    retained: bool,
+) -> tuple[JSONResponse, str | None]:
+    """Spec section 6 steps 4 to 9, returning ``(response, detail)``.
+
+    ``detail`` is ``None`` only for a rotation that issued a session. The
+    ZT-7 checks run before the rotation spends anything, the ordering
+    ``_exchange`` argues for its claim.
+    """
+    sessions: RefreshSessionStoreBase = request.app.state.refresh_session_store
+    revocations = revocation_store(request)
+    # Every retryable 503 below carries ``Retry-After``, the poll interval
+    # ``/token`` uses for its device-code 503s (spec, Discrepancies 5).
+    settings: ConfirmSettings = request.app.state.settings
+    retry_after = settings.device_poll_interval_seconds
+    now = datetime.now(UTC)
+
+    # STEP 4: CLASSIFY.
+    if family.revoked_at is not None:
+        return await _answer_revoked(revocations, family, now, retry_after)
+    if retained:
+        return await _answer_reuse(sessions, revocations, family, retry_after)
+    if family.generation >= MAX_GENERATIONS:
+        return _unrefreshable_response(), DETAIL_SESSION_GENERATIONS_EXHAUSTED
+    if family.is_expired(now):
+        return _unrefreshable_response(), DETAIL_SESSION_EXPIRED
+    client_id = _form_value(form, "client_id")
+    if client_id is not None and client_id != family.client_id:
+        return _unrefreshable_response(), DETAIL_CLIENT_ID_MISMATCH
+
+    # STEP 5: SCOPE. Absent or empty after canonicalization is "the scope
+    # originally granted" (RFC 6749 section 6); wider is refused.
+    requested = canonical_scope(_form_value(form, "scope") or "")
+    granted = family.scopes
+    if requested:
+        if not set(requested.split(" ")) <= set(family.scopes.split(" ")):
+            return (
+                _error(400, "invalid_scope", "the requested scope exceeds the grant"),
+                DETAIL_SCOPE_EXCEEDED,
+            )
+        granted = requested
+
+    # STEP 6: ZT-7, BEFORE THE ROTATION SPENDS ANYTHING.
+    try:
+        refused = await _refresh_revoked(revocations, family, now)
+        stamp = await revocations.customer_revoked_at(family.customer_ref)
+    except RevocationStoreUnavailable as exc:
+        logger.warning("refresh grant: revocation store unavailable, refusing to rotate")
+        return store_unavailable_response(retry_after), type(exc).__name__
+    if refused:
+        log_refusal("a session refresh")
+        return _unrefreshable_response(), DETAIL_REVOKED
+    if stamp is not None and stamp >= family.created_ms:
+        # ISSUED BEFORE A CUSTOMER REVOCATION: refused, and the family is
+        # revoked for good, so no later restore can revive it.
+        log_refusal("a session refresh of a family issued before a revocation")
+        await sessions.revoke(family.sid, reason="issued_before_revocation")
+        return _unrefreshable_response(), DETAIL_ISSUED_BEFORE_REVOCATION
+
+    # STEP 7: DRAW.
+    minter: SessionTokenMinter = request.app.state.session_minter
+    new_token = new_refresh_token(family.sid)
+    claims = minter.prepare(
+        customer=CustomerRef(value=family.customer_ref),
+        client_id=family.client_id,
+        scope=granted,
+        sid=family.sid,
+    )
+
+    # STEP 8: ROTATE, one compare-and-set. Any result but ROTATED re-runs the
+    # matching branch of step 4 against what the transaction saw: a
+    # concurrent refresh that won turns this one into REUSED.
+    outcome = await sessions.rotate(
+        family.sid,
+        presented_hash=presented_hash,
+        new_hash=hash_refresh_token(new_token),
+        access_jti=claims.jti,
+        access_expires_at=datetime.fromtimestamp(claims.exp, UTC),
+    )
+    if outcome.rotation is Rotation.REUSED:
+        return await _reuse_detected(revocations, family, outcome.jtis, retry_after)
+    if outcome.rotation is Rotation.REVOKED:
+        try:
+            await _reassert(revocations, outcome.jtis)
+        except RevocationStoreUnavailable as exc:
+            return store_unavailable_response(retry_after), type(exc).__name__
+        return _unrefreshable_response(), DETAIL_SESSION_REVOKED
+    if outcome.rotation is Rotation.EXHAUSTED:
+        return _unrefreshable_response(), DETAIL_SESSION_GENERATIONS_EXHAUSTED
+    if outcome.rotation is Rotation.GONE:
+        return _unrefreshable_response(), DETAIL_SESSION_EXPIRED
+    if outcome.rotation is not Rotation.ROTATED:
+        # UNKNOWN after step 3's proof means the record was replaced under a
+        # presentation it had accepted. Fail closed and loudly: the row
+        # records the exception's type.
+        raise RuntimeError(f"family {family.sid} no longer holds a hash it held a moment ago")
+
+    # STEP 9: SIGN. A raise leaves the family rotated and the client's token
+    # retained; its retry is reuse and revokes the family. Fail closed.
+    access_token = minter.sign(claims)
+    return (
+        JSONResponse(
+            status_code=200,
+            content={
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": ACCESS_TOKEN_LIFETIME_SECONDS,
+                "refresh_token": new_token,
+                "scope": granted,
+            },
+        ),
+        None,
+    )
+
+
+async def _refresh_revoked(
+    revocations: RevocationStoreBase, family: RefreshSession, now: datetime
+) -> bool:
+    """The first two ZT-7 checks of spec section 6 step 6.
+
+    The customer under any client, as ``/token`` asks; then the pair and the
+    kill switch, once on their own and once beside each live access ``jti``,
+    so an operator who revokes a live access token's ``jti`` also stops the
+    family refreshing past it. The check without a ``jti`` is there for a
+    family whose access tokens have all expired, which would otherwise ask
+    the pair and the kill switch nothing.
+    """
+    if await revocations.is_customer_revoked(family.customer_ref):
+        return True
+    base = {"sub": family.customer_ref, "client_id": family.client_id}
+    if await revocations.is_revoked(base):
+        return True
+    for jti in family.live_jtis(now):
+        if await revocations.is_revoked({**base, "jti": jti}):
+            return True
+    return False
+
+
+async def _answer_revoked(
+    revocations: RevocationStoreBase, family: RefreshSession, now: datetime, retry_after: int
+) -> tuple[JSONResponse, str | None]:
+    """A revoked family: re-assert its live jtis on the ZT-7 list, then refuse."""
+    try:
+        await _reassert(revocations, family.live_jtis(now))
+    except RevocationStoreUnavailable as exc:
+        return store_unavailable_response(retry_after), type(exc).__name__
+    return _unrefreshable_response(), DETAIL_SESSION_REVOKED
+
+
+async def _answer_reuse(
+    sessions: RefreshSessionStoreBase,
+    revocations: RevocationStoreBase,
+    family: RefreshSession,
+    retry_after: int,
+) -> tuple[JSONResponse, str | None]:
+    """A retained token on a live family: revoke it, then list its jtis.
+
+    A store raising answers 503 under its type name; the next presentation of
+    either token lands in the revoked branch and re-asserts.
+    """
+    try:
+        jtis = await sessions.revoke(family.sid, reason="reuse")
+    except Exception as exc:  # noqa: BLE001 -- any store failure is a retryable 503
+        return store_unavailable_response(retry_after), type(exc).__name__
+    return await _reuse_detected(revocations, family, jtis or (), retry_after)
+
+
+async def _reuse_detected(
+    revocations: RevocationStoreBase,
+    family: RefreshSession,
+    jtis: tuple[str, ...],
+    retry_after: int,
+) -> tuple[JSONResponse, str | None]:
+    logger.warning(
+        "refresh grant: a retained refresh token was presented; family %s (device code %s) "
+        "is revoked",
+        family.sid,
+        family.device_code_handle,
+    )
+    try:
+        await _reassert(revocations, jtis)
+    except RevocationStoreUnavailable as exc:
+        return store_unavailable_response(retry_after), type(exc).__name__
+    return _unrefreshable_response(), DETAIL_REFRESH_REUSED
 
 
 async def _discard_orphan(sessions: RefreshSessionStoreBase, sid: str, after: str) -> None:
