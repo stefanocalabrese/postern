@@ -71,7 +71,10 @@ from postern_core.auth.device_codes import (
 )
 from postern_core.auth.refresh_sessions import SESSION_ABSOLUTE_LIFETIME
 from postern_core.auth.resource_uri import is_normal_https_resource, is_plain_ascii_uri_text
-from postern_core.auth.revocation import CUSTOMER_REVOKED_AT_TTL_SECONDS
+from postern_core.auth.revocation import (
+    CUSTOMER_REVOKED_AT_TTL_SECONDS,
+    REVOKED_AT_MARGIN_SECONDS,
+)
 from postern_core.auth.vault import VaultSettings, vault_from_env
 from postern_core.config import bool_from_env, float_from_env, int_from_env
 
@@ -219,11 +222,13 @@ MIN_DEVICE_CODE_TTL_SECONDS = _MIN_DEVICE_CODE_TTL_SECONDS
 #: The longest ``POSTERN_DEVICE_CODE_TTL_SECONDS`` the customer revocation
 #: stamp can cover: `postern_core.auth.revocation`'s
 #: ``CUSTOMER_REVOKED_AT_TTL_SECONDS`` less the refresh family's lifetime and
-#: its 300-second margin, which is 900 today. An approved code must not
+#: ``REVOKED_AT_MARGIN_SECONDS``, which is 900 today. An approved code must not
 #: outlive the stamp it is compared with at ``POST /token``, and the stamp's
 #: writer cannot read this service's settings, so the ceiling lands here.
 MAX_DEVICE_CODE_TTL_SECONDS = (
-    CUSTOMER_REVOKED_AT_TTL_SECONDS - int(SESSION_ABSOLUTE_LIFETIME.total_seconds()) - 300
+    CUSTOMER_REVOKED_AT_TTL_SECONDS
+    - int(SESSION_ABSOLUTE_LIFETIME.total_seconds())
+    - REVOKED_AT_MARGIN_SECONDS
 )
 
 
@@ -273,7 +278,8 @@ def _device_code_ttl(name: str, default: int) -> int:
             f"{name} must be at most {MAX_DEVICE_CODE_TTL_SECONDS} seconds, got {value}. "
             "An approved device code must not outlive the customer revocation stamp "
             f"({CUSTOMER_REVOKED_AT_TTL_SECONDS} seconds) that POST /token compares its "
-            "approval with, less the one-hour session family and a 300-second margin."
+            "approval with, less the one-hour session family and a "
+            f"{REVOKED_AT_MARGIN_SECONDS}-second margin."
         )
     return value
 

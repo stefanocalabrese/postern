@@ -8,18 +8,20 @@ no Redis server of any kind ran in this repository: `pg_url` in
 tests/conftest.py starts a Postgres container and nothing started a Redis
 one, so those three classes were verified by reading.
 
-WHAT ``fakeredis`` ALREADY COVERS, and why this does not replace it. Four
+WHAT ``fakeredis`` ALREADY COVERS, and why this does not replace it. Two
 files drive Redis code through ``fakeredis``, they are fast, they pass, and
-none of them is touched here:
+neither is touched here:
 
 - tests/test_risk_session_wiring.py -- `RedisSessionStore` round trips,
   prefix, TTL arithmetic, the two-clock conversion.
 - tests/test_risk_middleware_actions.py -- a corrupt stored value refusing a
   call.
-- tests/test_zt7_revocation_reachable.py and
-  tests/test_zt7_confirm_revocation.py -- `RedisRevocationStore` across two
-  replicas and the operator's CLI, and the memory/Redis parity matrix for
-  ``is_customer_revoked``.
+
+Until 1 October 2026 there were four. tests/test_zt7_revocation_reachable.py
+and tests/test_zt7_confirm_revocation.py, which drive `RedisRevocationStore`
+across two replicas and the operator's CLI, moved to the ``redis_url``
+container when a customer-client revocation became one Lua script: fakeredis
+2.38.0 without ``lupa`` answers ``EVAL`` with "unknown command 'eval'".
 
 Measured on 2026-09-25, fakeredis 2.38.0 against redis:7-alpine, over every
 command these three stores issue (SETEX, GET, TTL, EXPIRE, DEL, ZADD, ZCARD,

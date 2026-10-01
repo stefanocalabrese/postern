@@ -175,23 +175,31 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: The slack ``CUSTOMER_REVOKED_AT_TTL_SECONDS`` keeps beyond the longest
+#: thing it must cover, for replication lag and the 2-second cross-clock
+#: tolerance. ``ConfirmSettings`` subtracts the same value for its device-code
+#: ceiling, so the two cannot drift apart.
+REVOKED_AT_MARGIN_SECONDS = 300
+
 #: How long ``customer_revoked_at`` remembers a customer revocation, restored
 #: or not. The refresh-family lifetime (3,600 s) plus the default device-code
 #: lifetime (900 s), the longest a family or an approved-but-unexchanged code
-#: can outlive the revocation it must be compared with, plus 300 s for
-#: replication lag and the 2-second cross-clock tolerance. A constant here and
-#: not a setting, because the writer (`postern_core.auth.revoke_cli`, or an
-#: operator's own backend) does not know confirm's settings; ``ConfirmSettings``
-#: refuses a device-code lifetime that would outgrow it.
-CUSTOMER_REVOKED_AT_TTL_SECONDS = 4_800
+#: can outlive the revocation it must be compared with, plus
+#: ``REVOKED_AT_MARGIN_SECONDS``: 4,800 s. A constant here and not a setting,
+#: because the writer (`postern_core.auth.revoke_cli`, or an operator's own
+#: backend) does not know confirm's settings; ``ConfirmSettings`` refuses a
+#: device-code lifetime that would outgrow it.
+CUSTOMER_REVOKED_AT_TTL_SECONDS = 3_600 + 900 + REVOKED_AT_MARGIN_SECONDS
 
 #: The revocation of a customer-client pair and its timestamp, as ONE
 #: server-side step on ONE clock: ``TIME``, then the pair's ``SADD``, then the
 #: customer's stamp with its expiry. Returns the stamp in milliseconds.
 #:
 #: A script that reads ``TIME`` and then writes must be replicated by its
-#: effects rather than by its body; whether the operator's Redis does that by
-#: default was not verified here and is the operator's to confirm. It runs as
+#: effects rather than by its body. Effects replication is the default from
+#: Redis 5.0 and the only mode from 7.0 (the Redis scripting introduction,
+#: read 1 October 2026), so the operator's Redis must be 5.0 or later. The
+#: two keys must share a slot, so it must not be a cluster. It runs as
 #: written on the suite's ``redis:7-alpine``.
 _REVOKE_CUSTOMER_CLIENT = (
     "local t = redis.call('TIME') "
@@ -756,7 +764,14 @@ class RedisRevocationStore(RevocationStoreBase):
             raise RevocationStoreUnavailable(
                 f"revocation timestamp could not be read: {type(exc).__name__}"
             ) from exc
-        return int(raw) if raw is not None else None
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation timestamp is corrupt: {type(exc).__name__}"
+            ) from exc
 
     async def restore_customer_client(self, *, customer_ref: str, client_id: str) -> None:
         await self._remove(self._pairs_key, _pair_member(customer_ref, client_id))

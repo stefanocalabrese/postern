@@ -19,6 +19,7 @@ import pytest
 from postern_core.auth import revocation
 from postern_core.auth.revocation import (
     CUSTOMER_REVOKED_AT_TTL_SECONDS,
+    REVOKED_AT_MARGIN_SECONDS,
     InMemoryRevocationStore,
     RedisRevocationStore,
     RevocationSnapshot,
@@ -45,7 +46,8 @@ async def store(request: pytest.FixtureRequest) -> AsyncIterator[RevocationStore
 
 
 def test_the_ttl_is_the_family_plus_the_device_code_plus_a_margin() -> None:
-    assert CUSTOMER_REVOKED_AT_TTL_SECONDS == 3_600 + 900 + 300
+    assert REVOKED_AT_MARGIN_SECONDS == 300
+    assert CUSTOMER_REVOKED_AT_TTL_SECONDS == 3_600 + 900 + REVOKED_AT_MARGIN_SECONDS == 4_800
     assert MAX_DEVICE_CODE_TTL_SECONDS == 900
 
 
@@ -117,6 +119,17 @@ async def test_the_in_memory_stamp_expires_after_the_ttl(
     assert await store.customer_revoked_at(CUSTOMER) == 1_000_000
     clock["ms"] += 1
     assert await store.customer_revoked_at(CUSTOMER) is None
+
+
+async def test_a_corrupt_stored_stamp_is_unavailable_not_a_crash(redis_url: str) -> None:
+    """A non-numeric value under the stamp's key fails closed, the way an
+    unreachable store does, rather than raising ``ValueError`` past it."""
+    prefix = f"ra{uuid4().hex[:12]}:"
+    store = RedisRevocationStore(url=redis_url, key_prefix=prefix)
+    await store._redis.set(f"{prefix}revoked:customer-at:{CUSTOMER}", "not-a-number")
+    with pytest.raises(RevocationStoreUnavailable):
+        await store.customer_revoked_at(CUSTOMER)
+    await store.close()
 
 
 async def test_an_unreachable_redis_is_unavailable_not_none() -> None:

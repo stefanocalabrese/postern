@@ -200,14 +200,23 @@ async def app_db(app_url: str) -> AsyncIterator[Database]:
 
 @pytest.fixture(scope="session")
 def redis_url() -> Iterator[str]:
-    """One Redis for the whole run, for `tests/test_redis_backed_stores.py`.
+    """One Redis for the whole run, shared by every test that requests it.
+
+    Seven files do, as of 1 October 2026: `tests/test_redis_backed_stores.py`,
+    which it was written for, tests/test_device_code_scanner_ip.py,
+    tests/test_confirm_customer_rate_limit.py, tests/test_refresh_sessions.py,
+    tests/test_customer_revoked_at.py, and the two ZT-7 files,
+    tests/test_zt7_revocation_reachable.py and
+    tests/test_zt7_confirm_revocation.py, whose ``shared_redis`` fixtures moved
+    here from fakeredis when a customer-client revocation became a Lua script.
 
     SESSION-SCOPED for the same reason `pg_url` is, and the reason is the
     container and not the data: starting one costs wall clock that `make ci`
-    pays before every commit, and the three stores under test all accept a
+    pays before every commit, and every store under test accepts a
     ``key_prefix``, so a namespace per test isolates them without a second
-    container or a flush. The ``stores`` fixture in that file is where that
-    happens, and its docstring is where the alternatives are priced.
+    container or a flush. The ``stores`` fixture in
+    `tests/test_redis_backed_stores.py` is where that first happened, and its
+    docstring is where the alternatives are priced.
 
     DOCKER IS PINGED HERE, before `RedisContainer` gets a chance to: an
     unreachable daemon otherwise surfaces as a 15-frame
@@ -224,8 +233,10 @@ def redis_url() -> Iterator[str]:
     `postern_core.auth.device_codes.create_device_code_store` all read that
     variable and switch backend when it is set. Exporting it session-wide
     would silently move every other test in the suite off the in-memory
-    stores they were written against. Tests here name the URL explicitly
-    instead.
+    stores they were written against. Tests name the URL explicitly instead,
+    and the two ZT-7 ``shared_redis`` fixtures, which need it in the
+    environment for a CLI that reads it, set it with ``monkeypatch`` for one
+    test at a time.
     """
     try:
         docker.from_env().ping()

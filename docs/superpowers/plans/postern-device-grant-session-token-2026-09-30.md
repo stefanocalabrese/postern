@@ -3267,8 +3267,10 @@ CUSTOMER_REVOKED_AT_TTL_SECONDS = 4_800
 #: customer's stamp with its expiry. Returns the stamp in milliseconds.
 #:
 #: A script that reads ``TIME`` and then writes must be replicated by its
-#: effects rather than by its body; whether the operator's Redis does that by
-#: default was not verified here and is the operator's to confirm. It runs as
+#: effects rather than by its body. Effects replication is the default from
+#: Redis 5.0 and the only mode from 7.0 (the Redis scripting introduction,
+#: read 1 October 2026), so the operator's Redis must be 5.0 or later. The
+#: two keys must share a slot, so it must not be a cluster. It runs as
 #: written on the suite's ``redis:7-alpine``.
 _REVOKE_CUSTOMER_CLIENT = (
     "local t = redis.call('TIME') "
@@ -13491,7 +13493,7 @@ The baseline, `41a1701` before Task 1, was exit 0 with 3487 passed. Every run is
 
 - **The compose stack was not brought up.** `docker compose config -q` accepts the file and `tests/test_vault_live.py` bootstraps the same Vault objects, but no run of `docker compose up` exercised the repointed `api`, the `redis` service or a real pairing through the containers.
 - **`SessionTokenVerifier` overrides a private method of a pinned dependency.** The signature pin and the counting-server test through `build_server` are the guard; both must be re-run on any `fastmcp` bump.
-- **Redis script replication.** `revoke_customer_client` reads `TIME` inside `EVAL` and then writes; it runs on the suite's `redis:7-alpine`, and whether the operator's Redis replicates it by effects is unverified, as the spec says.
+- **Redis script replication.** `revoke_customer_client` reads `TIME` inside `EVAL` and then writes; it runs on the suite's `redis:7-alpine`. Settled on 1 October 2026 from the Redis scripting introduction: effects replication is the default from Redis 5.0 and the only mode from 7.0, so the operator needs Redis 5.0 or later (7.0 or later recommended) with scripting enabled, and a non-clustered topology, as the spec's section 6 step 6 now says.
 - **The recall's store step catches every `Exception`.** That is the spec's fail-closed 503, but a programming error in `_recall` would also surface as a 503 the app retries, not as a 500.
 - **`POSTERN_REDIS_DEVICE_CODE_TTL` is not bounded by the new 900-second ceiling** (discrepancy 11).
 - **The Redis refresh-session cap can be overshot, and one crash leaves an uncounted family** (added 1 October 2026, accepted, no Lua script). `create` reads the count and writes the family in separate round trips, so N concurrent creates can all land: the store holds at most `max_sessions + N`, the same overshoot `RedisDeviceCodeStore` already accepts. A crash between `SET NX` and `ZADD` leaves a family the index does not count, bounded only by its one-hour key TTL; that gap is this store's alone, since the device-code store writes key and index in one `MULTI`.

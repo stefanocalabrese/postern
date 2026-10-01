@@ -135,6 +135,27 @@ class RedisSessionStore(SessionStoreBase):
 | `POSTERN_REDIS_URL` | `redis://localhost:6379/0` | Redis connection string (use `rediss://` for TLS) |
 | `POSTERN_REDIS_KEY_PREFIX` | `postern:` | Key prefix for multi-tenant deployments |
 
+### Topology and version (1 October 2026)
+
+**The Redis must be non-clustered**: a standalone instance, or a single-shard
+primary with replicas. Several steps span more than one key: the customer
+revocation script writes the pair set and the per-customer
+`revoked:customer-at:` key; `revoke_device_code` deletes a code's primary key,
+its index entry and its secondary keys in one `MULTI`/`EXEC`; the refresh-family
+store's `discard` deletes a family's key and its index entry in one
+`MULTI`/`EXEC`. Redis in cluster mode refuses any of those whose keys hash to
+different slots with `CROSSSLOT`, and none of the key names this code builds
+carries a hash tag.
+
+**Redis 5.0 or later, 7.0 or later recommended, with scripting enabled.** The
+customer revocation script reads `TIME` and then writes, which is safe only
+under effects replication. The Redis scripting introduction
+(https://redis.io/docs/latest/develop/programmability/eval-intro/, fetched
+1 October 2026): "In Redis 5.0, effects replication became the default mode. As
+of Redis 7.0, verbatim replication is no longer supported." The script cache is
+volatile, which needs no action: redis-py's `eval` sends the script body on
+every call.
+
 ## ContextVar Pattern (Per-Call Access)
 
 Each subsystem uses a `ContextVar` for per-call access to the current session context:
