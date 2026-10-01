@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import uuid4
 
+import postern_core.auth.refresh_sessions as refresh_sessions_module
 import pytest
 from postern_core.auth.refresh_sessions import (
     MAX_GENERATIONS,
@@ -24,6 +26,7 @@ from postern_core.auth.refresh_sessions import (
     RefreshSession,
     RefreshSessionCollision,
     RefreshSessionStoreBase,
+    RefreshSessionStoreContended,
     RefreshSessionStoreFull,
     Rotation,
     RotationOutcome,
@@ -97,6 +100,98 @@ async def _rotate(
     return outcome, new
 
 
+def _count_decisions(
+    monkeypatch: pytest.MonkeyPatch, before: Callable[[], None] | None = None
+) -> Callable[[], int]:
+    """Wrap the shared verdict so a test can count how often a store decided.
+
+    ``before`` runs on each call ahead of the real decision; the contention
+    tests use it to move the WATCHed key under the transaction.
+    """
+    calls = 0
+    original = refresh_sessions_module._decide
+
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if before is not None:
+            before()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(refresh_sessions_module, "_decide", counted)
+    return lambda: calls
+
+
+def _hold_first_reads(
+    monkeypatch: pytest.MonkeyPatch, store: RedisRefreshSessionStore, parties: int
+) -> None:
+    """Make the first ``parties`` WATCHed reads wait for one another.
+
+    Without it the first transaction can finish before the second WATCHes,
+    and the loser then reads the winner's record and never meets a moved
+    key. Held here, every transaction has read the old record before any of
+    them writes, so all but one must take the ``WatchError`` branch.
+    """
+    arrived = 0
+    all_read = asyncio.Event()
+    real_pipeline = store._redis.pipeline
+
+    def pipeline(*args: Any, **kwargs: Any) -> Any:
+        pipe = real_pipeline(*args, **kwargs)
+        real_get = pipe.get
+
+        async def get(key: str) -> Any:
+            nonlocal arrived
+            value = await real_get(key)
+            if arrived < parties:
+                arrived += 1
+                if arrived == parties:
+                    all_read.set()
+                await all_read.wait()
+            return value
+
+        pipe.get = get
+        return pipe
+
+    monkeypatch.setattr(store._redis, "pipeline", pipeline)
+
+
+@pytest.fixture
+def other_client(redis_url: str) -> Iterator[Any]:
+    """A second, synchronous Redis client: the writer a WATCH must notice."""
+    import redis
+
+    client: Any = redis.Redis.from_url(redis_url, decode_responses=True)
+    yield client
+    client.close()
+
+
+def _interfere(
+    monkeypatch: pytest.MonkeyPatch,
+    other: Any,
+    store: RedisRefreshSessionStore,
+    sid: str,
+    *,
+    times: int | None,
+) -> Callable[[], int]:
+    """Have ``other`` rewrite the family's key inside each decision.
+
+    It writes back the value already stored, so the record is unchanged and
+    only the WATCH is broken. ``times=None`` interferes on every attempt.
+    """
+    key = store._key(sid)
+    done = 0
+
+    def rewrite() -> None:
+        nonlocal done
+        if times is not None and done >= times:
+            return
+        done += 1
+        other.set(key, other.get(key), keepttl=True)
+
+    return _count_decisions(monkeypatch, before=rewrite)
+
+
 class TestTheToken:
     def test_the_format_and_the_sid(self) -> None:
         sid = new_sid()
@@ -161,6 +256,14 @@ class TestTheRecord:
         )
         assert RefreshSession.from_json(session.to_json()) == session
 
+    def test_repr_carries_no_hash(self) -> None:
+        session, _ = _family()
+        session = dataclasses.replace(session, retained_hashes=("f" * 64,))
+        outcome = RotationOutcome(Rotation.ROTATED, session)
+        for text in (repr(session), repr(outcome)):
+            assert session.current_hash not in text
+            assert "f" * 64 not in text
+
     def test_the_ttl_is_rounded_up(self) -> None:
         now = datetime(2026, 9, 30, 12, 0, 0, tzinfo=UTC)
         assert _ttl_seconds(now + timedelta(seconds=10, milliseconds=1), now) == 11
@@ -188,11 +291,13 @@ class TestCreate:
     @pytest.mark.parametrize("kind", BACKENDS)
     async def test_the_cap_refuses(self, kind: str, request: pytest.FixtureRequest) -> None:
         store = await _store(kind, request, max_sessions=2)
-        await store.create(_family()[0])
-        await store.create(_family()[0])
-        with pytest.raises(RefreshSessionStoreFull):
+        try:
             await store.create(_family()[0])
-        await store.close()
+            await store.create(_family()[0])
+            with pytest.raises(RefreshSessionStoreFull):
+                await store.create(_family()[0])
+        finally:
+            await store.close()
 
     async def test_get_of_a_missing_sid_is_none(self, store: RefreshSessionStoreBase) -> None:
         assert await store.get(new_sid()) is None
@@ -255,6 +360,20 @@ class TestRotate:
         assert outcome.rotation is Rotation.UNKNOWN
         assert await store.get(session.sid) == stored
 
+    async def test_a_wrong_secret_on_a_revoked_family_is_unknown_and_reveals_nothing(
+        self, store: RefreshSessionStoreBase
+    ) -> None:
+        # Possession first (RFC 9700 section 4.14.2): a hash this family never
+        # issued learns nothing, not even that the family is revoked.
+        session, _ = _family()
+        await store.create(session)
+        await store.revoke(session.sid, reason="recall")
+        before = await store.get(session.sid)
+        outcome, _ = await _rotate(store, session.sid, new_refresh_token(session.sid))
+        assert outcome.rotation is Rotation.UNKNOWN
+        assert outcome.jtis == ()
+        assert await store.get(session.sid) == before
+
     async def test_exhausted_at_max_generations(self, store: RefreshSessionStoreBase) -> None:
         session, token = _family()
         await store.create(session)
@@ -282,10 +401,13 @@ class TestRotate:
         assert [jti for jti, _ in stored.access_tokens] == ["fresh"]
 
     async def test_two_concurrent_rotations_are_one_rotated_and_one_reused(
-        self, store: RefreshSessionStoreBase
+        self, store: RefreshSessionStoreBase, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        decisions = _count_decisions(monkeypatch)
         session, token = _family()
         await store.create(session)
+        if isinstance(store, RedisRefreshSessionStore):
+            _hold_first_reads(monkeypatch, store, parties=2)
         results = await asyncio.gather(
             _rotate(store, session.sid, token, jti="a"),
             _rotate(store, session.sid, token, jti="b"),
@@ -295,6 +417,11 @@ class TestRotate:
         stored = await store.get(session.sid)
         assert stored is not None
         assert stored.revoked_reason == "reuse"
+        if isinstance(store, RedisRefreshSessionStore):
+            # Two presentations decided three times: the loser's EXEC met a
+            # moved WATCH and re-read, so REUSED came from the retry branch
+            # rather than from a read after the winner wrote.
+            assert decisions() == 3
 
 
 class TestRevoke:
@@ -318,13 +445,20 @@ class TestRedisSpecifics:
     async def test_the_key_ttl_is_the_absolute_lifetime(self, redis_url: str) -> None:
         prefix = f"rs{uuid4().hex[:12]}:"
         store = RedisRefreshSessionStore(url=redis_url, key_prefix=prefix)
-        session, _ = _family()
-        await store.create(session)
-        ttl = await store._redis.ttl(f"{prefix}refresh:session:{session.sid}")
-        assert 3590 <= ttl <= 3600
-        await _rotate(store, session.sid, _family(session.sid)[1])
-        assert await store._redis.ttl(f"{prefix}refresh:session:{session.sid}") > 3590
-        await store.close()
+        session, token = _family()
+        key = f"{prefix}refresh:session:{session.sid}"
+        try:
+            await store.create(session)
+            assert 3590 <= await store._redis.ttl(key) <= 3600
+            # A rotation that WRITES, so KEEPTTL is what is under test: a SET
+            # without it clears the expiry and TTL answers -1.
+            outcome, _ = await _rotate(store, session.sid, token)
+            assert outcome.rotation is Rotation.ROTATED
+            assert 0 < await store._redis.ttl(key) <= 3600
+            assert await store.revoke(session.sid, reason="recall") is not None
+            assert 0 < await store._redis.ttl(key) <= 3600
+        finally:
+            await store.close()
 
     async def test_an_undeserializable_record_is_gone(self, redis_url: str) -> None:
         prefix = f"rs{uuid4().hex[:12]}:"
@@ -335,6 +469,35 @@ class TestRedisSpecifics:
         outcome, _ = await _rotate(store, sid, new_refresh_token(sid))
         assert outcome.rotation is Rotation.GONE
         await store.close()
+
+    async def test_one_lost_watch_is_retried_and_rotates(
+        self, redis_url: str, other_client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = RedisRefreshSessionStore(url=redis_url, key_prefix=f"rs{uuid4().hex[:12]}:")
+        session, token = _family()
+        try:
+            await store.create(session)
+            decisions = _interfere(monkeypatch, other_client, store, session.sid, times=1)
+            outcome, _ = await _rotate(store, session.sid, token)
+            assert outcome.rotation is Rotation.ROTATED
+            assert decisions() == 2
+        finally:
+            await store.close()
+
+    async def test_exhausting_the_watch_retries_raises_and_writes_nothing(
+        self, redis_url: str, other_client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = RedisRefreshSessionStore(url=redis_url, key_prefix=f"rs{uuid4().hex[:12]}:")
+        session, token = _family()
+        try:
+            before = await store.create(session)
+            decisions = _interfere(monkeypatch, other_client, store, session.sid, times=None)
+            with pytest.raises(RefreshSessionStoreContended):
+                await _rotate(store, session.sid, token)
+            assert decisions() == 3
+            assert await store.get(session.sid) == before
+        finally:
+            await store.close()
 
     async def test_creation_is_stamped_from_the_redis_clock(self, redis_url: str) -> None:
         store = RedisRefreshSessionStore(url=redis_url, key_prefix=f"rs{uuid4().hex[:12]}:")

@@ -158,8 +158,8 @@ Code constants: `SESSION_ABSOLUTE_LIFETIME = timedelta(hours=1)`; `MAX_GENERATIO
 - `rotate(sid, *, presented_hash, new_hash, access_jti, access_expires_at) -> Rotation`. One compare-and-set, deciding from the record read inside the transaction with one pure function both backends share (the pattern `_scan_verdict` set):
   - `ROTATED`: unrevoked, unexpired, `presented_hash == current_hash`, `generation < MAX_GENERATIONS`. Retains the old hash, sets the new one, increments `generation`, records the new access `jti`, prunes.
   - `REUSED`: `presented_hash` is retained. Revokes with reason `reuse` in the same transaction; returns the unexpired jtis.
-  - `REVOKED`: already revoked. Writes nothing; returns the unexpired jtis.
-  - `UNKNOWN`: hash neither current nor retained. Writes nothing.
+  - `REVOKED`: already revoked, and the hash is current or retained. Writes nothing; returns the unexpired jtis.
+  - `UNKNOWN`: hash neither current nor retained, **checked first, in every state including revoked**. Writes nothing, returns no jtis. (Amended 1 October 2026: the first implementation answered `REVOKED` to any hash on a revoked family, which told a caller with a guessed secret that the family was revoked and handed back its jtis. Possession now comes before every other verdict, as §6 step 3 already required of the handler.)
   - `EXHAUSTED`, `GONE`: write nothing.
 - `revoke(sid, *, reason) -> tuple[str, ...] | None`. Idempotent; keeps the first reason; returns unexpired jtis, or `None` when no record exists.
 

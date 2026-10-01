@@ -2429,16 +2429,20 @@ def _is_current(session: RefreshSession, presented_hash: str) -> bool:
 def _rotation_verdict(session: RefreshSession, presented_hash: str, now: datetime) -> Rotation:
     """The one decision both backends make inside their transaction.
 
-    Revoked first, so a revoked family answers the same whatever is presented
-    once the caller has proved possession. Then a retained hash, which is
-    reuse. Then a hash this family never issued. Then the two ends of life.
+    POSSESSION FIRST. A hash this family never issued is ``UNKNOWN`` in every
+    state the family can be in, so a caller holding a ``sid`` and a guessed
+    secret learns nothing, not even that the family is revoked (RFC 9700
+    section 4.14.2). Then revoked, so a revoked family answers the same to
+    every token it issued. Then a retained hash, which is reuse. Then the
+    two ends of life.
     """
+    retained = presented_hash in session.retained_hashes
+    if not retained and not _is_current(session, presented_hash):
+        return Rotation.UNKNOWN
     if session.revoked_at is not None:
         return Rotation.REVOKED
-    if presented_hash in session.retained_hashes:
+    if retained:
         return Rotation.REUSED
-    if not _is_current(session, presented_hash):
-        return Rotation.UNKNOWN
     if session.generation >= MAX_GENERATIONS:
         return Rotation.EXHAUSTED
     if session.is_expired(now):
@@ -2787,6 +2791,8 @@ def create_refresh_session_store(
     logger.info("Using in-memory refresh session store (set POSTERN_REDIS_URL for Redis)")
     return InMemoryRefreshSessionStore(max_sessions=max_sessions)
 ```
+
+> **Amended 1 October 2026, after review of the Task 3 commit.** The verdict above now proves possession first: a hash the family never issued is `UNKNOWN` even on a revoked family, where it used to be `REVOKED` with the family's live jtis. Task 7's handler is unaffected, because it checks possession itself (spec section 6 step 3) before it calls `rotate`. The committed module also differs from this block in three ways the block does not repeat: `current_hash` and `retained_hashes` are `field(repr=False)`, the module docstring records the accepted Redis residuals (see Concerns), and the test file adds a possession test, a repr test, two WATCH-contention tests, a forced-interleaving counter on the concurrency test, and a TTL test that rotates with the family's own token. Step 4 then reports 57 passed, not 52.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -13488,6 +13494,7 @@ The baseline, `41a1701` before Task 1, was exit 0 with 3487 passed. Every run is
 - **Redis script replication.** `revoke_customer_client` reads `TIME` inside `EVAL` and then writes; it runs on the suite's `redis:7-alpine`, and whether the operator's Redis replicates it by effects is unverified, as the spec says.
 - **The recall's store step catches every `Exception`.** That is the spec's fail-closed 503, but a programming error in `_recall` would also surface as a 503 the app retries, not as a 500.
 - **`POSTERN_REDIS_DEVICE_CODE_TTL` is not bounded by the new 900-second ceiling** (discrepancy 11).
+- **The Redis refresh-session cap can be overshot, and one crash leaves an uncounted family** (added 1 October 2026, accepted, no Lua script). `create` reads the count and writes the family in separate round trips, so N concurrent creates can all land: the store holds at most `max_sessions + N`, the same overshoot `RedisDeviceCodeStore` already accepts. A crash between `SET NX` and `ZADD` leaves a family the index does not count, bounded only by its one-hour key TTL; that gap is this store's alone, since the device-code store writes key and index in one `MULTI`.
 - **Tasks 6 and 13 edit design documents.** Task 6 rewrites one sentence of `dev-docs/device-grant-session-token-spec.md` so the citation gate stays green, and Task 13 edits `CLAUDE.md`, decisions 0010 and 0012 and `dev-docs/qr-page-spec.md`, as spec section 11 and its "Docs that go stale" list ask. The dated records under `docs/verification/` are left alone.
 - **Task 6 is large** (twelve test files, one of them new and one the shared helper module, five production files and one sentence of the spec), because inverting the hotfix's assertions, adding `session_id` to every `consume_device_code` call and issuing the session cannot be split without a commit whose `make ci` fails. A reviewer may prefer to read its test changes by file.
 - **Task 5's first `make ci` run failed two tests it does not touch**, `test_update_challenge_status_unexpired_refuses_a_row_past_its_deadline` and `test_update_challenge_status_expired_accepts_a_row_past_its_deadline` in `tests/test_store_challenges.py`, while a second `make ci` ran in parallel on the same Docker host. Both compare `expires_at` with PostgreSQL's `now()`. Task 5 changes no store code; `tests/test_store_challenges.py` then passed three times in a row at that commit, and a solo re-run of the full `make ci` exited 0 with 3654 passed, which is the number the table carries. It reads as a timing flake already on `main`, and this plan does not fix it.

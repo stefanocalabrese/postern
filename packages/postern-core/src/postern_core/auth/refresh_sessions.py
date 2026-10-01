@@ -33,6 +33,17 @@ milliseconds, so the record keeps the creation instant exactly at that
 resolution (`RefreshSession.created_ms`). The store stamps it: Redis ``TIME``
 on the Redis backend, the one clock the revocation stamp is written with, and
 ``time.time_ns()`` in memory.
+
+ACCEPTED RESIDUALS ON REDIS, recorded rather than scripted. The cap is read
+and the family written in separate round trips, so N ``create`` calls running
+at once can all see room and all land: the store holds at most
+``max_sessions + N``. `postern_core.auth.device_codes`'s
+``RedisDeviceCodeStore`` accepts the same overshoot for the same reason. A
+crash between the ``SET NX`` and the ``ZADD`` leaves a family the index does
+not count, bounded only by its key's TTL (one hour). That second shape is this
+store's alone: the device-code store writes its primary key and index entry
+in one ``MULTI``. A Lua script would close both and was judged not worth it
+for a bound on standing memory.
 """
 
 from __future__ import annotations
@@ -49,7 +60,7 @@ import re
 import secrets
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -171,8 +182,10 @@ class RefreshSession:
     created_at: datetime
     expires_at: datetime
     generation: int
-    current_hash: str
-    retained_hashes: tuple[str, ...] = ()
+    # Out of ``repr`` so a logged record carries no hash an attacker could
+    # match against a token seen elsewhere.
+    current_hash: str = field(repr=False)
+    retained_hashes: tuple[str, ...] = field(default=(), repr=False)
     access_tokens: tuple[tuple[str, datetime], ...] = ()
     revoked_at: datetime | None = None
     revoked_reason: str = ""
@@ -268,16 +281,20 @@ def _is_current(session: RefreshSession, presented_hash: str) -> bool:
 def _rotation_verdict(session: RefreshSession, presented_hash: str, now: datetime) -> Rotation:
     """The one decision both backends make inside their transaction.
 
-    Revoked first, so a revoked family answers the same whatever is presented
-    once the caller has proved possession. Then a retained hash, which is
-    reuse. Then a hash this family never issued. Then the two ends of life.
+    POSSESSION FIRST. A hash this family never issued is ``UNKNOWN`` in every
+    state the family can be in, so a caller holding a ``sid`` and a guessed
+    secret learns nothing, not even that the family is revoked (RFC 9700
+    section 4.14.2). Then revoked, so a revoked family answers the same to
+    every token it issued. Then a retained hash, which is reuse. Then the
+    two ends of life.
     """
+    retained = presented_hash in session.retained_hashes
+    if not retained and not _is_current(session, presented_hash):
+        return Rotation.UNKNOWN
     if session.revoked_at is not None:
         return Rotation.REVOKED
-    if presented_hash in session.retained_hashes:
+    if retained:
         return Rotation.REUSED
-    if not _is_current(session, presented_hash):
-        return Rotation.UNKNOWN
     if session.generation >= MAX_GENERATIONS:
         return Rotation.EXHAUSTED
     if session.is_expired(now):
