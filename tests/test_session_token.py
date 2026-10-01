@@ -17,6 +17,7 @@ from typing import Any
 import httpx2
 import pytest
 from joserfc import jwt
+from joserfc.errors import JoseError
 from joserfc.jwk import KeySet, RSAKey
 from postern_core.auth.device_keys import no_enrolled_devices
 from postern_core.auth.keys import FileKeySource, GeneratedKeySource
@@ -141,6 +142,8 @@ class TestTheSessionKeySource:
         settings = replace(ConfirmSettings.for_testing(), vault=VAULT)
         _, source = build_session_minter(settings)
         assert isinstance(source, VaultTransitKeySource)
+        # The session key's own name, so a wiring slip to vault_write_key_name fails here.
+        assert source._key_name == "postern-session"  # noqa: SLF001
         source.close()
 
     def test_a_vault_and_a_pem_together_are_refused(self, tmp_path: Path) -> None:
@@ -197,7 +200,7 @@ class TestTheSessionJwksRoute:
         session = (await _get(app, SESSION_JWKS_PATH)).json()
         write = (await _get(app, JWKS_PATH)).json()
         jwt.decode(token, KeySet.import_key_set(session))
-        with pytest.raises(Exception):  # noqa: B017 -- any refusal to verify
+        with pytest.raises(JoseError):
             jwt.decode(token, KeySet.import_key_set(write))
 
     async def test_it_needs_no_assertion(self) -> None:
