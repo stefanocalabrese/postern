@@ -71,6 +71,8 @@ REQUIRED_ENV = {
     "POSTERN_BACKEND_BASE_URL": "https://backend.test",
     "POSTERN_JWKS_URI": "https://issuer.test/.well-known/jwks.json",
     "POSTERN_TOKEN_ISSUER": "https://issuer.test",
+    # A resource URI, which `build_server` requires once a JWKS URI is set.
+    "POSTERN_AUDIENCE": "https://mcp.postern.test/mcp",
 }
 
 
@@ -232,6 +234,7 @@ def test_create_app_starts_under_a_production_shaped_configuration() -> None:
         backend_base_url="https://backend.test",
         customer_jwks_uri="https://issuer.test/.well-known/jwks.json",
         customer_token_issuer="https://issuer.test",  # noqa: S106
+        audience="https://mcp.postern.test/mcp",
     )
     app = create_app(settings)
     assert isinstance(app.state.backend_client._minter, ReadTokenMinter)

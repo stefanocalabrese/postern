@@ -90,6 +90,7 @@ __all__ = [
     "VaultSettings",
     "VaultTransitError",
     "VaultTransitKeySource",
+    "public_key_ttl_from_env",
     "vault_from_env",
 ]
 
@@ -490,15 +491,26 @@ def vault_from_env() -> VaultSettings | None:
                 "ConnectTimeout, so this process mints nothing and reaches no backend."
             ),
         ),
-        public_key_ttl_seconds=float_from_env(
-            "POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS",
-            DEFAULT_PUBLIC_KEY_TTL_SECONDS,
-            minimum=0,
-            exclusive=True,
-            because=(
-                "It is how long a transit key read is reused before Vault is asked again; "
-                "at zero every signature costs a second round trip to re-read a public key "
-                "that changes only when an operator rotates it."
-            ),
+        public_key_ttl_seconds=public_key_ttl_from_env(),
+    )
+
+
+def public_key_ttl_from_env() -> float:
+    """``POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS``, read in one place for two readers.
+
+    `vault_from_env` above, for how long a transit key read is reused, and
+    ``services/api``'s settings, for how long its session-token verifier
+    trusts confirm's ``/session/jwks.json`` -- read whether or not a Vault is
+    configured, because the session key rotates the same way under a PEM.
+    """
+    return float_from_env(
+        "POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS",
+        DEFAULT_PUBLIC_KEY_TTL_SECONDS,
+        minimum=0,
+        exclusive=True,
+        because=(
+            "It is how long a transit key read is reused before Vault is asked again; "
+            "at zero every signature costs a second round trip to re-read a public key "
+            "that changes only when an operator rotates it."
         ),
     )

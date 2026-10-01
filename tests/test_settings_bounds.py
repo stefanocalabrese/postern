@@ -2238,7 +2238,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         assert len(STORE_BOUNDED_NAMES) == 2
         assert len(VAULT_BOUNDED_NAMES) == 2
         assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 51
-        assert len(names_read_by("api")) == 38
+        assert len(names_read_by("api")) == 39
         assert len(names_read_by("confirm")) == 63
         assert len(names_read_by("migrations")) == 3
 

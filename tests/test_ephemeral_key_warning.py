@@ -106,6 +106,7 @@ def test_the_api_warning_fires_under_a_production_shaped_configuration() -> None
         backend_base_url="https://backend.test",
         customer_jwks_uri="https://issuer.test/.well-known/jwks.json",
         customer_token_issuer="https://issuer.test",  # noqa: S106
+        audience="https://mcp.postern.test/mcp",
     )
     messages = _ephemeral_warnings(lambda: create_app(settings))
     assert [m for m in messages if MARKER in m], messages

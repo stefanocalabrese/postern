@@ -35,12 +35,14 @@ The customer resolver is injected (design decision D3) so that:
 backend itself, only passes it through to tools registered in later tasks.
 """
 
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthContext, AuthProvider
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from mcp.types import ToolAnnotations
+from postern_core.auth.resource_uri import is_normal_https_resource
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.modules.read import (
@@ -54,8 +56,11 @@ from postern_core.store.engine import Database
 from pydantic import ValidationError
 
 from services.api.consent import consent_for
+from services.api.session_verifier import SessionTokenVerifier
 from services.api.settings import Settings
 from services.api.tools import BUILTIN_READ_MODULES
+
+logger = logging.getLogger(__name__)
 
 SERVER_INSTRUCTIONS = """\
 Postern exposes read access to the customer's own bank accounts, cards and
@@ -162,14 +167,42 @@ def build_server(
             f"{settings.customer_token_issuer!r})"
         )
 
+    if has_jwks_uri and not is_normal_https_resource(settings.audience):
+        # THE AUDIENCE MUST BE THE MCP SERVER'S RESOURCE URI. RFC 8707 section
+        # 2 requires an absolute URI, and confirm stamps exactly this string
+        # as `aud` on every session token, so the default `postern` stops
+        # working in any deployment with customer authentication. That is the
+        # point, and the local stack sets a URI rather than the flag.
+        if not settings.allow_non_uri_audience:
+            raise ValueError(
+                f"POSTERN_AUDIENCE ({settings.audience!r}) must be the MCP server's "
+                "resource URI: an absolute https URI with a host, a lower-case scheme and "
+                "host, no default port and a non-empty path (RFC 8707 section 2), equal "
+                "to services/confirm's POSTERN_SESSION_TOKEN_AUDIENCE. Set "
+                "POSTERN_ALLOW_NON_URI_AUDIENCE for a local stack."
+            )
+        logger.warning(
+            "POSTERN_ALLOW_NON_URI_AUDIENCE is set: this server accepts access tokens for "
+            "the audience %r, which is not an absolute https URI. No deployment may run "
+            "this way.",
+            settings.audience,
+        )
+
     auth: AuthProvider | None = None
     if has_jwks_uri and has_issuer:
-        auth = JWTVerifier(
+        # A `JWTVerifier` whose JWKS cache is bounded: its TTL is the public
+        # key TTL, unknown kids are fetched at most once per 30 seconds, and
+        # concurrent misses share one fetch (`services/api/session_verifier.py`).
+        # Still a `JWTVerifier` in every other respect: signature, `exp`,
+        # `iss` and `aud` are the parent's checks, unchanged.
+        verifier: JWTVerifier = SessionTokenVerifier(
             jwks_uri=settings.customer_jwks_uri,
             issuer=settings.customer_token_issuer,
             audience=settings.audience,
             required_scopes=None,
+            cache_ttl_seconds=settings.customer_jwks_ttl_seconds,
         )
+        auth = verifier
     if auth_override is not None:
         auth = auth_override
 

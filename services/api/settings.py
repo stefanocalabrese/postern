@@ -27,7 +27,12 @@ bound refuses what is UNREPRESENTABLE, not what is unwise.
 import os
 from dataclasses import dataclass
 
-from postern_core.auth.vault import VaultSettings, vault_from_env
+from postern_core.auth.vault import (
+    DEFAULT_PUBLIC_KEY_TTL_SECONDS,
+    VaultSettings,
+    public_key_ttl_from_env,
+    vault_from_env,
+)
 from postern_core.config import bool_from_env, float_from_env, int_from_env
 
 
@@ -66,6 +71,15 @@ class Settings:
     customer_jwks_uri: str | None = None
     customer_token_issuer: str | None = None
     audience: str = "postern"
+    # How long the session-token verifier trusts the key set it fetched from
+    # `customer_jwks_uri`, from POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS whether
+    # or not a Vault is configured. `services/api/session_verifier.py` says
+    # why a removed key must stop verifying within this.
+    customer_jwks_ttl_seconds: float = DEFAULT_PUBLIC_KEY_TTL_SECONDS
+    # The local-stack escape from the audience refusal in
+    # `services/api/server.py`'s `build_server`: RFC 8707 section 2 requires an
+    # absolute URI, and the default above is not one.
+    allow_non_uri_audience: bool = False
     strict_headers: bool = False
     cache_ttl_seconds: int = 60
     # ZT-5: how many proxies in front of this process append to
@@ -306,6 +320,15 @@ class Settings:
             customer_jwks_uri=os.environ.get("POSTERN_JWKS_URI") or None,
             customer_token_issuer=os.environ.get("POSTERN_TOKEN_ISSUER") or None,
             audience=os.environ.get("POSTERN_AUDIENCE", "postern"),
+            customer_jwks_ttl_seconds=public_key_ttl_from_env(),
+            allow_non_uri_audience=bool_from_env(
+                "POSTERN_ALLOW_NON_URI_AUDIENCE",
+                False,
+                because=(
+                    "It lets a local stack run with an access-token audience that is not "
+                    "an absolute https URI, which RFC 8707 section 2 requires."
+                ),
+            ),
             # WAS ``== "1"`` UNTIL 2026-09-26, so
             # ``POSTERN_STRICT_HEADERS=true`` meant LAX headers -- the MCP
             # Streamable HTTP checks an operator thought they had turned on

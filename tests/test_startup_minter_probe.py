@@ -53,6 +53,7 @@ SETTINGS_SHAPES = [
             backend_base_url="https://backend.test",
             customer_jwks_uri="https://issuer.test/.well-known/jwks.json",
             customer_token_issuer="https://issuer.test",  # noqa: S106
+            audience="https://mcp.postern.test/mcp",
         ),
         id="production_shaped",
     ),

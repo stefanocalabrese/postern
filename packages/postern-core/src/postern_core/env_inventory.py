@@ -222,7 +222,7 @@ EVERYWHERE = ("api", "confirm", "migrations")
 INVENTORY: tuple[EnvVar, ...] = (
     EnvVar(ALLOWED_UNREAD_ENV, "string", EVERYWHERE),
     EnvVar(REQUIRED_ENV, "string", EVERYWHERE),
-    EnvVar("POSTERN_ALLOW_NON_URI_AUDIENCE", "flag", ("confirm",)),
+    EnvVar("POSTERN_ALLOW_NON_URI_AUDIENCE", "flag", BOTH),
     EnvVar("POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS", "flag", ("confirm",)),
     EnvVar("POSTERN_APP_ASSERTION_AUDIENCE", "string", ("confirm",)),
     EnvVar("POSTERN_APP_ASSERTION_ISSUER", "string", ("confirm",)),
