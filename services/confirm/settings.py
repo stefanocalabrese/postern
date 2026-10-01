@@ -69,7 +69,9 @@ from urllib.parse import urlsplit
 from postern_core.auth.device_codes import (
     MIN_DEVICE_CODE_TTL_SECONDS as _MIN_DEVICE_CODE_TTL_SECONDS,
 )
+from postern_core.auth.refresh_sessions import SESSION_ABSOLUTE_LIFETIME
 from postern_core.auth.resource_uri import is_normal_https_resource, is_plain_ascii_uri_text
+from postern_core.auth.revocation import CUSTOMER_REVOKED_AT_TTL_SECONDS
 from postern_core.auth.vault import VaultSettings, vault_from_env
 from postern_core.config import bool_from_env, float_from_env, int_from_env
 
@@ -214,6 +216,16 @@ def _pairing_enricher_timeout(value: float) -> float:
 #: read it.
 MIN_DEVICE_CODE_TTL_SECONDS = _MIN_DEVICE_CODE_TTL_SECONDS
 
+#: The longest ``POSTERN_DEVICE_CODE_TTL_SECONDS`` the customer revocation
+#: stamp can cover: `postern_core.auth.revocation`'s
+#: ``CUSTOMER_REVOKED_AT_TTL_SECONDS`` less the refresh family's lifetime and
+#: its 300-second margin, which is 900 today. An approved code must not
+#: outlive the stamp it is compared with at ``POST /token``, and the stamp's
+#: writer cannot read this service's settings, so the ceiling lands here.
+MAX_DEVICE_CODE_TTL_SECONDS = (
+    CUSTOMER_REVOKED_AT_TTL_SECONDS - int(SESSION_ABSOLUTE_LIFETIME.total_seconds()) - 300
+)
+
 
 def _device_code_ttl(name: str, default: int) -> int:
     """Read a device-code lifetime from the environment, or refuse to start.
@@ -226,14 +238,14 @@ def _device_code_ttl(name: str, default: int) -> int:
     a duration rather than a per-minute count, and `MIN_DEVICE_CODE_TTL_SECONDS`
     carries its derivation.
 
-    THE CEILING IS DELIBERATELY ABSENT. A lifetime that is too LONG is a
-    real risk -- it widens the window in which a leaked ``device_code`` is
-    worth relaying (A2) -- but it is a risk an operator can reason about and
-    RFC 8628 sets no bound on. A value that is too SHORT is different in
-    kind: it does not weaken a control, it produces a service that cannot
-    complete a pairing at all, and on the Redis backend it does so silently.
-    Only the second one is unrepresentable, so only the second one is
-    refused here.
+    A CEILING SINCE THE LAYER-1 SESSION TOKEN, `MAX_DEVICE_CODE_TTL_SECONDS`.
+    Until then a lifetime that was too LONG was left to the operator, as a
+    risk RFC 8628 sets no bound on. It is now unrepresentable in a narrower
+    sense: an approved code longer-lived than the customer revocation stamp
+    could be redeemed after a revoke-and-restore that the stamp no longer
+    remembers. A value that is too SHORT is refused for the older reason: it
+    produces a service that cannot complete a pairing at all, and on the
+    Redis backend it does so silently.
 
     The offending value is echoed for the reason `_positive_int` gives: this
     is an operator's own environment, not caller input.
@@ -255,6 +267,13 @@ def _device_code_ttl(name: str, default: int) -> int:
             "It is the lifetime of a device code, and a shorter one cannot outlive the "
             "browser's poll interval or the user's approval on their phone; at 1 second "
             "the Redis store's truncation discards the code without storing it at all."
+        )
+    if value > MAX_DEVICE_CODE_TTL_SECONDS:
+        raise ValueError(
+            f"{name} must be at most {MAX_DEVICE_CODE_TTL_SECONDS} seconds, got {value}. "
+            "An approved device code must not outlive the customer revocation stamp "
+            f"({CUSTOMER_REVOKED_AT_TTL_SECONDS} seconds) that POST /token compares its "
+            "approval with, less the one-hour session family and a 300-second margin."
         )
     return value
 

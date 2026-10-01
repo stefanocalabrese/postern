@@ -41,6 +41,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx2
 import pytest
@@ -347,30 +348,25 @@ async def audit_rows(db: Database, customer_ref: str = OWNER) -> list[AuditEntry
 
 
 @pytest.fixture
-def shared_redis(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
-    """One ``fakeredis`` server standing in for the deployment's Redis.
+def shared_redis(monkeypatch: pytest.MonkeyPatch, redis_url: str) -> Iterator[Any]:
+    """The suite's Redis standing in for the deployment's, in a prefix of its own.
 
     Every store built while this is active -- by either confirm app, and by
-    the CLI on its own thread and its own event loop -- calls the patched
-    ``redis.asyncio.from_url`` and lands on this one server. That is what makes
-    the two apps below genuinely two replicas of one deployment rather than two
-    objects sharing a reference. Copied deliberately from
-    ``tests/test_zt7_revocation_reachable.py`` rather than promoted to
-    ``conftest.py``: that file's fixture is the read path's and the two must be
-    free to diverge.
+    the CLI on its own thread and its own event loop -- reads
+    ``POSTERN_REDIS_URL`` and ``POSTERN_REDIS_KEY_PREFIX`` and lands on this
+    one key space. That is what makes the two apps below genuinely two replicas
+    of one deployment rather than two objects sharing a reference. Copied
+    deliberately from ``tests/test_zt7_revocation_reachable.py`` rather than
+    promoted to ``conftest.py``: that file's fixture is the read path's and the
+    two must be free to diverge.
+
+    A ``fakeredis`` server until the layer-1 session token: a customer-client
+    revocation is now one Lua script (``EVAL``), and fakeredis 2.38.0 without
+    ``lupa`` answers "unknown command 'eval'".
     """
-    import fakeredis
-    import fakeredis.aioredis
-    import redis.asyncio
-
-    server = fakeredis.FakeServer()
-
-    def _from_url(url: str, **kwargs: Any) -> Any:
-        return fakeredis.aioredis.FakeRedis(server=server, **kwargs)
-
-    monkeypatch.setattr(redis.asyncio, "from_url", _from_url)
-    monkeypatch.setenv("POSTERN_REDIS_URL", "redis://fake.test:6379/0")
-    yield server
+    monkeypatch.setenv("POSTERN_REDIS_URL", redis_url)
+    monkeypatch.setenv("POSTERN_REDIS_KEY_PREFIX", f"zt7c{uuid4().hex[:12]}:")
+    yield redis_url
 
 
 async def run_cli(*argv: str) -> tuple[int, str]:

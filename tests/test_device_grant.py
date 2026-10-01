@@ -1736,12 +1736,23 @@ class TestTheDeviceCodeTtlFloor:
         monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", str(MIN_DEVICE_CODE_TTL_SECONDS))
         assert ConfirmSettings.from_env().device_code_ttl_seconds == MIN_DEVICE_CODE_TTL_SECONDS
 
-    @pytest.mark.parametrize("raised", ["31", "300", "900", "1800", "3600"])
+    @pytest.mark.parametrize("raised", ["31", "300", "900"])
     def test_a_value_at_or_above_the_floor_is_read_from_the_environment(
         self, monkeypatch: pytest.MonkeyPatch, raised: str
     ) -> None:
         monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", raised)
         assert ConfirmSettings.from_env().device_code_ttl_seconds == int(raised)
+
+    @pytest.mark.parametrize("too_long", ["901", "1800", "3600"])
+    def test_a_value_above_the_revocation_stamp_ceiling_refuses_at_startup(
+        self, monkeypatch: pytest.MonkeyPatch, too_long: str
+    ) -> None:
+        """An approved code must not outlive the customer revocation stamp
+        ``POST /token`` compares its approval with: 4,800 seconds less the
+        one-hour family and a 300-second margin is 900."""
+        monkeypatch.setenv("POSTERN_DEVICE_CODE_TTL_SECONDS", too_long)
+        with pytest.raises(ValueError, match="must be at most 900 seconds"):
+            ConfirmSettings.from_env()
 
     def test_an_unset_or_empty_variable_keeps_the_default(
         self, monkeypatch: pytest.MonkeyPatch

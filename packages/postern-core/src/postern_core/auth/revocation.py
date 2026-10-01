@@ -106,6 +106,16 @@ after thirty minutes, the way a risk context does, would be worse than no
 kill switch: the operator would have acted once and been un-acted on by a
 timer. Every scope has an explicit restore command instead.
 
+ONE KEY THAT DOES EXPIRE, AND IT IS NOT A REVOCATION. Every customer-plus-client
+revocation also stamps WHEN it was written, per customer, in milliseconds:
+``customer_revoked_at``. The layer-1 session token compares that instant with
+when a refresh family was created and when a device code was approved, so a
+family or an approval that predates a revocation stays refused after the
+revocation is restored. The stamp outlives a restore on purpose and expires
+after `CUSTOMER_REVOKED_AT_TTL_SECONDS`, the longest anything it could refuse
+can live, because keeping a record that a named customer was cut off beyond
+that serves nothing (GDPR Article 5(1)(e)).
+
 FAIL CLOSED. A store that cannot answer raises `RevocationStoreUnavailable`
 and the middleware refuses the call. Reporting an outage as "not revoked"
 would silently un-revoke every entry at exactly the moment the operator most
@@ -155,6 +165,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -163,6 +174,37 @@ from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+#: How long ``customer_revoked_at`` remembers a customer revocation, restored
+#: or not. The refresh-family lifetime (3,600 s) plus the default device-code
+#: lifetime (900 s), the longest a family or an approved-but-unexchanged code
+#: can outlive the revocation it must be compared with, plus 300 s for
+#: replication lag and the 2-second cross-clock tolerance. A constant here and
+#: not a setting, because the writer (`postern_core.auth.revoke_cli`, or an
+#: operator's own backend) does not know confirm's settings; ``ConfirmSettings``
+#: refuses a device-code lifetime that would outgrow it.
+CUSTOMER_REVOKED_AT_TTL_SECONDS = 4_800
+
+#: The revocation of a customer-client pair and its timestamp, as ONE
+#: server-side step on ONE clock: ``TIME``, then the pair's ``SADD``, then the
+#: customer's stamp with its expiry. Returns the stamp in milliseconds.
+#:
+#: A script that reads ``TIME`` and then writes must be replicated by its
+#: effects rather than by its body; whether the operator's Redis does that by
+#: default was not verified here and is the operator's to confirm. It runs as
+#: written on the suite's ``redis:7-alpine``.
+_REVOKE_CUSTOMER_CLIENT = (
+    "local t = redis.call('TIME') "
+    "local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) "
+    "redis.call('SADD', KEYS[1], ARGV[1]) "
+    "redis.call('SET', KEYS[2], ms, 'EX', ARGV[2]) "
+    "return ms"
+)
+
+
+def _now_ms() -> int:
+    """This process's clock in milliseconds, for the in-memory backend."""
+    return time.time_ns() // 1_000_000
 
 
 @dataclass(frozen=True)
@@ -467,6 +509,22 @@ class RevocationStoreBase(ABC):
         snapshot = await self.entries()
         return any(customer == customer_ref for customer, _client in snapshot.customer_clients)
 
+    async def customer_revoked_at(self, customer_ref: str) -> int | None:
+        """When a revocation last named this customer, in ms since the epoch, or ``None``.
+
+        The latest instant any ``revoke_customer_client`` for this customer
+        was written, KEPT AFTER ``restore_customer_client`` and for
+        `CUSTOMER_REVOKED_AT_TTL_SECONDS` only. ``POST /token`` compares it
+        with a device code's approval and with a refresh family's creation,
+        so a grant that predates a revocation cannot be revived by a restore.
+
+        CONCRETE AND ``None`` BY DEFAULT, as `is_customer_revoked` is
+        concrete, so a test double that implements only the abstract methods
+        keeps working. Raises `RevocationStoreUnavailable` when the store
+        cannot answer.
+        """
+        return None
+
     async def close(self) -> None:  # noqa: B027 - concrete and empty on purpose
         """Release any connection this store holds. A no-op by default.
 
@@ -499,6 +557,8 @@ class InMemoryRevocationStore(RevocationStoreBase):
         self._sessions: set[str] = set()
         self._customer_clients: set[tuple[str, str]] = set()
         self._clients: set[str] = set()
+        #: ``customer_ref -> (stamp ms, expiry ms)``, swept on read.
+        self._revoked_at: dict[str, tuple[int, int]] = {}
 
     async def is_revoked(self, claims: Mapping[str, Any]) -> bool:
         return self._list.is_revoked(claims)
@@ -514,6 +574,18 @@ class InMemoryRevocationStore(RevocationStoreBase):
     async def revoke_customer_client(self, *, customer_ref: str, client_id: str) -> None:
         self._list.revoke_customer_client(customer_ref=customer_ref, client_id=client_id)
         self._customer_clients.add((customer_ref, client_id))
+        stamp = _now_ms()
+        self._revoked_at[customer_ref] = (stamp, stamp + CUSTOMER_REVOKED_AT_TTL_SECONDS * 1000)
+
+    async def customer_revoked_at(self, customer_ref: str) -> int | None:
+        entry = self._revoked_at.get(customer_ref)
+        if entry is None:
+            return None
+        stamp, expires = entry
+        if _now_ms() >= expires:
+            del self._revoked_at[customer_ref]
+            return None
+        return stamp
 
     async def restore_customer_client(self, *, customer_ref: str, client_id: str) -> None:
         self._list.restore_customer_client(customer_ref=customer_ref, client_id=client_id)
@@ -603,6 +675,9 @@ class RedisRevocationStore(RevocationStoreBase):
     def _clients_key(self) -> str:
         return f"{self._prefix}revoked:clients"
 
+    def _revoked_at_key(self, customer_ref: str) -> str:
+        return f"{self._prefix}revoked:customer-at:{customer_ref}"
+
     async def is_revoked(self, claims: Mapping[str, Any]) -> bool:
         """Check every applicable scope in one round trip.
 
@@ -659,7 +734,29 @@ class RedisRevocationStore(RevocationStoreBase):
         await self._remove(self._sessions_key, jti)
 
     async def revoke_customer_client(self, *, customer_ref: str, client_id: str) -> None:
-        await self._add(self._pairs_key, _pair_member(customer_ref, client_id))
+        """The pair's ``SADD`` and the customer's stamp, in one script on Redis's clock."""
+        try:
+            await self._redis.eval(
+                _REVOKE_CUSTOMER_CLIENT,
+                2,
+                self._pairs_key,
+                self._revoked_at_key(customer_ref),
+                _pair_member(customer_ref, client_id),
+                CUSTOMER_REVOKED_AT_TTL_SECONDS,
+            )
+        except Exception as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation entry could not be written: {type(exc).__name__}"
+            ) from exc
+
+    async def customer_revoked_at(self, customer_ref: str) -> int | None:
+        try:
+            raw = await self._redis.get(self._revoked_at_key(customer_ref))
+        except Exception as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation timestamp could not be read: {type(exc).__name__}"
+            ) from exc
+        return int(raw) if raw is not None else None
 
     async def restore_customer_client(self, *, customer_ref: str, client_id: str) -> None:
         await self._remove(self._pairs_key, _pair_member(customer_ref, client_id))

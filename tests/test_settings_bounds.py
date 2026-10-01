@@ -258,7 +258,7 @@ BOUNDED: tuple[Bounded, ...] = (
         "device_code_ttl_seconds",
         "confirm",
         900,
-        ("0", "1", "29", "-1"),
+        ("0", "1", "29", "-1", "901", "3600"),
         (str(MIN_DEVICE_CODE_TTL_SECONDS), "900"),
     ),
     Bounded(
