@@ -12,6 +12,7 @@ key is the only one there is to compare against.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import os
 from pathlib import Path
@@ -170,6 +171,24 @@ class TestTheComparisonItself:
         assert jwk_thumbprints(KeySet([key]).as_dict()) == jwk_thumbprints(
             KeySet([again]).as_dict()
         )
+
+    def test_a_zero_padded_rsa_member_has_the_minimal_thumbprint(self) -> None:
+        """RFC 7638 section 3.2 hashes the minimal encoding (RFC 7518 section
+        6.3.1.1), so a leading zero octet on ``n`` or ``e`` changes nothing."""
+
+        def pad(value: Any) -> str:
+            assert isinstance(value, str)
+            raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+            return base64.urlsafe_b64encode(b"\x00" + raw).rstrip(b"=").decode()
+
+        jwk = dict(KeySet([RSAKey.generate_key(2048)]).as_dict(private=False)["keys"][0])
+        plain = jwk_thumbprints({"keys": [jwk]})
+        assert jwk_thumbprints({"keys": [{**jwk, "n": pad(jwk["n"])}]}) == plain
+        assert jwk_thumbprints({"keys": [{**jwk, "e": pad(jwk["e"])}]}) == plain
+
+    def test_an_rsa_member_that_is_not_base64url_is_skipped(self) -> None:
+        assert jwk_thumbprints({"keys": [{"kty": "RSA", "e": "AQAB", "n": "!!"}]}) == set()
+        assert jwk_thumbprints({"keys": [{"kty": "RSA", "e": "AQAB", "n": 5}]}) == set()
 
     def test_the_thumbprint_lives_in_the_shared_library(self) -> None:
         """Moved on 2 October 2026 so ``services/api`` can use it too, which

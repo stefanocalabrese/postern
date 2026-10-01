@@ -493,8 +493,11 @@ def create_app(
         auth_override=auth_override,
         # The session-token verifier drops any fetched key that is this READ
         # key (`services/api/session_verifier.py`), so a token the read key
-        # signs is never accepted as a layer-1 session.
-        forbidden_session_thumbprints=jwk_thumbprints(read_key_source.public_jwks()),
+        # signs is never accepted as a layer-1 session. A reader, not a
+        # snapshot: it runs on every JWKS fetch, so a read key version Vault
+        # starts publishing after startup is guarded too. Under Vault the
+        # source caches its public keys for POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS.
+        forbidden_session_thumbprints=lambda: jwk_thumbprints(read_key_source.public_jwks()),
     )
     # Task 6: an audit row per tool call, success or failure, regardless of
     # whether consent enforcement itself is active -- see the module

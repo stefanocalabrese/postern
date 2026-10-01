@@ -13,6 +13,7 @@ that module re-exports both names.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 from collections.abc import Mapping
@@ -34,9 +35,11 @@ def jwk_thumbprints(jwks: Mapping[str, Any]) -> set[str]:
 
     Over the ``kty``'s required members only, so the ``kid``, ``use`` and
     every private member are ignored: two sources publishing one key under
-    two kids give one thumbprint. A key of another ``kty``, or missing a
-    required member, is skipped: it cannot be the same key as one that has
-    them, and a source publishing it must not crash the startup check.
+    two kids give one thumbprint. A key of another ``kty``, missing a
+    required member, or with an RSA ``n`` or ``e`` that is not base64url, is
+    skipped: it cannot be the same key as one that has them, and a source
+    publishing it must not crash the startup check. RSA ``n`` and ``e`` are
+    hashed in their minimal encoding, leading zero octets stripped.
     """
     thumbprints: set[str] = set()
     for jwk in jwks.get("keys", []):
@@ -44,7 +47,33 @@ def jwk_thumbprints(jwks: Mapping[str, Any]) -> set[str]:
         if members is None or any(member not in jwk for member in members):
             continue
         required = {member: jwk[member] for member in members}
+        if required["kty"] == "RSA":
+            # RFC 7638 section 3.2 hashes RFC 7518's minimal encoding, which
+            # forbids leading zero octets on `n` and `e` (section 6.3.1.1).
+            # A parser may still accept a padded value, so one key published
+            # padded would otherwise hash as a different key (2 October 2026).
+            # EC and OKP coordinates are fixed-length and are hashed as given.
+            n, e = _minimal(required["n"]), _minimal(required["e"])
+            if n is None or e is None:
+                continue
+            required |= {"n": n, "e": e}
         canonical = json.dumps(required, separators=(",", ":"), sort_keys=True)
         digest = hashlib.sha256(canonical.encode()).digest()
-        thumbprints.add(base64.urlsafe_b64encode(digest).rstrip(b"=").decode())
+        thumbprints.add(_b64url(digest))
     return thumbprints
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _minimal(value: Any) -> str | None:
+    """A base64url big-endian integer re-encoded without leading zero octets,
+    or ``None`` when ``value`` is not base64url text."""
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return _b64url(raw.lstrip(b"\x00") or b"\x00")

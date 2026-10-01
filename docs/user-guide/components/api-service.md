@@ -117,6 +117,16 @@ for the `build_model` wrapper that catches pydantic validation errors and re-rai
 When `POSTERN_JWKS_URI` and `POSTERN_TOKEN_ISSUER` are both set, the server builds a
 `JWTVerifier` and requires every tool call to carry a validated customer access token.
 
+**Runbook (2 October 2026): the api's availability depends on `services/confirm`'s
+`/session/jwks.json`.** The verifier (`services/api/session_verifier.py`) trusts the key
+set it fetched for `POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS` (300 by default). A refresh
+that fails (an HTTP error, a fetch longer than 5 seconds, or an answer that is not a
+key set) keeps the old set and is retried at most once per 30 seconds, but the old set
+is not served past its TTL. So when confirm's key set becomes unreachable, the api keeps
+verifying for what is left of one TTL and then refuses every session token until a
+fetch succeeds. That is intended: a key set that cannot be re-read cannot show that a
+key was not withdrawn. Alert on confirm's `/session/jwks.json` before the api's 401s.
+
 When either is unset (or both are `""`), the server runs in **no-auth mode**, suitable
 for local development and testing. A token is still minted internally for the stub IdP,
 but no verification occurs.

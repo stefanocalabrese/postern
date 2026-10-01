@@ -13,12 +13,13 @@ the last test sees FastMCP's unbounded refetch and fails. Re-run it on every
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -29,10 +30,15 @@ from fastmcp.server.auth.providers.jwt import JWTVerifier
 from joserfc import jwt
 from joserfc.jwk import KeySet, RSAKey
 from postern_core.auth.jwk_thumbprint import jwk_thumbprints
+from postern_core.auth.session_lifetime import (
+    ACCESS_TOKEN_LIFETIME_SECONDS,
+    SESSION_CLOCK_SKEW_SECONDS,
+)
 
 from services.api.main import create_app
 from services.api.server import build_server
 from services.api.session_verifier import (
+    FETCH_TIMEOUT_SECONDS,
     MIN_REFETCH_INTERVAL_SECONDS,
     READ_KEY_PUBLISHED_WARNING,
     SessionTokenVerifier,
@@ -76,7 +82,7 @@ class CountingJwks:
         self.fail = fail
         # When set, answers every request in place of the key set: a
         # malformed 200, or an exception such as a timeout.
-        self.answer: Callable[[httpx2.Request], httpx2.Response] | None = None
+        self.answer: Callable[[httpx2.Request], Any] | None = None
         self.fetches = 0
 
     async def __call__(self, request: httpx2.Request) -> httpx2.Response:
@@ -84,14 +90,22 @@ class CountingJwks:
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.answer is not None:
-            return self.answer(request)
+            answered = self.answer(request)
+            response: httpx2.Response = (
+                await answered if inspect.isawaitable(answered) else answered
+            )
+            return response
         if self.fail:
             return httpx2.Response(503, json={})
         return httpx2.Response(200, json=self.jwks)
 
 
 def _verifier(
-    handler: CountingJwks, *, ttl: float = 300.0, forbidden: frozenset[str] = frozenset()
+    handler: CountingJwks,
+    *,
+    ttl: float = 300.0,
+    forbidden: frozenset[str] | Callable[[], Iterable[str]] = frozenset(),
+    fetch_timeout: float = FETCH_TIMEOUT_SECONDS,
 ) -> SessionTokenVerifier:
     return SessionTokenVerifier(
         jwks_uri=JWKS_URI,
@@ -99,9 +113,38 @@ def _verifier(
         audience=AUDIENCE,
         required_scopes=None,
         cache_ttl_seconds=ttl,
-        forbidden_thumbprints=forbidden,
+        forbidden_thumbprints=forbidden if callable(forbidden) else (lambda: forbidden),
+        fetch_timeout_seconds=fetch_timeout,
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
+
+
+def _signed(key: RSAKey, **overrides: Any) -> str:
+    """A token over ``_claims()`` with ``overrides`` applied; ``None`` deletes."""
+    claims = _claims()
+    for name, value in overrides.items():
+        if value is None:
+            claims.pop(name, None)
+        else:
+            claims[name] = value
+    return jwt.encode({"alg": "RS256", "kid": str(key.kid)}, claims, key)
+
+
+async def _never(request: httpx2.Request) -> httpx2.Response:
+    """A JWKS endpoint that accepts the request and never answers."""
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
+def _padded(jwks: dict[str, Any]) -> dict[str, Any]:
+    """``jwks`` with a zero octet prefixed to every RSA ``n``: the same key,
+    encoded the way RFC 7518 section 6.3.1.1 forbids and a parser may accept."""
+    keys = []
+    for jwk in jwks["keys"]:
+        raw = base64.urlsafe_b64decode(jwk["n"] + "=" * (-len(jwk["n"]) % 4))
+        padded = base64.urlsafe_b64encode(b"\x00" + raw).rstrip(b"=").decode()
+        keys.append({**jwk, "n": padded})
+    return {"keys": keys}
 
 
 def _claims() -> dict[str, Any]:
@@ -122,10 +165,17 @@ def _timeout(request: httpx2.Request) -> httpx2.Response:
 
 
 #: Every way a fetch can fail after the transport answered, or instead of it.
-#: The first two reach the parent's parser after it has emptied its cache.
+#: The 200s reach the parent's parser after it has emptied its cache, and the
+#: last two of them parse into zero usable keys after a non-empty set.
 MALFORMED_ANSWERS = [
     pytest.param(lambda _r: httpx2.Response(200, json={"keys": 5}), id="keys-not-a-list"),
     pytest.param(lambda _r: httpx2.Response(200, json=[]), id="a-json-list"),
+    pytest.param(lambda _r: httpx2.Response(200, json={}), id="an-empty-object"),
+    pytest.param(lambda _r: httpx2.Response(200, json={"error": "x"}), id="an-error-object"),
+    pytest.param(lambda _r: httpx2.Response(200, json={"keys": "abc"}), id="keys-a-string"),
+    pytest.param(lambda _r: httpx2.Response(200, json={"keys": {"a": 1}}), id="keys-an-object"),
+    pytest.param(lambda _r: httpx2.Response(200, json={"keys": []}), id="no-keys"),
+    pytest.param(lambda _r: httpx2.Response(200, json={"keys": [5]}), id="no-usable-keys"),
     pytest.param(lambda _r: httpx2.Response(200, text="<html>"), id="not-json"),
     pytest.param(lambda _r: httpx2.Response(503, json={}), id="http-503"),
     pytest.param(_timeout, id="timeout"),
@@ -339,6 +389,181 @@ class TestTheReadKeyGuard:
         assert READ_KEY_PUBLISHED_WARNING not in caplog.text
 
 
+class TestAnAnswerThatIsNotAKeySet:
+    """Refused by the fetch itself, on a first fetch too, where there is no
+    cached set for the zero-usable-keys rule to compare against."""
+
+    @pytest.mark.parametrize(
+        "body", [{}, {"error": "x"}, {"keys": "abc"}, {"keys": {"a": 1}}, [], "keys"]
+    )
+    async def test_the_fetch_raises(self, body: Any) -> None:
+        verifier = _verifier(CountingJwks(body))
+        with pytest.raises(ValueError, match="not a"):
+            await verifier._fetch_jwks()
+
+    async def test_a_key_set_with_no_keys_is_still_a_key_set(self) -> None:
+        verifier = _verifier(CountingJwks({"keys": []}))
+        assert await verifier._fetch_jwks() == {"keys": []}
+
+
+class TestTheBoundedFetch:
+    """A JWKS endpoint that never answers holds the lock for at most the
+    fetch timeout, then counts as a failed fetch (2 October 2026)."""
+
+    def test_the_bound_is_five_seconds(self) -> None:
+        assert FETCH_TIMEOUT_SECONDS == 5.0
+
+    async def test_a_silent_endpoint_is_a_failed_fetch_and_the_cache_survives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = Clock(monkeypatch)
+        key, stranger = _key("session-1.v1"), _key("forged-1")
+        handler = CountingJwks(_jwks(key))
+        verifier = _verifier(handler, fetch_timeout=0.2)
+        assert await verifier.verify_token(_token(key)) is not None
+        handler.answer = _never
+        clock.advance(MIN_REFETCH_INTERVAL_SECONDS + 1)
+        started = asyncio.get_running_loop().time()
+        assert await verifier.verify_token(_token(stranger)) is None
+        assert asyncio.get_running_loop().time() - started < 2.0
+        assert await verifier.verify_token(_token(key)) is not None, "the cache was erased"
+        for _ in range(5):
+            assert await verifier.verify_token(_token(stranger)) is None
+        assert handler.fetches == 2, "a timed-out fetch is held to the floor"
+
+    async def test_build_server_uses_the_bound(self) -> None:
+        settings = Settings(
+            backend_base_url="https://backend.test",
+            customer_jwks_uri=JWKS_URI,
+            customer_token_issuer=ISSUER,
+            audience=AUDIENCE,
+        )
+        server = build_server(settings, resolver=lambda: TEST_CUSTOMER, backend=None)
+        assert isinstance(server.auth, SessionTokenVerifier)
+        assert server.auth._fetch_timeout == FETCH_TIMEOUT_SECONDS
+
+
+class TestTheClaims:
+    """``exp`` is required and bounded, ``iat`` and ``nbf`` are not in the
+    future (2 October 2026). The parent checks ``exp`` only when present and
+    reads neither of the others."""
+
+    LIMIT = ACCESS_TOKEN_LIFETIME_SECONDS + SESSION_CLOCK_SKEW_SECONDS
+
+    @pytest.fixture()
+    def key(self) -> RSAKey:
+        return _key("session-1.v1")
+
+    @pytest.fixture()
+    def verifier(self, key: RSAKey) -> SessionTokenVerifier:
+        return _verifier(CountingJwks(_jwks(key)))
+
+    def test_the_bounds_are_confirms(self) -> None:
+        from services.confirm import session_token
+
+        assert session_token.ACCESS_TOKEN_LIFETIME_SECONDS is ACCESS_TOKEN_LIFETIME_SECONDS
+        assert ACCESS_TOKEN_LIFETIME_SECONDS == 600
+        assert SESSION_CLOCK_SKEW_SECONDS == 30
+
+    async def test_a_genuine_token_verifies(
+        self, key: RSAKey, verifier: SessionTokenVerifier
+    ) -> None:
+        assert await verifier.verify_token(_signed(key)) is not None
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"exp": None}, id="no-exp"),
+            pytest.param({"exp": "9999999999"}, id="exp-a-string"),
+            pytest.param({"exp": True}, id="exp-a-bool"),
+            pytest.param({"iat": "now"}, id="iat-a-string"),
+            pytest.param({"nbf": "now"}, id="nbf-a-string"),
+        ],
+    )
+    async def test_a_malformed_time_claim_is_refused(
+        self, key: RSAKey, verifier: SessionTokenVerifier, overrides: dict[str, Any]
+    ) -> None:
+        assert await verifier.verify_token(_signed(key, **overrides)) is None
+
+    async def test_exp_beyond_the_lifetime_and_skew_is_refused(
+        self, key: RSAKey, verifier: SessionTokenVerifier
+    ) -> None:
+        now = int(time.time())
+        assert await verifier.verify_token(_signed(key, exp=now + self.LIMIT - 5)) is not None
+        assert await verifier.verify_token(_signed(key, exp=now + self.LIMIT + 5)) is None
+
+    @pytest.mark.parametrize("claim", ["iat", "nbf"])
+    async def test_a_future_iat_or_nbf_beyond_the_skew_is_refused(
+        self, key: RSAKey, verifier: SessionTokenVerifier, claim: str
+    ) -> None:
+        now = int(time.time())
+        inside = {claim: now + SESSION_CLOCK_SKEW_SECONDS - 5}
+        beyond = {claim: now + SESSION_CLOCK_SKEW_SECONDS + 5}
+        assert await verifier.verify_token(_signed(key, **inside)) is not None
+        assert await verifier.verify_token(_signed(key, **beyond)) is None
+
+    async def test_a_past_nbf_and_an_absent_iat_are_accepted(
+        self, key: RSAKey, verifier: SessionTokenVerifier
+    ) -> None:
+        now = int(time.time())
+        assert await verifier.verify_token(_signed(key, nbf=now - 60, iat=None)) is not None
+
+
+class TestTheReadKeyGuardFollowsTheKey:
+    """The guard hashes RSA ``n`` and ``e`` in their minimal encoding, and
+    re-reads the read key on every fetch (2 October 2026)."""
+
+    async def test_a_padded_encoding_of_the_read_key_is_still_dropped(self) -> None:
+        read, session = _key("read-1"), _key("session-1.v1")
+        published = {"keys": [*_padded(_jwks(read))["keys"], *_jwks(session)["keys"]]}
+        control = _verifier(CountingJwks(published))
+        assert await control.verify_token(_token(read)) is not None, (
+            "the parent accepts the padded key, so the guard is what refuses it"
+        )
+        guarded = _verifier(
+            CountingJwks(published), forbidden=frozenset(jwk_thumbprints(_jwks(read)))
+        )
+        assert await guarded.verify_token(_token(read)) is None
+        assert await guarded.verify_token(_token(session)) is not None
+
+    async def test_a_read_key_version_published_after_startup_is_guarded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = Clock(monkeypatch)
+        v1, v2, session = _key("read-1.v1"), _key("read-1.v2"), _key("session-1.v1")
+        read_set = [v1]
+        handler = CountingJwks(_jwks(session))
+        verifier = _verifier(handler, forbidden=lambda: jwk_thumbprints(_jwks(*read_set)))
+        assert await verifier.verify_token(_token(session)) is not None
+        read_set.append(v2)  # the read key rotates after startup
+        handler.jwks = _jwks(session, v2)  # and is published as a session key
+        clock.advance(301)
+        assert await verifier.verify_token(_token(v2)) is None
+        assert await verifier.verify_token(_token(session)) is not None
+        assert handler.fetches == 2
+
+    async def test_a_read_key_that_cannot_be_read_fails_the_fetch_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = Clock(monkeypatch)
+        session, stranger = _key("session-1.v1"), _key("forged-1")
+        broken = [False]
+
+        def read_thumbprints() -> set[str]:
+            if broken[0]:
+                raise ConnectionError("vault unreachable")
+            return set()
+
+        handler = CountingJwks(_jwks(session))
+        verifier = _verifier(handler, forbidden=read_thumbprints)
+        assert await verifier.verify_token(_token(session)) is not None
+        broken[0] = True
+        clock.advance(MIN_REFETCH_INTERVAL_SECONDS + 1)
+        assert await verifier.verify_token(_token(stranger)) is None
+        assert await verifier.verify_token(_token(session)) is not None, "the cache was erased"
+        assert handler.fetches == 2
+
+
 class TestTheSettings:
     def test_the_ttl_is_read_without_a_vault(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("POSTERN_BACKEND_BASE_URL", "https://backend.test")
@@ -517,3 +742,20 @@ class TestCreateAppWiresTheReadKeyGuard:
         pem.write_bytes(_key("read-1").as_pem(private=True))
         app = create_app(_api_settings(served, read_key_pem_path=str(pem)))
         await _assert_the_read_key_is_never_a_session_key(app, served)
+
+    async def test_a_read_key_published_after_startup_is_guarded(
+        self, served: _Served, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``create_app`` hands the verifier a reader, not a snapshot: a read
+        key the source starts publishing after startup (a Vault rotation) is
+        dropped by the next fetch."""
+        app = create_app(_api_settings(served))
+        rotated = _key("read-1.v2")
+        monkeypatch.setattr(
+            app.state.postern_read_key_source, "public_jwks", lambda: _jwks(rotated)
+        )
+        served.jwks = {"keys": [*_jwks(rotated)["keys"], *_jwks(served.key)["keys"]]}
+        verifier = app.state.postern_server.auth
+        assert await verifier.verify_token(_token(rotated)) is None
+        assert await verifier.verify_token(_token(served.key)) is not None
+        assert served.fetches == 1

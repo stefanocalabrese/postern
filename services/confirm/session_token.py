@@ -33,14 +33,15 @@ from typing import Any, Protocol
 from postern_core.auth.jwk_thumbprint import THUMBPRINT_MEMBERS as THUMBPRINT_MEMBERS
 from postern_core.auth.jwk_thumbprint import jwk_thumbprints as jwk_thumbprints
 from postern_core.auth.keys import KeySource, choose_key_source
+
+# Re-exported: the lifetime moved to the shared library on 2 October 2026, so
+# `services/api`'s verifier refuses an `exp` beyond the same number.
+from postern_core.auth.session_lifetime import (
+    ACCESS_TOKEN_LIFETIME_SECONDS as ACCESS_TOKEN_LIFETIME_SECONDS,
+)
 from postern_core.identity import CustomerRef
 
 from services.confirm.settings import ConfirmSettings
-
-#: How long an access token lives, in seconds. A code constant rather than a
-#: setting: the family's absolute lifetime is one hour and this is a tenth of
-#: it, and decision record 0010's amendment counts on the number.
-ACCESS_TOKEN_LIFETIME_SECONDS = 600
 
 
 @dataclass(frozen=True, slots=True)

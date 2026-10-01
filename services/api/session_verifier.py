@@ -4,8 +4,9 @@
 ``POST /token``: signed by the SESSION key and published at confirm's
 ``/session/jwks.json``, which this service fetches from ``POSTERN_JWKS_URI``.
 FastMCP 4.0.3's ``JWTVerifier`` already checks the signature against the key
-the token's ``kid`` names, ``exp``, ``iss`` and ``aud``; what it does not do
-is bound its JWKS fetches.
+the token's ``kid`` names, ``exp`` when present, ``iss`` and ``aud``; what it
+does not do is bound its JWKS fetches, require ``exp``, or read ``iat`` or
+``nbf``.
 
 WHAT THE PARENT DOES, read in the installed ``fastmcp/server/auth/providers/jwt.py``
 rather than recalled: its constructor sets a one-hour cache TTL, and its
@@ -15,7 +16,9 @@ that AND the ``kid`` is in it. Any other case fetches, with a fresh
 and no negative cache, so every token carrying an unseen ``kid`` causes one
 outbound fetch -- an unauthenticated caller can drive them at the api's full
 request rate -- and a key removed from the published set stays trusted for up
-to an hour.
+to an hour. Its ``load_access_token`` refuses ``exp`` only when the claim is
+present (``exp is not None and exp < time.time()``), and joserfc validates no
+claim, so a token minted without ``exp`` verified forever.
 
 WHAT THIS CHANGES, and nothing else:
 
@@ -26,18 +29,35 @@ WHAT THIS CHANGES, and nothing else:
   negative cache;
 - one fetch at a time, under an ``asyncio.Lock``, and callers that waited on
   it read its result instead of fetching again;
+- a fetch is bounded by `FETCH_TIMEOUT_SECONDS` (2 October 2026), so an
+  endpoint that accepts the connection and drips, or never answers, holds the
+  lock for that long and no longer;
 - a fetch that FAILS leaves the cache as it was and holds every further fetch
   to the same floor, so an unreachable JWKS endpoint is asked at most once per
   interval rather than once per request. FAILS means any of them: an HTTP
-  error, a timeout, a body that is not JSON, and a 200 whose JSON is not a key
-  set, which until 2 October 2026 erased the cache because the parent empties
-  it before it parses;
+  error, the bound above, a body that is not JSON, a 200 whose JSON is not
+  ``{"keys": [...]}``, and a key set that yields no usable key where the
+  previous one had some. Until 2 October 2026 the 200s erased the cache,
+  because the parent empties it before it parses;
 - a fetched key whose RFC 7638 thumbprint equals one of this service's own
   READ key is dropped before it is cached, with one fixed WARNING per fetch
   (2 October 2026). Startup cannot fetch confirm's key set, so this holds at
-  fetch time: a misconfigured ``POSTERN_JWKS_URI`` that points at this
-  service's own ``/.well-known/jwks.json``, or a session key that is the read
-  key, fails closed instead of accepting read-key tokens as sessions.
+  fetch time, and the read key is re-read on every fetch, so a version Vault
+  publishes after startup is covered: a misconfigured ``POSTERN_JWKS_URI``
+  that points at this service's own ``/.well-known/jwks.json``, or a session
+  key that is the read key, fails closed instead of accepting read-key tokens
+  as sessions;
+- after the parent accepts a token, ``exp`` must be a number no further ahead
+  than ``ACCESS_TOKEN_LIFETIME_SECONDS`` plus ``SESSION_CLOCK_SKEW_SECONDS``,
+  and ``iat`` and ``nbf``, when present, numbers no further ahead than the
+  skew (2 October 2026).
+
+AVAILABILITY DEPENDS ON CONFIRM'S KEY SET, BY DESIGN. Once the cache is older
+than its TTL, no session token verifies until a fetch succeeds; a failed
+refresh keeps the old set but does not serve it as fresh. So the grace after
+confirm's ``/session/jwks.json`` becomes unreachable is what is left of one
+TTL, and then the api refuses every customer. Failing closed is the intent: a
+key set that cannot be re-read cannot show that a key was not withdrawn.
 
 IT OVERRIDES TWO PRIVATE METHODS of a pinned dependency (``fastmcp>=4.0.3,<5``),
 ``_get_jwks_key`` and ``_fetch_jwks``.
@@ -55,17 +75,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Callable, Iterable
+from typing import Any, TypeGuard
 
+from fastmcp.server.auth import AccessToken
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.auth.jwk_thumbprint import jwk_thumbprints
+from postern_core.auth.session_lifetime import (
+    ACCESS_TOKEN_LIFETIME_SECONDS,
+    SESSION_CLOCK_SKEW_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
 #: The floor under fetches for a ``kid`` the cache has never held, in seconds.
 MIN_REFETCH_INTERVAL_SECONDS = 30.0
+
+#: The bound on one JWKS fetch, in seconds, connect to parsed body. Below the
+#: parent's own 10-second client timeout, which bounds each phase and not the
+#: whole, so a server dripping one byte a second never trips it. Every caller
+#: with an unknown kid waits on the lock behind this fetch.
+FETCH_TIMEOUT_SECONDS = 5.0
 
 #: Logged once per fetch that dropped a key, and fixed: no kid, no key bytes.
 READ_KEY_PUBLISHED_WARNING = (
@@ -77,6 +109,35 @@ READ_KEY_PUBLISHED_WARNING = (
 )
 
 
+def _no_thumbprints() -> Iterable[str]:
+    return ()
+
+
+def _is_time(value: Any) -> TypeGuard[int | float]:
+    """A finite JSON number; ``bool`` excluded, as ``services/confirm/auth.py`` does."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    return math.isfinite(value)
+
+
+def _time_claim_refusal(claims: dict[str, Any], now: float) -> str | None:
+    """Why a token the parent accepted must still be refused, or ``None``.
+
+    The returned string goes into a log line and never a claim value.
+    """
+    exp = claims.get("exp")
+    if not _is_time(exp):
+        return "token carries no numeric exp"
+    if exp - now > ACCESS_TOKEN_LIFETIME_SECONDS + SESSION_CLOCK_SKEW_SECONDS:
+        return "token exp is beyond the session token lifetime"
+    for name in ("iat", "nbf"):
+        if name in claims:
+            value = claims[name]
+            if not _is_time(value) or value - now > SESSION_CLOCK_SKEW_SECONDS:
+                return f"token {name} is not a number or is in the future"
+    return None
+
+
 class SessionTokenVerifier(JWTVerifier):
     """``JWTVerifier`` with a bounded JWKS cache; see the module docstring."""
 
@@ -85,42 +146,62 @@ class SessionTokenVerifier(JWTVerifier):
         *,
         cache_ttl_seconds: float,
         min_refetch_interval_seconds: float = MIN_REFETCH_INTERVAL_SECONDS,
-        forbidden_thumbprints: Iterable[str] = (),
+        forbidden_thumbprints: Callable[[], Iterable[str]] = _no_thumbprints,
+        fetch_timeout_seconds: float = FETCH_TIMEOUT_SECONDS,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._session_ttl = cache_ttl_seconds
         self._refetch_floor = min_refetch_interval_seconds
-        self._forbidden = frozenset(forbidden_thumbprints)
+        self._forbidden_thumbprints = forbidden_thumbprints
+        self._fetch_timeout = fetch_timeout_seconds
         self._last_fetch = float("-inf")
         self._last_fetch_failed = False
         self._fetch_lock = asyncio.Lock()
 
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        access = await super().load_access_token(token)
+        if access is None:
+            return None
+        refusal = _time_claim_refusal(access.claims, time.time())
+        if refusal is not None:
+            logger.info("Session token rejected: %s", refusal)
+            return None
+        return access
+
     async def _fetch_jwks(self) -> dict[str, Any]:
-        """The parent's fetch, minus every key whose thumbprint is forbidden.
+        """The parent's fetch, refused unless it is a key set, minus every key
+        whose thumbprint is the read key's.
 
         Here and not after the parent's parse, because the parent caches and
         returns a key in one step: a key dropped here never reaches the cache,
         so a token naming its kid is an unknown kid, held to the floor like
-        any other. An answer that is not a ``{"keys": [...]}`` object is
-        returned untouched, for the parent to fail on; an entry whose ``kty``
-        is not a string is kept, for the parent to skip.
+        any other. An entry whose ``kty`` is not a string is kept, for the
+        parent to skip. The read key is read here, on every fetch, and any
+        exception from reading it fails the fetch.
         """
         data = await super()._fetch_jwks()
-        if not self._forbidden or not isinstance(data, dict):
+        if not (isinstance(data, dict) and isinstance(data.get("keys"), list)):
+            raise ValueError('JWKS answer is not a {"keys": [...]} object')
+        try:
+            forbidden = frozenset(self._forbidden_thumbprints())
+        except Exception as error:
+            raise ValueError(
+                f"the read key's thumbprints could not be read ({type(error).__name__})"
+            ) from error
+        if not forbidden:
             return data
-        keys = data.get("keys")
-        if not isinstance(keys, list):
-            return data
-        kept = [jwk for jwk in keys if not self._is_forbidden(jwk)]
+        keys = data["keys"]
+        kept = [jwk for jwk in keys if not self._is_forbidden(jwk, forbidden)]
         if len(kept) != len(keys):
             logger.warning(READ_KEY_PUBLISHED_WARNING)
         return {**data, "keys": kept}
 
-    def _is_forbidden(self, jwk: Any) -> bool:
+    @staticmethod
+    def _is_forbidden(jwk: Any, forbidden: frozenset[str]) -> bool:
         if not isinstance(jwk, dict) or not isinstance(jwk.get("kty"), str):
             return False
-        return bool(jwk_thumbprints({"keys": [jwk]}) & self._forbidden)
+        return bool(jwk_thumbprints({"keys": [jwk]}) & forbidden)
 
     def _cached(self, kid: str | None, now: float) -> str | None:
         """The cached key for ``kid`` while the cache is fresh, else ``None``."""
@@ -166,9 +247,18 @@ class SessionTokenVerifier(JWTVerifier):
             # stamps the cache time only after a fetch that succeeded.
             self._jwks_cache_time = 0
             try:
-                return await super()._get_jwks_key(kid)
+                async with asyncio.timeout(self._fetch_timeout):
+                    return await super()._get_jwks_key(kid)
+            except TimeoutError as error:
+                # A `ValueError`, because the parent's `load_access_token`
+                # turns only that family into a refusal: a bare
+                # `TimeoutError` would surface as a 500.
+                raise ValueError("JWKS fetch timed out") from error
             finally:
-                self._last_fetch_failed = self._jwks_cache_time == 0
+                # Zero usable keys where there were some is a failure too: a
+                # key set confirm meant to empty still expires with the TTL.
+                emptied = bool(previous_keys) and not self._jwks_cache
+                self._last_fetch_failed = self._jwks_cache_time == 0 or emptied
                 if self._last_fetch_failed:
                     self._jwks_cache = previous_keys
                     self._jwks_cache_time = previous
