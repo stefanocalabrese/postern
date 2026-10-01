@@ -256,6 +256,8 @@ A new `_refresh` beside `_exchange`, returning `(response, detail)` so the row i
 
 **Note, 1 October 2026: a signature that fails after the rotation.** Step 9 raising leaves the family rotated and the client's token retained, so the client's retry is reuse, the family is revoked and the customer re-pairs. This spec accepts that as fail-closed. Option for the spec owner: prepare, sign, then rotate and return the token only if the rotation succeeds; the invariant (no externally visible token whose jti is unrecorded) still holds; it changes this section's stated order of steps 8 and 9; not taken.
 
+**Note, 1 October 2026: a store outage at the rotation.** Step 8 raising a store outage (a Redis error, a socket error or a timeout) answers 503 `temporarily_unavailable` with `Retry-After`, recorded under the exception's type name, and issues nothing. If the store committed the rotation before the reply was lost, the client's retry with its old refresh token is reuse, the family is revoked and the customer re-pairs. Accepted: the store cannot tell a lost reply from a stolen token.
+
 **Response (200)**: §5's five keys with the new refresh token and granted scope, and the same two headers. Any other `grant_type` still answers 404 `unsupported_grant_type` (Discrepancies).
 
 ### 7. Session-swap recall at `POST /scan`

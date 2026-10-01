@@ -781,12 +781,10 @@ async def _token_response(request: Request) -> JSONResponse:
             "only the device_code and refresh_token grants are supported",
         )
 
-    device_code_raw = form.get("device_code", "")
-    device_code_value: str = (
-        device_code_raw.file.read().decode()
-        if hasattr(device_code_raw, "file")
-        else str(device_code_raw)
-    )
+    try:
+        device_code_value = _form_value(form, "device_code") or ""
+    except MalformedParameter as exc:
+        return _error(400, "invalid_request", str(exc))
     if not device_code_value:
         return _error(400, "invalid_request", "device_code is required")
 
@@ -1082,7 +1080,7 @@ async def _exchange(
     except RefreshSessionStoreFull as exc:
         logger.warning("device grant: %s; refusing to mint", exc)
         return _session_store_unavailable_response(retry_after), type(exc).__name__
-    except (RedisError, OSError, TimeoutError) as exc:
+    except SESSION_STORE_OUTAGES as exc:
         logger.warning(
             "device grant: refresh-family store unavailable (%s); refusing to mint",
             type(exc).__name__,
@@ -1367,24 +1365,29 @@ async def _refresh(
         # tokens go on the ZT-7 list now, not at the client's next refresh: the
         # api would otherwise honour them for up to their remaining lifetime.
         log_refusal("a session refresh of a family issued before a revocation")
+        outage: str | None = None
         try:
             jtis = await sessions.revoke(family.sid, reason="issued_before_revocation")
         except SESSION_STORE_OUTAGES as exc:
             # Still refused: the stamp refuses this family on every
             # presentation for the rest of its life, which the stamp's TTL
             # covers, so the outage costs only the revocation's permanence.
+            # The live access tokens are cut from the record this request
+            # read, so they die now either way.
             logger.warning(
                 "refresh grant: could not revoke family %s issued before a revocation: %s",
                 family.sid,
                 type(exc).__name__,
             )
-            return _unrefreshable_response(), type(exc).__name__
+            outage = type(exc).__name__
+            jtis = family.live_jtis(now)
         try:
             await _reassert(revocations, jtis or ())
         except RevocationStoreUnavailable as exc:
-            # The family is revoked, so the next presentation re-asserts.
+            # Retryable: a revoked family re-asserts on its next presentation,
+            # and an unrevoked one meets this branch again.
             return store_unavailable_response(retry_after), type(exc).__name__
-        return _unrefreshable_response(), DETAIL_ISSUED_BEFORE_REVOCATION
+        return _unrefreshable_response(), outage or DETAIL_ISSUED_BEFORE_REVOCATION
 
     # STEP 7: DRAW.
     minter: SessionTokenMinter = request.app.state.session_minter
@@ -1399,13 +1402,25 @@ async def _refresh(
     # STEP 8: ROTATE, one compare-and-set. Any result but ROTATED re-runs the
     # matching branch of step 4 against what the transaction saw: a
     # concurrent refresh that won turns this one into REUSED.
-    outcome = await sessions.rotate(
-        family.sid,
-        presented_hash=presented_hash,
-        new_hash=hash_refresh_token(new_token),
-        access_jti=claims.jti,
-        access_expires_at=datetime.fromtimestamp(claims.exp, UTC),
-    )
+    #
+    # A STORE OUTAGE is a retryable 503 that issued nothing. If the store
+    # committed the rotation before the reply was lost, the client's retry
+    # with the same token is reuse and revokes the family: the customer
+    # re-pairs. Accepted (spec section 6, note of 1 October 2026).
+    try:
+        outcome = await sessions.rotate(
+            family.sid,
+            presented_hash=presented_hash,
+            new_hash=hash_refresh_token(new_token),
+            access_jti=claims.jti,
+            access_expires_at=datetime.fromtimestamp(claims.exp, UTC),
+        )
+    except SESSION_STORE_OUTAGES as exc:
+        logger.warning(
+            "refresh grant: refresh-family store unavailable (%s); refusing to rotate",
+            type(exc).__name__,
+        )
+        return store_unavailable_response(retry_after), type(exc).__name__
     if outcome.rotation is Rotation.REUSED:
         return await _reuse_detected(revocations, family, outcome.jtis, retry_after)
     if outcome.rotation is Rotation.REVOKED:

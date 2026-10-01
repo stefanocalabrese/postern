@@ -619,7 +619,34 @@ class TestZt7:
             _refused(await _refresh(app, first["refresh_token"]))
         assert "TimeoutError" in caplog.text and _sid(first) in caplog.text
         assert (await _family(app, first)).generation == 0
-        assert [r.detail for r in await _rows(clean)] == ["TimeoutError", "TimeoutError"]
+        assert await store.is_revoked({"jti": _jti(first)}), "cut even though the revoke failed"
+        # The second presentation meets the cut jti in the ZT-7 checks first.
+        assert [r.detail for r in await _rows(clean)] == ["TimeoutError", DETAIL_REVOKED]
+
+    async def test_both_stores_down_on_an_issued_before_family_is_a_retryable_503(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.revoke_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+        await store.restore_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def family_store_down(sid: str, *, reason: str) -> tuple[str, ...] | None:
+            raise TimeoutError("simulated outage")
+
+        async def revocation_store_down(*, jti: str) -> None:
+            raise RevocationStoreUnavailable("simulated outage")
+
+        monkeypatch.setattr(sessions, "revoke", family_store_down)
+        monkeypatch.setattr(store, "revoke_session", revocation_store_down)
+        _retryable(app, await _refresh(app, first["refresh_token"]))
+        assert (await _family(app, first)).generation == 0
+        assert [r.detail for r in await _rows(clean)] == ["RevocationStoreUnavailable"]
 
     @pytest.mark.parametrize(("offset_ms", "refused"), [(700, True), (0, True), (-1, False)])
     async def test_milliseconds_decide_at_the_edge(
@@ -685,6 +712,36 @@ class TestTheRotationItself:
         response = await _refresh(app, first["refresh_token"])
         assert response.status_code == 500
         assert [r.detail for r in await _rows(clean)] == ["RefreshSessionStoreContended"]
+
+    @pytest.mark.parametrize(
+        "exc",
+        [RedisConnectionError("redis went away"), TimeoutError("timed out"), OSError("reset")],
+        ids=["redis.ConnectionError", "TimeoutError", "OSError"],
+    )
+    async def test_a_store_outage_at_the_rotation_is_a_retryable_503(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+        exc: Exception,
+    ) -> None:
+        first = await _session(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        real_rotate = sessions.rotate
+
+        async def down(*args: Any, **kwargs: Any) -> Any:
+            raise exc
+
+        monkeypatch.setattr(sessions, "rotate", down)
+        response = await _refresh(app, first["refresh_token"])
+        _retryable(app, response)
+        assert "access_token" not in response.text
+        assert (await _family(app, first)).generation == 0
+        assert [r.detail for r in await _rows(clean)] == [type(exc).__name__]
+
+        monkeypatch.setattr(sessions, "rotate", real_rotate)
+        session_claims(await _refresh(app, first["refresh_token"]), app)
 
     async def test_a_concurrent_winner_turns_this_refresh_into_reuse(
         self,

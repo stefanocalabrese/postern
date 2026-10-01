@@ -341,6 +341,111 @@ class TestAFamilyStoreThatCannotAnswer:
         assert (row.outcome, row.detail) == (OUTCOME_RAISED, "RefreshSessionCollision")
         assert "session_id" not in row.arguments
 
+    async def test_the_outage_tuple_has_one_definition(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``_exchange`` and the refresh grant catch the same module constant,
+        so widening it widens both."""
+
+        class Widened(Exception):
+            pass
+
+        monkeypatch.setattr(
+            device_auth,
+            "SESSION_STORE_OUTAGES",
+            (*device_auth.SESSION_STORE_OUTAGES, Widened),
+        )
+        device = await _approved(app, key_pair)
+        app.state.refresh_session_store = _CreateRaises(Widened("an outage by definition"))
+
+        response = await _exchange(app, device["device_code"])
+
+        assert response.status_code == 503, response.text
+        (row,) = await _token_rows(clean)
+        assert row.detail == "Widened"
+
+
+class TestStrictParameters:
+    """Every ``/token`` parameter is read once and strictly (1 October 2026).
+
+    A repeated parameter (RFC 6749 section 3.2) or a file part that is not
+    UTF-8 is 400 ``invalid_request``, before the lookup: no row, and the code
+    is left exactly as it was.
+    """
+
+    async def _still_redeemable(
+        self, app: Starlette, device: dict[str, Any], clean: Database
+    ) -> None:
+        assert await _token_rows(clean) == []
+        stored = await app.state.device_code_store.get_device_code(device["device_code"])
+        assert stored.exchanged_at is None
+        session_claims(await _exchange(app, device["device_code"]), app)
+
+    async def test_a_repeated_device_code(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        device = await _approved(app, key_pair)
+        async with _client(app) as client:
+            response = await client.post(
+                "/token",
+                content=(
+                    f"grant_type=device_code&device_code={device['device_code']}"
+                    f"&device_code={device['device_code']}"
+                ),
+                headers={"content-type": "application/x-www-form-urlencoded"},
+            )
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "invalid_request"
+        assert response.headers["cache-control"] == "no-store"
+        await self._still_redeemable(app, device, clean)
+
+    async def test_a_device_code_file_part_that_is_not_utf8(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        device = await _approved(app, key_pair)
+        async with _client(app) as client:
+            response = await client.post(
+                "/token",
+                data={"grant_type": "device_code"},
+                files={"device_code": ("value", b"\xff\xfe\xfd", "text/plain")},
+            )
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "invalid_request"
+        await self._still_redeemable(app, device, clean)
+
+    async def test_a_utf8_device_code_file_part_is_read(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        device = await _approved(app, key_pair)
+        async with _client(app) as client:
+            response = await client.post(
+                "/token",
+                data={"grant_type": "device_code"},
+                files={"device_code": ("value", device["device_code"].encode(), "text/plain")},
+            )
+        session_claims(response, app)
+
+    async def test_a_repeated_grant_type_on_the_device_grant(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        device = await _approved(app, key_pair)
+        async with _client(app) as client:
+            response = await client.post(
+                "/token",
+                content=(
+                    "grant_type=device_code&grant_type=device_code"
+                    f"&device_code={device['device_code']}"
+                ),
+                headers={"content-type": "application/x-www-form-urlencoded"},
+            )
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "invalid_request"
+        await self._still_redeemable(app, device, clean)
+
 
 class TestAClaimThatRaises:
     """``consume_device_code`` raising after ``create`` (amended 1 October 2026).
