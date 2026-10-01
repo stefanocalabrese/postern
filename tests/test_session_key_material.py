@@ -235,6 +235,41 @@ class TestNonRsaKeys:
             )
 
 
+class TestASessionKeyWithNoThumbprint:
+    """An empty ``mine`` would pass every overlap vacuously: refused instead."""
+
+    class _Publishes:
+        def __init__(self, jwks: Any) -> None:
+            self._jwks = jwks
+
+        def public_jwks(self) -> Any:
+            return self._jwks
+
+    @pytest.mark.parametrize(
+        "jwks",
+        [{"keys": [{"kty": "oct", "k": "c2VjcmV0"}]}, {"keys": []}, {}],
+        ids=["oct only", "no keys", "no keys member"],
+    )
+    def test_it_is_refused_at_startup(self, jwks: Any) -> None:
+        with pytest.raises(ValueError) as raised:
+            refuse_shared_key_material(
+                session=self._Publishes(jwks),
+                others=[("POSTERN_READ_KEY_PEM_PATH", _Source(RSAKey.generate_key(2048)))],
+                session_variable="POSTERN_SESSION_KEY_PEM_PATH",
+            )
+        message = str(raised.value)
+        assert "POSTERN_SESSION_KEY_PEM_PATH" in message
+        assert "could not be fingerprinted" in message
+
+    def test_it_is_refused_even_with_nothing_to_compare_against(self) -> None:
+        with pytest.raises(ValueError, match="could not be fingerprinted"):
+            refuse_shared_key_material(
+                session=self._Publishes({"keys": []}),
+                others=[],
+                session_variable="POSTERN_VAULT_SESSION_KEY_NAME",
+            )
+
+
 class TestVaultKeyNamesAreStripped:
     def test_a_trailing_space_does_not_make_two_names_different(self) -> None:
         settings = dataclasses.replace(

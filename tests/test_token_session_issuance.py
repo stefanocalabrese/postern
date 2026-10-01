@@ -478,7 +478,8 @@ class TestAClaimThatRaises:
                 "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
             )
 
-        assert response.status_code == 500
+        # An outage, and the re-read shows the code unspent: retryable.
+        assert response.status_code == 503
         assert "access_token" not in response.text
         assert sessions._sessions == {}, "a claim that raised left its family behind"
         (row,) = await _token_rows(clean)
@@ -514,11 +515,220 @@ class TestAClaimThatRaises:
                     data={"grant_type": "device_code", "device_code": device["device_code"]},
                 )
 
-        assert response.status_code == 500
+        assert response.status_code == 503
         (orphan,) = sessions._sessions
         assert f"orphaned session family {orphan}" in caplog.text
         (row,) = await _token_rows(clean)
         assert (row.outcome, row.detail) == (OUTCOME_RAISED, "TimeoutError")
+
+
+def _raw_client(app: Starlette) -> httpx2.AsyncClient:
+    return httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    )
+
+
+OUTAGES = [
+    redis_exceptions.ConnectionError("redis went away"),
+    TimeoutError("timed out"),
+    OSError("reset by peer"),
+]
+OUTAGE_IDS = ["redis.ConnectionError", "TimeoutError", "OSError"]
+
+
+def _assert_retryable(app: Starlette, response: httpx2.Response) -> None:
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "temporarily_unavailable"
+    assert response.headers["retry-after"] == str(app.state.settings.device_poll_interval_seconds)
+    assert response.headers["cache-control"] == "no-store"
+    assert "access_token" not in response.text
+
+
+class TestADeviceCodeStoreThatCannotAnswer:
+    """The device-code store is Redis too (1 October 2026).
+
+    An outage that provably left the code unspent is a retryable 503 with
+    ``Retry-After``; one that may have spent it is a 500.
+    """
+
+    @pytest.mark.parametrize("exc", OUTAGES, ids=OUTAGE_IDS)
+    async def test_an_outage_at_the_lookup_is_retryable_and_writes_nothing(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+        exc: Exception,
+    ) -> None:
+        device = await _approved(app, key_pair)
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        real = store.get_device_code
+
+        async def down(device_code: str) -> DeviceCode | None:
+            raise exc
+
+        monkeypatch.setattr(store, "get_device_code", down)
+        async with _raw_client(app) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+        _assert_retryable(app, response)
+        assert await _token_rows(clean) == []
+
+        monkeypatch.setattr(store, "get_device_code", real)
+        session_claims(await _exchange(app, device["device_code"]), app)
+
+    async def test_an_outage_revoking_an_expired_code_is_retryable(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        device = await _approved(app, key_pair)
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        code = store._codes[device["device_code"]]
+        store._codes[device["device_code"]] = dataclasses.replace(
+            code, expires_at=datetime.now(UTC) - timedelta(seconds=1)
+        )
+        real = store.revoke_device_code
+
+        async def down(device_code: str) -> None:
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(store, "revoke_device_code", down)
+        async with _raw_client(app) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+        _assert_retryable(app, response)
+        assert await _token_rows(clean) == []
+
+        monkeypatch.setattr(store, "revoke_device_code", real)
+        again = await _exchange(app, device["device_code"])
+        assert again.json()["error"] == "expired_token"
+
+    @pytest.mark.parametrize("exc", OUTAGES, ids=OUTAGE_IDS)
+    async def test_a_claim_outage_on_a_provably_unspent_code_is_retryable(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+        exc: Exception,
+    ) -> None:
+        device = await _approved(app, key_pair)
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        real = store.consume_device_code
+
+        async def down(device_code: str, *, session_id: str) -> bool:
+            raise exc
+
+        monkeypatch.setattr(store, "consume_device_code", down)
+        async with _raw_client(app) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+        _assert_retryable(app, response)
+        assert sessions._sessions == {}
+        (row,) = await _token_rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, type(exc).__name__)
+        stored = await store.get_device_code(device["device_code"])
+        assert stored is not None
+        assert stored.exchanged_at is None
+
+        monkeypatch.setattr(store, "consume_device_code", real)
+        app.state._approved_poll_times = {}
+        session_claims(await _exchange(app, device["device_code"]), app)
+
+    async def test_a_claim_that_committed_before_the_reply_was_lost_is_a_500(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The code is spent and its family discarded: the session is lost and
+        the customer re-pairs (spec section 5, note of 1 October 2026)."""
+        device = await _approved(app, key_pair)
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        real = store.consume_device_code
+
+        async def committed_then_lost(device_code: str, *, session_id: str) -> bool:
+            assert await real(device_code, session_id=session_id)
+            raise redis_exceptions.ConnectionError("reply lost after EXEC")
+
+        monkeypatch.setattr(store, "consume_device_code", committed_then_lost)
+        async with _raw_client(app) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+        assert response.status_code == 500
+        assert "access_token" not in response.text
+        assert sessions._sessions == {}
+        stored = await store.get_device_code(device["device_code"])
+        assert stored is not None
+        assert stored.exchanged_at is not None
+        (row,) = await _token_rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, "ConnectionError")
+
+    async def test_a_claim_outage_whose_re_read_fails_is_a_500(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        device = await _approved(app, key_pair)
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+        real_get = store.get_device_code
+        reads = 0
+
+        async def get_once(device_code: str) -> DeviceCode | None:
+            nonlocal reads
+            reads += 1
+            if reads > 1:
+                raise TimeoutError("re-read timed out")
+            return await real_get(device_code)
+
+        async def down(device_code: str, *, session_id: str) -> bool:
+            raise TimeoutError("claim timed out")
+
+        monkeypatch.setattr(store, "get_device_code", get_once)
+        monkeypatch.setattr(store, "consume_device_code", down)
+        async with _raw_client(app) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+        assert response.status_code == 500
+        assert reads == 2
+        (row,) = await _token_rows(clean)
+        assert row.detail == "TimeoutError"
+
+    async def test_a_claim_fault_that_is_not_an_outage_is_a_500(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        device = await _approved(app, key_pair)
+        store: InMemoryDeviceCodeStore = app.state.device_code_store
+
+        async def broken(device_code: str, *, session_id: str) -> bool:
+            raise ValueError("a programming error")
+
+        monkeypatch.setattr(store, "consume_device_code", broken)
+        async with _raw_client(app) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+        assert response.status_code == 500
+        (row,) = await _token_rows(clean)
+        assert row.detail == "ValueError"
 
 
 class TestALostClaim:

@@ -169,8 +169,18 @@ def refuse_shared_key_material(
     which the path and name checks in ``check_session_token_settings`` can see.
     ``others`` pairs each other key's variable name with its source.
     ``ValueError`` names both variables and carries no key bytes.
+
+    A session source whose own set yields NO thumbprint (an unsupported
+    ``kty``, a missing member, no keys at all) is refused too: an empty set
+    overlaps nothing, so the comparison would pass without having compared.
     """
     mine = jwk_thumbprints(session.public_jwks())
+    if not mine:
+        raise ValueError(
+            f"{session_variable}: the session key's public key could not be fingerprinted "
+            "(no RSA, EC or OKP key with its RFC 7638 members in what it publishes), so it "
+            "cannot be shown to differ from the read and the write key. Refusing to start."
+        )
     for variable, source in others:
         if mine & jwk_thumbprints(source.public_jwks()):
             raise ValueError(

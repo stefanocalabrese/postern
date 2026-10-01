@@ -203,6 +203,8 @@ Then, replacing the hotfix's 503:
 
 Family before spend, because §7 finds the family through the `session_id` step 3 writes; created first, the record exists before any reader can learn its id.
 
+**Note, 1 October 2026: device-code store outages.** The device-code store is the same Redis. A store outage (a Redis error, a socket error or a timeout) at the lookup, or while revoking an expired code, spent nothing and resolved nobody: 503 `temporarily_unavailable` with `Retry-After` set to `device_poll_interval_seconds`, and no row. At step 3 a claim that raises an outage may have committed with its reply lost, so the family from step 2 is discarded and the code is re-read. Only a code the re-read shows unspent gets the retryable 503, recorded under the exception's type name. A spent code, a missing one or a re-read that fails as well is a 500 under the claim's exception: if the claim committed, the code is spent and the session it named was discarded, so that pairing is lost and the customer re-pairs. Accepted as the conservative choice: a 503 there would send the browser to retry a code no retry can redeem.
+
 **Response (200)**:
 
 ```json

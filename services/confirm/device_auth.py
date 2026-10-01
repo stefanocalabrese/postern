@@ -285,6 +285,11 @@ UNKNOWN_REFRESH_LOG_ENTRIES = 4_096
 #: anything else is a fault, propagates and is a 500.
 SESSION_STORE_OUTAGES: tuple[type[Exception], ...] = (RedisError, OSError, TimeoutError)
 
+#: The same types for the device-code store, which is the same Redis (or the
+#: same process) behind ``POSTERN_REDIS_URL``. Its own name so a reader of the
+#: device grant's ``/token`` path is not sent to the refresh family's store.
+DEVICE_STORE_OUTAGES = SESSION_STORE_OUTAGES
+
 # ---------------------------------------------------------------------------
 # Error responses — RFC 8628 §3.3 and §3.4 error codes.
 # ---------------------------------------------------------------------------
@@ -800,7 +805,13 @@ async def _token_response(request: Request) -> JSONResponse:
     if unserved is not None:
         return unserved
 
-    code: DeviceCode | None = await store.get_device_code(device_code_value)
+    # A STORE OUTAGE here resolved nobody and spent nothing: a retryable 503
+    # with the poll interval, and no row.
+    try:
+        code: DeviceCode | None = await store.get_device_code(device_code_value)
+    except DEVICE_STORE_OUTAGES as exc:
+        logger.warning("device grant: device-code store unavailable (%s)", type(exc).__name__)
+        return store_unavailable_response(settings.device_poll_interval_seconds)
     if code is None:
         # NO ROW, AND THE ASYMMETRY WITH ``POST /approve`` IS DELIBERATE. The
         # same shape one endpoint over IS recorded, as the enumeration signal,
@@ -815,7 +826,15 @@ async def _token_response(request: Request) -> JSONResponse:
         # NO ROW. This runs before the identity is read, so it resolves nobody
         # even for a code that HAD been approved, and it is the ordinary end of
         # every abandoned pairing rather than an event.
-        await store.revoke_device_code(device_code_value)
+        try:
+            await store.revoke_device_code(device_code_value)
+        except DEVICE_STORE_OUTAGES as exc:
+            # Retryable: the next poll finds the code expired again.
+            logger.warning(
+                "device grant: device-code store unavailable (%s) revoking an expired code",
+                type(exc).__name__,
+            )
+            return store_unavailable_response(settings.device_poll_interval_seconds)
         _drop_poll_time(request, device_code_value)
         return _error(400, "expired_token", "device code has expired")
 
@@ -1102,9 +1121,34 @@ async def _exchange(
     # propagates (amended 1 October 2026), so no family outlives an exchange
     # that issued nothing. Either row keeps the `session_id`, which is how a
     # lost claim's `device_code_spent` row differs from a replay's.
+    #
+    # A CLAIM THAT RAISES A STORE OUTAGE may or may not have committed (an
+    # EXEC whose reply was lost). The family is discarded either way, then the
+    # code is re-read: only a code PROVABLY unspent gets a retryable 503. A
+    # spent code, a gone one or a re-read that fails too re-raises the claim's
+    # exception, a 500: a committed claim means a spent code whose session was
+    # just discarded, and the customer re-pairs (spec section 5, note of
+    # 1 October 2026).
     store: DeviceCodeStoreBase = request.app.state.device_code_store
     try:
         claimed = await store.consume_device_code(code.device_code, session_id=sid)
+    except DEVICE_STORE_OUTAGES as exc:
+        await _discard_orphan(sessions, sid, "a claim that raised")
+        try:
+            reread = await store.get_device_code(code.device_code)
+        except Exception as reread_exc:  # noqa: BLE001 -- unknown state, the claim's error stands
+            logger.warning(
+                "device grant: re-read after a failed claim failed too (%s)",
+                type(reread_exc).__name__,
+            )
+            raise exc from reread_exc
+        if reread is None or reread.exchanged_at is not None:
+            raise
+        logger.warning(
+            "device grant: device-code store unavailable (%s) at the claim; the code is unspent",
+            type(exc).__name__,
+        )
+        return store_unavailable_response(retry_after), type(exc).__name__
     except Exception:
         await _discard_orphan(sessions, sid, "a claim that raised")
         raise
