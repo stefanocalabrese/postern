@@ -211,7 +211,7 @@ def _device_key_store(settings: ConfirmSettings) -> DeviceKeyStoreBase:
     return FileDeviceKeyStore(Path(settings.device_keys_path))
 
 
-def _refuse_process_local_sessions(settings: ConfirmSettings) -> None:
+def _refuse_process_local_sessions(settings: ConfirmSettings) -> bool:
     """Refuse to start the device grant on per-process state, unless told to.
 
     Without ``POSTERN_REDIS_URL`` the refresh-family store and this service's
@@ -226,16 +226,18 @@ def _refuse_process_local_sessions(settings: ConfirmSettings) -> None:
     ``recall_local_only``. ``RuntimeError``, the type
     `postern_core.config.enforce_redis_requirement` chose for a
     deployment-wide contract not met.
+
+    Returns whether sessions are process local, which a recall records.
     """
     if redis_url_from_env():
-        return
+        return False
     if settings.allow_process_local_sessions:
         logger.warning(
             "POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS is set and POSTERN_REDIS_URL is not: "
             "refresh families and recalls live in this process only, and services/api "
             "never sees a recalled token. No multi-replica deployment may run this way."
         )
-        return
+        return True
     raise RuntimeError(
         "the confirm service cannot issue layer-1 sessions without shared state: "
         "POSTERN_REDIS_URL is not set, so refresh families and the ZT-7 list would be "
@@ -372,7 +374,7 @@ def create_confirm_app(
     # POSTERN_REQUIRE_REDIS hears its message first. This one is the device
     # grant's own: without a shared Redis a session cannot be refreshed on
     # another replica or recalled at all.
-    _refuse_process_local_sessions(settings)
+    process_local_sessions = _refuse_process_local_sessions(settings)
     # The issuer and audience of every access token, refused here rather than
     # in `ConfirmSettings.__post_init__` so a settings object built by hand is
     # refused exactly where a deployment would be.
@@ -609,6 +611,9 @@ def create_confirm_app(
     app.state.session_minter = session_minter
     app.state.device_code_store = device_code_store
     app.state.refresh_session_store = refresh_session_store
+    # Read by a recall at `POST /scan`, which records `recall_local_only` when
+    # the stores it wrote are this process's own.
+    app.state.process_local_sessions = process_local_sessions
     # Expose database for the approval callback.
     app.state.postern_database = db
     # ZT-7: read by `services/confirm/revocation.py`'s `revocation_store` on

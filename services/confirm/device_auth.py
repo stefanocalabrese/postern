@@ -155,6 +155,8 @@ from services.confirm.audit import (
     DETAIL_NOT_SCANNED,
     DETAIL_QR_INVALID,
     DETAIL_QR_STALE,
+    DETAIL_RECALL_LOCAL_ONLY,
+    DETAIL_RECALL_NO_SESSION,
     DETAIL_REFRESH_REUSED,
     DETAIL_REVOKED,
     DETAIL_SCAN_CONFLICT,
@@ -165,6 +167,7 @@ from services.confirm.audit import (
     DETAIL_SESSION_REVOKED,
     DETAIL_STORED_IDENTITY_MALFORMED,
     DETAIL_USER_CODE_NOT_FOUND,
+    RECALL_TOOL_NAME,
     REFRESH_TOOL_NAME,
     SCAN_ROUTE,
     SCAN_TOOL_NAME,
@@ -2173,6 +2176,24 @@ def _scan_conflict_response() -> JSONResponse:
     return _error(400, "scan_conflict", "this pairing was scanned by another device")
 
 
+def _recall_retry_response() -> JSONResponse:
+    """The 503 ``POST /scan`` answers when a recall could not complete.
+
+    ``Retry-After: 1``, because the retry must land inside the rotation
+    token's window: ``/scan`` checks the MAC before ``claim_scan``, so a retry
+    later than 10 to 12 seconds answers ``qr_stale`` and recalls nothing. The
+    mobile pairing contract tells the app to retry once, immediately.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "temporarily_unavailable",
+            "error_description": "the pairing could not be cancelled; retry now",
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
 def _scan_context_response(code: DeviceCode) -> JSONResponse:
     """What the app shows beside the pairing code the user reads off the page.
 
@@ -2377,6 +2398,11 @@ async def _scan(
     the same 200 before this date and still does; since 2026-09-30 its row is
     ``returned`` with ``DETAIL_ALREADY_SCANNED`` instead of NULL, so the NULL
     rows count first scans only.
+
+    ``CONFLICT_EXCHANGED`` RECALLS THE SESSION (spec section 7): the swap was
+    noticed after the other customer's pairing was exchanged, so the family
+    ``POST /token`` issued is revoked and its access tokens listed, before the
+    ``scan_conflict`` answer. `_recall` carries the order and the failure mode.
     """
     try:
         customer = CustomerRef(value=subject)
@@ -2493,8 +2519,81 @@ async def _scan(
             device_code_handle(code.device_code),
             claim.value,
         )
+        if claim is ScanClaim.CONFLICT_EXCHANGED and not await _recall(request, audit, code=code):
+            return _Scanned(_recall_retry_response(), DETAIL_SCAN_CONFLICT)
         return _Scanned(_scan_conflict_response(), DETAIL_SCAN_CONFLICT)
     return _Scanned(_unpairable_response(), DETAIL_USER_CODE_NOT_FOUND)
+
+
+async def _recall(request: Request, scan_audit: PairingAudit, *, code: DeviceCode) -> bool:
+    """Recall the session a session swap produced, write its row, and say if it held.
+
+    Spec section 7. Customer B scanned victim A's QR first and approved; A's
+    AI client exchanged and holds a session for B's accounts; A's scan is this
+    request. In order:
+
+    1. RE-READ THE ROW. ``code`` was read before ``claim_scan``, possibly
+       before the exchange, and ``session_id`` is written in the same
+       compare-and-set as ``exchanged_at``.
+    2. REVOKE THE FAMILY FIRST, so it cannot refresh into a ``jti`` step 3
+       never names; ``revoke`` returns every live access ``jti``.
+    3. LIST EACH ACCESS TOKEN on the ZT-7 store, which ``services/api``
+       checks on every ``tools/call`` and ``tools/list``.
+
+    The row names the family's customer (B), shares the scan row's
+    ``call_id``, and is ``returned`` only when the family was revoked and
+    every ``jti`` reached a shared store. Returns ``False`` when a step
+    raised, and the caller answers a 503 the app retries at once; ``True``
+    otherwise, including the rows that record nothing to recall. An audit
+    write failure raises: a revocation that happened is the safe state, so
+    nothing is withdrawn.
+    """
+    settings: ConfirmSettings = request.app.state.settings
+    subject = code.scanned_by
+    sid = ""
+    detail: str | None = None
+    held = True
+    try:
+        row = await request.app.state.device_code_store.get_device_code(code.device_code)
+        if row is not None:
+            subject = row.customer_ref or subject
+            sid = row.session_id
+        sessions: RefreshSessionStoreBase = request.app.state.refresh_session_store
+        jtis = await sessions.revoke(sid, reason="recall") if sid else None
+        if jtis is None:
+            detail = DETAIL_RECALL_NO_SESSION
+        else:
+            await _reassert(revocation_store(request), jtis)
+            if request.app.state.process_local_sessions:
+                detail = DETAIL_RECALL_LOCAL_ONLY
+    except Exception as exc:  # noqa: BLE001 -- recorded and answered 503; the app retries
+        detail = type(exc).__name__
+        held = False
+        logger.error(
+            "device scan: recalling the session of pairing %s failed with %s; the session "
+            "may still be live",
+            device_code_handle(code.device_code),
+            detail,
+        )
+    recall = PairingAudit(
+        db=request.app.state.postern_database,
+        call_id=scan_audit.call_id,
+        at=datetime.now(UTC),
+        started=time.monotonic(),
+        subject=subject,
+        claims={},
+        client_ip_value=pairing_client_ip(request, settings.trusted_proxy_hops),
+        tool_name=RECALL_TOOL_NAME,
+        route=SCAN_ROUTE,
+    )
+    recall.names(
+        device_code=code.device_code, session_id=sid or None, paired_client_id=code.client_id
+    )
+    if detail is None:
+        await recall.recalled()
+    else:
+        await recall.refused(detail)
+    return held
 
 
 async def _pairing_network_signals(

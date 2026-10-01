@@ -546,16 +546,14 @@ async def test_session_swap_before_the_exchange_revokes_the_pairing(
     ]
 
 
-async def test_session_swap_after_the_exchange_is_refused_with_nothing_revoked(
+async def test_session_swap_after_the_exchange_is_refused_and_leaves_the_row(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """The window this spec does not close: B's token is already out. The
-    conflict is refused and recorded; the spent row is left exactly as it was,
-    because revoking it would recall nothing.
-
-    SPENT THROUGH THE STORE since 2026-09-30: ``POST /token`` spends nothing
-    while issuance is disabled, so the spent state is reached the way an
-    earlier build left it, and the way the session-token change will again."""
+    """The conflict is refused and recorded, and the spent row is left exactly
+    as it was: revoking a spent code recalls nothing. What IS recalled is the
+    session the exchange issued, through its ``session_id``;
+    ``tests/test_scan_recall.py`` holds that. Spent here through the store with
+    no family, so the recall row records nothing to recall."""
     code = await start(app)
     assert (await scan(app, key_pair, BOB, code)).status_code == 200
     assert await device_store_of(app).approve_scanned(code.device_code, BOB) is True

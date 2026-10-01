@@ -896,6 +896,13 @@ SCAN_ROUTE = "/scan"
 #: ``detail`` filter; ``route`` stays ``TOKEN_ROUTE``.
 REFRESH_TOOL_NAME = "device_grant.refresh"
 
+#: What ``tool_name`` carries on the recall row ``POST /scan`` writes when a
+#: second customer's scan finds the pairing already exchanged: the session
+#: the exchange issued is revoked. ``route`` stays ``SCAN_ROUTE``, the row
+#: names the recalled family's customer, and it shares the scan row's
+#: ``call_id``.
+RECALL_TOOL_NAME = "device_grant.recall"
+
 #: The stored ``customer_ref`` on an approved device code will not parse as a
 #: ``CustomerRef``.
 #:
@@ -1111,6 +1118,13 @@ DETAIL_SCOPE_EXCEEDED = "scope_exceeded"
 #: The family was created at or before a customer revocation, whether or not
 #: that revocation has since been restored; the family is revoked for good.
 DETAIL_ISSUED_BEFORE_REVOCATION = "issued_before_revocation"
+#: A recall found nothing to recall: the exchanged row is gone, names no
+#: family, or names one the store no longer holds.
+DETAIL_RECALL_NO_SESSION = "recall_no_session"
+#: A recall ran under ``POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS``: it was written
+#: to process-local stores that ``services/api`` does not read, so the access
+#: token it named is still accepted there.
+DETAIL_RECALL_LOCAL_ONLY = "recall_local_only"
 
 
 def device_code_handle(device_code: str) -> str:
@@ -1524,6 +1538,14 @@ class PairingAudit:
         short form is that a raise here has to be able to stop the token
         reaching the caller, and it can only do that while the response is
         still an object in this process.
+        """
+        await self._write(OUTCOME_RETURNED, None)
+
+    async def recalled(self) -> None:
+        """Record that a session a swap produced was recalled.
+
+        ``returned`` with a NULL ``detail``, and its own method rather than
+        ``minted``: only a ``POST /token`` row claims a session was issued.
         """
         await self._write(OUTCOME_RETURNED, None)
 

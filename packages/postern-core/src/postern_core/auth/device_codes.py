@@ -250,7 +250,9 @@ class ScanClaim(enum.Enum):
     #: pairing is revoked in the same transaction: the session-swap defence.
     CONFLICT_REVOKED = "conflict_revoked"
     #: Another customer holds the scan and the code was already exchanged.
-    #: Nothing written, because revoking a spent code recalls nothing.
+    #: Nothing written here, because revoking a spent code recalls nothing:
+    #: ``POST /scan`` recalls the session the exchange issued instead, through
+    #: the ``session_id`` the exchange wrote on the row.
     CONFLICT_EXCHANGED = "conflict_exchanged"
     #: The row is missing or expired.
     GONE = "gone"
