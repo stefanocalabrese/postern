@@ -1098,6 +1098,7 @@ class TestTheConfiguredLimits:
             "/verify/state",
             "/verify.js",
             "/verify.css",
+            "/session/jwks.json",
         ):
             assert path in DEFAULT_LIMITS
 
@@ -1155,6 +1156,7 @@ class TestTheLimitsAreSettableWithoutACodeChange:
         ("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_STATE", "rate_limit_verify_state"),
         ("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_JS", "rate_limit_verify_js"),
         ("POSTERN_CONFIRM_RATE_LIMIT_VERIFY_CSS", "rate_limit_verify_css"),
+        ("POSTERN_CONFIRM_RATE_LIMIT_SESSION_JWKS", "rate_limit_session_jwks"),
     ]
 
     @pytest.mark.parametrize(("name", "field"), NAMES)
@@ -1212,6 +1214,7 @@ class TestTheLimitsAreSettableWithoutACodeChange:
                 verify_state=settings.rate_limit_verify_state,
                 verify_js=settings.rate_limit_verify_js,
                 verify_css=settings.rate_limit_verify_css,
+                session_jwks=settings.rate_limit_session_jwks,
             )
             == DEFAULT_LIMITS
         )

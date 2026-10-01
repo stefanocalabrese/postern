@@ -627,6 +627,7 @@ async def test_an_unauthenticated_oversized_request_is_413_and_never_reaches_the
         ("/scan", "application/json"),
         (PROTECTED, "application/json"),
         ("/.well-known/jwks.json", "application/json"),
+        ("/session/jwks.json", "application/json"),
         ("/verify", "text/plain"),
         ("/verify/qr.svg", "text/plain"),
         ("/verify/state", "text/plain"),

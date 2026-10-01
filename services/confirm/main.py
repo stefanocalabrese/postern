@@ -96,7 +96,7 @@ from services.confirm.customer_rate_limit import (
     customer_limits_from_settings,
 )
 from services.confirm.device_auth import PAIRING_ENRICHMENT_SLOTS, device_auth_routes
-from services.confirm.jwks import jwks_route
+from services.confirm.jwks import jwks_route, session_jwks_route
 from services.confirm.minter import build_write_minter
 from services.confirm.rate_limit import (
     RATE_LIMIT_WINDOW_SECONDS,
@@ -104,6 +104,7 @@ from services.confirm.rate_limit import (
     RateLimit,
     limits_from_settings,
 )
+from services.confirm.session_token import build_session_minter
 from services.confirm.settings import ConfirmSettings
 from services.confirm.verify_page import verify_page_routes
 
@@ -316,6 +317,14 @@ def create_confirm_app(
     # --- Write key / minter (existing path) ---
     _write_minter, write_key_source = build_write_minter(settings)
 
+    # --- Session key / minter (the layer-1 access token) ---
+    #
+    # A THIRD KEY, which signs the access tokens `POST /token` issues and
+    # nothing else, published at `/session/jwks.json` beside the write set and
+    # never inside it. `services/confirm/session_token.py` says why it is not
+    # the read key and not `InternalTokenMinter`.
+    session_minter, session_key_source = build_session_minter(settings)
+
     # --- Read key / minter (device grant exception) ---
     #
     # THE ONE PROCESS IN THIS REPOSITORY THAT HOLDS TWO KEYS, and it is a
@@ -397,7 +406,7 @@ def create_confirm_app(
 
     # --- Assemble routes ---
     routes: list[Route] = (
-        [jwks_route(write_key_source)]
+        [jwks_route(write_key_source), session_jwks_route(session_key_source)]
         + device_auth_routes(
             store=device_code_store,
             settings=settings,
@@ -438,6 +447,7 @@ def create_confirm_app(
                     verify_state=settings.rate_limit_verify_state,
                     verify_js=settings.rate_limit_verify_js,
                     verify_css=settings.rate_limit_verify_css,
+                    session_jwks=settings.rate_limit_session_jwks,
                 ),
                 fallback_limit=Limit(settings.rate_limit_default, RATE_LIMIT_WINDOW_SECONDS),
             ),
@@ -504,10 +514,12 @@ def create_confirm_app(
     )
     # Expose key sources on ``app.state`` for external consumers.
     app.state.postern_write_key_source = write_key_source
+    app.state.postern_session_key_source = session_key_source
     app.state.postern_read_key_source = read_key_source
     # Expose minters and store for the device auth routes.
     app.state.read_minter = read_minter
     app.state.write_minter = _write_minter
+    app.state.session_minter = session_minter
     app.state.device_code_store = device_code_store
     # Expose database for the approval callback.
     app.state.postern_database = db

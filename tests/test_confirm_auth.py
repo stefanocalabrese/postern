@@ -306,18 +306,20 @@ async def test_an_unknown_path_is_401_and_not_404(app: Starlette) -> None:
             assert response.status_code == 401, (path, response.status_code)
 
 
-def test_the_public_path_list_is_exactly_these_eight() -> None:
-    """Adding a ninth must be a deliberate, reviewed act.
+def test_the_public_path_list_is_exactly_these_nine() -> None:
+    """Adding a tenth must be a deliberate, reviewed act.
 
     ``PUBLIC_PATHS`` is the single exemption list for the whole service. A
     change to it is a change to what the write path serves anonymously, and it
     should never happen as a side effect of some other edit. The five
     ``/verify`` entries are the browser's pairing page, and
     ``dev-docs/decisions/0021-public-html-on-the-write-key-service.md`` is
-    where serving them here was decided.
+    where serving them here was decided. ``/session/jwks.json`` is the
+    session key's public half, which ``services/api``'s verifier fetches.
     """
     assert PUBLIC_PATHS == {
         "/.well-known/jwks.json",
+        "/session/jwks.json",
         "/device_authorization",
         "/token",
         "/verify",

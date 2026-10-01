@@ -146,6 +146,7 @@ def test_the_confirm_composition_root_is_silent_when_a_real_pem_is_configured(
     settings = ConfirmSettings(
         write_key_pem_path=_private_pem(tmp_path, "write.pem", "write-1"),
         read_key_pem_path=_private_pem(tmp_path, "read.pem", "read-1"),
+        session_key_pem_path=_private_pem(tmp_path, "session.pem", "session-1"),
         # Required since the confirm service gained inbound authentication:
         # `create_confirm_app` refuses to build without all three (there is no
         # unauthenticated mode on the write path). This test is about signing
@@ -178,7 +179,7 @@ def test_the_confirm_composition_root_is_silent_when_a_real_pem_is_configured(
             lambda: create_confirm_app(
                 ConfirmSettings.for_testing(), device_key_store=no_enrolled_devices()
             ),
-            2,  # write + read (device grant exception)
+            3,  # write + read (device grant exception) + session
             id="confirm",
         ),
     ],
@@ -209,12 +210,14 @@ def test_the_warning_names_the_consequence_not_only_the_state(
     # The API service has exactly one warning about the read key.
     if expected_count == 1:
         assert "POSTERN_READ_KEY_PEM_PATH" in messages[0]
-    # The confirm service has warnings for both write and read keys.
-    if expected_count == 2:
+    # The confirm service has warnings for the write, read and session keys.
+    if expected_count == 3:
         write_msg = [m for m in messages if "POSTERN_WRITE_KEY_PEM_PATH" in m]
         read_msg = [m for m in messages if "POSTERN_READ_KEY_PEM_PATH" in m]
+        session_msg = [m for m in messages if "POSTERN_SESSION_KEY_PEM_PATH" in m]
         assert len(write_msg) == 1
         assert len(read_msg) == 1
+        assert len(session_msg) == 1
 
 
 def test_the_record_the_warning_cites_exists() -> None:

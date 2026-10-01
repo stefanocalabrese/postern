@@ -185,6 +185,10 @@ DEFAULT_LIMITS: dict[str, Limit] = {
     "/verify/state": Limit(requests=300, window_seconds=60),
     "/verify.js": Limit(requests=60, window_seconds=60),
     "/verify.css": Limit(requests=60, window_seconds=60),
+    # Fetched by every ``services/api`` worker process on a cache miss, which
+    # its verifier floors at one per 30 seconds per unknown kid plus one per
+    # TTL; replicas may share one NAT address, so the ceiling is generous.
+    "/session/jwks.json": Limit(requests=300, window_seconds=60),
 }
 
 #: What an unlisted path gets. See "WHY DEFAULT-DENY ON PATHS" above.
@@ -212,8 +216,9 @@ def limits_from_settings(
     verify_state: int,
     verify_js: int,
     verify_css: int,
+    session_jwks: int,
 ) -> dict[str, Limit]:
-    """Build the per-path limit map from ten per-minute request counts.
+    """Build the per-path limit map from eleven per-minute request counts.
 
     Here rather than in `services/confirm/main.py` so the composition root
     stays assembly, and here rather than in `services/confirm/settings.py` so
@@ -231,6 +236,7 @@ def limits_from_settings(
         "/verify/state": Limit(verify_state, RATE_LIMIT_WINDOW_SECONDS),
         "/verify.js": Limit(verify_js, RATE_LIMIT_WINDOW_SECONDS),
         "/verify.css": Limit(verify_css, RATE_LIMIT_WINDOW_SECONDS),
+        "/session/jwks.json": Limit(session_jwks, RATE_LIMIT_WINDOW_SECONDS),
     }
 
 

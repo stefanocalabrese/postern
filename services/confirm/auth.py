@@ -152,9 +152,16 @@ MAX_ASSERTION_MAX_LIFETIME_SECONDS = 3600
 #:
 #: ``/verify.css``
 #:     The page's only stylesheet, so ``style-src 'self'`` has a target.
+#:
+#: ``/session/jwks.json``
+#:     The PUBLIC half of the session key, which signs the layer-1 access
+#:     tokens ``POST /token`` issues. ``services/api``'s verifier fetches it
+#:     holding no assertion, which is why it is here; like the write set above
+#:     it carries no private material (``services/confirm/jwks.py``).
 PUBLIC_PATHS = frozenset(
     {
         "/.well-known/jwks.json",
+        "/session/jwks.json",
         "/device_authorization",
         "/token",
         "/verify",

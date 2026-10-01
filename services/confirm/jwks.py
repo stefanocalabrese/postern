@@ -37,6 +37,15 @@ intentional, for reasons stronger than "the import-linter contract forbids
    the other does not. Check for exactly that when touching either file.
 
 `services/api/jwks.py` carries the matching comment.
+
+A SECOND ROUTE, `session_jwks_route`, publishes the SESSION key at
+`SESSION_JWKS_PATH` (``dev-docs/device-grant-session-token-spec.md`` section
+2). It is a separate route with its own path and NOT a path parameter on
+`jwks_route`, for the reason above turned around: `jwks_route`'s body is the
+one that must change in step with the api's copy, and a merged or
+parameterised publisher is the convenience that measurement priced. The two
+sets share no kid and no modulus, and ``/.well-known/jwks.json`` stays
+write-only.
 """
 
 from postern_core.auth.keys import KeySource
@@ -46,9 +55,22 @@ from starlette.routing import Route
 
 JWKS_PATH = "/.well-known/jwks.json"
 
+#: Where the SESSION key's public half is published, for ``services/api``'s
+#: verifier to fetch. Public (`services/confirm/auth.py`'s ``PUBLIC_PATHS``).
+SESSION_JWKS_PATH = "/session/jwks.json"
+
 
 def jwks_route(source: KeySource) -> Route:
     async def handler(_: Request) -> JSONResponse:
         return JSONResponse(source.public_jwks())
 
     return Route(JWKS_PATH, handler, methods=["GET"])
+
+
+def session_jwks_route(source: KeySource) -> Route:
+    """The session key set, and only it, at `SESSION_JWKS_PATH`."""
+
+    async def handler(_: Request) -> JSONResponse:
+        return JSONResponse(source.public_jwks())
+
+    return Route(SESSION_JWKS_PATH, handler, methods=["GET"])
