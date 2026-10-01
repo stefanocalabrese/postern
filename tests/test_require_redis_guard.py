@@ -248,6 +248,30 @@ class TestTheWritePathStillFailsOnAuthenticationFirst:
         assert "inbound authentication" in str(raised.value)
 
 
+class TestTheSessionRefusalComesAfterTheRedisGuard:
+    """``_refuse_process_local_sessions`` sits beside this guard and after it.
+
+    The device grant's own refusal of per-process state is narrower -- it is
+    about refresh families and recalls, and it has a development flag -- so
+    an operator who also set POSTERN_REQUIRE_REDIS hears the deployment-wide
+    contract's message first.
+    """
+
+    def test_required_and_absent_hears_this_guard_first(
+        self, key_pair: RSAKeyPair, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(REQUIRE_REDIS_ENV, "1")
+        with pytest.raises(RuntimeError) as raised:
+            _confirm(key_pair, allow_process_local_sessions=False)
+        assert str(raised.value).startswith(SHARED_PREFIX)
+
+    def test_not_required_and_absent_hears_the_session_refusal(self, key_pair: RSAKeyPair) -> None:
+        with pytest.raises(RuntimeError) as raised:
+            _confirm(key_pair, allow_process_local_sessions=False)
+        assert not str(raised.value).startswith(SHARED_PREFIX)
+        assert "POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS" in str(raised.value)
+
+
 # ---------------------------------------------------------------------------
 # The read path. Unchanged, and pinned so that it stays unchanged.
 # ---------------------------------------------------------------------------

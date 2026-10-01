@@ -156,6 +156,10 @@ def _settings(omitted: str | None = None) -> ConfirmSettings:
         app_assertion_jwks_uri=v["app_assertion_jwks_uri"],
         app_assertion_issuer=v["app_assertion_issuer"],
         app_assertion_audience=v["app_assertion_audience"],
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
     )
 
 

@@ -212,6 +212,10 @@ def confirm_app(
         database_pool_size=pool_size,
         database_max_overflow=max_overflow,
         database_pool_timeout_seconds=pool_timeout_seconds,
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
     )
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
     return create_confirm_app(

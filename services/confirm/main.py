@@ -70,6 +70,8 @@ and ``services.confirm.callback`` for the challenge approval handler.
 
 import asyncio
 import enum
+import logging
+import os
 from pathlib import Path
 
 from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -105,8 +107,10 @@ from services.confirm.rate_limit import (
     limits_from_settings,
 )
 from services.confirm.session_token import build_session_minter
-from services.confirm.settings import ConfirmSettings
+from services.confirm.settings import ConfirmSettings, check_session_token_settings
 from services.confirm.verify_page import verify_page_routes
+
+logger = logging.getLogger(__name__)
 
 
 class _FromEntryPoints(enum.Enum):
@@ -202,6 +206,41 @@ def _device_key_store(settings: ConfirmSettings) -> DeviceKeyStoreBase:
     return FileDeviceKeyStore(Path(settings.device_keys_path))
 
 
+def _refuse_process_local_sessions(settings: ConfirmSettings) -> None:
+    """Refuse to start the device grant on per-process state, unless told to.
+
+    Without ``POSTERN_REDIS_URL`` the refresh-family store and this service's
+    ZT-7 store are per process: a refresh token from one replica is
+    ``invalid_grant`` at another, and a recall at ``POST /scan`` writes the
+    revoked ``jti`` into this process's memory, which ``services/api`` never
+    reads. A service that cannot recall should not look ready, so this is a
+    refusal at startup and not at ``POST /token``.
+
+    ``POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS`` is the development way out; with
+    it the service starts, says so here, and every recall row records
+    ``recall_local_only``. ``RuntimeError``, the type
+    `postern_core.config.enforce_redis_requirement` chose for a
+    deployment-wide contract not met.
+    """
+    if os.environ.get("POSTERN_REDIS_URL"):
+        return
+    if settings.allow_process_local_sessions:
+        logger.warning(
+            "POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS is set and POSTERN_REDIS_URL is not: "
+            "refresh families and recalls live in this process only, and services/api "
+            "never sees a recalled token. No multi-replica deployment may run this way."
+        )
+        return
+    raise RuntimeError(
+        "the confirm service cannot issue layer-1 sessions without shared state: "
+        "POSTERN_REDIS_URL is not set, so refresh families and the ZT-7 list would be "
+        "per process, a refresh token from one replica would be refused at another, and a "
+        "recall at POST /scan would never reach services/api. Set POSTERN_REDIS_URL to "
+        "the Redis services/api uses, or set POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS for a "
+        "single-process development stack."
+    )
+
+
 def create_confirm_app(
     settings: ConfirmSettings | None = None,
     *,
@@ -249,7 +288,12 @@ def create_confirm_app(
             be parsed. Refusing to build is the point in all three cases: it
             makes a confirm service that authenticates nobody, or that cannot
             verify an approval signature, unreachable by construction rather
-            than by remembering to configure one.
+            than by remembering to configure one. Also for every refusal
+            ``check_session_token_settings`` makes.
+        RuntimeError: if ``POSTERN_REDIS_URL`` is unset and
+            ``allow_process_local_sessions`` is not (see
+            ``_refuse_process_local_sessions``), after
+            ``enforce_redis_requirement``'s own refusal.
         EnricherSeamViolation: if the installed enricher set is refused by
             ``load_network_enricher``: more than one, one that will not
             import, or one whose ``lookup`` is not async.
@@ -305,6 +349,15 @@ def create_confirm_app(
             "to accept per-replica state."
         )
     )
+    # BESIDE THAT GUARD AND AFTER IT, so an operator who also set
+    # POSTERN_REQUIRE_REDIS hears its message first. This one is the device
+    # grant's own: without a shared Redis a session cannot be refreshed on
+    # another replica or recalled at all.
+    _refuse_process_local_sessions(settings)
+    # The issuer and audience of every access token, refused here rather than
+    # in `ConfirmSettings.__post_init__` so a settings object built by hand is
+    # refused exactly where a deployment would be.
+    check_session_token_settings(settings)
 
     # THE PAIRING NETWORK ENRICHER, LOADED ONCE AND BEFORE ANY KEY IS BUILT,
     # so a refused installed set lands at composition like every other

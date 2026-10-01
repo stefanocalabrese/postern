@@ -528,6 +528,10 @@ def _app(key_pair: RSAKeyPair, **kwargs: Any) -> Starlette:
         app_assertion_jwks_uri="https://app.postern-local-dev.invalid/.well-known/jwks.json",
         app_assertion_issuer="https://app.postern-local-dev.invalid",
         app_assertion_audience=AUDIENCE,
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
         **kwargs,
     )
     return create_confirm_app(
@@ -597,6 +601,10 @@ async def test_an_unauthenticated_oversized_request_is_413_and_never_reaches_the
         app_assertion_issuer="https://app.postern-local-dev.invalid",
         app_assertion_audience=AUDIENCE,
         max_body_bytes=LIMIT,
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
     )
     app = create_confirm_app(
         settings, assertion_verifier=NeverCalled(), device_key_store=no_enrolled_devices()
@@ -732,7 +740,14 @@ def pg_url() -> Generator[str]:
 
 @pytest.fixture()
 def settings(pg_url: str) -> ConfirmSettings:
-    return ConfirmSettings(backend_base_url="https://backend.test", database_url=pg_url)
+    return ConfirmSettings(
+        backend_base_url="https://backend.test",
+        database_url=pg_url,
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
+    )
 
 
 @pytest.fixture()
@@ -935,6 +950,10 @@ async def test_an_oversized_body_writes_no_row_at_all(
         backend_base_url=settings.backend_base_url,
         database_url=settings.database_url,
         max_body_bytes=LIMIT,
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
     )
     app = create_confirm_app(
         tight, assertion_verifier=verifier, device_key_store=no_enrolled_devices()

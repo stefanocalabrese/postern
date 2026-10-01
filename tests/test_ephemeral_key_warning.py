@@ -154,6 +154,10 @@ def test_the_confirm_composition_root_is_silent_when_a_real_pem_is_configured(
         app_assertion_jwks_uri="https://app.postern.invalid/.well-known/jwks.json",
         app_assertion_issuer="https://app.postern.invalid",
         app_assertion_audience="postern-confirm",
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
     )
     assert [
         m

@@ -175,6 +175,10 @@ def settings(pg_url: str) -> ConfirmSettings:
         backend_base_url="https://backend.test",
         database_url=pg_url,
         max_body_bytes=2 * len(ONE_MIB),
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
     )
 
 

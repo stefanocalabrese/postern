@@ -98,6 +98,10 @@ def settings(pg_url: str) -> ConfirmSettings:
     return ConfirmSettings(
         backend_base_url="https://backend.test",  # never reached; transport is mocked
         database_url=pg_url,
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
     )
 
 

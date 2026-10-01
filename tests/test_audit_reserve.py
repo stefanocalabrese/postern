@@ -805,6 +805,10 @@ def _confirm_settings(pg_url: str, **overrides: Any) -> ConfirmSettings:
         "database_pool_size": 1,
         "database_max_overflow": 0,
         "database_pool_timeout_seconds": POOL_TIMEOUT,
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        "allow_non_uri_audience": True,
+        "allow_process_local_sessions": True,
     }
     fields.update(overrides)
     return ConfirmSettings(**fields)

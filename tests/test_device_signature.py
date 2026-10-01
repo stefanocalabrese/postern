@@ -88,7 +88,14 @@ ATTACKER_PRIVATE, _ATTACKER_PUBLIC = device_key("attacker-phone")
 
 @pytest.fixture()
 def settings(pg_url: str) -> ConfirmSettings:
-    return ConfirmSettings(backend_base_url="https://backend.test", database_url=pg_url)
+    return ConfirmSettings(
+        backend_base_url="https://backend.test",
+        database_url=pg_url,
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -700,6 +707,10 @@ def test_the_configured_path_is_what_builds_the_store(
         backend_base_url=settings.backend_base_url,
         database_url=settings.database_url,
         device_keys_path=str(document),
+        # The two development flags `ConfirmSettings.for_testing` sets: this
+        # settings object is built by hand, so it gets the safe defaults.
+        allow_non_uri_audience=True,
+        allow_process_local_sessions=True,
     )
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
 
