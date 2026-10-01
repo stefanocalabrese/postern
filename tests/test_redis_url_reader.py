@@ -82,14 +82,26 @@ class TestEveryCallSiteAgrees:
 
 
 def test_no_module_reads_the_variable_except_the_one_reader() -> None:
-    """A raw read in a module under ``packages`` or ``services`` is the drift."""
+    """A raw read in a module under ``packages``, ``services``, ``stub`` or ``tools``.
+
+    A line naming ``POSTERN_REDIS_URL`` or ``REDIS_URL_ENV`` next to ``environ``
+    or ``getenv`` is the drift, whatever the quote style or the accessor
+    (``.get(...)`` or a subscript). Docstrings that merely name the variable
+    carry neither word and pass.
+    """
     root = Path(__file__).resolve().parent.parent
     allowed = {root / "packages/postern-core/src/postern_core/config.py"}
-    needles = ('environ.get("POSTERN_REDIS_URL"', 'getenv("POSTERN_REDIS_URL"')
-    offenders = [
-        str(path.relative_to(root))
-        for base in ("packages", "services")
-        for path in (root / base).rglob("*.py")
-        if path not in allowed and any(n in path.read_text() for n in needles)
-    ]
+    scanned = 0
+    offenders: list[str] = []
+    for base in ("packages", "services", "stub", "tools"):
+        for path in (root / base).rglob("*.py"):
+            scanned += 1
+            if path in allowed:
+                continue
+            for number, line in enumerate(path.read_text().splitlines(), start=1):
+                if ("environ" in line or "getenv" in line) and (
+                    "POSTERN_REDIS_URL" in line or "REDIS_URL_ENV" in line
+                ):
+                    offenders.append(f"{path.relative_to(root)}:{number}")
+    assert scanned > 0
     assert offenders == []

@@ -721,8 +721,14 @@ class ConfirmSettings:
             write_key_pem_path=os.environ.get("POSTERN_WRITE_KEY_PEM_PATH") or None,
             write_key_kid=os.environ.get("POSTERN_WRITE_KEY_KID", "write-1"),
             vault=vault_from_env(),
-            vault_write_key_name=os.environ.get("POSTERN_VAULT_WRITE_KEY_NAME", "postern-write"),
-            vault_read_key_name=os.environ.get("POSTERN_VAULT_READ_KEY_NAME", "postern-read"),
+            vault_write_key_name=os.environ.get(
+                "POSTERN_VAULT_WRITE_KEY_NAME", "postern-write"
+            ).strip()
+            or "postern-write",
+            vault_read_key_name=os.environ.get(
+                "POSTERN_VAULT_READ_KEY_NAME", "postern-read"
+            ).strip()
+            or "postern-read",
             write_token_issuer=os.environ.get(
                 "POSTERN_WRITE_TOKEN_ISSUER", "https://mcp-write.internal"
             ),
@@ -986,7 +992,8 @@ class ConfirmSettings:
             session_key_kid=os.environ.get("POSTERN_SESSION_KEY_KID", "session-1"),
             vault_session_key_name=os.environ.get(
                 "POSTERN_VAULT_SESSION_KEY_NAME", "postern-session"
-            ),
+            ).strip()
+            or "postern-session",
             session_token_issuer=os.environ.get(
                 "POSTERN_SESSION_TOKEN_ISSUER", "https://auth.postern.internal"
             ),
@@ -1088,7 +1095,12 @@ class ConfirmSettings:
 
 
 def _refuse_shared_session_key(settings: ConfirmSettings) -> None:
-    """Refuse a SESSION key that is the read key or the write key.
+    """Refuse a SESSION key NAMED as the read key or the write key.
+
+    THE CHEAP EARLY ERROR, and not the whole control: it compares names, kids
+    and resolved paths, so a copied PEM, a hardlink or a case-different path
+    passes it. ``services.confirm.session_token.refuse_shared_key_material``
+    compares the key material itself, once the three sources are built.
 
     The three keys are kept apart by what each one is trusted for, and that
     holds only while they are three keys: a session token signed by the write
@@ -1101,15 +1113,15 @@ def _refuse_shared_session_key(settings: ConfirmSettings) -> None:
     pairs: list[tuple[str, str | None, str, str | None]] = [
         (
             "POSTERN_VAULT_SESSION_KEY_NAME",
-            settings.vault_session_key_name,
+            settings.vault_session_key_name.strip(),
             "POSTERN_VAULT_READ_KEY_NAME",
-            settings.vault_read_key_name,
+            settings.vault_read_key_name.strip(),
         ),
         (
             "POSTERN_VAULT_SESSION_KEY_NAME",
-            settings.vault_session_key_name,
+            settings.vault_session_key_name.strip(),
             "POSTERN_VAULT_WRITE_KEY_NAME",
-            settings.vault_write_key_name,
+            settings.vault_write_key_name.strip(),
         ),
         (
             "POSTERN_SESSION_KEY_KID",

@@ -21,10 +21,14 @@ ever have issued. ``prepare`` draws the ``jti`` and reads the clock once;
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import time
 import uuid
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from postern_core.auth.keys import KeySource, choose_key_source
 from postern_core.identity import CustomerRef
@@ -114,6 +118,52 @@ class SessionTokenMinter:
         ``VaultTransitError``; it never returns an unsigned token.
         """
         return self._key_source.sign(claims.as_claims())
+
+
+class PublishesJwks(Protocol):
+    """The one capability the material check needs: a public key set."""
+
+    def public_jwks(self) -> Any: ...
+
+
+def jwk_thumbprints(jwks: Mapping[str, Any]) -> set[str]:
+    """The RFC 7638 SHA-256 thumbprint of every RSA key in a JWKS.
+
+    Over ``e``, ``kty`` and ``n`` only, so the ``kid``, ``use`` and every
+    private member are ignored: two sources publishing one key under two kids
+    give one thumbprint.
+    """
+    thumbprints: set[str] = set()
+    for jwk in jwks.get("keys", []):
+        required = {"e": jwk["e"], "kty": jwk["kty"], "n": jwk["n"]}
+        canonical = json.dumps(required, separators=(",", ":"), sort_keys=True)
+        digest = hashlib.sha256(canonical.encode()).digest()
+        thumbprints.add(base64.urlsafe_b64encode(digest).rstrip(b"=").decode())
+    return thumbprints
+
+
+def refuse_shared_key_material(
+    *,
+    session: PublishesJwks,
+    others: Iterable[tuple[str, PublishesJwks]],
+    session_variable: str,
+) -> None:
+    """Refuse a session key whose PUBLIC half is also the read or write key's.
+
+    Compares what each source publishes, so it holds for a copied PEM, a
+    hardlink, a case-different path and a Vault transit key alike, none of
+    which the path and name checks in ``check_session_token_settings`` can see.
+    ``others`` pairs each other key's variable name with its source.
+    ``ValueError`` names both variables and carries no key bytes.
+    """
+    mine = jwk_thumbprints(session.public_jwks())
+    for variable, source in others:
+        if mine & jwk_thumbprints(source.public_jwks()):
+            raise ValueError(
+                f"{session_variable} and {variable} resolve to the same key MATERIAL. The "
+                "session key must be a different key from the read and the write key; a "
+                "copied file, a hardlink or one Vault key under two names is still one key."
+            )
 
 
 def build_session_minter(settings: ConfirmSettings) -> tuple[SessionTokenMinter, KeySource]:

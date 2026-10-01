@@ -111,7 +111,7 @@ from services.confirm.rate_limit import (
     RateLimit,
     limits_from_settings,
 )
-from services.confirm.session_token import build_session_minter
+from services.confirm.session_token import build_session_minter, refuse_shared_key_material
 from services.confirm.settings import ConfirmSettings, check_session_token_settings
 from services.confirm.verify_page import verify_page_routes
 
@@ -416,6 +416,17 @@ def create_confirm_app(
         pem_env_var="POSTERN_READ_KEY_PEM_PATH",
     )
     read_minter = InternalTokenMinter(issuer=settings.read_token_issuer, key_source=read_key_source)
+    # KEY SEPARATION BY MATERIAL, not by name or path: the three sources are
+    # built, so compare the public keys they publish. The read entry goes when
+    # the read key leaves this service (Task 9); the write entry stays.
+    refuse_shared_key_material(
+        session=session_key_source,
+        others=[
+            ("POSTERN_WRITE_KEY_PEM_PATH or POSTERN_VAULT_WRITE_KEY_NAME", write_key_source),
+            ("POSTERN_READ_KEY_PEM_PATH or POSTERN_VAULT_READ_KEY_NAME", read_key_source),
+        ],
+        session_variable="POSTERN_SESSION_KEY_PEM_PATH or POSTERN_VAULT_SESSION_KEY_NAME",
+    )
 
     # --- Device code store ---
     #
