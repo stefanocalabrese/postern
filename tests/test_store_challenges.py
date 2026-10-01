@@ -16,12 +16,26 @@ import pytest
 from postern_core.domain.verification import VerificationTier
 from postern_core.store import challenges
 from postern_core.store.models import ChallengeRecord
+from sqlalchemy import func, select
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
+
+
+async def _db_now(session: AsyncSession) -> datetime:
+    """The database's clock, which is the one expiry is decided on.
+
+    ``now()`` is ``transaction_timestamp()``, the same instant the
+    ``expiry="unexpired"`` and ``expiry="expired"`` predicates compare
+    ``expires_at`` against inside this session's transaction. A test that builds
+    a deadline from ``datetime.now(UTC)`` instead measures the host's clock
+    against the container's, and fails whenever they disagree by more than its
+    margin (a Docker Desktop VM clock lags after the host sleeps).
+    """
+    return (await session.execute(select(func.now()))).scalar_one()
 
 
 async def _insert_challenge(
@@ -33,8 +47,8 @@ async def _insert_challenge(
     payload: dict[str, Any] | None = None,
     tier: VerificationTier = VerificationTier.APP_APPROVAL,
 ) -> ChallengeRecord:
-    """Insert a raw ``ChallengeRecord`` and flush."""
-    now = datetime.now(UTC)
+    """Insert a raw ``ChallengeRecord`` and flush, stamped from the DB clock."""
+    now = await _db_now(session)
     ttl = {0: 30, 1: 180, 2: 300}[int(tier)]
     record = ChallengeRecord(
         challenge_id=challenge_id,
@@ -106,7 +120,7 @@ async def test_get_challenge_returns_row(session: AsyncSession) -> None:
 async def test_get_challenge_does_not_filter_on_expiry(session: AsyncSession) -> None:
     """``get_challenge`` returns expired rows — expiry is checked by the
     caller (polling loop) or via ``get_active_challenge``."""
-    past = datetime.now(UTC) - timedelta(hours=1)
+    past = await _db_now(session) - timedelta(hours=1)
     record = await _insert_challenge(  # noqa: E501
         session, challenge_id="chal_expired", tier=VerificationTier.APP_APPROVAL
     )
@@ -131,7 +145,7 @@ async def test_get_active_challenge_returns_pending(session: AsyncSession) -> No
 
 
 async def test_get_active_challenge_returns_none_for_expired(session: AsyncSession) -> None:
-    past = datetime.now(UTC) - timedelta(hours=1)
+    past = await _db_now(session) - timedelta(hours=1)
     record = await _insert_challenge(  # noqa: E501
         session, challenge_id="chal_expired_active", tier=VerificationTier.APP_APPROVAL
     )
@@ -384,7 +398,7 @@ async def test_update_challenge_status_unexpired_refuses_a_row_past_its_deadline
 ) -> None:
     """``expiry="unexpired"`` puts the deadline in the ``WHERE`` clause."""
     record = await _insert_challenge(session, challenge_id="chal_deadline_passed")
-    record.expires_at = datetime.now(UTC) - timedelta(minutes=5)
+    record.expires_at = await _db_now(session) - timedelta(minutes=5)
     await session.flush()
 
     result = await challenges.update_challenge_status(
@@ -425,7 +439,7 @@ async def test_update_challenge_status_expired_accepts_a_row_past_its_deadline(
     session: AsyncSession,
 ) -> None:
     record = await _insert_challenge(session, challenge_id="chal_retire_me")
-    record.expires_at = datetime.now(UTC) - timedelta(minutes=5)
+    record.expires_at = await _db_now(session) - timedelta(minutes=5)
     await session.flush()
 
     result = await challenges.update_challenge_status(
@@ -450,7 +464,7 @@ async def test_update_challenge_status_ignores_the_deadline_by_default(
     not be defeated by a clock that ran out while the backend was answering.
     """
     record = await _insert_challenge(session, challenge_id="chal_ignore_deadline")
-    record.expires_at = datetime.now(UTC) - timedelta(minutes=5)
+    record.expires_at = await _db_now(session) - timedelta(minutes=5)
     await session.flush()
 
     result = await challenges.update_challenge_status(
@@ -615,3 +629,77 @@ async def test_get_challenge_without_refresh_answers_from_the_identity_map(
                 sa_text("DELETE FROM challenges WHERE challenge_id LIKE 'chal_lock_%'")
             )
             await cleanup.commit()
+
+
+# ---------------------------------------------------------------------------
+# One clock. A challenge is stamped and judged on the database's clock, so a
+# Python process whose clock is wrong cannot change any expiry decision.
+#
+# Observed once, 1 October 2026, after about 20 hours of host idle: the Docker
+# Desktop VM's clock lagged the host's by more than 300 seconds, and the two
+# tests that put a deadline five minutes either side of ``datetime.now(UTC)``
+# disagreed with the database's ``now()``. The same skew applied to a real
+# ``create_challenge`` would have stamped ``expires_at`` on one clock and
+# judged it on the other.
+# ---------------------------------------------------------------------------
+
+_SKEWS = [timedelta(minutes=10), timedelta(minutes=-10)]
+
+
+def _skew_python_clock(monkeypatch: pytest.MonkeyPatch, offset: timedelta) -> None:
+    """Make every ``datetime.now`` the store module can see run ``offset`` off.
+
+    ``raising=False`` because the point of the fix is that the module stops
+    reading the Python clock, so the names may legitimately not exist.
+    """
+
+    class _SkewedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> "_SkewedDatetime":
+            real = datetime.now(tz)
+            return cls.fromtimestamp((real + offset).timestamp(), tz)
+
+    monkeypatch.setattr(challenges, "datetime", _SkewedDatetime, raising=False)
+
+
+@pytest.mark.parametrize("offset", _SKEWS, ids=["python-ahead", "python-behind"])
+async def test_a_fresh_challenge_is_unexpired_whatever_the_python_clock_says(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, offset: timedelta
+) -> None:
+    _skew_python_clock(monkeypatch, offset)
+    record = await challenges.create_challenge(
+        session,
+        challenge_id="chal_skew",
+        customer_ref="cust_7f3a",
+        tool_name="payments.create_payment",
+        payload={},
+        tier=VerificationTier.APP_APPROVAL,
+    )
+
+    # Returned record carries the stamped values, on the database's clock.
+    db_now = await _db_now(session)
+    assert record.expires_at - record.created_at == timedelta(seconds=180)
+    assert abs((record.created_at - db_now).total_seconds()) < 5
+
+    assert await challenges.get_active_challenge(session, "chal_skew") is not None
+    claimed = await challenges.update_challenge_status(
+        session,
+        "chal_skew",
+        status="approved",
+        expected_status="pending",
+        expiry="unexpired",
+    )
+    assert claimed is not None
+    assert claimed.status == "approved"
+
+
+@pytest.mark.parametrize("offset", _SKEWS, ids=["python-ahead", "python-behind"])
+async def test_a_challenge_past_its_deadline_is_expired_whatever_the_python_clock_says(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, offset: timedelta
+) -> None:
+    record = await _insert_challenge(session, challenge_id="chal_skew_past")
+    record.expires_at = await _db_now(session) - timedelta(seconds=30)
+    await session.flush()
+    _skew_python_clock(monkeypatch, offset)
+
+    assert await challenges.get_active_challenge(session, "chal_skew_past") is None

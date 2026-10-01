@@ -21,8 +21,7 @@ Usage::
     existing = await get_challenge(session, challenge.challenge_id)
 """
 
-import datetime as _dt
-from datetime import UTC, datetime
+from datetime import timedelta
 from typing import Any, Literal
 
 from sqlalchemy import func, select, update
@@ -78,11 +77,11 @@ async def create_challenge(
         tier: Verification tier required for this operation.
 
     Returns:
-        The persisted ``ChallengeRecord`` (with timestamps set).
+        The persisted ``ChallengeRecord``, with ``created_at`` and
+        ``expires_at`` as the database stamped them (its clock, not this
+        process's).
     """
-    now = datetime.now(UTC)
-
-    # Compute expires_at based on tier.
+    # Compute the TTL from the tier.
     ttl_seconds = {
         VerificationTier.SESSION_ONLY: 30,
         VerificationTier.APP_APPROVAL: 180,
@@ -94,6 +93,14 @@ async def create_challenge(
         tier_int = int(tier)
     ttl = ttl_seconds.get(VerificationTier(tier_int), 180)  # default to tier-1 TTL.
 
+    # Both timestamps are SQL expressions, evaluated by the database, so
+    # ``expires_at`` is stamped on the clock that ``update_challenge_status``
+    # and ``get_active_challenge`` later judge it on. Taking ``now`` from
+    # ``datetime.now(UTC)`` here and comparing against ``now()`` there made two
+    # clocks decide one deadline, and a host and a container whose clocks
+    # differ by more than the TTL disagree about whether a fresh challenge has
+    # already expired. ``now()`` is the transaction's start, the same instant
+    # the expiry predicates see inside one transaction.
     record = ChallengeRecord(
         challenge_id=challenge_id,
         customer_ref=customer_ref,
@@ -101,11 +108,15 @@ async def create_challenge(
         payload=payload,
         tier=tier_int,
         status="pending",
-        created_at=now,
-        expires_at=now.replace() + _dt.timedelta(seconds=ttl),
+        created_at=func.now(),
+        expires_at=func.now() + timedelta(seconds=ttl),
     )
     session.add(record)
     await session.flush()
+    # The attributes hold SQL expressions until the database has answered, so
+    # read the stamped values back; without this the returned record's
+    # timestamps are unloaded and touching them raises under asyncio.
+    await session.refresh(record, ["created_at", "expires_at"])
     return record
 
 
@@ -169,10 +180,15 @@ async def get_active_challenge(
     Returns:
         The ``ChallengeRecord`` if active, or ``None`` (not found or expired).
     """
-    now = datetime.now(UTC)
-    record = await get_challenge(session, challenge_id)
-    if record is not None and record.expires_at <= now:
-        return None  # Expired — treat as absent.
+    # Expiry is decided by the database's ``now()`` in the same statement,
+    # never by comparing ``expires_at`` with this process's clock, which is not
+    # the clock ``create_challenge`` stamped it on.
+    stmt = select(ChallengeRecord).where(
+        ChallengeRecord.challenge_id == challenge_id,
+        ChallengeRecord.expires_at > func.now(),
+    )
+    result = await session.execute(stmt)
+    record = result.scalar_one_or_none()
     return record
 
 
