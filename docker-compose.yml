@@ -4,11 +4,15 @@
 # no real customer; the header said "no Vault" until that date and the `vault`
 # and `vault-init` services below are what changed.
 #
-# `POSTERN_JWKS_URI`/`POSTERN_TOKEN_ISSUER` point at `backend-stub`'s own
-# disposable local IdP (`stub/backend.py`'s `/.well-known/jwks.json` and
-# `/mint-token` routes), not left empty as the plan originally drafted this
-# file. Two Task 13 findings, both against the current `services/api/*`
-# code, drove that:
+# `POSTERN_JWKS_URI`/`POSTERN_TOKEN_ISSUER` on `api` point at `confirm`'s
+# `/session/jwks.json` and its session issuer since the layer-1 session token:
+# the whole device grant, refresh and recall run end to end in this stack, and
+# the customer token `api` accepts is the one `POST /token` issues. Until then
+# they pointed at `backend-stub`'s disposable local IdP (`stub/backend.py`'s
+# `/.well-known/jwks.json` and `/mint-token` routes), which still exists but
+# whose tokens name another issuer and another key, so `api` refuses them.
+# They were never left empty, which the plan originally drafted, for two
+# Task 13 findings, both against the `services/api/*` code of the day:
 #
 # 1. `Settings.from_env()` used to read `POSTERN_JWKS_URI`/`POSTERN_TOKEN_ISSUER`
 #    via a required `os.environ[...]`, which can only ever produce a `str`
@@ -43,6 +47,17 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # The shared state both services need: the ZT-7 list, device codes, refresh
+  # families and the risk session store. `services/confirm` refuses to start
+  # without POSTERN_REDIS_URL unless POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS is
+  # set, and this stack does not set it, so a recall at `/scan` reaches `api`.
+  # The same image `tests/conftest.py`'s `redis_url` fixture runs.
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
 
   # OPERATOR CHECKLIST ITEM 11, applied here rather than described. Until
   # 29 September 2026 every container in this file connected as `postern`, the
@@ -142,9 +157,9 @@ services:
   # even though it knows the key's name, the mount and the address -- measured
   # in `tests/test_vault_live.py::TestTheReadServiceCannotSignWithTheWriteKey`
   # and demonstrable against this stack with one curl. `postern-write` carries
-  # both, which is the device-grant exception `services/confirm/settings.py`
-  # records: that service mints the browser's read token in the same atomic step
-  # as the write one.
+  # the write key and the SESSION key, which signs the layer-1 access tokens
+  # `confirm` issues at `POST /token`, and nothing on the read key: no process
+  # holds READ and WRITE together since the layer-1 session token.
   #
   # THE TOKENS GO TO A FILE ON A SHARED VOLUME, not into an environment
   # variable, and that is the whole reason this service exists rather than two
@@ -165,16 +180,17 @@ services:
       vault secrets enable transit || true;
       vault write -f transit/keys/postern-read type=rsa-2048;
       vault write -f transit/keys/postern-write type=rsa-2048;
+      vault write -f transit/keys/postern-session type=rsa-2048;
       echo "path \"transit/sign/postern-read\" { capabilities = [\"update\"] }
       path \"transit/keys/postern-read\" { capabilities = [\"read\"] }" | vault policy write postern-read -;
       echo "path \"transit/sign/postern-write\" { capabilities = [\"update\"] }
       path \"transit/keys/postern-write\" { capabilities = [\"read\"] }
-      path \"transit/sign/postern-read\" { capabilities = [\"update\"] }
-      path \"transit/keys/postern-read\" { capabilities = [\"read\"] }" | vault policy write postern-write -;
+      path \"transit/sign/postern-session\" { capabilities = [\"update\"] }
+      path \"transit/keys/postern-session\" { capabilities = [\"read\"] }" | vault policy write postern-write -;
       vault token create -policy=postern-read -period=24h -field=token > /vault-tokens/read.token;
       vault token create -policy=postern-write -period=24h -field=token > /vault-tokens/write.token;
       chmod 0444 /vault-tokens/read.token /vault-tokens/write.token;
-      echo "vault-init: transit enabled, two keys, two policies, two tokens";
+      echo "vault-init: transit enabled, three keys, two policies, two tokens";
       '
     depends_on:
       vault:
@@ -253,9 +269,15 @@ services:
       # before the trigger is consulted. An RCE in this container inherits
       # exactly this.
       POSTERN_DATABASE_URL: postgresql+asyncpg://postern_app:postern_app@db:5432/postern
-      POSTERN_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
-      POSTERN_TOKEN_ISSUER: "https://postern-local-dev.invalid"
-      POSTERN_AUDIENCE: "postern"
+      # THE SESSION TOKENS `confirm` ISSUES, verified against its
+      # `/session/jwks.json`. The issuer is confirm's default
+      # POSTERN_SESSION_TOKEN_ISSUER and the audience is the same resource URI
+      # confirm stamps as `aud`, so neither container needs
+      # POSTERN_ALLOW_NON_URI_AUDIENCE. The fetch is lazy, at the first token.
+      POSTERN_JWKS_URI: http://confirm:8080/session/jwks.json
+      POSTERN_TOKEN_ISSUER: "https://auth.postern.internal"
+      POSTERN_AUDIENCE: "https://mcp.postern.internal/mcp"
+      POSTERN_REDIS_URL: redis://redis:6379/0
       POSTERN_STRICT_HEADERS: "0"
       # THE SIGNING KEY IS NOT IN THIS CONTAINER. With these three set,
       # `postern_core.auth.keys.choose_key_source` builds a
@@ -282,6 +304,8 @@ services:
         condition: service_healthy
       db-grants:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
       vault-init:
         condition: service_completed_successfully
 
@@ -342,15 +366,20 @@ services:
       - ./stub/device-keys.json:/etc/postern/device-keys.json:ro
       - vault-tokens:/vault-tokens:ro
     environment:
-      # BOTH KEYS THROUGH ONE VAULT TOKEN, and that is the device-grant
-      # exception rather than a hole: this service mints the browser's read
-      # token in the same atomic step as the write one, so its policy carries
-      # `update` on both sign paths. What no policy anywhere grants is the
-      # reverse -- `api`'s token has nothing on `transit/sign/postern-write`.
+      # THE WRITE KEY AND THE SESSION KEY THROUGH ONE VAULT TOKEN, and no
+      # read key: `POST /token` issues a layer-1 session signed by
+      # `postern-session`, which `api` verifies at `/session/jwks.json`. What
+      # no policy anywhere grants is the reverse -- `api`'s token has nothing
+      # on `transit/sign/postern-write` or `transit/sign/postern-session`.
       POSTERN_VAULT_ADDR: http://vault:8200
       POSTERN_VAULT_TOKEN_PATH: /vault-tokens/write.token
       POSTERN_VAULT_WRITE_KEY_NAME: postern-write
-      POSTERN_VAULT_READ_KEY_NAME: postern-read
+      POSTERN_VAULT_SESSION_KEY_NAME: postern-session
+      # The MCP server's resource URI, stamped as `aud` on every access token
+      # and equal to `api`'s POSTERN_AUDIENCE above.
+      POSTERN_SESSION_TOKEN_AUDIENCE: "https://mcp.postern.internal/mcp"
+      # Refresh families and recalls must reach `api`: the same Redis.
+      POSTERN_REDIS_URL: redis://redis:6379/0
       POSTERN_APP_ASSERTION_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
       POSTERN_APP_ASSERTION_ISSUER: "https://postern-local-dev.invalid"
       POSTERN_APP_ASSERTION_AUDIENCE: "postern-confirm"
@@ -370,6 +399,8 @@ services:
         condition: service_healthy
       db-grants:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
       vault-init:
         condition: service_completed_successfully
 

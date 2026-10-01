@@ -56,12 +56,15 @@ from testcontainers.community.vault import VaultContainer
 
 from services.api.main import create_app
 from services.api.settings import Settings
+from services.confirm.main import create_confirm_app
 from services.confirm.minter import build_write_minter
+from services.confirm.session_token import build_session_minter
 from services.confirm.settings import ConfirmSettings
 
 CUST = CustomerRef(value="cust_7f3a")
 READ_KEY = "postern-read"
 WRITE_KEY = "postern-write"
+SESSION_KEY = "postern-session"
 ROOT = "postern-live-root"  # noqa: S105 -- the dev-mode container's own token
 
 #: What each service's Vault token is allowed to do, verbatim HCL.
@@ -78,11 +81,13 @@ path "transit/sign/postern-read" { capabilities = ["update"] }
 path "transit/keys/postern-read" { capabilities = ["read"] }
 """
 
+#: The confirm service's policy: the write key and the session key, and since
+#: the layer-1 session token nothing on the read key.
 WRITE_POLICY = """
-path "transit/sign/postern-write" { capabilities = ["update"] }
-path "transit/keys/postern-write" { capabilities = ["read"] }
-path "transit/sign/postern-read"  { capabilities = ["update"] }
-path "transit/keys/postern-read"  { capabilities = ["read"] }
+path "transit/sign/postern-write"   { capabilities = ["update"] }
+path "transit/keys/postern-write"   { capabilities = ["read"] }
+path "transit/sign/postern-session" { capabilities = ["update"] }
+path "transit/keys/postern-session" { capabilities = ["read"] }
 """
 
 
@@ -109,7 +114,8 @@ def vault() -> Iterator[LiveVault]:
     below.
 
     THE FIVE STEPS ARE THE OPERATOR CHECKLIST, EXECUTED. Enable transit, create
-    two RSA keys, write two policies, mint one token per policy. Nothing here
+    three RSA keys (read, write, session), write two policies, mint one token
+    per policy. Nothing here
     is a test fixture's convenience: this is `docker-compose.yml`'s
     ``vault-init`` service in Python, and if the two ever disagree one of them
     is wrong about what a deployment needs.
@@ -122,7 +128,7 @@ def vault() -> Iterator[LiveVault]:
         address = container.get_connection_url()
         with httpx2.Client(base_url=address, headers={"X-Vault-Token": ROOT}, timeout=30.0) as root:
             _raise_for(root.post("/v1/sys/mounts/transit", json={"type": "transit"}))
-            for name in (READ_KEY, WRITE_KEY):
+            for name in (READ_KEY, WRITE_KEY, SESSION_KEY):
                 _raise_for(root.post(f"/v1/transit/keys/{name}", json={"type": "rsa-2048"}))
             tokens = {}
             for name, policy in (("postern-read", READ_POLICY), ("postern-write", WRITE_POLICY)):
@@ -338,6 +344,70 @@ class TestTheReadServiceCannotSignWithTheWriteKey:
         write_kids = {entry["kid"] for entry in write_source.public_jwks()["keys"]}
         assert read_kids.isdisjoint(write_kids)
         assert _moduli(read_source.public_jwks()).isdisjoint(_moduli(write_source.public_jwks()))
+
+
+class TestTheConfirmServiceSignsSessionsAndNothingOnTheReadKey:
+    """The confirm token after the layer-1 session token: SESSION yes, READ no."""
+
+    def test_the_session_minter_signs_through_the_session_transit_key(
+        self, vault: LiveVault
+    ) -> None:
+        settings = ConfirmSettings(
+            vault=_credentialled(vault, vault.write_token),
+            vault_session_key_name=SESSION_KEY,
+        )
+        minter, source = build_session_minter(settings)
+        claims = minter.prepare(customer=CUST, client_id="c", scope="accounts:read", sid="s")
+        token = minter.sign(claims)
+        decoded = jwt.decode(
+            token, KeySet.import_key_set(source.public_jwks()), algorithms=["RS256"]
+        )
+        assert decoded.claims["jti"] == claims.jti
+        assert decoded.header["kid"].startswith("session-1.v")
+        source.close()
+
+    def test_the_confirm_token_cannot_sign_with_the_read_key(self, vault: LiveVault) -> None:
+        impostor = VaultTransitKeySource(
+            address=vault.address, key_name=READ_KEY, kid="read-1", token=vault.write_token
+        )
+        with pytest.raises(VaultTransitError, match="403"):
+            impostor.sign({"sub": CUST.value, "aud": "accounts.svc"})
+        impostor.close()
+
+    def test_the_api_token_cannot_sign_with_the_session_key(self, vault: LiveVault) -> None:
+        impostor = VaultTransitKeySource(
+            address=vault.address, key_name=SESSION_KEY, kid="session-1", token=vault.read_token
+        )
+        with pytest.raises(VaultTransitError, match="403"):
+            impostor.sign({"sub": CUST.value, "aud": "https://mcp.postern.test/mcp"})
+        impostor.close()
+
+    async def test_session_jwks_publishes_the_versioned_session_kids(
+        self, vault: LiveVault
+    ) -> None:
+        from postern_core.auth.device_keys import no_enrolled_devices
+
+        settings = ConfirmSettings(
+            app_assertion_jwks_uri="https://issuer.test/.well-known/jwks.json",
+            app_assertion_issuer="https://issuer.test",
+            app_assertion_audience="postern-confirm",
+            vault=_credentialled(vault, vault.write_token),
+            vault_write_key_name=WRITE_KEY,
+            vault_session_key_name=SESSION_KEY,
+            allow_non_uri_audience=True,
+            allow_process_local_sessions=True,
+        )
+        app = create_confirm_app(settings, device_key_store=no_enrolled_devices())
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://confirm.test"
+        ) as client:
+            session = (await client.get("/session/jwks.json")).json()
+            write = (await client.get("/.well-known/jwks.json")).json()
+        kids = [entry["kid"] for entry in session["keys"]]
+        assert kids and all(kid.startswith("session-1.v") for kid in kids)
+        assert _moduli(session).isdisjoint(_moduli(write))
+        app.state.postern_session_key_source.close()
+        app.state.postern_write_key_source.close()
 
 
 class TestRotation:
