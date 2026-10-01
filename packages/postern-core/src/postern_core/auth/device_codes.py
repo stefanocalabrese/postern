@@ -308,6 +308,11 @@ class DeviceCode:
             ``scanned_by`` and ``scanned_at`` and never after. ``None`` until
             scanned, and on a record the previous release wrote, which
             recorded no scanner address. Recorded only; nothing reads it back.
+        session_id: The refresh family ``POST /token`` created for this code,
+            written by ``consume_device_code`` in the same compare-and-set as
+            ``exchanged_at``. ``POST /scan`` reads it to recall a family a
+            session swap produced. Empty until exchanged, and on a record an
+            earlier release wrote.
 
     ``exchanged_at`` IS WHY A SPENT CODE IS STILL HERE. The alternative was
     revoking the code on a successful exchange, which is one fewer field and
@@ -349,6 +354,7 @@ class DeviceCode:
     scanned_by: str = ""
     scanned_at: datetime | None = None
     scanner_ip: str | None = None
+    session_id: str = ""
 
     @property
     def user_code_display(self) -> str:
@@ -462,17 +468,18 @@ class DeviceCodeStoreBase(ABC):
         """
 
     @abstractmethod
-    async def consume_device_code(self, device_code: str) -> bool:
+    async def consume_device_code(self, device_code: str, *, session_id: str) -> bool:
         """Claim a device code for one token exchange. ``True`` to one caller only.
 
-        Sets ``exchanged_at`` on a code that has none and answers ``True``;
+        Sets ``exchanged_at`` and ``session_id`` on a code that has none, in
+        one write, and answers ``True``;
         answers ``False`` for a code this store does not hold and for one
         already spent. The code is MARKED, never removed -- see
         ``DeviceCode.exchanged_at`` for why the row has to survive.
 
         MUST BE ATOMIC, and this line is the whole contract rather than a
         preference. The caller is `services/confirm/device_auth.py`'s
-        ``token_endpoint``, which mints a read token only for the caller that
+        ``token_endpoint``, which issues a session only to the caller that
         wins here. A backend that read the code, awaited anything, and then
         wrote would answer ``True`` to every request in a concurrent burst,
         which is the defect this method exists to close in a form that needs
@@ -485,6 +492,12 @@ class DeviceCodeStoreBase(ABC):
         spent and the customer re-pairing from a fresh QR. That is the
         direction ``services/confirm/device_auth.py``'s ``_withdraw_pairing``
         already chose for the endpoint before this one.
+
+        ``session_id`` IS REQUIRED, for the reason ``claim_scan`` gives for
+        ``scanner_ip``: it is the refresh family ``POST /token`` created for
+        this exchange, and ``POST /scan`` finds that family through it to
+        recall a session swap. Written in the same write as ``exchanged_at``,
+        so once a scan sees the code exchanged it sees the family too.
         """
 
     @abstractmethod
@@ -796,7 +809,7 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         code = self._codes.get(device_code) if device_code is not None else None
         return _live_match(code, "user_code", user_code)
 
-    async def consume_device_code(self, device_code: str) -> bool:
+    async def consume_device_code(self, device_code: str, *, session_id: str) -> bool:
         """Claim this code for one exchange. ``True`` to one caller only.
 
         ATOMIC BY NOT YIELDING, which is the whole implementation and is worth
@@ -811,7 +824,11 @@ class InMemoryDeviceCodeStore(DeviceCodeStoreBase):
         if existing is None or existing.exchanged_at is not None:
             return False
         self._codes[device_code] = existing.__class__(
-            **{**asdict_frozen(existing), "exchanged_at": datetime.now(UTC)}
+            **{
+                **asdict_frozen(existing),
+                "exchanged_at": datetime.now(UTC),
+                "session_id": session_id,
+            }
         )
         return True
 
@@ -1157,7 +1174,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             return None
         return _live_match(await self.get_device_code(device_code), "user_code", user_code)
 
-    async def consume_device_code(self, device_code: str) -> bool:
+    async def consume_device_code(self, device_code: str, *, session_id: str) -> bool:
         """Claim this code for one exchange. ``True`` to one caller only.
 
         ATOMIC BY MAKING THE SERVER SETTLE IT, which is the only place that can
@@ -1203,7 +1220,13 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
                         return False
                     if code.exchanged_at is not None:
                         return False
-                    spent = DeviceCode(**{**asdict_frozen(code), "exchanged_at": datetime.now(UTC)})
+                    spent = DeviceCode(
+                        **{
+                            **asdict_frozen(code),
+                            "exchanged_at": datetime.now(UTC),
+                            "session_id": session_id,
+                        }
+                    )
                     pipe.multi()
                     pipe.set(key, spent.to_json(), keepttl=True)
                     await pipe.execute()
@@ -1432,6 +1455,7 @@ def _device_code_to_dict(dc: DeviceCode) -> dict[str, Any]:
         "scanned_by": dc.scanned_by,
         "scanned_at": dc.scanned_at.timestamp() if dc.scanned_at else None,
         "scanner_ip": dc.scanner_ip,
+        "session_id": dc.session_id,
     }
 
 
@@ -1494,6 +1518,9 @@ def _device_code_from_dict(data: dict[str, Any]) -> DeviceCode:
         # fail-closed default: the previous release recorded no scanner
         # address, so there is none.
         scanner_ip=str(raw_scanner_ip) if raw_scanner_ip is not None else None,
+        # ABSENT MEANS EMPTY: a record an earlier release wrote was exchanged,
+        # if at all, before any family existed, so there is none to recall.
+        session_id=str(data.get("session_id", "")),
     )
 
 

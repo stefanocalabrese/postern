@@ -569,8 +569,8 @@ async def test_consuming_a_code_marks_it_once_against_a_real_server(
     store = stores.device_codes()
     code = await _create(store)
 
-    assert await store.consume_device_code(code.device_code) is True
-    assert await store.consume_device_code(code.device_code) is False
+    assert await store.consume_device_code(code.device_code, session_id="") is True
+    assert await store.consume_device_code(code.device_code, session_id="") is False
 
     stored = await store.get_device_code(code.device_code)
     assert stored is not None, "the claim deleted the key instead of marking it"
@@ -591,8 +591,8 @@ async def test_two_concurrent_claims_on_one_key_answer_true_to_exactly_one(
     code = await _create(store)
 
     won = await asyncio.gather(
-        store.consume_device_code(code.device_code),
-        store.consume_device_code(code.device_code),
+        store.consume_device_code(code.device_code, session_id=""),
+        store.consume_device_code(code.device_code, session_id=""),
     )
 
     assert sorted(won) == [False, True]
@@ -623,7 +623,7 @@ async def test_the_claim_does_not_move_a_device_codes_expiry(
     code = await _create(store, expires_in=120)
     before = await store._redis.ttl(store._key(code.device_code))
 
-    assert await store.consume_device_code(code.device_code) is True
+    assert await store.consume_device_code(code.device_code, session_id="") is True
 
     after = await store._redis.ttl(store._key(code.device_code))
     assert after <= before, f"the claim extended a device code's life from {before}s to {after}s"
@@ -639,7 +639,7 @@ async def test_a_code_the_server_never_held_cannot_be_claimed(stores: RedisStore
     """
     store = stores.device_codes()
 
-    assert await store.consume_device_code("never-existed") is False
+    assert await store.consume_device_code("never-existed", session_id="") is False
     assert await store._redis.exists(store._key("never-existed")) == 0
 
 
@@ -802,7 +802,7 @@ async def test_a_consumed_code_still_resolves_by_both_keys(stores: RedisStores) 
     store = stores.device_codes()
     code = await _create(store)
 
-    assert await store.consume_device_code(code.device_code) is True
+    assert await store.consume_device_code(code.device_code, session_id="") is True
 
     found = await store.get_by_user_code(code.user_code)
     assert found is not None and found.exchanged_at is not None
@@ -906,7 +906,7 @@ async def test_a_conflict_on_an_exchanged_code_writes_nothing(stores: RedisStore
     code = await _create(store)
     await store.claim_scan(code.device_code, OTHER, scanner_ip=None)
     await store.approve_scanned(code.device_code, OTHER)
-    await store.consume_device_code(code.device_code)
+    await store.consume_device_code(code.device_code, session_id="")
     before = await store._redis.get(store._key(code.device_code))
 
     assert (

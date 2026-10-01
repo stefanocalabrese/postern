@@ -148,6 +148,16 @@ async def customer_revoked(request: Request, customer_ref: str) -> bool:
     return await revocation_store(request).is_customer_revoked(customer_ref)
 
 
+async def customer_revoked_since(request: Request, customer_ref: str) -> int | None:
+    """When a revocation last named this customer, in ms, or ``None``.
+
+    The stamp `postern_core.auth.revocation`'s ``customer_revoked_at``
+    keeps after a restore. Raises ``RevocationStoreUnavailable`` like
+    `customer_revoked`.
+    """
+    return await revocation_store(request).customer_revoked_at(customer_ref)
+
+
 def revoked_response(description: str) -> JSONResponse:
     """The 403 all three assertion-backed endpoints return.
 
@@ -165,7 +175,7 @@ def revoked_response(description: str) -> JSONResponse:
     )
 
 
-def store_unavailable_response() -> JSONResponse:
+def store_unavailable_response(retry_after: int | None = None) -> JSONResponse:
     """The 503 ``POST /token`` answers when the revocation store cannot answer.
 
     NO TOKEN IS MINTED ON THIS PATH, which is the fail-closed half and is not
@@ -184,6 +194,10 @@ def store_unavailable_response() -> JSONResponse:
     is the honest name for the condition, no §5.2 code means "come back", and
     inventing a private one would be worse. Paired with 503 so a client that
     reads the status rather than the body also sees "retry".
+
+    ``retry_after`` sets ``Retry-After``. ``POST /token`` passes its poll
+    interval, the pace it holds an approved code's polls to, so a client that
+    honours the header is never answered ``slow_down``.
     """
     return JSONResponse(
         status_code=503,
@@ -191,6 +205,7 @@ def store_unavailable_response() -> JSONResponse:
             "error": "temporarily_unavailable",
             "error_description": "authorization state cannot be checked; retry shortly",
         },
+        headers={"Retry-After": str(retry_after)} if retry_after is not None else None,
     )
 
 

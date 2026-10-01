@@ -79,6 +79,7 @@ from postern_core.auth.device_codes import create_device_code_store
 from postern_core.auth.device_keys import DeviceKeyStoreBase, FileDeviceKeyStore
 from postern_core.auth.internal_jwt import InternalTokenMinter
 from postern_core.auth.keys import choose_key_source
+from postern_core.auth.refresh_sessions import create_refresh_session_store
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement
 from postern_core.env_inventory import enforce_known_environment
@@ -408,6 +409,14 @@ def create_confirm_app(
     # evicting.
     device_code_store = create_device_code_store(max_codes=settings.max_device_codes)
 
+    # --- Refresh families (the layer-1 session) ---
+    #
+    # The same ``POSTERN_REDIS_URL`` as the device code store, so a refresh on
+    # any replica finds the family an exchange on any other created.
+    # `_refuse_process_local_sessions` above is why this cannot silently be
+    # per process.
+    refresh_session_store = create_refresh_session_store(max_sessions=settings.max_refresh_sessions)
+
     # --- ZT-7 revocation (shared with every `services/api` replica) ---
     #
     # THE SAME FACTORY BOTH SERVICES CALL, deliberately, so one
@@ -460,11 +469,7 @@ def create_confirm_app(
     # --- Assemble routes ---
     routes: list[Route] = (
         [jwks_route(write_key_source), session_jwks_route(session_key_source)]
-        + device_auth_routes(
-            store=device_code_store,
-            settings=settings,
-            read_minter=read_minter,
-        )
+        + device_auth_routes(store=device_code_store, settings=settings)
         + verify_page_routes()
         + callback_routes()
     )
@@ -574,6 +579,7 @@ def create_confirm_app(
     app.state.write_minter = _write_minter
     app.state.session_minter = session_minter
     app.state.device_code_store = device_code_store
+    app.state.refresh_session_store = refresh_session_store
     # Expose database for the approval callback.
     app.state.postern_database = db
     # ZT-7: read by `services/confirm/revocation.py`'s `revocation_store` on

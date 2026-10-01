@@ -219,7 +219,7 @@ class TestTheSecondaryLookups:
         store = InMemoryDeviceCodeStore()
         code = await _create(store)
 
-        assert await store.consume_device_code(code.device_code) is True
+        assert await store.consume_device_code(code.device_code, session_id="") is True
 
         by_code = await store.get_by_user_code(code.user_code)
         assert by_code is not None and by_code.exchanged_at is not None
@@ -352,7 +352,7 @@ class TestClaimScan:
         code = await _create(store)
         await store.claim_scan(code.device_code, BOB, scanner_ip=None)
         await store.approve_scanned(code.device_code, BOB)
-        await store.consume_device_code(code.device_code)
+        await store.consume_device_code(code.device_code, session_id="")
         before = await store.get_device_code(code.device_code)
 
         assert (

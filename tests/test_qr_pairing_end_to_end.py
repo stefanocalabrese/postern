@@ -8,24 +8,23 @@ QR: the ``user_code`` and the rotation token come out of the ``app_link`` the
 state endpoint serves, which is the string the QR encodes, and the
 ``device_code`` never leaves the browser.
 
-``POST /token`` ends the flow with a 503 and no token, twice, one interval
-apart (a poll inside the interval gets ``slow_down`` and no row), because
-issuance is disabled until the layer-1 session token lands: the token it used
-to return was a layer-2 backend token, signed with the read key
-``services/api`` publishes. This test builds ``services/api`` over the SAME
-read key as the confirm service, so a token like that one would verify
-against the api's own JWKS, and asserts that no ``/token`` body carries one.
+``POST /token`` ends the flow with a layer-1 session: an access token whose
+audience is the MCP server, signed by the SESSION key, and a refresh token. A
+replay of the spent code is refused. The regression this file was written for
+still runs: before 30 September 2026 ``/token`` returned a layer-2 backend
+token, signed with the read key ``services/api`` publishes, so this test
+builds ``services/api`` over a read key of its own and asserts that no
+``/token`` body carries a token the api's JWKS verifies, and that every
+JWT-shaped string in one is a session token.
 
 The audit trail is read back at the end: one row each for the scan and the
-approval, and one ``issuance_disabled`` row per ``/token`` 503 after the
-approval, joined on the device code's handle.
+approval, the mint, and the replay, joined on the device code's handle.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -35,6 +34,7 @@ import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from joserfc.jwk import RSAKey
 from postern_core.auth.device_keys import no_enrolled_devices
+from postern_core.auth.revocation import decision_scope
 from postern_core.identity import CustomerRef
 from postern_core.store.engine import Database
 from postern_core.store.models import OUTCOME_RAISED, OUTCOME_RETURNED, AuditEntry
@@ -44,7 +44,7 @@ from starlette.applications import Starlette
 from services.api.main import create_app as create_api_app
 from services.api.settings import Settings as ApiSettings
 from services.confirm.audit import (
-    DETAIL_ISSUANCE_DISABLED,
+    DETAIL_DEVICE_CODE_SPENT,
     DETAIL_NOT_SCANNED,
     PAIRING_TOOL_NAME,
     SCAN_TOOL_NAME,
@@ -53,8 +53,8 @@ from services.confirm.audit import (
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
 from tests.device_grant_helpers import (
-    ISSUANCE_DISABLED_BODY,
     assert_no_body_carries_a_token_the_api_trusts,
+    session_claims,
     verifies_against,
 )
 from tests.fixtures.append_only_bypass import (
@@ -82,10 +82,8 @@ async def clean(database: Database) -> AsyncIterator[Database]:
 
 @pytest.fixture()
 def read_key_pem(tmp_path: Path) -> str:
-    """One read key on disk, for BOTH services, as a Vault deployment shares
-    transit key ``postern-read`` between them. Without it each app generates
-    its own key and no token of confirm's could ever verify against the api's
-    JWKS, which would make the regression below pass for the wrong reason."""
+    """The api's read key on disk, so the control below can mint with the
+    same key the api publishes."""
     key = RSAKey.generate_key(2048, parameters={"kid": "read-1", "use": "sig", "alg": "RS256"})
     pem = tmp_path / "read.pem"
     pem.write_bytes(key.as_pem(private=True))
@@ -93,11 +91,11 @@ def read_key_pem(tmp_path: Path) -> str:
 
 
 @pytest.fixture()
-def app(pg_url: str, read_key_pem: str) -> tuple[Starlette, RSAKeyPair]:
+def app(pg_url: str) -> tuple[Starlette, RSAKeyPair]:
     key_pair = RSAKeyPair.generate()
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
     built = create_confirm_app(
-        replace(ConfirmSettings.for_testing(), database_url=pg_url, read_key_pem_path=read_key_pem),
+        replace(ConfirmSettings.for_testing(), database_url=pg_url),
         assertion_verifier=verifier,
         device_key_store=no_enrolled_devices(),
     )
@@ -105,27 +103,28 @@ def app(pg_url: str, read_key_pem: str) -> tuple[Starlette, RSAKeyPair]:
 
 
 @pytest.fixture()
-async def api_jwks(read_key_pem: str) -> dict[str, Any]:
-    """The key set ``services/api`` publishes at ``/.well-known/jwks.json``,
-    fetched over ASGI from the assembled app: the set Istio trusts."""
-    api = create_api_app(
+async def api(read_key_pem: str) -> tuple[Any, dict[str, Any]]:
+    """An assembled ``services/api`` and the key set it publishes at
+    ``/.well-known/jwks.json``, fetched over ASGI: the set Istio trusts."""
+    built = create_api_app(
         replace(ApiSettings.for_testing(), read_key_pem_path=read_key_pem),
         resolver=lambda: CustomerRef(value=CUSTOMER),
     )
     async with httpx2.AsyncClient(
-        transport=httpx2.ASGITransport(app=api), base_url="http://api.test"
+        transport=httpx2.ASGITransport(app=built), base_url="http://api.test"
     ) as client:
-        async with api.router.lifespan_context(api):
+        async with built.router.lifespan_context(built):
             published = await client.get("/.well-known/jwks.json")
     assert published.status_code == 200
     jwks: dict[str, Any] = published.json()
-    return jwks
+    return built, jwks
 
 
 async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
-    app: tuple[Starlette, RSAKeyPair], clean: Database, api_jwks: dict[str, Any]
+    app: tuple[Starlette, RSAKeyPair], clean: Database, api: tuple[Any, dict[str, Any]]
 ) -> None:
     confirm, key_pair = app
+    api_app, api_jwks = api
     assertion = key_pair.create_token(
         subject=CUSTOMER, issuer=ISSUER, audience=AUDIENCE, expires_in_seconds=60
     )
@@ -198,45 +197,41 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
         token = await browser.post(
             "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
         )
-        too_soon = await browser.post(
+        replay = await browser.post(
             "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
         )
-        # The browser waits one interval, as the 503's Retry-After tells it
-        # to; simulated by moving the recorded poll back rather than sleeping.
-        confirm.state._approved_poll_times[grant["device_code"]] -= timedelta(
-            seconds=int(token.headers["retry-after"])
-        )
-        second = await browser.post(
-            "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
-        )
+        session_jwks = (await browser.get("/session/jwks.json")).json()
 
-    # THE CONTROL THAT MAKES THE REGRESSION MEAN SOMETHING. The read minter is
-    # still wired, and what it signs verifies against the api's published
-    # JWKS: that is exactly the layer-2 token /token used to hand out. If this
-    # stopped verifying, the assertion below would pass for any body at all.
-    backend_token = confirm.state.read_minter.mint(
-        subject=CustomerRef(value=CUSTOMER), audience="accounts.svc", scope="accounts:read"
-    )
+    # THE CONTROL THAT MAKES THE REGRESSION MEAN SOMETHING. A token the api's
+    # own read minter signs verifies against the api's published JWKS: that is
+    # exactly the layer-2 token /token used to hand out. If this stopped
+    # verifying, the assertion below would pass for any body at all.
+    with decision_scope(False):
+        backend_token = api_app.state.backend_client._minter(
+            CustomerRef(value=CUSTOMER), "accounts.svc"
+        )
     assert verifies_against(backend_token, api_jwks)
 
     # The regression, before the status checks so a reintroduced token fails
     # on the property that matters rather than on a status code.
+    settings = confirm.state.settings
     assert_no_body_carries_a_token_the_api_trusts(
-        [token.text, too_soon.text, second.text], api_jwks
+        [token.text, replay.text],
+        api_jwks,
+        session_jwks,
+        issuer=settings.session_token_issuer,
+        audience=settings.session_token_audience,
     )
 
-    # Issuance is disabled: the same 503 twice, because the code is not spent,
-    # with a poll inside the interval answered slow_down in between.
-    assert token.status_code == 503, token.text
-    assert token.json() == ISSUANCE_DISABLED_BODY
-    assert token.headers["retry-after"] == str(confirm.state.settings.device_poll_interval_seconds)
-    assert too_soon.status_code == 400, too_soon.text
-    assert too_soon.json()["error"] == "slow_down"
-    assert second.status_code == 503, second.text
-    assert second.json() == ISSUANCE_DISABLED_BODY
+    claims = session_claims(token, confirm)
+    assert claims["sub"] == CUSTOMER
+    assert claims["client_id"] == "claude-code"
+    assert replay.status_code == 400, replay.text
+    assert replay.json()["error"] == "invalid_grant"
     stored = await confirm.state.device_code_store.get_device_code(grant["device_code"])
     assert stored is not None
-    assert stored.exchanged_at is None, "a refused /token spent the device code"
+    assert stored.exchanged_at is not None
+    assert stored.session_id == claims["sid"]
 
     async with clean.sessionmaker() as s:
         written = list((await s.execute(select(AuditEntry).order_by(AuditEntry.id))).scalars())
@@ -245,13 +240,17 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
         (PAIRING_TOOL_NAME, OUTCOME_RAISED, DETAIL_NOT_SCANNED),
         (SCAN_TOOL_NAME, OUTCOME_RETURNED, None),
         (PAIRING_TOOL_NAME, OUTCOME_RETURNED, None),
-        (TOKEN_TOOL_NAME, OUTCOME_RAISED, DETAIL_ISSUANCE_DISABLED),
-        (TOKEN_TOOL_NAME, OUTCOME_RAISED, DETAIL_ISSUANCE_DISABLED),
+        (TOKEN_TOOL_NAME, OUTCOME_RETURNED, None),
+        (TOKEN_TOOL_NAME, OUTCOME_RAISED, DETAIL_DEVICE_CODE_SPENT),
     ]
     successes = [r for r in written if r.outcome == OUTCOME_RETURNED]
     assert [(r.tool_name, r.detail) for r in successes] == [
         (SCAN_TOOL_NAME, None),
         (PAIRING_TOOL_NAME, None),
+        (TOKEN_TOOL_NAME, None),
     ]
-    chain = successes + [r for r in written if r.tool_name == TOKEN_TOOL_NAME]
+    chain = [
+        r for r in written if r.tool_name != PAIRING_TOOL_NAME or r.outcome == OUTCOME_RETURNED
+    ]
     assert len({r.arguments["device_code_handle"] for r in chain}) == 1
+    assert successes[2].arguments["session_id"] == claims["sid"]

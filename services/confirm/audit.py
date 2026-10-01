@@ -904,8 +904,14 @@ SCAN_ROUTE = "/scan"
 DETAIL_STORED_IDENTITY_MALFORMED = "stored_identity_malformed"
 #: ``POST /token`` was presented an approved, unexpired, unspent device code
 #: for a customer who is not revoked, and refused to issue anything, because
-#: issuance is disabled (since 2026-09-30) until the layer-1 session token
-#: exists.
+#: issuance was disabled (on 2026-09-30) until the layer-1 session token
+#: existed.
+#:
+#: HISTORICAL SINCE THE LAYER-1 SESSION TOKEN, and kept for the rows that
+#: carry it: ``POST /token`` issues a session again and no code in this
+#: repository writes this literal any more. ``audit_log`` is append-only, so
+#: deleting the name would leave those rows carrying a value nothing in the
+#: tree names -- the precedent ``DETAIL_USER_CODE_MISMATCH`` set.
 #:
 #: WHY IT IS DISABLED. The token this endpoint used to return was a layer-2
 #: backend token: ``aud=accounts.svc``, ``scope=accounts:read``,
@@ -1139,7 +1145,7 @@ class PairingAudit:
 
     THREE ENDPOINTS, ONE WRITER. ``POST /scan`` claims a pairing for the
     customer whose app scanned it, ``POST /approve`` pairs the client, and
-    ``POST /token`` mints the read token that pairing authorises; all three
+    ``POST /token`` issues the layer-1 session that pairing authorises; all three
     write through this class, which is why ``tool_name`` and ``route`` are
     constructor arguments. ``POST /device_authorization``, where the grant
     begins, writes nothing at all -- see the rule below and that handler's
@@ -1318,6 +1324,7 @@ class PairingAudit:
         "_paired_client_id",
         "_redaction_budget_exhausted",
         "_route",
+        "_session_id",
         "_started",
         "_tool_name",
     )
@@ -1365,6 +1372,7 @@ class PairingAudit:
         # far enough to know, where a key holding null reads as "we looked and
         # there was nothing", which on the revoked path would be false.
         self._device_code_handle: str | None = None
+        self._session_id: str | None = None
         self._paired_client_id: str | None = None
 
     @property
@@ -1378,7 +1386,13 @@ class PairingAudit:
         """
         return self._call_id
 
-    def names(self, *, device_code: str | None = None, paired_client_id: str | None = None) -> None:
+    def names(
+        self,
+        *,
+        device_code: str | None = None,
+        session_id: str | None = None,
+        paired_client_id: str | None = None,
+    ) -> None:
         """Record which pairing this attempt was aimed at, as it becomes known.
 
         Two values arriving at two different points, through one method, so
@@ -1403,9 +1417,16 @@ class PairingAudit:
         meaningful degree, because ``ConfirmSettings.max_client_id_length``
         bounds this value at 256 characters at the endpoint that stored it and
         ``/device_authorization`` rejects rather than truncates a longer one.
+
+        ``session_id`` is a refresh family's id, written RAW: it is in every
+        access token of that family and so not a secret, and an operator
+        revoking a family needs it verbatim. No token, no segment of one and
+        no digest of one is ever written.
         """
         if device_code is not None:
             self._device_code_handle = device_code_handle(device_code)
+        if session_id is not None:
+            self._session_id = session_id
         if paired_client_id is not None:
             self._paired_client_id = scrub_text(paired_client_id)
 
@@ -1441,9 +1462,8 @@ class PairingAudit:
         """
         await self._write(OUTCOME_RETURNED, detail, risk_signals)
 
-    # No caller since 2026-09-30; the pending session-token change uses it again.
     async def minted(self) -> None:
-        """Record that a read token was signed for this customer.
+        """Record that a session was issued for this customer.
 
         The same row as ``approved`` above writes and a separate name on
         purpose. Both are ``outcome='returned'`` with a NULL ``detail``,
@@ -1549,7 +1569,7 @@ class PairingAudit:
     def _arguments(self) -> dict[str, Any]:
         """What this pairing attempt was, bounded the way both services bound it.
 
-        FOUR KEYS AT MOST, IN THIS ORDER, and the order is the first-fit rule
+        FIVE KEYS AT MOST, IN THIS ORDER, and the order is the first-fit rule
         ``cap_arguments`` applies: server-chosen keys first, the one
         caller-supplied key last, so an over-limit tree keeps what identifies
         the request and drops what carried the junk.
@@ -1570,6 +1590,8 @@ class PairingAudit:
         tree: dict[str, Any] = {"route": self._route}
         if self._device_code_handle is not None:
             tree["device_code_handle"] = self._device_code_handle
+        if self._session_id is not None:
+            tree["session_id"] = self._session_id
         if self._client_ip is not None:
             tree["client_ip"] = self._client_ip
         if self._paired_client_id is not None:

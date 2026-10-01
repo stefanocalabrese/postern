@@ -85,7 +85,7 @@ from services.confirm.rate_limit import (
     route_key,
 )
 from services.confirm.settings import ConfirmSettings
-from tests.device_grant_helpers import ISSUANCE_DISABLED_BODY, scan_in_store
+from tests.device_grant_helpers import scan_in_store, session_claims
 from tests.test_device_grant import AUDIENCE, ISSUER, bearer
 
 # ---------------------------------------------------------------------------
@@ -849,8 +849,7 @@ class TestThroughTheAssembledApp:
         A full device pairing: the browser starts one, the operator's app
         approves it with a verified assertion, the browser polls ``/token``.
         Three requests, nowhere near any limit. The poll reaches the handler
-        and gets the issuance-disabled 503 (no token since 2026-09-30), which
-        is not the limiter's 429.
+        and is issued a session, which is not the limiter's 429.
         """
         app = _app(key_pair)
         async with _client(app) as client:
@@ -871,8 +870,7 @@ class TestThroughTheAssembledApp:
                 data={"grant_type": "device_code", "device_code": device["device_code"]},
             )
 
-        assert exchanged.status_code == 503
-        assert exchanged.json() == ISSUANCE_DISABLED_BODY
+        session_claims(exchanged, app)
         assert "write_token" not in exchanged.json()
 
     async def test_a_legitimate_pairing_still_completes_while_another_bucket_floods(
@@ -908,10 +906,8 @@ class TestThroughTheAssembledApp:
                 data={"grant_type": "device_code", "device_code": device["device_code"]},
                 headers=customer,
             )
-        # Reached the handler, not the flooded bucket's 429: the issuance-
-        # disabled 503 every approved code gets since 2026-09-30.
-        assert exchanged.status_code == 503
-        assert exchanged.json() == ISSUANCE_DISABLED_BODY
+        # Reached the handler, not the flooded bucket's 429: a session.
+        session_claims(exchanged, app)
 
     async def test_a_full_store_answers_retryable_and_leaves_pairings_alone(
         self, key_pair: RSAKeyPair
@@ -1033,12 +1029,8 @@ class TestTheSlowDownInteraction:
         """The per-code ``slow_down`` is still skipped once a code is approved,
         and the thing that bounds an approved code is the code itself.
 
-        SINCE 2026-09-30 NO EXCHANGE SPENDS A CODE, because issuance is
-        disabled pending the layer-1 session token, so the first poll here gets
-        the issuance-disabled 503 and leaves the code unspent. The code is then
-        spent through the store, the state a build before 2026-09-30 left
-        behind and the session-token change will produce again, and the other
-        19 polls meet the spent-code refusal.
+        The first poll is issued a session and spends the code, and the
+        other 19 meet the spent-code refusal.
 
         THIS TEST ASSERTED THE OPPOSITE UNTIL 2026-09-26, and what it asserted
         was a defect rather than a property: 20 exchanges of one approved code,
@@ -1065,15 +1057,11 @@ class TestTheSlowDownInteraction:
                 headers=bearer(key_pair),
             )
             body = {"grant_type": "device_code", "device_code": device["device_code"]}
-            answers = [await client.post("/token", data=body)]
-            assert await app.state.device_code_store.consume_device_code(device["device_code"]), (
-                "the refused first poll had already spent the code"
-            )
-            answers += [await client.post("/token", data=body) for _ in range(19)]
+            answers = [await client.post("/token", data=body) for _ in range(20)]
 
         statuses = [r.status_code for r in answers]
-        assert statuses == [503] + [400] * 19
-        assert answers[0].json() == ISSUANCE_DISABLED_BODY
+        assert statuses == [200] + [400] * 19
+        session_claims(answers[0], app)
         errors = [r.json()["error"] for r in answers[1:]]
         assert errors == ["invalid_grant"] * 19
         assert 429 not in statuses, "the address-bucket limit fired inside its own budget"

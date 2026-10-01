@@ -559,7 +559,7 @@ async def test_session_swap_after_the_exchange_is_refused_with_nothing_revoked(
     code = await start(app)
     assert (await scan(app, key_pair, BOB, code)).status_code == 200
     assert await device_store_of(app).approve_scanned(code.device_code, BOB) is True
-    assert await device_store_of(app).consume_device_code(code.device_code) is True
+    assert await device_store_of(app).consume_device_code(code.device_code, session_id="") is True
     before = await device_store_of(app).get_device_code(code.device_code)
 
     resp = await scan(app, key_pair, ALICE, code)

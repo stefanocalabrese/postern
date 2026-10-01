@@ -32,6 +32,7 @@ from postern_core.auth.device_codes import (
 from starlette.applications import Starlette
 
 from services.confirm.qr_token import slot_at, token_for
+from services.confirm.session_token import ACCESS_TOKEN_LIFETIME_SECONDS
 
 
 def stored_form(user_code: str) -> str:
@@ -82,15 +83,44 @@ def overwrite_in_memory(app: Starlette, code: DeviceCode) -> None:
     store._codes[code.device_code] = code
 
 
-#: What ``POST /token`` answers for an approved, unexpired device code since
-#: 2026-09-30, byte for byte. Issuance is disabled until the layer-1 session
-#: token lands: the token this endpoint used to return was a layer-2 backend
-#: token (``aud=accounts.svc``, signed with the read key ``services/api``
-#: publishes), which a public client must never hold.
-ISSUANCE_DISABLED_BODY = {
-    "error": "temporarily_unavailable",
-    "error_description": "session token issuance is not enabled",
-}
+#: The five keys of ``POST /token``'s success body, spec section 5, and no
+#: other: in particular nothing a layer-2 verifier would accept.
+SESSION_RESPONSE_KEYS = frozenset(
+    {"access_token", "token_type", "expires_in", "refresh_token", "scope"}
+)
+
+
+def session_claims(response: Any, app: Starlette) -> dict[str, Any]:
+    """Assert ``response`` is a session issued by ``app``; return the access token's claims.
+
+    The exact key set, both RFC 6749 section 5.1 headers, and an access token
+    that verifies against the key set ``/session/jwks.json`` publishes, under
+    the configured issuer and audience, with no ``act``. The refresh token
+    names the same family the access token's ``sid`` does.
+    """
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == SESSION_RESPONSE_KEYS, body
+    assert body["token_type"] == "Bearer"  # noqa: S105
+    assert body["expires_in"] == ACCESS_TOKEN_LIFETIME_SECONDS
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    published = app.state.postern_session_key_source.public_jwks()
+    claims = dict(
+        joserfc_jwt.decode(
+            body["access_token"],
+            KeySet.import_key_set(published),
+            algorithms=["RS256"],
+        ).claims
+    )
+    settings = app.state.settings
+    assert claims["iss"] == settings.session_token_issuer
+    assert claims["aud"] == settings.session_token_audience
+    assert "act" not in claims
+    assert claims["scope"] == body["scope"]
+    assert body["refresh_token"].split(".")[1] == claims["sid"]
+    return claims
+
 
 #: Three base64url segments joined by dots, the compact JWS shape, with the
 #: first starting ``ey``: a JOSE header is a JSON object, and both ``{"`` and
@@ -139,16 +169,26 @@ def verifies_against(token: str, jwks: dict[str, Any]) -> bool:
 
 
 def assert_no_body_carries_a_token_the_api_trusts(
-    bodies: list[str], api_jwks: dict[str, Any]
+    bodies: list[str],
+    api_jwks: dict[str, Any],
+    session_jwks: dict[str, Any],
+    *,
+    issuer: str,
+    audience: str,
 ) -> None:
     """The regression for the layer-2 token ``POST /token`` used to return.
 
     Checked twice, the narrower property first so a failure names it: no
     string in any body verifies against the JWKS ``services/api`` publishes,
-    which is the key set Istio trusts; and no body holds anything JWT-shaped
-    at all.
+    which is the key set Istio trusts; and every JWT-shaped string in any body
+    is a layer-1 session token -- it verifies against ``/session/jwks.json``
+    and carries the session issuer and audience.
     """
     shaped = [s for body in bodies for s in jwt_shaped_strings(body)]
     trusted = [s for s in shaped if verifies_against(s, api_jwks)]
     assert trusted == [], "a /token response carried a token the api's JWKS verifies"
-    assert shaped == [], f"a /token response carried a JWT-shaped string: {shaped!r}"
+    session_keys = KeySet.import_key_set(session_jwks)  # type: ignore[arg-type]
+    for token in shaped:
+        claims = joserfc_jwt.decode(token, session_keys, algorithms=["RS256"]).claims
+        assert claims["iss"] == issuer, claims
+        assert claims["aud"] == audience, claims

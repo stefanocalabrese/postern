@@ -12,9 +12,9 @@ that followed it, and only if any followed.
 THE CHAIN, AND WHICH LINKS ARE RECORDED. ``POST /approve`` and
 ``POST /token`` each write one row, so a pairing and each exchange attempted
 off the back of it are both countable and join on
-``arguments['device_code_handle']``. Since 2026-09-30 the exchange row is the
-``issuance_disabled`` refusal, because ``POST /token`` mints nothing until the
-layer-1 session token exists.
+``arguments['device_code_handle']``. The exchange row is the mint of a
+layer-1 session, ``returned`` with a NULL ``detail`` and the family's
+``session_id`` beside the handle.
 ``POST /device_authorization`` writes none, deliberately, and
 ``test_device_authorization_writes_nothing`` is where that is asserted rather
 than assumed. So is most of ``POST /token``: at the configured 5-second poll
@@ -63,6 +63,7 @@ from postern_core.auth.device_codes import (
     DeviceCodeStoreContended,
 )
 from postern_core.auth.device_keys import no_enrolled_devices
+from postern_core.auth.refresh_sessions import InMemoryRefreshSessionStore
 from postern_core.auth.revocation import RevocationStoreBase, RevocationStoreUnavailable
 from postern_core.store import audit as audit_store
 from postern_core.store.engine import Database
@@ -81,7 +82,6 @@ from services.confirm.audit import (
     DETAIL_DEVICE_CODE_NOT_FOUND,
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
-    DETAIL_ISSUANCE_DISABLED,
     DETAIL_NOT_SCANNED,
     DETAIL_REVOKED,
     DETAIL_SCANNED_BY_OTHER,
@@ -95,12 +95,13 @@ from services.confirm.audit import (
     TOKEN_TOOL_NAME,
 )
 from services.confirm.main import create_confirm_app
+from services.confirm.session_token import SessionClaims, SessionTokenMinter
 from services.confirm.settings import ConfirmSettings
 from tests.device_grant_helpers import (
-    ISSUANCE_DISABLED_BODY,
     jwt_shaped_strings,
     overwrite_in_memory,
     scan_in_store,
+    session_claims,
 )
 from tests.fixtures.append_only_bypass import (
     delete_audit_rows_by_bypassing_the_append_only_triggers,
@@ -961,9 +962,7 @@ async def test_a_pairing_that_cannot_be_audited_does_not_stand(
     closed here means the pairing is withdrawn, not merely reported as
     failed -- otherwise ``POST /token`` treats the code as approved for a
     customer no pairing row names: it reads that customer off the code, runs
-    the ZT-7 check against them and writes ``issuance_disabled`` rows under
-    their name. It hands out no token today only because issuance is
-    disabled; the pending session-token change would hand one out.
+    the ZT-7 check against them and issues a session in their name.
     """
     code = await issue(app)
 
@@ -1141,56 +1140,62 @@ async def paired(app: Starlette, key_pair: RSAKeyPair) -> DeviceCode:
     return code
 
 
-async def test_an_approved_code_is_refused_503_unspent_and_recorded_as_issuance_disabled(
+class SignMustNotBeCalled:
+    """Stands in for the session minter: ``prepare`` is the real one, and a
+    ``sign`` raises and counts. A stand-in rather than ``patch.object`` on the
+    app's minter, so the real object is untouched for the next test."""
+
+    def __init__(self, real: SessionTokenMinter) -> None:
+        self._real = real
+        self.calls = 0
+
+    def prepare(self, **kwargs: Any) -> SessionClaims:
+        return self._real.prepare(**kwargs)
+
+    def sign(self, claims: SessionClaims) -> str:
+        self.calls += 1
+        raise AssertionError("POST /token signed a session it must not issue")
+
+
+async def test_an_approved_code_is_issued_a_session_spent_and_recorded_as_minted(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """Issuance is disabled until the layer-1 session token lands.
+    """One approved code, one session, one ``returned`` row with NULL ``detail``.
 
-    The token this endpoint used to return was a layer-2 backend token, signed
-    with the read key ``services/api`` publishes, so a public client that
-    completed a pairing held a credential the accounts backend accepts. Three
-    properties of the refusal that replaced it: the body is the fixed 503, the
-    minter is never called, and the code is not spent -- a poll after the
-    interval gets the same answer and a second row, not the spent-code
-    refusal. The pacing is pinned in the next test.
+    The row names the family by ``session_id``, raw, beside the device code's
+    handle, so an operator can revoke that family and join it to the pairing.
+    A replay after that is the spent-code refusal and its own row.
     """
     code = await paired(app, key_pair)
 
-    class MustNotBeCalled:
-        """Stands in for the read minter. A stand-in rather than
-        ``patch.object``, because ``InternalTokenMinter`` is a frozen
-        dataclass."""
-
-        calls = 0
-
-        def mint(self, **kwargs: Any) -> str:
-            MustNotBeCalled.calls += 1
-            raise AssertionError("POST /token reached the read minter")
-
-    app.state.read_minter = MustNotBeCalled()
-
     first = await exchange(app, code.device_code)
-    assert first.status_code == 503, first.text
-    assert first.json() == ISSUANCE_DISABLED_BODY
+    claims = session_claims(first, app)
 
     written = await rows(clean)
     assert [r.tool_name for r in written] == [PAIRING_TOOL_NAME, TOKEN_TOOL_NAME]
-    refusal = written[1]
-    assert refusal.outcome == OUTCOME_RAISED
-    assert refusal.detail == DETAIL_ISSUANCE_DISABLED
-    assert refusal.customer_ref == CUSTOMER
-    assert refusal.arguments["route"] == TOKEN_ROUTE
-    assert refusal.arguments["device_code_handle"] == handle_of(code.device_code)
+    mint = written[1]
+    assert mint.outcome == OUTCOME_RETURNED
+    assert mint.detail is None
+    assert mint.customer_ref == CUSTOMER
+    assert mint.arguments["route"] == TOKEN_ROUTE
+    assert mint.arguments["device_code_handle"] == handle_of(code.device_code)
+    assert mint.arguments["session_id"] == claims["sid"]
+    assert set(mint.arguments) == {
+        "route",
+        "device_code_handle",
+        "session_id",
+        "client_ip",
+        "paired_client_id",
+    }
 
     stored = await unwrap(app.state.device_code_store, code.device_code)
-    assert stored.exchanged_at is None, "a refused exchange spent the device code"
+    assert stored.exchanged_at is not None, "an issued exchange left the device code redeemable"
+    assert stored.session_id == claims["sid"]
 
-    interval_ago(app, code.device_code)
     second = await exchange(app, code.device_code)
-    assert second.status_code == 503, second.text
-    assert second.json() == ISSUANCE_DISABLED_BODY
-    assert [r.detail for r in await rows(clean)][1:] == [DETAIL_ISSUANCE_DISABLED] * 2
-    assert MustNotBeCalled.calls == 0
+    assert second.status_code == 400, second.text
+    assert second.json()["error"] == "invalid_grant"
+    assert [r.detail for r in await rows(clean)][1:] == [None, DETAIL_DEVICE_CODE_SPENT]
 
 
 def interval_ago(app: Starlette, device_code: str) -> None:
@@ -1203,26 +1208,34 @@ def interval_ago(app: Starlette, device_code: str) -> None:
 async def test_polls_of_an_approved_code_are_paced_at_the_interval(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """Two polls inside the interval: the 503 once, then ``slow_down``, one row.
+    """Two polls inside the interval: the store-full 503 once, then ``slow_down``.
 
-    Without pacing, a client honouring the retryable 503 would come straight
-    back at the address-bucket limiter's pace until the code's TTL, each poll
-    an ``audit_log`` INSERT and a revocation read. ``Retry-After`` tells it
-    the interval, which is the pace this endpoint enforces.
+    The pacing governs an approved code that gets a RETRYABLE answer. Without
+    it a client honouring the 503 would come straight back at the
+    address-bucket limiter's pace until the code's TTL, each poll an
+    ``audit_log`` INSERT and a store read. ``Retry-After`` tells it the
+    interval, which is the pace this endpoint enforces, and the code stays
+    redeemable because the family was never created. No session is signed.
     """
     code = await paired(app, key_pair)
     interval = app.state.settings.device_poll_interval_seconds
+    app.state.refresh_session_store = InMemoryRefreshSessionStore(max_sessions=0)
+    minter = SignMustNotBeCalled(app.state.session_minter)
+    app.state.session_minter = minter
 
     first = await exchange(app, code.device_code)
     second = await exchange(app, code.device_code)
 
     assert first.status_code == 503, first.text
-    assert first.json() == ISSUANCE_DISABLED_BODY
+    assert first.json()["error"] == "temporarily_unavailable"
     assert first.headers["retry-after"] == str(interval)
     assert second.status_code == 400, second.text
     assert second.json()["error"] == "slow_down"
     token_rows = [r for r in await rows(clean) if r.tool_name == TOKEN_TOOL_NAME]
-    assert [r.detail for r in token_rows] == [DETAIL_ISSUANCE_DISABLED]
+    assert [r.detail for r in token_rows] == ["RefreshSessionStoreFull"]
+    assert minter.calls == 0
+    stored = await unwrap(app.state.device_code_store, code.device_code)
+    assert stored.exchanged_at is None, "a full family store spent the device code"
 
 
 async def test_the_first_poll_after_approval_is_not_paced_by_the_last_pending_one(
@@ -1239,8 +1252,7 @@ async def test_the_first_poll_after_approval_is_not_paced_by_the_last_pending_on
 
     after = await exchange(app, code.device_code)
 
-    assert after.status_code == 503, after.text
-    assert after.json() == ISSUANCE_DISABLED_BODY
+    session_claims(after, app)
 
 
 async def test_a_token_exchange_writes_one_row(
@@ -1251,20 +1263,17 @@ async def test_a_token_exchange_writes_one_row(
     ``tool_name`` is its own literal rather than the pairing's, so an operator
     can ask "which pairings completed" and "which exchanges were attempted"
     separately. Both are ``device_grant.*``, neither is a registered MCP tool.
-    Since 2026-09-30 the row records the issuance-disabled refusal, because no
-    token is minted.
     """
     code = await paired(app, key_pair)
 
     resp = await exchange(app, code.device_code)
-    assert resp.status_code == 503
-    assert "access_token" not in resp.json()
+    session_claims(resp, app)
 
     written = await rows(clean)
     assert [r.tool_name for r in written] == [PAIRING_TOOL_NAME, TOKEN_TOOL_NAME]
     mint = written[1]
-    assert mint.outcome == OUTCOME_RAISED
-    assert mint.detail == DETAIL_ISSUANCE_DISABLED
+    assert mint.outcome == OUTCOME_RETURNED
+    assert mint.detail is None
     assert mint.customer_ref == CUSTOMER
     assert mint.reaching_at is None
     assert mint.arguments["route"] == TOKEN_ROUTE
@@ -1301,14 +1310,14 @@ async def test_the_token_row_names_no_credential(
 ) -> None:
     """Nothing of a credential reaches the table from the token endpoint.
 
-    Until 2026-09-30 this took the minted token apart segment by segment and
-    asserted none of it was on the row. No token is minted now, so the body
-    is asserted to hold nothing JWT-shaped, and the one credential this
-    request did carry, the device code, is asserted absent from the row.
+    The access token is taken apart segment by segment, the refresh token's
+    secret likewise, and none of it is on the row; nor is the device code the
+    request carried. The family id is there, raw, and that is allowed: it is
+    in every access token of the family and selects a record, nothing more.
     """
     code = await paired(app, key_pair)
     resp = await exchange(app, code.device_code)
-    assert jwt_shaped_strings(resp.text) == []
+    body = resp.json()
 
     _, mint = await rows(clean)
     serialised = json.dumps(
@@ -1320,7 +1329,12 @@ async def test_the_token_row_names_no_credential(
         }
     )
     assert jwt_shaped_strings(serialised) == []
+    for segment in body["access_token"].split("."):
+        assert segment not in serialised
+    assert body["refresh_token"] not in serialised
+    assert body["refresh_token"].split(".")[2] not in serialised
     assert code.device_code not in serialised
+    assert mint.arguments["session_id"] == body["refresh_token"].split(".")[1]
 
 
 # ---------------------------------------------------------------------------
@@ -1526,15 +1540,10 @@ async def test_a_token_that_cannot_be_audited_is_never_returned(
 ) -> None:
     """The ordering decision, asserted on the RESPONSE BODY rather than the status.
 
-    Since 2026-09-30 the exchange mints nothing, so what fails closed here is
-    the issuance-disabled refusal: its row cannot be written, the request
-    answers 500, and nothing reaches the caller. The order below is kept
-    because the session-token change will mint here again.
-
     ``/approve`` fails closed by withdrawing the pairing, because the pairing
     is in this deployment's own store. A mint cannot be withdrawn: the token is
-    signed and nothing here can revoke it inside its 60-second life. So the
-    order is mint, then commit the row, then return -- and the token is only
+    signed and nothing here can take it back from a caller once it is
+    serialised. So the order is mint, then commit the row, then return -- and the token is only
     ever serialised to a caller after the row is durable. An implementation
     that wrote the row first would refuse a customer who did nothing wrong
     whenever the store blinked; one that returned before writing would hand out
@@ -1557,40 +1566,45 @@ async def test_a_token_that_cannot_be_audited_is_never_returned(
     assert await rows(clean) == []
 
 
-async def test_a_signing_key_that_would_fail_is_never_reached(
+async def test_a_mint_that_raises_leaves_a_raised_row_and_the_code_spent(
     app: Starlette, clean: Database, key_pair: RSAKeyPair
 ) -> None:
-    """The minter is wired and not called, so its failure cannot surface.
+    """A signing key that fails at step 4 of spec section 5.
 
-    Until 2026-09-30 this asserted that a mint which raised left a ``raised``
-    row naming the exception rather than a ``returned`` row claiming a token.
-    Issuance is disabled now, so a minter that raises on every call is the
-    sharpest witness that ``/token`` never reaches it: the answer is the
-    issuance-disabled 503 and the row says so, with no success row claiming
-    a mint.
+    The row names the exception rather than a ``returned`` row claiming a
+    session, nothing reaches the caller, and the code stays spent with a
+    family holding a never-issued ``jti`` -- harmless, and the customer
+    re-pairs.
     """
     code = await paired(app, key_pair)
     await _wipe(clean)
 
     class Unsignable:
-        """Stands in for the minter. A stand-in rather than ``patch.object``:
-        ``InternalTokenMinter`` is a frozen dataclass, so patching an attribute
-        on an instance raises ``FrozenInstanceError`` when the patch unwinds."""
+        """Stands in for the session minter: the real ``prepare``, and a
+        ``sign`` that fails the way an unreachable Vault does."""
 
-        def mint(self, **kwargs: Any) -> str:
+        def __init__(self, real: SessionTokenMinter) -> None:
+            self._real = real
+
+        def prepare(self, **kwargs: Any) -> SessionClaims:
+            return self._real.prepare(**kwargs)
+
+        def sign(self, claims: SessionClaims) -> str:
             raise RuntimeError("the signing key source is unavailable")
 
-    app.state.read_minter = Unsignable()
+    app.state.session_minter = Unsignable(app.state.session_minter)
 
     resp = await exchange(app, code.device_code, as_a_server_would=True)
 
-    assert resp.status_code == 503
-    assert resp.json() == ISSUANCE_DISABLED_BODY
+    assert resp.status_code == 500
+    assert "access_token" not in resp.text
 
     row = await one_row(clean)
     assert row.outcome == OUTCOME_RAISED, "a row claimed a mint that never happened"
-    assert row.detail == DETAIL_ISSUANCE_DISABLED
+    assert row.detail == "RuntimeError"
     assert row.customer_ref == CUSTOMER
+    stored = await unwrap(app.state.device_code_store, code.device_code)
+    assert stored.exchanged_at is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1621,13 +1635,12 @@ async def test_a_replay_of_a_spent_device_code_is_recorded(
     branch before any identity is read, and this row is the thing that would
     be lost.
 
-    SPENT THROUGH THE STORE since 2026-09-30, because no exchange spends a
-    code any more; a code an earlier build spent is how this row still
-    arises, in a shared store that outlives the deploy.
+    SPENT THROUGH THE STORE, so the test is about the replay and not the
+    mint that would otherwise spend it.
     """
     code = await paired(app, key_pair)
     store: DeviceCodeStoreBase = app.state.device_code_store
-    assert await store.consume_device_code(code.device_code) is True
+    assert await store.consume_device_code(code.device_code, session_id="") is True
     await _wipe(clean)
 
     replay = await exchange(app, code.device_code)
@@ -1658,7 +1671,7 @@ async def test_a_replayed_code_produces_one_row_per_attempt_under_one_handle(
     """
     code = await paired(app, key_pair)
     store: DeviceCodeStoreBase = app.state.device_code_store
-    assert await store.consume_device_code(code.device_code) is True
+    assert await store.consume_device_code(code.device_code, session_id="") is True
     await _wipe(clean)
 
     for _ in range(3):

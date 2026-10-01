@@ -30,7 +30,6 @@ from starlette.applications import Starlette
 from services.confirm.audit import (
     DETAIL_ALREADY_APPROVED,
     DETAIL_ALREADY_SCANNED,
-    DETAIL_ISSUANCE_DISABLED,
     DETAIL_QR_INVALID,
     DETAIL_QR_STALE,
     DETAIL_SCAN_CONFLICT,
@@ -367,14 +366,14 @@ async def test_the_approvers_repeat_and_the_approve_and_token_rows_keep_null(
         form={"grant_type": "device_code", "device_code": code.device_code},
         forwarded_for=LAPTOP,
     )
-    assert token.status_code == 503
+    assert token.status_code == 200, token.text
 
     first_scan, approve_row, approved_mine, token_row = await rows(clean)
     assert first_scan.risk_signals == expected_signal("different")
     assert approve_row.tool_name != SCAN_TOOL_NAME and approve_row.risk_signals is None
     assert approved_mine.detail == DETAIL_ALREADY_APPROVED
     assert approved_mine.risk_signals is None
-    assert token_row.detail == DETAIL_ISSUANCE_DISABLED
+    assert token_row.detail is None
     assert token_row.risk_signals is None
 
 

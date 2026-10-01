@@ -140,7 +140,7 @@ async def test_a_conflict_on_an_exchanged_code_does_not_move_the_address(
     code = await _create(writer)
     await writer.claim_scan(code.device_code, BOB, scanner_ip=FIRST)
     await writer.approve_scanned(code.device_code, BOB)
-    await writer.consume_device_code(code.device_code)
+    await writer.consume_device_code(code.device_code, session_id="")
     before = await _read(reader, code.device_code)
 
     assert (

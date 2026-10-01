@@ -10,9 +10,9 @@ Covers:
   no bearer: the browser holds no credential (RFC 8628's entire premise).
 - Token exchange with the ``device_code`` grant type (pending, approved,
   expired, slow_down) — public, no bearer, and never returns a write token
-  (audit finding C-01). Since 2026-09-30 it returns no token at all: an
-  approved code gets a 503 because issuance is disabled pending the layer-1
-  session token, and the code is not spent.
+  (audit finding C-01). An approved code is issued a layer-1 session and
+  spent; ``tests/test_token_session_issuance.py`` holds the session's own
+  properties.
 - Mobile app approval callback (``POST /approve``) — requires a verified
   banking-app bearer assertion (``services/confirm/auth.py``); the customer
   comes from the verified ``sub`` and from nowhere else. A request body can
@@ -66,9 +66,9 @@ from services.confirm.device_auth import approve_callback
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import MIN_DEVICE_CODE_TTL_SECONDS, ConfirmSettings
 from tests.device_grant_helpers import (
-    ISSUANCE_DISABLED_BODY,
     jwt_shaped_strings,
     scan_in_store,
+    session_claims,
 )
 
 # Imported for its VALUE, not to run it: `SHORTEST_STORED_TTL` is where the
@@ -513,16 +513,14 @@ class TestTokenExchangeEndpoint:
         # Expired codes should be revoked.
         assert await store.get_device_code("expired-code") is None
 
-    async def test_approved_exchange_is_refused_and_the_approval_names_the_bearer_subject(
+    async def test_approved_exchange_issues_a_session_for_the_bearer_subject(
         self, app: Starlette, key_pair: RSAKeyPair
     ) -> None:
         """`/token` used to read `client_id`, the field a caller of
         `/device_authorization` controls; it now reads `customer_ref`, which
-        only a verified `/approve` write ever sets (audit finding C-01).
-
-        Since 2026-09-30 an approved code gets the issuance-disabled 503 and
-        no token, so the identity is asserted on the stored code instead of
-        on a minted token's `sub`."""
+        only a verified `/approve` write ever sets (audit finding C-01). The
+        session's `sub` is that customer, and the browser's `client_id` is
+        carried as a claim marked unverified, never as the subject."""
         async with _client(app) as client:
             device = await _start_device_grant(client, client_id="cust_should_be_ignored")
             approve = await _approve(app, client, device, bearer(key_pair, subject="cust_7f3a"))
@@ -533,14 +531,16 @@ class TestTokenExchangeEndpoint:
                 data={"grant_type": "device_code", "device_code": device["device_code"]},
             )
 
-        assert resp.status_code == 503
-        assert resp.json() == ISSUANCE_DISABLED_BODY
-        assert jwt_shaped_strings(resp.text) == []
+        claims = session_claims(resp, app)
+        assert claims["sub"] == "cust_7f3a"
+        assert claims["client_id"] == "cust_should_be_ignored"
+        assert claims["client_id_verified"] is False
 
         stored = await app.state.device_code_store.get_device_code(device["device_code"])
         assert stored is not None
         assert stored.customer_ref == "cust_7f3a"
-        assert stored.exchanged_at is None
+        assert stored.exchanged_at is not None
+        assert stored.session_id == claims["sid"]
 
     async def test_approved_with_empty_customer_ref_is_invalid_state(self, app: Starlette) -> None:
         """A code that reads as approved with no identity attached must mint
@@ -922,8 +922,7 @@ class TestFullLifecycle:
             )
             assert resp.status_code == 200
 
-            # Step 4: Poll token after approval → the issuance-disabled 503,
-            # and no token of any kind in the body.
+            # Step 4: Poll token after approval → a layer-1 session.
             resp = await client.post(
                 "/token",
                 data={
@@ -931,9 +930,7 @@ class TestFullLifecycle:
                     "device_code": device_code_value,
                 },
             )
-            assert resp.status_code == 503
-            assert resp.json() == ISSUANCE_DISABLED_BODY
-            assert jwt_shaped_strings(resp.text) == []
+            assert session_claims(resp, app)["sub"] == "cust_abc"
 
     async def test_expired_then_new_code(self, app: Starlette) -> None:
         """Expired code is rejected; a new code works."""
@@ -1323,14 +1320,12 @@ class TestCompleteFlow:
             )
             assert approve_resp.status_code == 200
 
-            # 4. Poll after approval: issuance is disabled, so no token.
+            # 4. Poll after approval: a layer-1 session.
             token_resp = await c.post(
                 "/token",
                 data={"grant_type": "device_code", "device_code": dc["device_code"]},
             )
-        assert token_resp.status_code == 503
-        assert token_resp.json() == ISSUANCE_DISABLED_BODY
-        assert jwt_shaped_strings(token_resp.text) == []
+        assert session_claims(token_resp, app)["sub"] == "cust_7f3a"
 
 
 # ---------------------------------------------------------------------------
@@ -1529,9 +1524,8 @@ class TestAuditFindingC01SubjectValueInBodyIsIgnored:
     ) -> None:
         """A body naming `subject_value: cust_victim` alongside a genuine
         bearer for `cust_attacker` approves the code for the attacker, never
-        the name in the body. Asserted on the stored `customer_ref`, the value
-        `/token` reads, since `/token` has minted nothing from it since
-        2026-09-30."""
+        the name in the body, on the stored `customer_ref` and on the
+        session's `sub`."""
         async with _client(app) as client:
             device = await _start_device_grant(client, client_id="cust_victim")
             await scan_in_store(app, device["user_code"], "cust_attacker")
@@ -1548,13 +1542,11 @@ class TestAuditFindingC01SubjectValueInBodyIsIgnored:
                 data={"grant_type": "device_code", "device_code": device["device_code"]},
             )
 
-        assert token_resp.status_code == 503
-        assert token_resp.json() == ISSUANCE_DISABLED_BODY
+        assert session_claims(token_resp, app)["sub"] == "cust_attacker"
 
         stored = await app.state.device_code_store.get_device_code(device["device_code"])
         assert stored is not None
         assert stored.customer_ref == "cust_attacker"
-        assert "cust_victim" not in token_resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -1590,10 +1582,11 @@ class TestUserCodeAcceptedForms:
 
 class TestTokenResponseNeverIncludesAWriteToken:
     """Audit finding C-01: aud=payments.svc scope=payments:execute must
-    never reach an HTTP client from this endpoint again. Since 2026-09-30
-    the same holds for the read token: the approved body carries no token."""
+    never reach an HTTP client from this endpoint again, and since 2026-09-30
+    neither may the layer-2 read token: the approved body carries exactly the
+    five keys of a layer-1 session."""
 
-    async def test_approved_exchange_body_has_exactly_the_two_error_keys(
+    async def test_approved_exchange_body_has_exactly_the_five_session_keys(
         self, app: Starlette, key_pair: RSAKeyPair
     ) -> None:
         async with _client(app) as client:
@@ -1606,11 +1599,10 @@ class TestTokenResponseNeverIncludesAWriteToken:
                 data={"grant_type": "device_code", "device_code": device["device_code"]},
             )
 
-        assert resp.status_code == 503
+        session_claims(resp, app)
         data = resp.json()
-        assert set(data) == {"error", "error_description"}
         assert "write_token" not in data
-        assert "access_token" not in data
+        assert "id_token" not in data
 
 
 # ---------------------------------------------------------------------------
@@ -1870,12 +1862,10 @@ class TestAPairingCompletesAtTheConfiguredTtl:
             )
             assert approved.status_code == 200
 
-            # The pairing completes as far as issuance, which is disabled.
             issued = await client.post(
                 "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
             )
-            assert issued.status_code == 503
-            assert issued.json() == ISSUANCE_DISABLED_BODY
+            assert session_claims(issued, app)["sub"] == "cust_abc"
 
             stored = await app.state.device_code_store.get_device_code(device["device_code"])
             assert stored is not None, "the code the pairing used was really stored"
@@ -1896,44 +1886,34 @@ async def _exchange(client: httpx2.AsyncClient, device_code: str) -> httpx2.Resp
 
 
 class TestASpentDeviceCodeStaysSpent:
-    """A code that was spent is refused, and a refused exchange spends nothing.
+    """A code that was spent is refused, and one approved code is one session.
 
-    UNTIL 2026-09-30 THE EXCHANGE THAT MINTED SPENT THE CODE, and
+    THE EXCHANGE THAT ISSUES SPENDS THE CODE, and
     ``dev-docs/decisions/0012-device-code-single-use.md`` carries why one
-    approved code is worth at most one token: RFC 8628 §5.2 calls what a
+    approved code is worth at most one grant: RFC 8628 §5.2 calls what a
     device code redeems an authorization code, and RFC 6749 §10.5 makes those
-    "short lived and single-use". Issuance is now disabled pending the layer-1
-    session token, so no exchange spends a code, and these tests reach a spent
-    code the way a deployment still can: through the store, as a build before
-    2026-09-30 left it, in a shared Redis that outlives the deploy.
-
-    The spent-code refusal is therefore the one tested here, together with the
-    new property it sits beside: a refused exchange of an approved code leaves
-    it unspent, including when two of them race.
+    "short lived and single-use". Most tests here spend the code through the
+    store so they are about the refusal and not the mint.
     """
 
-    async def test_a_refused_exchange_leaves_the_code_unspent(
+    async def test_an_issued_exchange_spends_the_code_and_a_second_is_refused(
         self, app: Starlette, key_pair: RSAKeyPair
     ) -> None:
-        """Two polls of one approved code a full interval apart, one answer,
-        and nothing spent. The wait is simulated by moving the recorded poll
-        back one interval; a poll inside it is ``slow_down`` (pinned in
-        ``tests/test_pairing_audit.py``)."""
+        """The first poll after approval is issued a session and spends the
+        code; a replay, unpaced because it is terminal, is ``invalid_grant``."""
         async with _client(app) as client:
             device = await _start_device_grant(client)
             assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
 
             first = await _exchange(client, device["device_code"])
-            app.state._approved_poll_times[device["device_code"]] -= timedelta(
-                seconds=app.state.settings.device_poll_interval_seconds
-            )
             second = await _exchange(client, device["device_code"])
 
-        assert first.status_code == second.status_code == 503
-        assert first.json() == second.json() == ISSUANCE_DISABLED_BODY
+        session_claims(first, app)
+        assert second.status_code == 400
+        assert second.json()["error"] == "invalid_grant"
         stored = await app.state.device_code_store.get_device_code(device["device_code"])
         assert stored is not None
-        assert stored.exchanged_at is None
+        assert stored.exchanged_at is not None
 
     async def test_a_spent_code_stays_in_the_store_and_is_refused(
         self, app: Starlette, key_pair: RSAKeyPair
@@ -1949,7 +1929,7 @@ class TestASpentDeviceCodeStaysSpent:
         async with _client(app) as client:
             device = await _start_device_grant(client)
             assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
-            assert await store.consume_device_code(device["device_code"]) is True
+            assert await store.consume_device_code(device["device_code"], session_id="") is True
 
             replay = await _exchange(client, device["device_code"])
 
@@ -1974,7 +1954,7 @@ class TestASpentDeviceCodeStaysSpent:
         async with _client(app) as client:
             device = await _start_device_grant(client)
             assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
-            assert await store.consume_device_code(device["device_code"]) is True
+            assert await store.consume_device_code(device["device_code"], session_id="") is True
 
             spent = await _exchange(client, device["device_code"])
             never_existed = await _exchange(client, "no-such-device-code")
@@ -1995,7 +1975,7 @@ class TestASpentDeviceCodeStaysSpent:
         async with _client(app) as client:
             device = await _start_device_grant(client)
             assert (await _approve(app, client, device, bearer(key_pair))).status_code == 200
-            assert await store.consume_device_code(device["device_code"]) is True
+            assert await store.consume_device_code(device["device_code"], session_id="") is True
 
             class Unavailable:
                 async def is_customer_revoked(self, customer_ref: str) -> bool:
@@ -2007,18 +1987,16 @@ class TestASpentDeviceCodeStaysSpent:
         assert replay.status_code == 400
         assert replay.json()["error"] == "invalid_grant"
 
-    async def test_two_concurrent_exchanges_issue_nothing_and_spend_nothing(
+    async def test_exactly_one_of_two_concurrent_exchanges_is_issued_a_session(
         self, app: Starlette, key_pair: RSAKeyPair
     ) -> None:
-        """The race this class used to force for the claim, kept for the refusal.
-
-        Until the pacing of approved codes it held two requests inside the
-        revocation check with a barrier, so both reached the point where a
-        token used to be minted. Now the pacing check lets exactly one through
-        (the check and the record have no ``await`` between them), so the
-        other is answered ``slow_down`` before the revocation check, and a
-        barrier of two would never release. Neither gets a token, and the
-        code is still unspent afterwards.
+        """Within one process the approved-poll pacing lets exactly one through
+        (the check and the record have no ``await`` between them), so the other
+        is answered ``slow_down`` before a family is drawn -- or, when the
+        first finishes before the second reads the code, the spent code's
+        ``invalid_grant``. Either way one session. The two-replica form of the
+        race, where both pass the pacing and the claim decides, is in
+        ``tests/test_token_session_issuance.py``.
         """
         async with _client(app) as client:
             device = await _start_device_grant(client)
@@ -2029,14 +2007,11 @@ class TestASpentDeviceCodeStaysSpent:
                 _exchange(client, device["device_code"]),
             )
 
-        assert sorted(r.status_code for r in both) == [400, 503]
+        assert sorted(r.status_code for r in both) == [200, 400]
         by_status = {r.status_code: r for r in both}
-        assert by_status[503].json() == ISSUANCE_DISABLED_BODY
-        assert by_status[400].json()["error"] == "slow_down"
-        assert [jwt_shaped_strings(r.text) for r in both] == [[], []]
-        stored = await app.state.device_code_store.get_device_code(device["device_code"])
-        assert stored is not None
-        assert stored.exchanged_at is None
+        session_claims(by_status[200], app)
+        assert by_status[400].json()["error"] in {"slow_down", "invalid_grant"}
+        assert jwt_shaped_strings(by_status[400].text) == []
 
 
 class TestConsumingADeviceCodeInTheStore:
@@ -2056,8 +2031,8 @@ class TestConsumingADeviceCodeInTheStore:
             verification_uri="https://auth.example.com/verify",
         )
 
-        assert await store.consume_device_code(code.device_code) is True
-        assert await store.consume_device_code(code.device_code) is False
+        assert await store.consume_device_code(code.device_code, session_id="") is True
+        assert await store.consume_device_code(code.device_code, session_id="") is False
 
     async def test_it_marks_the_code_rather_than_removing_it(
         self, store: InMemoryDeviceCodeStore
@@ -2068,7 +2043,7 @@ class TestConsumingADeviceCodeInTheStore:
             verification_uri="https://auth.example.com/verify",
         )
 
-        await store.consume_device_code(code.device_code)
+        await store.consume_device_code(code.device_code, session_id="")
 
         stored = await store.get_device_code(code.device_code)
         assert stored is not None
@@ -2078,7 +2053,7 @@ class TestConsumingADeviceCodeInTheStore:
     async def test_a_code_the_store_never_held_cannot_be_consumed(
         self, store: InMemoryDeviceCodeStore
     ) -> None:
-        assert await store.consume_device_code("never-existed") is False
+        assert await store.consume_device_code("never-existed", session_id="") is False
 
     async def test_two_concurrent_claims_answer_true_to_exactly_one(
         self, store: InMemoryDeviceCodeStore
@@ -2095,8 +2070,8 @@ class TestConsumingADeviceCodeInTheStore:
         )
 
         won = await asyncio.gather(
-            store.consume_device_code(code.device_code),
-            store.consume_device_code(code.device_code),
+            store.consume_device_code(code.device_code, session_id=""),
+            store.consume_device_code(code.device_code, session_id=""),
         )
 
         assert sorted(won) == [False, True]

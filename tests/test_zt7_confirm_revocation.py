@@ -63,7 +63,7 @@ from services.confirm.audit import DETAIL_REVOKED, UNRESOLVED_TOOL_NAME
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
-from tests.device_grant_helpers import ISSUANCE_DISABLED_BODY, scan_in_store
+from tests.device_grant_helpers import scan_in_store, session_claims
 from tests.fixtures.append_only_bypass import (
     delete_audit_rows_by_bypassing_the_append_only_triggers,
 )
@@ -695,16 +695,12 @@ async def test_a_revoked_customers_device_code_exchange_mints_nothing(
 ) -> None:
     """Verification step 4, first half: ``/token`` refuses a revoked customer.
 
-    ZT-7's bar is that a revoked identity stops OBTAINING access. Since
-    2026-09-30 ``/token`` issues nothing to anyone (issuance is disabled
-    pending the layer-1 session token), so what this pins is the ORDER: the
-    revocation check still runs before the issuance refusal, so a revoked
-    customer's code is answered ``access_denied`` and not the 503 every other
-    approved code gets. Both directions in one test: before the revocation a
-    code gets the issuance-disabled 503, after it another gets
-    ``access_denied``.
+    ZT-7's bar is that a revoked identity stops OBTAINING access. Both
+    directions in one test: before the revocation a code is issued a
+    session, after it another is answered ``access_denied`` and issued
+    nothing.
 
-    TWO CODES, kept from when a successful exchange spent the code
+    TWO CODES, because a successful exchange spends the code
     (`dev-docs/decisions/0012-device-code-single-use.md`). Both codes are
     paired BEFORE the revocation because they have to be: ``POST /approve``
     refuses a revoked customer too, one step earlier, which is what
@@ -717,8 +713,7 @@ async def test_a_revoked_customers_device_code_exchange_mints_nothing(
     served = await post_form(
         app, "/token", {"grant_type": "device_code", "device_code": served_code}
     )
-    assert served.status_code == 503, served.text
-    assert served.json() == ISSUANCE_DISABLED_BODY
+    assert session_claims(served, app)["sub"] == OWNER
 
     await store_of(app).revoke_customer_client(customer_ref=OWNER, client_id=CLIENT)
 
@@ -842,9 +837,12 @@ async def test_an_unreachable_store_makes_the_token_endpoint_retryable_not_denie
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "temporarily_unavailable"
     assert "access_token" not in response.json()
-    # The outage's own 503, not the issuance-disabled one: the revocation
-    # check still runs before the issuance refusal.
-    assert response.json() != ISSUANCE_DISABLED_BODY
+    # The outage's own 503, with the poll interval as its Retry-After so a
+    # client honouring it is never answered slow_down.
+    assert response.json()["error_description"] == (
+        "authorization state cannot be checked; retry shortly"
+    )
+    assert response.headers["retry-after"] == str(app.state.settings.device_poll_interval_seconds)
 
 
 # ---------------------------------------------------------------------------

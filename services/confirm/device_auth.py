@@ -3,19 +3,18 @@
 Endpoints:
 - ``POST /device_authorization`` — Generate device code + QR pairing data.
 - ``POST /token`` with ``grant_type=device_code`` — The browser's poll.
-  Returns an error until the mobile app approves, and since 2026-09-30 a 503
-  after it too: token issuance is disabled pending the layer-1 session token
-  (see "WHAT ``/token`` RETURNS" below).
+  Returns an error until the mobile app approves, then a layer-1 session:
+  an access token for this deployment's MCP server and a refresh token (see
+  "WHAT ``/token`` RETURNS" below).
 - ``POST /scan`` -- Mobile app scan of the QR (binds the pairing to the first
   customer who presents a current rotation token).
 - ``POST /approve`` — Mobile app approval callback (marks device code as
   approved).
 
 The confirm service is the right home for these because:
-1. It holds the READ key the device grant used to mint the browser's token
-   (a controlled exception to the key-split architecture — see
-   ``ConfirmSettings`` docstring). Nothing on this path signs with it while
-   issuance is disabled; the key stays wired until the session-token change.
+1. It holds the SESSION key, which signs the layer-1 access token and
+   nothing else (``services/confirm/session_token.py``), and publishes its
+   public half at ``/session/jwks.json`` for ``services/api`` to verify.
 2. The approval callback needs to update device code state, which lives in
    the same service as the token endpoint.
 
@@ -45,7 +44,7 @@ holds no credential at all, and they are named in that module's
 WHO CAN BE CUT, AND WHERE (ZT-7). All three endpoints that know a customer
 refuse a revoked one: ``POST /scan`` and ``POST /approve`` on the assertion's
 ``sub``, before the device code is touched, and ``POST /token`` on the
-``customer_ref`` stored on the device code, before the issuance refusal.
+``customer_ref`` stored on the device code, before anything is issued.
 Nothing is keyed on ``DeviceCode.client_id`` -- the browser supplies it
 unauthenticated at ``POST /device_authorization``, so a kill switch enforced
 on it would be theatre. ``services/confirm/revocation.py`` holds the full
@@ -56,23 +55,22 @@ WHAT THIS MODULE NO LONGER DOES. It used to take the customer identity from
 WRITE-signed token from ``/token``. Together those made three unauthenticated
 calls sufficient to obtain ``aud=payments.svc scope=payments:execute`` for any
 customer named in a JSON body. Both are gone: the identity comes from a
-verified assertion, and ``/token`` returns no token at all. A write token is
+verified assertion, and ``/token`` returns no write token. A write token is
 minted inside the approval path in ``services/confirm/callback.py``, where it
 is used and discarded, and is never serialized to an HTTP client.
 
-WHAT ``/token`` RETURNS, since 2026-09-30: for an approved, unexpired code
-whose customer is not revoked, a 503 ``temporarily_unavailable`` ("session
-token issuance is not enabled"), with the code left unspent and one
-``audit_log`` row under ``DETAIL_ISSUANCE_DISABLED``. Until then it returned a
-read token with ``aud=accounts.svc``, ``scope=accounts:read`` and
-``act.sub=svc:postern``, signed with the READ key. That is a layer-2 backend
-token, and handoff §7.1 keeps the two layers apart for this reason: under
-Vault both services sign with transit key ``postern-read``, which
-``services/api`` publishes at its JWKS and Istio trusts, so any client that
-completed a pairing, a phishing client included, held a token the accounts
-backend accepts. The browser should hold a layer-1 session token that only
-this deployment's MCP server accepts. That token is a later change; until it
-lands, this endpoint issues nothing.
+WHAT ``/token`` RETURNS: for an approved, unexpired code whose customer is
+not revoked, a layer-1 access token (``aud`` = the MCP server, 600 seconds,
+signed with the SESSION key) and a ``prt1.`` refresh token, the code spent in
+the same compare-and-set that records the family. Before 30 September 2026 it
+returned a read token with ``aud=accounts.svc``, ``scope=accounts:read`` and
+``act.sub=svc:postern``, signed with the READ key: a layer-2 backend token,
+which handoff §7.1 keeps apart from layer 1 because under Vault both services
+signed with transit key ``postern-read`` and any client that completed a
+pairing held a token the accounts backend accepts. From then until the
+session token landed it answered 503 and issued nothing
+(``DETAIL_ISSUANCE_DISABLED``, historical now). ``dev-docs/device-grant-session-token-spec.md``
+is the contract.
 
 That is also why ``device_auth_routes`` takes no ``write_minter`` any more.
 Nothing on the device grant path signs with the write key, so this module is
@@ -87,11 +85,7 @@ Usage in ``main.py``::
     )
 
     store = build_device_code_store(settings)
-    routes = device_auth_routes(
-        store=store,
-        settings=settings,
-        read_minter=read_minter,
-    )
+    routes = device_auth_routes(store=store, settings=settings)
 """
 
 from __future__ import annotations
@@ -113,7 +107,17 @@ from postern_core.auth.device_codes import (
     ScanClaim,
     create_device_code_store,
 )
-from postern_core.auth.internal_jwt import InternalTokenMinter
+from postern_core.auth.refresh_sessions import (
+    RefreshSession,
+    RefreshSessionStoreBase,
+    RefreshSessionStoreFull,
+    canonical_scope,
+    hash_refresh_token,
+    ms_of,
+    new_refresh_token,
+    new_sid,
+)
+from postern_core.auth.resource_uri import normalize_resource
 from postern_core.auth.revocation import RevocationStoreUnavailable
 from postern_core.identity import CustomerRef
 from postern_core.risk.pairing_network import (
@@ -139,7 +143,6 @@ from services.confirm.audit import (
     DETAIL_ALREADY_SCANNED,
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_INVALID_SUBJECT,
-    DETAIL_ISSUANCE_DISABLED,
     DETAIL_NOT_SCANNED,
     DETAIL_QR_INVALID,
     DETAIL_QR_STALE,
@@ -160,9 +163,14 @@ from services.confirm.auth import unauthenticated_response, verified_claims, ver
 from services.confirm.qr_token import QrVerdict, slot_at, verify_token
 from services.confirm.revocation import (
     customer_revoked,
+    customer_revoked_since,
     log_refusal,
     revoked_response,
     store_unavailable_response,
+)
+from services.confirm.session_token import (
+    ACCESS_TOKEN_LIFETIME_SECONDS,
+    SessionTokenMinter,
 )
 from services.confirm.settings import DEFAULT_DEVICE_SCOPES, ConfirmSettings
 
@@ -184,6 +192,26 @@ logger = logging.getLogger(__name__)
 #: duration. It is no defence against a provider that never yields: that one
 #: blocks the loop before the semaphore matters.
 PAIRING_ENRICHMENT_SLOTS = 8
+
+#: The ``client_id`` a pairing may not declare. ``services/api``'s risk
+#: middleware uses ``-`` for "no client on this token", so a pairing named
+#: ``-`` would share one risk budget and one revocation key with every token
+#: that carries none. Spelled here rather than imported, because
+#: ``.importlinter`` forbids this service from reading ``services.api``.
+RESERVED_CLIENT_ID = "-"
+
+#: RFC 6749 section 5.1: "The authorization server MUST include the HTTP
+#: "Cache-Control" response header field [RFC2616] with a value of "no-store"
+#: in any response containing tokens ... as well as the "Pragma" response
+#: header field [RFC2616] with a value of "no-cache"." On every ``/token``
+#: response, not only the ones that carry a token.
+TOKEN_RESPONSE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+#: How far this process's clock may disagree with Redis's when an approval
+#: (written on this clock) is compared with a customer revocation stamp
+#: (written on Redis's), in milliseconds. It errs toward refusal: a customer
+#: whose approval lands within two seconds after a revocation re-pairs.
+APPROVAL_CLOCK_TOLERANCE_MS = 2_000
 
 # ---------------------------------------------------------------------------
 # Error responses — RFC 8628 §3.3 and §3.4 error codes.
@@ -401,6 +429,8 @@ async def device_authorization(request: Request) -> JSONResponse:
 
     if not client_id:
         return _error(400, "invalid_request", "client_id is required")
+    if client_id == RESERVED_CLIENT_ID:
+        return _error(400, "invalid_request", "client_id '-' is reserved")
 
     # REJECTED, never truncated. Truncating would silently store a different
     # ``client_id`` than the caller sent and a different scope set than the
@@ -528,24 +558,46 @@ def _paced(
 
 
 async def token_endpoint(request: Request) -> JSONResponse:
+    """``POST /token``, every answer carrying ``TOKEN_RESPONSE_HEADERS``.
+
+    A wrapper so no exit can forget the two headers RFC 6749 section 5.1
+    requires: `_token_response` answers, this stamps.
+    """
+    response = await _token_response(request)
+    response.headers.update(TOKEN_RESPONSE_HEADERS)
+    return response
+
+
+def _resource_refusal(form: Any, settings: ConfirmSettings) -> JSONResponse | None:
+    """400 ``invalid_target`` for a ``resource`` this deployment does not serve.
+
+    RFC 8707 section 2. Absent is accepted. Present, it must occur once and,
+    in `postern_core.auth.resource_uri`'s normal form, equal the access
+    token's audience; a fragment, a relative reference and a repeat are all
+    ``invalid_target`` ("The requested resource is invalid, missing, unknown,
+    or malformed"). Request shape only, so no row.
+    """
+    values = form.getlist("resource")
+    if not values:
+        return None
+    presented = values[0] if len(values) == 1 and isinstance(values[0], str) else None
+    normalized = normalize_resource(presented) if presented is not None else None
+    if normalized is None or normalized != settings.session_token_audience:
+        return _error(400, "invalid_target", "the requested resource is not served here")
+    return None
+
+
+async def _token_response(request: Request) -> JSONResponse:
     """Answer a device-code poll, and record every answer that names a customer.
 
-    ISSUANCE IS DISABLED SINCE 2026-09-30, pending the layer-1 session token.
-    An approved, unexpired code for a customer who is not revoked is answered
-    503 ``temporarily_unavailable`` with ``error_description`` "session token
-    issuance is not enabled"; nothing is minted, the code is NOT spent, and
-    the row carries ``DETAIL_ISSUANCE_DISABLED``. Until then this endpoint
-    returned a read token: ``aud=accounts.svc``, ``scope=accounts:read``,
-    ``act.sub=svc:postern``, 60 seconds, signed with the READ key. That is a
-    layer-2 backend token (handoff §7.1). Under Vault both services sign with
-    transit key ``postern-read``, which ``services/api`` publishes at its JWKS
-    and Istio trusts, so any client that completed a pairing, a phishing
-    client included, held a token the accounts backend accepts. The browser
-    should hold a layer-1 token only this deployment's MCP server accepts; it
-    does not exist yet, so nothing is issued. The single-use argument below is
-    kept because it applies unchanged to whatever the session-token change
-    issues here, and ``dev-docs/decisions/0012-device-code-single-use.md``
-    still carries it; no exit spends a code today.
+    AN APPROVED CODE IS WORTH ONE SESSION. An approved, unexpired, unspent
+    code for a customer who is not revoked gets a layer-1 access token and a
+    refresh token (spec section 5 of
+    ``dev-docs/device-grant-session-token-spec.md``), and the code is spent in
+    the same compare-and-set that records which family it created. Before
+    30 September 2026 this endpoint returned a layer-2 read token
+    (``aud=accounts.svc``), and between then and the session token it issued
+    nothing (``DETAIL_ISSUANCE_DISABLED``).
 
     ONE APPROVED CODE IS WORTH ONE TOKEN. Until 2026-09-26 it was worth every
     token a caller cared to ask for until the code expired: this handler minted
@@ -565,61 +617,62 @@ async def token_endpoint(request: Request) -> JSONResponse:
     Request body:
         grant_type: "device_code" (required for this path).
         device_code: The opaque device code from /device_authorization.
+        resource: Optional, RFC 8707; see `_resource_refusal`.
 
     Response while pending (400):
         {"error": "authorization_pending", "error_description": "..."}
 
-    Response after approval (503), since 2026-09-30:
-        {
-            "error": "temporarily_unavailable",
-            "error_description": "session token issuance is not enabled",
-        }
+    Response after approval (200):
+        {"access_token": "...", "token_type": "Bearer", "expires_in": 600,
+         "refresh_token": "prt1.<sid>.<secret>", "scope": "<canonical scopes>"}
 
-    There is no token in that response, and there must never again be one a
-    backend accepts: not a ``write_token`` (audit finding C-01) and not the
-    read token this endpoint returned until 2026-09-30. This endpoint is
-    public and its only credential is the ``device_code``, so anything it
-    returns is reachable by whoever holds that value. The write path mints its
-    own token inside ``services/confirm/callback.py``, per request, and never
-    hands one out.
+    There is no layer-2 token in that response and there must never be one: not
+    a ``write_token`` (audit finding C-01) and not the read token this
+    endpoint returned until 2026-09-30. The access token's audience is this
+    deployment's MCP server and its key signs nothing else, so no domain
+    service accepts it. The write path mints its own token inside
+    ``services/confirm/callback.py``, per request, and never hands one out.
 
     Error codes per RFC 8628 §3.4:
         authorization_pending — not yet approved, keep polling.
         slow_down — client is polling too fast (adds 5s to interval). Since
             2026-09-30 also answered to an approved, unspent code polled
-            within the interval, because such a poll gets a retryable 503.
+            within the interval, because two retryable 503s remain: the
+            revocation store's outage and a full refresh-family store.
         access_denied — user explicitly denied on mobile app, OR the customer
             who approved this code has been revoked (ZT-7). The two are
             deliberately indistinguishable here; see the comment at the check.
         expired_token — device code has passed its TTL.
 
-    And two that are RFC 6749 §5.2's, because RFC 8628 has no code for either:
-        invalid_grant — the code is unknown, or a build before 2026-09-30
-            spent it. One body for both, so the response is not an oracle;
-            ``_unredeemable_response`` above carries why this code and not one
-            of the four.
-        temporarily_unavailable — either the revocation store could not be
-            consulted, or the code is approved and issuance is disabled. Both
-            answer 503 and spend nothing; the two descriptions differ.
+    And three that are RFC 6749 §5.2's or RFC 8707's, because RFC 8628 has
+    no code for them:
+        invalid_grant -- the code is unknown, or spent (by an earlier exchange,
+            or by a concurrent one that won the claim). One body for all
+            three, so the response is not an oracle; ``_unredeemable_response``
+            above carries why this code and not one of the four.
+        temporarily_unavailable -- the revocation store could not be
+            consulted, or the refresh-family store is full. Both answer 503
+            with ``Retry-After`` set to the poll interval and spend nothing.
+        invalid_target -- a ``resource`` this deployment does not serve.
 
     WHAT IS RECORDED, AND HOW LITTLE OF IT. This endpoint wrote no
     ``audit_log`` row until 2026-09-26, which left the device grant's chain
-    with a hole in the middle. It now writes exactly one row on each of FIVE
-    exits -- the issuance-disabled refusal, a ZT-7 refusal, a stored identity
-    that will not parse, a revocation store that could not answer, and a spent
-    code -- plus one for any exception ``_exchange`` raises, and nothing on
-    the other eight: a wrong grant type, a missing ``device_code``, an unknown
-    code, an expired code, ``slow_down`` on a pending code, ``slow_down`` on
-    an approved one, ``authorization_pending``, and an approved code with no
-    customer on it.
+    with a hole in the middle. It now writes exactly one row on each of SIX
+    exits -- the mint, a ZT-7 refusal (now, or since the approval), a stored
+    identity that will not parse, a revocation store that could not answer, a
+    full refresh-family store, and a spent code (a replay, or a lost claim)
+    -- plus one for any exception ``_exchange`` raises, and nothing on the
+    other nine: a wrong grant type, an unserved ``resource``, a missing
+    ``device_code``, an unknown code, an expired code, ``slow_down`` on a
+    pending code, ``slow_down`` on an approved one, ``authorization_pending``,
+    and an approved code with no customer on it.
 
-    RE-COUNTED ON 2026-09-30, twice, from the exits of this function,
-    ``_paced`` and ``_exchange`` together, which is the only way to count
-    them. The count was six recorded and seven unrecorded before the
-    issuance refusal: the mint went, the refusal took its place, and the
-    second spent-code exit (a lost ``consume_device_code`` claim) went with
-    the claim, leaving five and seven. Pacing approved codes then added the
-    eighth unrecorded exit.
+    RE-COUNTED WITH THE LAYER-1 SESSION TOKEN, from the exits of this
+    function, ``_paced``, `_resource_refusal` and ``_exchange`` together,
+    which is the only way to count them. The issuance refusal went and the
+    mint came back; the full family store and the lost claim are new
+    recorded exits (the lost claim under the spent-code detail it shares);
+    the ``resource`` refusal is a new unrecorded one. Six recorded, nine not.
 
     EVERY UNRECORDED EXIT IS ONE THAT RESOLVED NOBODY, and that is the rule
     rather than a list: ``services/confirm/audit.py``'s ``PairingAudit`` owes a
@@ -631,12 +684,13 @@ async def token_endpoint(request: Request) -> JSONResponse:
     answered before any identity exists. That is what keeps this table from
     becoming a log of a browser waiting: at the configured 5-second interval
     and 900-second lifetime a poll loop can run 180 times and write nothing
-    while pending, and at most one ``issuance_disabled`` row per interval once
-    approved. The empty-``customer_ref`` exit is the one that reads the field
-    and finds nobody, and it is logged instead.
+    while pending, and at most one row per interval once approved while a
+    503 is being retried. The empty-``customer_ref`` exit is the one that
+    reads the field and finds nobody, and it is logged instead.
 
-    NOTHING OF A TOKEN WOULD GO ANYWHERE, and the rule stands for the
-    session-token change: not the string, not a segment of it, not a digest.
+    NOTHING OF A TOKEN GOES INTO A ROW: not the string, not a segment of it,
+    not a digest. The row carries the family's ``session_id``, which every
+    access token of the family carries anyway.
     """
     at = datetime.now(UTC)
     started = time.monotonic()
@@ -665,6 +719,12 @@ async def token_endpoint(request: Request) -> JSONResponse:
     store: DeviceCodeStoreBase = request.app.state.device_code_store
     settings: ConfirmSettings = request.app.state.settings
 
+    # AHEAD OF THE LOOKUP: request shape only, so it resolves nobody and
+    # writes no row.
+    unserved = _resource_refusal(form, settings)
+    if unserved is not None:
+        return unserved
+
     code: DeviceCode | None = await store.get_device_code(device_code_value)
     if code is None:
         # NO ROW, AND THE ASYMMETRY WITH ``POST /approve`` IS DELIBERATE. The
@@ -688,12 +748,16 @@ async def token_endpoint(request: Request) -> JSONResponse:
     # ``interval`` parameter. Enforced while authorization is pending, and
     # since 2026-09-30 also on an approved code that is not spent.
     #
-    # WHY APPROVED CODES ARE PACED NOW. They used to be exempt because an
-    # approved poll got its token at once. While issuance is disabled an
-    # approved poll gets a retryable 503 instead, and a client honouring it
-    # would retry at the address-bucket limiter's pace (300 a minute) until
-    # the 900-second TTL, each retry costing an ``audit_log`` INSERT and a
-    # revocation read. Paced, it costs one of each per interval.
+    # WHY APPROVED CODES ARE PACED. The first poll after approval is answered
+    # at once (its own map, never paced by the last pending poll) and on
+    # success spends the code. What the pacing governs is an approved code
+    # that gets a RETRYABLE answer -- the revocation store's outage 503 and a
+    # full refresh-family store's 503 -- which a client honouring it would
+    # otherwise retry at the address-bucket limiter's pace (300 a minute),
+    # each retry costing an ``audit_log`` INSERT and a store read. Paced, it
+    # costs one of each per interval. It also cuts a burst of concurrent polls
+    # on one approved code within one process to one, before a family is
+    # drawn, so orphaned families come only from polls on different replicas.
     #
     # ANSWERED HERE, before ``customer_ref`` is read, so a paced poll writes
     # no row, exactly as the pending ``slow_down`` never has. A SPENT code is
@@ -711,8 +775,7 @@ async def token_endpoint(request: Request) -> JSONResponse:
         if slowed is not None:
             return slowed
 
-    # Approved. Nothing is minted below: issuance is disabled pending the
-    # layer-1 session token (`_exchange`'s last return says why).
+    # Approved.
     #
     # `customer_ref` is written by `approve_callback` from a VERIFIED
     # assertion `sub` and by nothing else. Reading `client_id` here instead
@@ -790,13 +853,15 @@ async def token_endpoint(request: Request) -> JSONResponse:
         raise
 
     # THE ROW IS COMMITTED BEFORE THE RESPONSE IS RETURNED, fail-closed per
-    # decision 0006: a raise here drops `response` and the caller gets a 500.
-    # Every exit refuses since 2026-09-30, so there is no mint for this to
-    # guard; the order is kept because the session-token change will mint
-    # here again, and `PairingAudit`'s "FAIL CLOSED AT A MINT" section carries
-    # why that order is the right one. Do not move this below the `return`.
+    # decision 0006: a raise here drops `response` and the caller gets a 500,
+    # so a session no row names never leaves this process. `PairingAudit`'s
+    # "FAIL CLOSED AT A MINT" section carries why that order is the right one.
+    # Do not move this below the `return`.
     try:
-        await audit.refused(detail)
+        if detail is None:
+            await audit.minted()
+        else:
+            await audit.refused(detail)
     except Exception as audit_exc:
         logger.error(
             "audit write failed for a device-grant token exchange that answered %d; "
@@ -813,28 +878,26 @@ async def _exchange(
     audit: PairingAudit,
     *,
     code: DeviceCode,
-) -> tuple[JSONResponse, str]:
-    """The spent check, the ZT-7 check and the refusal, returning ``(response, detail)``.
+) -> tuple[JSONResponse, str | None]:
+    """The checks and the mint, returning ``(response, detail)``.
 
-    ``detail`` is always one of ``services/confirm/audit.py``'s ``DETAIL_*``
-    literals or an exception's type name, because since 2026-09-30 no exit
-    here mints: an approved code that passes every check is answered with
-    ``DETAIL_ISSUANCE_DISABLED`` (the comment at that return carries why).
-    Split out from ``token_endpoint`` so the row is written in exactly one
-    place, which is the same division ``approve_callback`` and
-    ``services/confirm/callback.py`` both make.
+    ``detail`` is ``None`` for the one exit that issues a session, and
+    otherwise one of ``services/confirm/audit.py``'s ``DETAIL_*`` literals or
+    an exception's type name. Split out from ``token_endpoint`` so the row is
+    written in exactly one place, which is the same division
+    ``approve_callback`` and ``services/confirm/callback.py`` both make.
 
     THE SPENT CHECK COMES FIRST because a code that can never be redeemed
     again must not be answered with a retryable code. Put it after the ZT-7
     check and a replay arriving while the revocation store is down is answered
     503 ``temporarily_unavailable``, which tells the browser to come back for a
-    grant no retry will ever redeem. No build from 2026-09-30 on spends a
-    code, so this check answers only codes an earlier build spent while they
-    live in a shared store.
+    grant no retry will ever redeem.
 
-    THE ZT-7 CHECK COMES BEFORE THE ISSUANCE REFUSAL, so a revoked customer is
-    still answered ``access_denied`` and recorded under ``DETAIL_REVOKED``, as
-    they were when this endpoint minted.
+    THEN ZT-7, THEN THE MINT, in spec section 5's order: a customer revoked
+    now, or revoked at or after the approval (step 0, which a restore does not
+    undo); then the family is drawn and created BEFORE the code is spent, so a
+    recall at ``POST /scan`` that sees the code exchanged always finds the
+    family and its first ``jti``; then the claim; then the signature.
     """
     if code.exchanged_at is not None:
         return _unredeemable_response(), DETAIL_DEVICE_CODE_SPENT
@@ -892,59 +955,105 @@ async def _exchange(
     # revocation take effect on the write path". The outage records the
     # exception's own type instead, which is how an operator tells an outage
     # from a refusal -- the caller cannot, and must not.
+    settings: ConfirmSettings = request.app.state.settings
+    retry_after = settings.device_poll_interval_seconds
     try:
         revoked = await customer_revoked(request, customer.value)
+        # STEP 0: REVOKED SINCE THE APPROVAL. The approval predates a
+        # revocation, so a later restore must not make it redeemable. The one
+        # comparison across two clocks -- the approval is this process's, the
+        # stamp Redis's -- so it carries `APPROVAL_CLOCK_TOLERANCE_MS` and
+        # errs toward refusal.
+        stamp = await customer_revoked_since(request, customer.value)
     except RevocationStoreUnavailable as exc:
         logger.warning("device grant: revocation store unavailable, refusing to mint")
-        return store_unavailable_response(), type(exc).__name__
-    if revoked:
+        return store_unavailable_response(retry_after), type(exc).__name__
+    approved_ms = ms_of(code.approved_at) if code.approved_at is not None else 0
+    if revoked or (stamp is not None and stamp >= approved_ms - APPROVAL_CLOCK_TOLERANCE_MS):
         log_refusal("a device-grant token exchange")
         return _error(400, "access_denied", "authorization was refused"), DETAIL_REVOKED
 
-    # ISSUANCE IS DISABLED, AND NOTHING IS SPENT OR SIGNED. Until 2026-09-30
-    # this point claimed the code with ``consume_device_code`` and minted a
-    # token with ``aud=accounts.svc``, ``scope=accounts:read`` and
-    # ``act.sub=svc:postern``, signed with the READ key, and returned it to
-    # the browser. That is a layer-2 backend token (handoff §7.1): under Vault
-    # both services sign with the same transit key, ``services/api`` publishes
-    # it at its JWKS and Istio trusts that set, so any client that completed a
-    # pairing, a phishing client included, held a credential the accounts
-    # backend accepts. What the browser should get is a layer-1 session token
-    # only this deployment's own MCP server accepts, and that token does not
-    # exist yet, so this endpoint issues nothing until it does.
-    #
-    # THE CODE IS NOT CLAIMED, because nothing is issued for it: spending it
-    # would make the eventual session-token change unable to serve a pairing
-    # completed today, and would turn this refusal into the spent-code one
-    # on the next poll. The spent check above still answers any code a build
-    # before this one spent.
-    #
-    # AFTER THE ZT-7 CHECK, deliberately, so a revoked customer's code is
-    # still answered ``access_denied`` and a revocation-store outage still
-    # answers its own 503: both are conclusions about the customer, and the
-    # browser must not be able to tell from this refusal which one applies.
-    #
-    # 503 ``temporarily_unavailable`` rather than a terminal code, for the
-    # reason `services/confirm/revocation.py`'s ``store_unavailable_response``
-    # gives: the browser did nothing wrong, and ``access_denied`` would tell it
-    # the customer refused a pairing they in fact approved. The read minter is
-    # still wired on ``app.state``; removing it belongs to the session-token
-    # change.
-    #
-    # ``Retry-After`` carries the poll interval, which is also what
-    # ``token_endpoint`` now paces approved codes at: a client that honours
-    # the header is never answered ``slow_down``.
-    settings: ConfirmSettings = request.app.state.settings
+    # STEP 1: DRAW the family id, the first refresh token and the access
+    # token's claims. The `jti` is drawn here, before anything is written, so
+    # the family can name it from its first moment.
+    minter: SessionTokenMinter = request.app.state.session_minter
+    sessions: RefreshSessionStoreBase = request.app.state.refresh_session_store
+    sid = new_sid()
+    refresh_token = new_refresh_token(sid)
+    scope = canonical_scope(code.scopes)
+    claims = minter.prepare(customer=customer, client_id=code.client_id, scope=scope, sid=sid)
+    audit.names(session_id=sid)
+
+    # STEP 2: CREATE THE FAMILY BEFORE THE CODE IS SPENT. A full store leaves
+    # the code redeemable and answers a retryable 503, the argument this
+    # docstring makes for ZT-7 before the claim.
+    now = datetime.now(UTC)
+    family = RefreshSession(
+        sid=sid,
+        customer_ref=customer.value,
+        client_id=code.client_id,
+        scopes=scope,
+        created_at=now,
+        expires_at=now,
+        generation=0,
+        current_hash=hash_refresh_token(refresh_token),
+        access_tokens=((claims.jti, datetime.fromtimestamp(claims.exp, UTC)),),
+        device_code_handle=device_code_handle(code.device_code),
+    )
+    try:
+        await sessions.create(family)
+    except RefreshSessionStoreFull as exc:
+        logger.warning("device grant: %s; refusing to mint", exc)
+        return _session_store_full_response(retry_after), type(exc).__name__
+
+    # STEP 3: SPEND THE CODE, recording which family it created. A lost claim
+    # means a concurrent exchange won: this family is an orphan nobody holds a
+    # token for, so it is discarded, and a failure to discard is tolerated --
+    # the orphan holds a hash nobody has and expires within the hour.
+    store: DeviceCodeStoreBase = request.app.state.device_code_store
+    if not await store.consume_device_code(code.device_code, session_id=sid):
+        try:
+            await sessions.discard(sid)
+        except Exception as exc:  # noqa: BLE001 -- an orphan is harmless, the claim is not
+            logger.warning(
+                "device grant: could not discard orphaned session family %s after a lost claim: %s",
+                sid,
+                type(exc).__name__,
+            )
+        return _unredeemable_response(), DETAIL_DEVICE_CODE_SPENT
+
+    # STEP 4: SIGN. A raise leaves the code spent and a family holding a
+    # never-issued `jti`; harmless, and the customer re-pairs.
+    access_token = minter.sign(claims)
     return (
         JSONResponse(
-            status_code=503,
+            status_code=200,
             content={
-                "error": "temporarily_unavailable",
-                "error_description": "session token issuance is not enabled",
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": ACCESS_TOKEN_LIFETIME_SECONDS,
+                "refresh_token": refresh_token,
+                "scope": scope,
             },
-            headers={"Retry-After": str(settings.device_poll_interval_seconds)},
         ),
-        DETAIL_ISSUANCE_DISABLED,
+        None,
+    )
+
+
+def _session_store_full_response(retry_after: int) -> JSONResponse:
+    """The 503 ``POST /token`` answers when the refresh-family store is full.
+
+    The shape of `_store_full_response`, with ``Retry-After`` set to the poll
+    interval rather than the device-code lifetime: the code is live, paced,
+    and redeemable the moment a family expires.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "temporarily_unavailable",
+            "error_description": "the service cannot open a new session right now; retry shortly",
+        },
+        headers={"Retry-After": str(retry_after)},
     )
 
 
@@ -954,8 +1063,8 @@ async def _exchange(
 # Called by the operator's banking app after the user has scanned the QR
 # (``POST /scan``), compared the pairing codes and completed identity
 # verification. It marks the device code approved so the browser's poll at
-# ``POST /token`` stops answering ``authorization_pending`` (it answers the
-# issuance-disabled 503 instead, until the session-token change).
+# ``POST /token`` stops answering ``authorization_pending`` and is issued a
+# session instead.
 #
 # The app sends ``user_code`` and nothing else that names the pairing.
 # ``device_code`` is refused if present: it is the only credential
@@ -1183,8 +1292,8 @@ async def approve_callback(request: Request) -> JSONResponse:
         # already moved and this process cannot unmove it. A pairing is in
         # this deployment's own store, so leaving it standing behind a 500
         # would be fail-closed in the response and fail-open in substance:
-        # the browser polls `/token` against an approval no row names (and,
-        # once the session-token change lands, is handed a token for it).
+        # the browser polls `/token` against an approval no row names and is
+        # handed a session for it.
         # `PairingAudit` carries the full argument and what the availability
         # cost is.
         if outcome.approved_device_code is not None:
@@ -2031,16 +2140,18 @@ async def _enriched_matches(
 def device_auth_routes(
     store: DeviceCodeStoreBase,
     settings: ConfirmSettings,
-    read_minter: InternalTokenMinter,
 ) -> list[Route]:
     """Build the device authorization route list.
 
     Args:
         store: Device code storage backend.
         settings: Service settings (TTL, URIs, poll interval).
-        read_minter: Minter for read tokens. Accepted and not called since
-            2026-09-30, while ``/token`` issuance is disabled; its removal
-            belongs to the layer-1 session-token change.
+
+    NO MINTER AND NO FAMILY STORE. The handlers read the session minter and
+    the refresh-family store from ``app.state``, where ``create_confirm_app``
+    puts them, as they read the device code store; a parameter nothing reads
+    would only look like wiring. The read minter this took until the layer-1
+    session token went the same way.
 
     Returns:
         Starlette Route objects to mount on the confirm service app.
