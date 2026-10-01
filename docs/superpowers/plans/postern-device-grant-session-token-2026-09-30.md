@@ -2792,19 +2792,19 @@ def create_refresh_session_store(
     return InMemoryRefreshSessionStore(max_sessions=max_sessions)
 ```
 
-> **Amended 1 October 2026, after review of the Task 3 commit.** The verdict above now proves possession first: a hash the family never issued is `UNKNOWN` even on a revoked family, where it used to be `REVOKED` with the family's live jtis. Task 7's handler is unaffected, because it checks possession itself (spec section 6 step 3) before it calls `rotate`. The committed module also differs from this block in three ways the block does not repeat: `current_hash` and `retained_hashes` are `field(repr=False)`, the module docstring records the accepted Redis residuals (see Concerns), and the test file adds a possession test, a repr test, two WATCH-contention tests, a forced-interleaving counter on the concurrency test, and a TTL test that rotates with the family's own token. Step 4 then reports 57 passed, not 52.
+> **Amended 1 October 2026, after review of the Task 3 commit.** The verdict above now proves possession first: a hash the family never issued is `UNKNOWN` even on a revoked family, where it used to be `REVOKED` with the family's live jtis. Task 7's handler is unaffected, because it checks possession itself (spec section 6 step 3) before it calls `rotate`. The committed module also differs from this block in three ways the block does not repeat: `current_hash` and `retained_hashes` are `field(repr=False)`, the module docstring records the accepted Redis residuals (see Concerns), and the test file adds a possession test, a repr test, two WATCH-contention tests for `rotate` and two for `revoke` (one of them pinning that a revoke losing its WATCH to a rotation keeps the rotation's new jti), a forced-interleaving counter on the concurrency test, and a TTL test that rotates with the family's own token. Steps 4 and 5 carry the amended counts.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_refresh_sessions.py -q`
 
-Expected: 52 passed
+Expected: 59 passed (52 as first written; the 1 October amendment adds 7)
 
 - [ ] **Step 5: Format, then run the gate**
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3628 passed at validation).
+Expected: exit 0 (3628 passed at validation, before the 1 October amendment's 7 tests; the validation table below records the same pre-amendment measurement).
 
 - [ ] **Step 6: Commit**
 

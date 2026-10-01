@@ -101,15 +101,19 @@ async def _rotate(
 
 
 def _count_decisions(
-    monkeypatch: pytest.MonkeyPatch, before: Callable[[], None] | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    before: Callable[[], None] | None = None,
+    *,
+    target: str = "_decide",
 ) -> Callable[[], int]:
-    """Wrap the shared verdict so a test can count how often a store decided.
+    """Wrap a pure step so a test can count how often a store decided.
 
+    ``target`` is ``_decide`` for ``rotate`` and ``_revoked`` for ``revoke``.
     ``before`` runs on each call ahead of the real decision; the contention
     tests use it to move the WATCHed key under the transaction.
     """
     calls = 0
-    original = refresh_sessions_module._decide
+    original = getattr(refresh_sessions_module, target)
 
     def counted(*args: Any, **kwargs: Any) -> Any:
         nonlocal calls
@@ -118,7 +122,7 @@ def _count_decisions(
             before()
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(refresh_sessions_module, "_decide", counted)
+    monkeypatch.setattr(refresh_sessions_module, target, counted)
     return lambda: calls
 
 
@@ -190,6 +194,37 @@ def _interfere(
         other.set(key, other.get(key), keepttl=True)
 
     return _count_decisions(monkeypatch, before=rewrite)
+
+
+def _interfere_with_revoke(
+    monkeypatch: pytest.MonkeyPatch,
+    other: Any,
+    store: RedisRefreshSessionStore,
+    sid: str,
+    *,
+    times: int | None,
+    change: Callable[[RefreshSession], RefreshSession] | None = None,
+) -> Callable[[], int]:
+    """`_interfere` for ``revoke``: ``other`` writes inside each ``_revoked``.
+
+    With ``change`` the write is that record, the shape of a rotation landing
+    between revoke's read and its write; without it the stored value is
+    written back unchanged. ``times=None`` interferes on every attempt.
+    """
+    key = store._key(sid)
+    done = 0
+
+    def rewrite() -> None:
+        nonlocal done
+        if times is not None and done >= times:
+            return
+        done += 1
+        raw = other.get(key)
+        if change is not None:
+            raw = change(RefreshSession.from_json(raw)).to_json()
+        other.set(key, raw, keepttl=True)
+
+    return _count_decisions(monkeypatch, before=rewrite, target="_revoked")
 
 
 class TestTheToken:
@@ -495,6 +530,53 @@ class TestRedisSpecifics:
             with pytest.raises(RefreshSessionStoreContended):
                 await _rotate(store, session.sid, token)
             assert decisions() == 3
+            assert await store.get(session.sid) == before
+        finally:
+            await store.close()
+
+    async def test_a_revoke_that_loses_its_watch_to_a_rotation_keeps_the_new_jti(
+        self, redis_url: str, other_client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A rotation lands between revoke's read and its write. Without the
+        # WATCH, revoke would write the record it read and drop "jti-rotated",
+        # and the recall's jti list would miss a live access token.
+        store = RedisRefreshSessionStore(url=redis_url, key_prefix=f"rs{uuid4().hex[:12]}:")
+        session, _ = _family()
+
+        def rotation(record: RefreshSession) -> RefreshSession:
+            return refresh_sessions_module._rotated(
+                record, "e" * 64, "jti-rotated", _in(600), datetime.now(UTC)
+            )
+
+        try:
+            await store.create(session)
+            calls = _interfere_with_revoke(
+                monkeypatch, other_client, store, session.sid, times=1, change=rotation
+            )
+            jtis = await store.revoke(session.sid, reason="recall")
+            assert jtis is not None
+            assert set(jtis) == {"jti-0", "jti-rotated"}
+            stored = await store.get(session.sid)
+            assert stored is not None
+            assert stored.revoked_reason == "recall"
+            assert [jti for jti, _ in stored.access_tokens] == ["jti-0", "jti-rotated"]
+            assert calls() == 2
+        finally:
+            await store.close()
+
+    async def test_a_revoke_exhausting_its_watch_retries_raises_and_writes_nothing(
+        self, redis_url: str, other_client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = RedisRefreshSessionStore(url=redis_url, key_prefix=f"rs{uuid4().hex[:12]}:")
+        session, _ = _family()
+        try:
+            before = await store.create(session)
+            calls = _interfere_with_revoke(
+                monkeypatch, other_client, store, session.sid, times=None
+            )
+            with pytest.raises(RefreshSessionStoreContended):
+                await store.revoke(session.sid, reason="recall")
+            assert calls() == 3
             assert await store.get(session.sid) == before
         finally:
             await store.close()
