@@ -5,9 +5,16 @@
 # and `vault-init` services below are what changed.
 #
 # `POSTERN_JWKS_URI`/`POSTERN_TOKEN_ISSUER` on `api` point at `confirm`'s
-# `/session/jwks.json` and its session issuer since the layer-1 session token:
-# the whole device grant, refresh and recall run end to end in this stack, and
-# the customer token `api` accepts is the one `POST /token` issues. Until then
+# `/session/jwks.json` and its session issuer since the layer-1 session token.
+# What this stack was measured to show on 2 October 2026: the Vault key split
+# (api's token signs only `postern-read`, confirm's only `postern-write` and
+# `postern-session`), both of confirm's key sets, `api` accepting a session
+# token signed by confirm's session key and refusing one from `backend-stub`,
+# and one Redis both services write to. It does NOT complete a pairing:
+# `/scan` and `/approve` need a banking-app assertion with audience
+# `postern-confirm` and an enrolled device, and this stack has neither (the
+# stub's `/mint-token` stamps its own `POSTERN_AUDIENCE`, `postern`, and
+# `stub/device-keys.json` enrols nobody). Until then
 # they pointed at `backend-stub`'s disposable local IdP (`stub/backend.py`'s
 # `/.well-known/jwks.json` and `/mint-token` routes), which still exists but
 # whose tokens name another issuer and another key, so `api` refuses them.
@@ -31,7 +38,7 @@
 #    -- and that returns `None` on every request when no auth provider is
 #    configured at all, so every call fails closed with "request carries no
 #    validated access token" (proven manually: see
-#    docs/decisions/0004-base-images.md). Proving a real masked `tools/call`
+#    dev-docs/decisions/0004-base-images.md). Proving a real masked `tools/call`
 #    response therefore needs genuine, if throwaway, customer JWT auth, not
 #    the empty-string shape the plan assumed would still be "no auth".
 services:
@@ -53,11 +60,20 @@ services:
   # without POSTERN_REDIS_URL unless POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS is
   # set, and this stack does not set it, so a recall at `/scan` reaches `api`.
   # The same image `tests/conftest.py`'s `redis_url` fixture runs.
+  #
+  # DEV ONLY: no password, no TLS, reachable by every container on this
+  # network. A deployment owes `rediss://` (TLS), AUTH with a per-service ACL
+  # user, and no public exposure, since this store holds live device codes and
+  # refresh-token families. Persistence is off (`--save ""`, no AOF) so those
+  # are never snapshotted to the container's anonymous `/data` volume.
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
+      timeout: 3s
+      retries: 15
 
   # OPERATOR CHECKLIST ITEM 11, applied here rather than described. Until
   # 29 September 2026 every container in this file connected as `postern`, the
@@ -146,7 +162,8 @@ services:
       timeout: 3s
       retries: 15
 
-  # The five objects an operator creates, executed. This is
+  # The objects an operator creates (transit, three keys, two policies, two
+  # tokens), executed. This is
   # `tests/test_vault_live.py`'s `vault` fixture as a shell script, and the two
   # must stay in step: if they disagree, one of them is wrong about what a
   # deployment needs.
@@ -274,6 +291,8 @@ services:
       # POSTERN_SESSION_TOKEN_ISSUER and the audience is the same resource URI
       # confirm stamps as `aud`, so neither container needs
       # POSTERN_ALLOW_NON_URI_AUDIENCE. The fetch is lazy, at the first token.
+      # Plain HTTP is dev-only: a deployment fetches this over TLS, because a
+      # MITM on this fetch can plant a key and forge any customer's token.
       POSTERN_JWKS_URI: http://confirm:8080/session/jwks.json
       POSTERN_TOKEN_ISSUER: "https://auth.postern.internal"
       POSTERN_AUDIENCE: "https://mcp.postern.internal/mcp"
@@ -329,17 +348,20 @@ services:
     # Without these three lines this container crash-loops, which is the
     # intended behaviour of that guard and the reason they are here.
     #
-    # The audience is `postern-confirm` and NOT `postern`, which is what the
-    # `api` service above uses. That is the one value worth getting right: if
-    # both services took the same audience from the same issuer, a customer
+    # The app-assertion audience is `postern-confirm`: a different issuer, key
+    # and audience from the session token `api` verifies (issuer
+    # `https://auth.postern.internal`, audience
+    # `https://mcp.postern.internal/mcp`, key `postern-session`). That is the
+    # one value worth getting right: if both services took the same audience
+    # from the same issuer, a customer
     # token good enough to list a balance would also be good enough to approve
     # a payment, and the read/write split would hold at the signing layer
     # while being void at the identity layer. Nothing in either process can
     # detect that -- they are separate deployments with separate environments
     # -- so the split lives here and in the operator's Terraform.
     #
-    # The JWKS points at `backend-stub` only because it is the one thing in
-    # this stack that publishes a key set. There is still no `depends_on`: the
+    # The JWKS points at `backend-stub` because the stub stands in for the
+    # banking app's assertion issuer. There is still no `depends_on`: the
     # fetch is lazy, inside `load_access_token`, so a `confirm` that starts
     # before the stub is up simply refuses tokens until it is.
     #
@@ -353,8 +375,8 @@ services:
     # The file it points at enrols NOBODY, so this stack starts, warns loudly,
     # and refuses every approval with `device_not_enrolled`. That is the whole
     # local-development path: explicit, greppable, and not a mode that
-    # verifies less. This service has no database wired here anyway, so it
-    # could not approve a challenge if it wanted to.
+    # verifies less. The database is wired (POSTERN_DATABASE_URL below), but
+    # with nobody enrolled no approval can pass the signature check.
     #
     # BIND-MOUNTED RATHER THAN BAKED IN, and that is not a preference:
     # `.dockerignore` excludes `stub/` from the build context of both images,

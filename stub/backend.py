@@ -290,10 +290,12 @@ async def cards(request: Request) -> JSONResponse:
 # `fastmcp.server.dependencies.get_access_token()`, which returns `None` on
 # every request when no auth provider is configured at all (there is no
 # validated principal to attach to `request.scope["user"]` for it to read).
-# `docker-compose.yml`'s `api` service therefore points `POSTERN_JWKS_URI`
-# at this file's own `/.well-known/jwks.json`, so `services/api/server.py`'s
-# `JWTVerifier` has something real (if throwaway) to check a bearer token
-# against, and a token minted by `/mint-token` below verifies against it.
+# `docker-compose.yml`'s `api` service pointed `POSTERN_JWKS_URI` at this
+# file's own `/.well-known/jwks.json` until 2 October 2026. It now points at
+# `confirm`'s `/session/jwks.json`, so `api` refuses a token minted by
+# `/mint-token` below (another issuer, audience and key). What still reads
+# this key set in that stack is `confirm`, as its app-assertion issuer
+# (`POSTERN_APP_ASSERTION_JWKS_URI`), standing in for the banking app.
 #
 # Neither route carries the subject check the four domain routes above now
 # carry, and that is not an omission: both belong to hop 1. A JWKS is a
@@ -322,9 +324,11 @@ async def mint_token(request: Request) -> PlainTextResponse:
     """Dev-only: mint a bearer token this same process's JWKS can verify.
 
     `POSTERN_TOKEN_ISSUER`/`POSTERN_AUDIENCE` are read from this service's
-    own environment (`docker-compose.yml` sets the same two values on both
-    `backend-stub` and `api`) so the minted token and the `api` service's
-    `JWTVerifier` always agree without hardcoding the same string twice.
+    own environment. `docker-compose.yml` sets them on `backend-stub` only,
+    to `https://postern-local-dev.invalid` and `postern`; `api` verifies
+    `confirm`'s session tokens instead and refuses this token, and
+    `confirm`'s app-assertion audience is `postern-confirm`, so in that
+    stack neither service accepts what this route mints.
     `sub` defaults to a `CustomerRef`-shaped value (`postern_core.identity`)
     already present in `ACCOUNTS` above.
     """

@@ -237,8 +237,9 @@ class TestTheWireContract:
 class TestTheKeyNeverLeavesVault:
     """The property the whole change is bought for, asserted against Vault."""
 
+    @pytest.mark.parametrize("key_name", [READ_KEY, WRITE_KEY, SESSION_KEY])
     def test_vault_refuses_to_export_the_private_key_to_its_own_root_token(
-        self, vault: LiveVault
+        self, vault: LiveVault, key_name: str
     ) -> None:
         """NOT 403 from a policy, which an operator could widen. 400, because
         a transit key created without ``exportable`` has no export to permit
@@ -251,16 +252,17 @@ class TestTheKeyNeverLeavesVault:
         that returns it.
         """
         with vault.client(vault.root_token) as client:
-            response = client.get(f"/v1/transit/export/signing-key/{READ_KEY}")
+            response = client.get(f"/v1/transit/export/signing-key/{key_name}")
         assert response.status_code == 400
         assert "not exportable" in response.text
 
-    def test_the_key_is_not_marked_exportable(self, vault: LiveVault) -> None:
+    @pytest.mark.parametrize("key_name", [READ_KEY, WRITE_KEY, SESSION_KEY])
+    def test_the_key_is_not_marked_exportable(self, vault: LiveVault, key_name: str) -> None:
         """The state behind the refusal above, so a reader can tell the two
         apart: a key created ``exportable=true`` would answer that export 200
         and this test is what would say so."""
         with vault.client(vault.root_token) as client:
-            data = _raise_for(client.get(f"/v1/transit/keys/{READ_KEY}")).json()["data"]
+            data = _raise_for(client.get(f"/v1/transit/keys/{key_name}")).json()["data"]
         assert data["exportable"] is False
         assert data["type"] == "rsa-2048"
 
@@ -357,30 +359,36 @@ class TestTheConfirmServiceSignsSessionsAndNothingOnTheReadKey:
             vault_session_key_name=SESSION_KEY,
         )
         minter, source = build_session_minter(settings)
-        claims = minter.prepare(customer=CUST, client_id="c", scope="accounts:read", sid="s")
-        token = minter.sign(claims)
-        decoded = jwt.decode(
-            token, KeySet.import_key_set(source.public_jwks()), algorithms=["RS256"]
-        )
-        assert decoded.claims["jti"] == claims.jti
-        assert decoded.header["kid"].startswith("session-1.v")
-        source.close()
+        try:
+            claims = minter.prepare(customer=CUST, client_id="c", scope="accounts:read", sid="s")
+            token = minter.sign(claims)
+            decoded = jwt.decode(
+                token, KeySet.import_key_set(source.public_jwks()), algorithms=["RS256"]
+            )
+            assert decoded.claims["jti"] == claims.jti
+            assert decoded.header["kid"].startswith("session-1.v")
+        finally:
+            source.close()
 
     def test_the_confirm_token_cannot_sign_with_the_read_key(self, vault: LiveVault) -> None:
         impostor = VaultTransitKeySource(
             address=vault.address, key_name=READ_KEY, kid="read-1", token=vault.write_token
         )
-        with pytest.raises(VaultTransitError, match="403"):
-            impostor.sign({"sub": CUST.value, "aud": "accounts.svc"})
-        impostor.close()
+        try:
+            with pytest.raises(VaultTransitError, match="403"):
+                impostor.sign({"sub": CUST.value, "aud": "accounts.svc"})
+        finally:
+            impostor.close()
 
     def test_the_api_token_cannot_sign_with_the_session_key(self, vault: LiveVault) -> None:
         impostor = VaultTransitKeySource(
             address=vault.address, key_name=SESSION_KEY, kid="session-1", token=vault.read_token
         )
-        with pytest.raises(VaultTransitError, match="403"):
-            impostor.sign({"sub": CUST.value, "aud": "https://mcp.postern.test/mcp"})
-        impostor.close()
+        try:
+            with pytest.raises(VaultTransitError, match="403"):
+                impostor.sign({"sub": CUST.value, "aud": "https://mcp.postern.test/mcp"})
+        finally:
+            impostor.close()
 
     async def test_session_jwks_publishes_the_versioned_session_kids(
         self, vault: LiveVault
@@ -398,16 +406,18 @@ class TestTheConfirmServiceSignsSessionsAndNothingOnTheReadKey:
             allow_process_local_sessions=True,
         )
         app = create_confirm_app(settings, device_key_store=no_enrolled_devices())
-        async with httpx2.AsyncClient(
-            transport=httpx2.ASGITransport(app=app), base_url="http://confirm.test"
-        ) as client:
-            session = (await client.get("/session/jwks.json")).json()
-            write = (await client.get("/.well-known/jwks.json")).json()
-        kids = [entry["kid"] for entry in session["keys"]]
-        assert kids and all(kid.startswith("session-1.v") for kid in kids)
-        assert _moduli(session).isdisjoint(_moduli(write))
-        app.state.postern_session_key_source.close()
-        app.state.postern_write_key_source.close()
+        try:
+            async with httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=app), base_url="http://confirm.test"
+            ) as client:
+                session = (await client.get("/session/jwks.json")).json()
+                write = (await client.get("/.well-known/jwks.json")).json()
+            kids = [entry["kid"] for entry in session["keys"]]
+            assert kids and all(kid.startswith("session-1.v") for kid in kids)
+            assert _moduli(session).isdisjoint(_moduli(write))
+        finally:
+            app.state.postern_session_key_source.close()
+            app.state.postern_write_key_source.close()
 
 
 class TestRotation:
