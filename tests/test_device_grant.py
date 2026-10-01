@@ -57,6 +57,7 @@ from postern_core.auth.device_codes import (
     _generate_user_code,
 )
 from postern_core.auth.device_keys import no_enrolled_devices
+from postern_core.auth.refresh_sessions import InMemoryRefreshSessionStore
 from postern_core.auth.revocation import RevocationStoreUnavailable
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -1542,7 +1543,19 @@ class TestAuditFindingC01SubjectValueInBodyIsIgnored:
                 data={"grant_type": "device_code", "device_code": device["device_code"]},
             )
 
-        assert session_claims(token_resp, app)["sub"] == "cust_attacker"
+        claims = session_claims(token_resp, app)
+        assert claims["sub"] == "cust_attacker"
+        # The victim's name reaches the response in exactly one place: the
+        # `client_id` claim, because the browser named itself `cust_victim`
+        # at /device_authorization, and that claim is marked unverified.
+        # Nowhere in the raw body, in no other claim, and not in the refresh
+        # token or the scope.
+        assert "cust_victim" not in token_resp.text
+        assert [k for k, v in claims.items() if "cust_victim" in json.dumps(v)] == ["client_id"]
+        assert claims["client_id"] == "cust_victim"
+        assert claims["client_id_verified"] is False
+        body = token_resp.json()
+        assert all("cust_victim" not in str(body[k]) for k in body if k != "access_token")
 
         stored = await app.state.device_code_store.get_device_code(device["device_code"])
         assert stored is not None
@@ -2012,6 +2025,12 @@ class TestASpentDeviceCodeStaysSpent:
         session_claims(by_status[200], app)
         assert by_status[400].json()["error"] in {"slow_down", "invalid_grant"}
         assert jwt_shaped_strings(by_status[400].text) == []
+        stored = await app.state.device_code_store.get_device_code(device["device_code"])
+        assert stored is not None
+        assert stored.exchanged_at is not None
+        sessions = app.state.refresh_session_store
+        assert isinstance(sessions, InMemoryRefreshSessionStore)
+        assert list(sessions._sessions) == [stored.session_id], "not exactly one family"
 
 
 class TestConsumingADeviceCodeInTheStore:

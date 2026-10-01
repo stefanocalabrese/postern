@@ -55,6 +55,7 @@ from services.confirm.settings import ConfirmSettings
 from tests.device_grant_helpers import (
     assert_no_body_carries_a_token_the_api_trusts,
     session_claims,
+    signed_by_any_key_in,
     verifies_against,
 )
 from tests.fixtures.append_only_bypass import (
@@ -201,6 +202,7 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
             "/token", data={"grant_type": "device_code", "device_code": grant["device_code"]}
         )
         session_jwks = (await browser.get("/session/jwks.json")).json()
+        write_jwks = (await browser.get("/.well-known/jwks.json")).json()
 
     # THE CONTROL THAT MAKES THE REGRESSION MEAN SOMETHING. A token the api's
     # own read minter signs verifies against the api's published JWKS: that is
@@ -211,6 +213,7 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
             CustomerRef(value=CUSTOMER), "accounts.svc"
         )
     assert verifies_against(backend_token, api_jwks)
+    assert signed_by_any_key_in(backend_token, api_jwks)
 
     # The regression, before the status checks so a reintroduced token fails
     # on the property that matters rather than on a status code.
@@ -221,9 +224,17 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
         session_jwks,
         issuer=settings.session_token_issuer,
         audience=settings.session_token_audience,
+        write_jwks=write_jwks,
     )
 
     claims = session_claims(token, confirm)
+    # EXPLICITLY, on the one token issued: neither the key set Istio trusts
+    # (the api's read JWKS) nor confirm's write JWKS verifies it, whatever kid
+    # it names. Only /session/jwks.json does, which `session_claims` checked.
+    access_token = token.json()["access_token"]
+    assert not signed_by_any_key_in(access_token, api_jwks)
+    assert not signed_by_any_key_in(access_token, write_jwks)
+    assert signed_by_any_key_in(access_token, session_jwks)
     assert claims["sub"] == CUSTOMER
     assert claims["client_id"] == "claude-code"
     assert replay.status_code == 400, replay.text

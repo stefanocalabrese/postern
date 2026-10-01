@@ -31,12 +31,15 @@ from postern_core.auth.device_codes import (
 from postern_core.auth.device_keys import no_enrolled_devices
 from postern_core.auth.refresh_sessions import (
     InMemoryRefreshSessionStore,
+    RefreshSession,
+    RefreshSessionCollision,
     RefreshSessionStoreBase,
     ms_of,
 )
 from postern_core.auth.revocation import InMemoryRevocationStore
 from postern_core.store.engine import Database
 from postern_core.store.models import OUTCOME_RAISED, AuditEntry
+from redis import exceptions as redis_exceptions
 from sqlalchemy import select
 from starlette.applications import Starlette
 
@@ -259,7 +262,158 @@ class TestAFullFamilyStore:
         app.state.refresh_session_store = real
         app.state._approved_poll_times[device["device_code"]] -= timedelta(seconds=60)
         session_claims(await _exchange(app, device["device_code"]), app)
-        assert [r.detail for r in await _token_rows(clean)] == ["RefreshSessionStoreFull", None]
+        refused, minted = await _token_rows(clean)
+        assert [refused.detail, minted.detail] == ["RefreshSessionStoreFull", None]
+        # The refused row names no family, because none was ever stored.
+        assert "session_id" not in refused.arguments
+        assert "session_id" in minted.arguments
+
+
+class _CreateRaises(InMemoryRefreshSessionStore):
+    """A family store whose ``create`` raises ``exc``; everything else is real."""
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def create(self, session: RefreshSession) -> RefreshSession:
+        raise self._exc
+
+
+class TestAFamilyStoreThatCannotAnswer:
+    """``create`` failing for a reason other than the cap (amended 1 October 2026).
+
+    A connection or timeout error is an outage, answered like the full store:
+    a retryable 503 with ``Retry-After``, the code unspent, no token, and a row
+    under the exception's class name that names no family. A collision is not
+    an outage, and stays a 500.
+    """
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ConnectionError("refused"),
+            TimeoutError("timed out"),
+            redis_exceptions.ConnectionError("redis went away"),
+            redis_exceptions.TimeoutError("redis timed out"),
+        ],
+        ids=["ConnectionError", "TimeoutError", "redis.ConnectionError", "redis.TimeoutError"],
+    )
+    async def test_an_outage_is_a_retryable_503_and_spends_nothing(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database, exc: BaseException
+    ) -> None:
+        device = await _approved(app, key_pair)
+        app.state.refresh_session_store = _CreateRaises(exc)
+
+        response = await _exchange(app, device["device_code"])
+
+        assert response.status_code == 503, response.text
+        assert response.json()["error"] == "temporarily_unavailable"
+        assert response.headers["retry-after"] == str(
+            app.state.settings.device_poll_interval_seconds
+        )
+        assert "access_token" not in response.text
+        stored = await app.state.device_code_store.get_device_code(device["device_code"])
+        assert stored.exchanged_at is None
+        (row,) = await _token_rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, type(exc).__name__)
+        assert "session_id" not in row.arguments
+
+    async def test_a_collision_is_a_500_and_spends_nothing(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        device = await _approved(app, key_pair)
+        app.state.refresh_session_store = _CreateRaises(RefreshSessionCollision("same sid"))
+
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://t",
+        ) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+
+        assert response.status_code == 500
+        assert "access_token" not in response.text
+        stored = await app.state.device_code_store.get_device_code(device["device_code"])
+        assert stored.exchanged_at is None
+        (row,) = await _token_rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, "RefreshSessionCollision")
+        assert "session_id" not in row.arguments
+
+
+class TestAClaimThatRaises:
+    """``consume_device_code`` raising after ``create`` (amended 1 October 2026).
+
+    The family it would have recorded is discarded before the exception
+    propagates, as on a lost claim, so no family outlives an exchange that
+    issued nothing; a discard that fails too is logged and tolerated, and the
+    claim's own exception is the one recorded.
+    """
+
+    async def test_the_family_is_discarded_and_the_exception_recorded(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        device = await _approved(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def raises(device_code: str, *, session_id: str) -> bool:
+            raise ConnectionError("redis went away mid-claim")
+
+        monkeypatch.setattr(app.state.device_code_store, "consume_device_code", raises)
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://t",
+        ) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": device["device_code"]}
+            )
+
+        assert response.status_code == 500
+        assert "access_token" not in response.text
+        assert sessions._sessions == {}, "a claim that raised left its family behind"
+        (row,) = await _token_rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, "ConnectionError")
+        assert row.arguments["session_id"]
+
+    async def test_a_failing_discard_is_logged_and_the_claims_exception_recorded(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        device = await _approved(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def raises(device_code: str, *, session_id: str) -> bool:
+            raise TimeoutError("claim timed out")
+
+        async def broken(sid: str) -> None:
+            raise ConnectionError("redis went away")
+
+        monkeypatch.setattr(app.state.device_code_store, "consume_device_code", raises)
+        monkeypatch.setattr(sessions, "discard", broken)
+        with caplog.at_level(logging.WARNING, logger="services.confirm.device_auth"):
+            async with httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://t",
+            ) as client:
+                response = await client.post(
+                    "/token",
+                    data={"grant_type": "device_code", "device_code": device["device_code"]},
+                )
+
+        assert response.status_code == 500
+        (orphan,) = sessions._sessions
+        assert f"orphaned session family {orphan}" in caplog.text
+        (row,) = await _token_rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, "TimeoutError")
 
 
 class TestALostClaim:
@@ -286,6 +440,45 @@ class TestALostClaim:
         assert len(sessions._sessions) == 1, "the losing exchange left an orphaned family"
         details = {r.detail for r in await _token_rows(clean)}
         assert details == {DETAIL_DEVICE_CODE_SPENT, None}
+
+    async def test_a_lost_claims_row_names_the_family_it_discarded(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Deterministic, where the race above may resolve as a plain replay.
+
+        A lost claim's ``device_code_spent`` row carries the ``session_id`` of
+        the family it created and then discarded; a replay's carries none.
+        That is how an operator tells the two apart (amended 1 October 2026).
+        """
+        device = await _approved(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def lost(device_code: str, *, session_id: str) -> bool:
+            return False
+
+        monkeypatch.setattr(app.state.device_code_store, "consume_device_code", lost)
+        response = await _exchange(app, device["device_code"])
+
+        assert response.json()["error"] == "invalid_grant"
+        assert sessions._sessions == {}
+        (row,) = await _token_rows(clean)
+        assert row.detail == DETAIL_DEVICE_CODE_SPENT
+        assert row.arguments["session_id"]
+
+    async def test_a_replays_row_names_no_family(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        device = await _approved(app, key_pair)
+        session_claims(await _exchange(app, device["device_code"]), app)
+        replay = await _exchange(app, device["device_code"])
+        assert replay.json()["error"] == "invalid_grant"
+        _, replayed = await _token_rows(clean)
+        assert replayed.detail == DETAIL_DEVICE_CODE_SPENT
+        assert "session_id" not in replayed.arguments
 
     async def test_a_failing_discard_is_logged_and_tolerated(
         self,
@@ -316,6 +509,78 @@ class TestALostClaim:
         assert f"orphaned session family {orphan}" in caplog.text
         assert "ConnectionError" in caplog.text
         assert [r.detail for r in await _token_rows(clean)] == [DETAIL_DEVICE_CODE_SPENT]
+
+
+class TestEveryTokenResponseIsHeadered:
+    """RFC 6749 section 5.1's two headers on EVERY ``/token`` response
+    (amended 1 October 2026), including the ones no handler writes: the
+    rate limiter's 429, the body limit's 413 and the 500 Starlette's
+    ``ServerErrorMiddleware`` sends for an unhandled exception. Stamped at the
+    ASGI layer outside that middleware, so no exit can miss them."""
+
+    @staticmethod
+    def _assert_headered(response: httpx2.Response) -> None:
+        assert response.headers.get_list("cache-control") == ["no-store"]
+        assert response.headers.get_list("pragma") == ["no-cache"]
+
+    async def test_an_unknown_code_and_a_wrong_grant_type(self, app: Starlette) -> None:
+        async with _client(app) as client:
+            unknown = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": "unknown"}
+            )
+            wrong = await client.post("/token", data={"grant_type": "password"})
+        assert unknown.status_code == 400
+        assert wrong.status_code == 404
+        self._assert_headered(unknown)
+        self._assert_headered(wrong)
+
+    async def test_an_unhandled_exception_500(
+        self, app: Starlette, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def boom(device_code: str) -> DeviceCode | None:
+            raise RuntimeError("the device code store fell over")
+
+        monkeypatch.setattr(app.state.device_code_store, "get_device_code", boom)
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://t",
+        ) as client:
+            response = await client.post(
+                "/token", data={"grant_type": "device_code", "device_code": "any"}
+            )
+        assert response.status_code == 500
+        self._assert_headered(response)
+
+    async def test_a_rate_limited_refusal(self, key_pair: RSAKeyPair, pg_url: str) -> None:
+        """The address-bucket limiter's refusal. On ``/token`` it is RFC 8628's
+        400 ``slow_down`` rather than the 429 every other path gets
+        (`services/confirm/rate_limit.py` carries why), and the limiter writes
+        it without reaching the handler."""
+        app = _app(key_pair, pg_url, rate_limit_token=1)
+        async with _client(app) as client:
+            await client.post("/token", data={"grant_type": "password"})
+            limited = await client.post("/token", data={"grant_type": "password"})
+        assert limited.status_code == 400
+        assert limited.json()["error"] == "slow_down"
+        assert "retry-after" in limited.headers
+        self._assert_headered(limited)
+
+    async def test_an_oversized_413(self, key_pair: RSAKeyPair, pg_url: str) -> None:
+        app = _app(key_pair, pg_url, max_body_bytes=1024)
+        async with _client(app) as client:
+            response = await client.post(
+                "/token",
+                content=b"grant_type=device_code&device_code=" + b"a" * 2048,
+                headers={"content-type": "application/x-www-form-urlencoded"},
+            )
+        assert response.status_code == 413
+        self._assert_headered(response)
+
+    async def test_another_path_is_left_alone(self, app: Starlette) -> None:
+        async with _client(app) as client:
+            response = await client.get("/session/jwks.json")
+        assert response.status_code == 200
+        assert "pragma" not in response.headers
 
 
 class TestARevocationThatPredatesTheApproval:

@@ -134,9 +134,11 @@ from postern_core.risk.pairing_network import (
 from postern_core.risk.types import signal_to_json
 from postern_core.store.engine import Database
 from pydantic import ValidationError
+from redis.exceptions import RedisError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from services.confirm.audit import (
     DETAIL_ALREADY_APPROVED,
@@ -206,6 +208,48 @@ RESERVED_CLIENT_ID = "-"
 #: header field [RFC2616] with a value of "no-cache"." On every ``/token``
 #: response, not only the ones that carry a token.
 TOKEN_RESPONSE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+_TOKEN_HEADER_NAMES = frozenset(name.lower().encode("latin-1") for name in TOKEN_RESPONSE_HEADERS)
+_TOKEN_HEADERS_RAW = [
+    (name.lower().encode("latin-1"), value.encode("latin-1"))
+    for name, value in TOKEN_RESPONSE_HEADERS.items()
+]
+
+
+class TokenResponseHeaders:
+    """Stamp ``TOKEN_RESPONSE_HEADERS`` on every response for ``/token``.
+
+    Pure ASGI, and installed by ``create_confirm_app`` OUTSIDE Starlette's
+    ``ServerErrorMiddleware`` (amended 1 October 2026), because the
+    ``token_endpoint`` wrapper only reaches answers the handler writes. Three
+    answers on this path never pass through it: the address-bucket limiter's
+    refusal, the body limit's 413 and the 500 ``ServerErrorMiddleware`` sends
+    for an unhandled exception. Spec section 5 puts both headers on "every
+    other ``/token`` response", so they are set here, on the
+    ``http.response.start`` message, replacing any value already present.
+    Every other path passes through untouched.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") != TOKEN_ROUTE:
+            await self.app(scope, receive, send)
+            return
+
+        async def stamped(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in _TOKEN_HEADER_NAMES
+                ]
+                message = {**message, "headers": headers + _TOKEN_HEADERS_RAW}
+            await send(message)
+
+        await self.app(scope, receive, stamped)
+
 
 #: How far this process's clock may disagree with Redis's when an approval
 #: (written on this clock) is compared with a customer revocation stamp
@@ -982,11 +1026,14 @@ async def _exchange(
     refresh_token = new_refresh_token(sid)
     scope = canonical_scope(code.scopes)
     claims = minter.prepare(customer=customer, client_id=code.client_id, scope=scope, sid=sid)
-    audit.names(session_id=sid)
 
     # STEP 2: CREATE THE FAMILY BEFORE THE CODE IS SPENT. A full store leaves
     # the code redeemable and answers a retryable 503, the argument this
-    # docstring makes for ZT-7 before the claim.
+    # docstring makes for ZT-7 before the claim. So does a store that cannot
+    # answer (amended 1 October 2026): a connection or timeout error is an
+    # outage, not a verdict, and a 500 would tell the browser to give up on a
+    # pairing the customer approved. A `RefreshSessionCollision` is neither,
+    # and still propagates to a 500.
     now = datetime.now(UTC)
     family = RefreshSession(
         sid=sid,
@@ -1004,22 +1051,34 @@ async def _exchange(
         await sessions.create(family)
     except RefreshSessionStoreFull as exc:
         logger.warning("device grant: %s; refusing to mint", exc)
-        return _session_store_full_response(retry_after), type(exc).__name__
+        return _session_store_unavailable_response(retry_after), type(exc).__name__
+    except (RedisError, OSError, TimeoutError) as exc:
+        logger.warning(
+            "device grant: refresh-family store unavailable (%s); refusing to mint",
+            type(exc).__name__,
+        )
+        return _session_store_unavailable_response(retry_after), type(exc).__name__
+
+    # NAMED ONLY ONCE IT EXISTS, so a full-store or outage row never carries
+    # the id of a family that was never stored (amended 1 October 2026).
+    audit.names(session_id=sid)
 
     # STEP 3: SPEND THE CODE, recording which family it created. A lost claim
     # means a concurrent exchange won: this family is an orphan nobody holds a
     # token for, so it is discarded, and a failure to discard is tolerated --
-    # the orphan holds a hash nobody has and expires within the hour.
+    # the orphan holds a hash nobody has and expires within the hour. A claim
+    # that RAISES discards the family the same way before the exception
+    # propagates (amended 1 October 2026), so no family outlives an exchange
+    # that issued nothing. Either row keeps the `session_id`, which is how a
+    # lost claim's `device_code_spent` row differs from a replay's.
     store: DeviceCodeStoreBase = request.app.state.device_code_store
-    if not await store.consume_device_code(code.device_code, session_id=sid):
-        try:
-            await sessions.discard(sid)
-        except Exception as exc:  # noqa: BLE001 -- an orphan is harmless, the claim is not
-            logger.warning(
-                "device grant: could not discard orphaned session family %s after a lost claim: %s",
-                sid,
-                type(exc).__name__,
-            )
+    try:
+        claimed = await store.consume_device_code(code.device_code, session_id=sid)
+    except Exception:
+        await _discard_orphan(sessions, sid, "a claim that raised")
+        raise
+    if not claimed:
+        await _discard_orphan(sessions, sid, "a lost claim")
         return _unredeemable_response(), DETAIL_DEVICE_CODE_SPENT
 
     # STEP 4: SIGN. A raise leaves the code spent and a family holding a
@@ -1040,12 +1099,33 @@ async def _exchange(
     )
 
 
-def _session_store_full_response(retry_after: int) -> JSONResponse:
-    """The 503 ``POST /token`` answers when the refresh-family store is full.
+async def _discard_orphan(sessions: RefreshSessionStoreBase, sid: str, after: str) -> None:
+    """Discard a family no token was issued for, tolerating a failure.
 
-    The shape of `_store_full_response`, with ``Retry-After`` set to the poll
-    interval rather than the device-code lifetime: the code is live, paced,
-    and redeemable the moment a family expires.
+    The orphan holds a hash nobody has and expires within the hour, so a
+    failed discard is logged with the ``sid`` and never replaces the answer.
+    """
+    try:
+        await sessions.discard(sid)
+    except Exception as exc:  # noqa: BLE001 -- an orphan is harmless, the claim is not
+        logger.warning(
+            "device grant: could not discard orphaned session family %s after %s: %s",
+            sid,
+            after,
+            type(exc).__name__,
+        )
+
+
+def _session_store_unavailable_response(retry_after: int) -> JSONResponse:
+    """The 503 ``POST /token`` answers when no family can be created.
+
+    The store is full, or it could not answer (amended 1 October 2026; this
+    was ``_session_store_full_response``). One body for both: the browser's
+    remedy is the same, and the row's ``detail`` (the exception's class name)
+    is where an operator tells them apart. The shape of
+    `_store_full_response`, with ``Retry-After`` set to the poll interval
+    rather than the device-code lifetime: the code is live, paced, and
+    redeemable the moment a family can be created.
     """
     return JSONResponse(
         status_code=503,

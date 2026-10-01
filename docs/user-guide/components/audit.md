@@ -162,7 +162,16 @@ pairing-code attempt budget) are defined in `services/confirm/audit.py` because
 for a miss, and the budget was removed with the old lookup. The `minted` method has no
 caller until the session-token change.
 
-`WHERE detail = 'device_code_spent'` is the whole replay query. `WHERE detail =
+`device_code_spent` covers two events on `POST /token`, and `arguments` separates
+them. A replay of a spent code is refused before any refresh family exists, so its row
+carries no `session_id`. A lost concurrent claim (another replica spent the code
+between this exchange creating its family and claiming the code) carries the
+`session_id` of the family this exchange created and then discarded; no token was
+issued from it, and if the discard itself failed a warning log line naming the same id
+is the only other trace. `WHERE detail = 'device_code_spent' AND NOT arguments ?
+'session_id'` is the whole replay query. A `/token` row refused because the family
+store was full or unreachable names no `session_id` either, because no family was
+stored. `WHERE detail =
 'revoked'` is the whole answer, on the write path, to whether a revocation took
 effect: the challenge approval and all three device-grant endpoints record a
 revocation refusal under this one shared detail.

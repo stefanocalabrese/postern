@@ -4350,6 +4350,8 @@ with:
         assert claims["aud"] == audience, claims
 ```
 
+> **Amended 1 October 2026 (review follow-up, commit after Task 6).** The tree differs from the helper blocks above. ``session_claims`` also asserts that no key confirm publishes at ``/.well-known/jwks.json`` signed the access token. A new ``signed_by_any_key_in`` tries each key on its own, ignoring the ``kid``, and the e2e helper uses it for the api's read JWKS and for an optional ``write_jwks`` keyword argument.
+
 In `tests/test_confirm_rate_limit.py`, replace:
 
 ```python
@@ -4739,6 +4741,8 @@ with:
 
 ```
 
+> **Amended 1 October 2026 (review follow-up, commit after Task 6).** The tree adds back the assertion this inversion dropped, narrowed: ``cust_victim`` is absent from the raw body, from the refresh token and the scope, and from every claim except ``client_id`` (where the browser put it, with ``client_id_verified`` false).
+
 In `tests/test_device_grant.py`, replace:
 
 ```python
@@ -5034,6 +5038,8 @@ with:
         assert jwt_shaped_strings(by_status[400].text) == []
 
 ```
+
+> **Amended 1 October 2026 (review follow-up, commit after Task 6).** The tree adds back the two assertions this inversion dropped: the code's ``exchanged_at`` is set, and the in-memory family store holds exactly one family, the one the code's ``session_id`` names.
 
 In `tests/test_device_grant.py`, replace:
 
@@ -6071,6 +6077,8 @@ with:
 
 ```
 
+> **Amended 1 October 2026 (review follow-up, commit after Task 6).** The tree also fetches confirm's ``/.well-known/jwks.json``, passes it to the e2e helper as ``write_jwks``, and asserts directly that the access token is signed by no key in the api's read JWKS or in that write JWKS, and by a key in ``/session/jwks.json``.
+
 In `tests/test_qr_pairing_end_to_end.py`, replace:
 
 ```python
@@ -6716,6 +6724,8 @@ class TestTheClaimRecordsTheFamily:
         del legacy["session_id"]
         assert DeviceCode.from_dict(legacy).session_id == ""
 ```
+
+> **Amended 1 October 2026 (review follow-up, commit after Task 6).** The file in the tree has eleven more test functions than this block (three new classes, two more in ``TestALostClaim``), and the full-store test also asserts that its row names no ``session_id``. ``create`` raising ``ConnectionError``, ``TimeoutError`` or a redis-py ``ConnectionError``/``TimeoutError`` answers a retryable 503 with ``Retry-After``, leaves the code unspent and writes a row under the class name with no ``session_id``; a ``RefreshSessionCollision`` is a 500 with the code unspent. ``consume_device_code`` raising discards the family (a failing discard is logged) and records the claim's exception. A lost claim's row carries the discarded family's ``session_id`` and a replay's carries none. Both RFC 6749 section 5.1 headers appear on an unknown code, a wrong grant type, a forced 500, the limiter's refusal and a 413. On ``/token`` the limiter answers 400 ``slow_down``, never 429, so that refusal is the one tested.
 
 In `tests/test_zt7_confirm_revocation.py`, replace:
 
@@ -8030,6 +8040,8 @@ def _session_store_full_response(retry_after: int) -> JSONResponse:
         headers={"Retry-After": str(retry_after)},
     )
 ```
+
+> **Amended 1 October 2026 (review follow-up, commit after Task 6).** The tree differs from this block in four places. (a) ``audit.names(session_id=sid)`` runs after ``create`` succeeds, so a refused row never names a family that was never stored. (b) ``create`` raising ``RedisError``, ``OSError`` or ``TimeoutError`` answers the same retryable 503 as a full store, under the exception's class name. (c) ``consume_device_code`` raising discards the family, then re-raises. (d) The 503 helper is ``_session_store_unavailable_response``, and discarding goes through ``_discard_orphan``. Separately, ``TokenResponseHeaders`` (pure ASGI, in ``services/confirm/device_auth.py``) is wrapped around the whole app by a ``Starlette`` subclass in ``services/confirm/main.py``, outside ``ServerErrorMiddleware``, so every ``/token`` response carries both headers. ``DETAIL_DEVICE_CODE_SPENT``'s comment and ``docs/user-guide/components/audit.md`` say how a lost claim's row differs from a replay's.
 
 In `services/confirm/device_auth.py`, replace:
 

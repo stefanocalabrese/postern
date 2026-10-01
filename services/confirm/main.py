@@ -89,6 +89,7 @@ from postern_core.store.engine import Database
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.routing import Route
+from starlette.types import ASGIApp
 
 from services.confirm.auth import AppAssertionMiddleware, AssertionVerifier
 from services.confirm.body_limit import BodySizeLimit
@@ -98,7 +99,11 @@ from services.confirm.customer_rate_limit import (
     create_customer_rate_limit_store,
     customer_limits_from_settings,
 )
-from services.confirm.device_auth import PAIRING_ENRICHMENT_SLOTS, device_auth_routes
+from services.confirm.device_auth import (
+    PAIRING_ENRICHMENT_SLOTS,
+    TokenResponseHeaders,
+    device_auth_routes,
+)
 from services.confirm.jwks import jwks_route, session_jwks_route
 from services.confirm.minter import build_write_minter
 from services.confirm.rate_limit import (
@@ -240,6 +245,20 @@ def _refuse_process_local_sessions(settings: ConfirmSettings) -> None:
         "the Redis services/api uses, or set POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS for a "
         "single-process development stack."
     )
+
+
+class _ConfirmApp(Starlette):
+    """``Starlette`` with `TokenResponseHeaders` wrapped around the whole stack.
+
+    Outside ``ServerErrorMiddleware``, which Starlette always installs
+    outermost of the ``middleware=`` list, so the 500 it sends for an
+    unhandled exception on ``/token`` carries ``Cache-Control: no-store`` and
+    ``Pragma: no-cache`` too; no entry in that list can reach it. Amended
+    1 October 2026.
+    """
+
+    def build_middleware_stack(self) -> ASGIApp:
+        return TokenResponseHeaders(super().build_middleware_stack())
 
 
 def create_confirm_app(
@@ -474,7 +493,7 @@ def create_confirm_app(
         + callback_routes()
     )
 
-    app = Starlette(
+    app = _ConfirmApp(
         routes=routes,
         middleware=[
             # AHEAD OF THE BODY LIMIT, AND THEREFORE AHEAD OF EVERYTHING.

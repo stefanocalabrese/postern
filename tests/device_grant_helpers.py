@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from joserfc import jwt as joserfc_jwt
-from joserfc.jwk import KeySet
+from joserfc.jwk import KeySet, RSAKey
 from postern_core.auth.device_codes import (
     DeviceCode,
     DeviceCodeStoreBase,
@@ -119,6 +119,10 @@ def session_claims(response: Any, app: Starlette) -> dict[str, Any]:
     assert "act" not in claims
     assert claims["scope"] == body["scope"]
     assert body["refresh_token"].split(".")[1] == claims["sid"]
+    # NOT A WRITE TOKEN: no key confirm publishes at /.well-known/jwks.json
+    # signed it, whatever kid it carries.
+    write_jwks = app.state.postern_write_key_source.public_jwks()
+    assert not signed_by_any_key_in(body["access_token"], write_jwks)
     return claims
 
 
@@ -168,6 +172,23 @@ def verifies_against(token: str, jwks: dict[str, Any]) -> bool:
     return True
 
 
+def signed_by_any_key_in(token: str, jwks: Any) -> bool:
+    """Whether any key in ``jwks`` verifies ``token``'s RS256 signature.
+
+    Each key is tried on its own, ignoring the ``kid`` the token names, so a
+    ``False`` means no key in the set signed it and not merely that the kid
+    was absent: two key sets that reuse a kid, or one that is re-keyed under
+    the same kid, cannot make a negative assertion pass for the wrong reason.
+    """
+    for key in jwks["keys"]:
+        try:
+            joserfc_jwt.decode(token, RSAKey.import_key(key), algorithms=["RS256"])
+        except Exception:  # noqa: BLE001, S112 -- any failure to verify is a "no"
+            continue
+        return True
+    return False
+
+
 def assert_no_body_carries_a_token_the_api_trusts(
     bodies: list[str],
     api_jwks: dict[str, Any],
@@ -175,6 +196,7 @@ def assert_no_body_carries_a_token_the_api_trusts(
     *,
     issuer: str,
     audience: str,
+    write_jwks: dict[str, Any] | None = None,
 ) -> None:
     """The regression for the layer-2 token ``POST /token`` used to return.
 
@@ -183,10 +205,17 @@ def assert_no_body_carries_a_token_the_api_trusts(
     which is the key set Istio trusts; and every JWT-shaped string in any body
     is a layer-1 session token -- it verifies against ``/session/jwks.json``
     and carries the session issuer and audience.
+
+    Both negatives try every key on its own (`signed_by_any_key_in`), and
+    ``write_jwks``, when given, is confirm's own ``/.well-known/jwks.json``:
+    no body may carry a token the write key signed either.
     """
     shaped = [s for body in bodies for s in jwt_shaped_strings(body)]
-    trusted = [s for s in shaped if verifies_against(s, api_jwks)]
+    trusted = [s for s in shaped if signed_by_any_key_in(s, api_jwks)]
     assert trusted == [], "a /token response carried a token the api's JWKS verifies"
+    if write_jwks is not None:
+        written = [s for s in shaped if signed_by_any_key_in(s, write_jwks)]
+        assert written == [], "a /token response carried a token confirm's write key signed"
     session_keys = KeySet.import_key_set(session_jwks)  # type: ignore[arg-type]
     for token in shaped:
         claims = joserfc_jwt.decode(token, session_keys, algorithms=["RS256"]).claims

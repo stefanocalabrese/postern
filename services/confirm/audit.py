@@ -1020,6 +1020,16 @@ DETAIL_SCAN_CONFLICT = "scan_conflict"
 #: ``PairingAudit``'s rule would owe nothing and this literal would be
 #: unreachable. ``dev-docs/decisions/0012-device-code-single-use.md`` carries
 #: that trade.
+#:
+#: TWO EVENTS SHARE IT, AND ``arguments`` TELLS THEM APART (1 October 2026).
+#: A replay is refused before a family is drawn, so its row carries no
+#: ``session_id``. A LOST CLAIM -- a concurrent exchange on another replica
+#: spent the code between this one creating its family and claiming the
+#: code -- carries the ``session_id`` of the family this exchange created and
+#: then DISCARDED: no token was issued from it. If the discard failed, a
+#: warning naming that ``sid`` ("could not discard orphaned session family")
+#: is the only trace, and the family expires within the hour. So the replay
+#: query is ``detail = 'device_code_spent' AND NOT arguments ? 'session_id'``.
 DETAIL_DEVICE_CODE_SPENT = "device_code_spent"
 #: A repeat approval by the customer who scanned the code, normally a retried
 #: request: at ``POST /approve`` when the code is already approved, and at
