@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, Starlette routes on the existing confirm app, FastMCP 4.0.3's `JWTVerifier`, joserfc, redis-py 5.3.1 (`WATCH`/`MULTI`, `EVAL`, `TIME`), `httpx2` ASGI and mock transports, testcontainers Postgres, Redis and Vault already started by `tests/conftest.py` and `tests/test_vault_live.py`.
 
-**Depends on:** `docs/superpowers/plans/postern-pairing-network-signal-2026-09-30.md`, which is executed FIRST. Every task below is written against the tree that plan leaves: `claim_scan(..., *, scanner_ip)`, `DeviceCode.scanner_ip`, `PairingAudit.approved`/`approved_again` taking `risk_signals`, `_withdraw_pairing`'s `"cancelled"` cause, `create_confirm_app`'s `network_enricher` keyword and enricher semaphore, `ConfirmSettings.pairing_enricher_timeout_seconds`, and `env_inventory` at 74 rows. If that plan has not been executed, stop: the replace steps below will not find their text.
+**Depends on:** `origin/main` at `41a1701`, which carries the pairing-network-signal plan (`docs/superpowers/plans/postern-pairing-network-signal-2026-09-30.md`, executed and merged) and its review follow-ups (`368cc87`, `4d13cca`, `f88b857`, `41a1701`). Every replace step below was re-derived against that tree. If `main` has moved past `41a1701` in `services/confirm/device_auth.py`, `services/confirm/audit.py` or the files each task names, re-check each replace step's old text before pasting.
 
 ---
 
@@ -25,7 +25,7 @@
 
 ## Verified facts this plan depends on
 
-All measured on 30 September 2026 against the tree the pairing-network-signal plan leaves (its eight tasks applied to `3c852d6`, `make ci` exit 0, 3436 passed) and the project's CPython 3.12 virtualenv.
+All measured against `41a1701` (`make ci` exit 0, 3487 passed) and the project's CPython 3.12 virtualenv, on 30 September and 1 October 2026.
 
 - **FastMCP 4.0.3's `JWTVerifier`** (read in the installed `fastmcp/server/auth/providers/jwt.py`): the constructor sets `self._cache_ttl = 3600`; `_get_jwks_key` returns from `self._jwks_cache` only while `time.time() - self._jwks_cache_time < self._cache_ttl` and the kid is cached, and otherwise calls `_fetch_jwks`, which uses an injected `http_client` if one was passed and a fresh `httpx2.AsyncClient(timeout=10)` if not; it stamps `_jwks_cache_time` only after a fetch that returned; `load_access_token` returns `None` for any failure. `str(inspect.signature(JWTVerifier._get_jwks_key))` prints `(self, kid: 'str | None') -> 'str'`: the module uses `from __future__ import annotations`.
 - **`httpx2.MockTransport` accepts an `async` handler** (its `handle_async_request` awaits a non-`Response` return), which is how the coalescing test holds a fetch open.
@@ -929,7 +929,7 @@ Expected: 433 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3501 passed at validation).
+Expected: exit 0 (3552 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -1771,7 +1771,7 @@ Expected: 285 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3525 passed at validation).
+Expected: exit 0 (3576 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -2798,7 +2798,7 @@ Expected: 52 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3577 passed at validation).
+Expected: exit 0 (3628 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -3517,7 +3517,7 @@ Expected: 543 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3593 passed at validation).
+Expected: exit 0 (3644 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -4169,7 +4169,7 @@ Expected: 320 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3603 passed at validation).
+Expected: exit 0 (3654 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -4188,7 +4188,7 @@ Spec section 5 in full, and section 9's `names(session_id=)`: the hotfix's 503 p
 - Modify: `dev-docs/device-grant-session-token-spec.md` (one sentence of the Compatibility section)
 - Modify: `packages/postern-core/src/postern_core/auth/device_codes.py` (`DeviceCode.session_id`, `consume_device_code` on the base and both backends, the two dict helpers)
 - Modify: `services/confirm/audit.py` (`PairingAudit.names`, `__slots__`, `_arguments`, `minted`; `DETAIL_ISSUANCE_DISABLED`'s comment)
-- Modify: `services/confirm/device_auth.py` (`RESERVED_CLIENT_ID`, `TOKEN_RESPONSE_HEADERS`, `APPROVAL_CLOCK_TOLERANCE_MS`, `token_endpoint`, `_resource_refusal`, `_token_response`, `_exchange`, `_session_store_full_response`, `device_auth_routes`)
+- Modify: `services/confirm/device_auth.py` (`RESERVED_CLIENT_ID`, `TOKEN_RESPONSE_HEADERS`, `APPROVAL_CLOCK_TOLERANCE_MS`, `token_endpoint`, `_resource_refusal`, `_token_response`, `_exchange`, `_session_store_full_response`, `device_auth_routes` (no longer takes `read_minter`, and takes no session parameters))
 - Modify: `services/confirm/main.py` (the family store, `device_auth_routes` call, `app.state.refresh_session_store`)
 - Modify: `services/confirm/revocation.py` (`customer_revoked_since`, `store_unavailable_response`)
 - Modify: `tests/device_grant_helpers.py`
@@ -6799,7 +6799,7 @@ with:
 
 Run: `uv run pytest tests/test_confirm_rate_limit.py tests/test_device_code_pairing_store.py tests/test_device_code_scanner_ip.py tests/test_device_grant.py tests/test_pairing_audit.py tests/test_qr_pairing_end_to_end.py tests/test_redis_backed_stores.py tests/test_scan.py tests/test_scan_network_signal.py tests/test_token_session_issuance.py tests/test_zt7_confirm_revocation.py -q`
 
-Expected: FAIL, `68 failed, 469 passed`. The first failure reads `AssertionError: {"error":"temporarily_unavailable","error_description":"session token issuance is not enabled"}`.
+Expected: FAIL, `68 failed, 471 passed`. The first failure reads `AssertionError: {"error":"temporarily_unavailable","error_description":"session token issuance is not enabled"}`.
 
 - [ ] **Step 3: Implement**
 
@@ -7305,18 +7305,21 @@ is the contract.
 In `services/confirm/device_auth.py`, replace:
 
 ```python
+    store = build_device_code_store(settings)
+    routes = device_auth_routes(
+        store=store,
         settings=settings,
         read_minter=read_minter,
     )
+"""
 ```
 
 with:
 
 ```python
-        settings=settings,
-        session_minter=session_minter,
-        session_store=session_store,
-    )
+    store = build_device_code_store(settings)
+    routes = device_auth_routes(store=store, settings=settings)
+"""
 ```
 
 In `services/confirm/device_auth.py`, replace:
@@ -8068,8 +8071,6 @@ with:
 
 ```python
     settings: ConfirmSettings,
-    session_minter: SessionTokenMinter,
-    session_store: RefreshSessionStoreBase,
 ) -> list[Route]:
 ```
 
@@ -8087,12 +8088,12 @@ with:
 
 ```python
         settings: Service settings (TTL, URIs, poll interval).
-        session_minter: The layer-1 access-token minter over the SESSION key.
-        session_store: The refresh-family store.
 
-    The handlers read all four from ``app.state``, where
-    ``create_confirm_app`` puts them; they are parameters here so the route
-    table names what the device grant depends on, as it always has.
+    NO MINTER AND NO FAMILY STORE. The handlers read the session minter and
+    the refresh-family store from ``app.state``, where ``create_confirm_app``
+    puts them, as they read the device code store; a parameter nothing reads
+    would only look like wiring. The read minter this took until the layer-1
+    session token went the same way.
 
 ```
 
@@ -8136,18 +8137,21 @@ with:
 In `services/confirm/main.py`, replace:
 
 ```python
+        [jwks_route(write_key_source), session_jwks_route(session_key_source)]
+        + device_auth_routes(
+            store=device_code_store,
             settings=settings,
             read_minter=read_minter,
         )
+        + verify_page_routes()
 ```
 
 with:
 
 ```python
-            settings=settings,
-            session_minter=session_minter,
-            session_store=refresh_session_store,
-        )
+        [jwks_route(write_key_source), session_jwks_route(session_key_source)]
+        + device_auth_routes(store=device_code_store, settings=settings)
+        + verify_page_routes()
 ```
 
 In `services/confirm/main.py`, replace:
@@ -8242,13 +8246,13 @@ with:
 
 Run: `uv run pytest tests/test_confirm_rate_limit.py tests/test_device_code_pairing_store.py tests/test_device_code_scanner_ip.py tests/test_device_grant.py tests/test_pairing_audit.py tests/test_qr_pairing_end_to_end.py tests/test_redis_backed_stores.py tests/test_scan.py tests/test_scan_network_signal.py tests/test_token_session_issuance.py tests/test_zt7_confirm_revocation.py -q`
 
-Expected: 537 passed
+Expected: 539 passed
 
 - [ ] **Step 5: Format, then run the gate**
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3630 passed at validation).
+Expected: exit 0 (3681 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -9399,7 +9403,7 @@ Expected: 29 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3659 passed at validation).
+Expected: exit 0 (3710 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -10112,7 +10116,7 @@ Expected: 43 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3666 passed at validation).
+Expected: exit 0 (3717 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -10683,7 +10687,7 @@ Expected: 416 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3667 passed at validation).
+Expected: exit 0 (3718 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -11509,7 +11513,7 @@ Expected: 438 passed
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3683 passed at validation).
+Expected: exit 0 (3734 passed at validation).
 
 - [ ] **Step 6: Commit**
 
@@ -11951,7 +11955,7 @@ with:
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3687 passed at validation).
+Expected: exit 0 (3738 passed at validation).
 
 - [ ] **Step 5: Commit**
 
@@ -12640,7 +12644,7 @@ Expected: 6 passed. These tests pass on their first run: they measure behaviour 
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3692 passed at validation).
+Expected: exit 0 (3743 passed at validation).
 
 - [ ] **Step 4: Commit**
 
@@ -13368,7 +13372,7 @@ with:
 
 Run: `uv run ruff format packages services tests && make ci`
 
-Expected: exit 0 (3692 passed at validation).
+Expected: exit 0 (3743 passed at validation).
 
 - [ ] **Step 3: Commit**
 
@@ -13386,7 +13390,7 @@ Every section of `dev-docs/device-grant-session-token-spec.md` and every item of
 | Spec item | Task |
 |---|---|
 | §1 confirm is the layer-1 authorization server; api verifies and never signs | 2, 6, 10 |
-| §1 read key removed from `create_confirm_app` and `ConfirmSettings`; inventory rows to `("api",)`; `device_auth_routes` takes `session_minter` and `session_store` | 9 (routes: 6) |
+| §1 read key removed from `create_confirm_app` and `ConfirmSettings`; inventory rows to `("api",)`; `device_auth_routes` loses `read_minter` (and takes no session parameters, discrepancy 17) | 9 (routes: 6) |
 | §1 `test_the_confirm_settings_have_no_read_key_field` tightens | 9 |
 | §2 session key via `choose_key_source`, `build_session_minter` in `session_token.py` after `build_write_minter` | 2 |
 | §2 nine settings, inventory entries, `POSTERN_ALLOW_NON_URI_AUDIENCE` read by both | 1 (api read: 10) |
@@ -13449,42 +13453,43 @@ Each is a point where the spec and the code, or two parts of the spec, disagree,
 14. **A failed JWKS fetch.** Section 8 floors refetches for unknown kids only; a JWKS endpoint that is down would still be asked once per request with a stale known kid. **Plan:** a failed fetch leaves the cache as it was and holds every further fetch to the same 30-second floor.
 15. **The api's TTL read.** Section 8 says the api's `Settings` reads `POSTERN_VAULT_PUBLIC_KEY_TTL_SECONDS` "whether or not Vault is configured". **Plan:** through `public_key_ttl_from_env` in `postern_core.auth.vault`, which `vault_from_env` also calls, so the variable keeps one read site and one bound.
 16. **Two concurrent exchanges in one process** answer one session and either `slow_down` or `invalid_grant` for the other, depending on scheduling. **Plan:** the renamed test accepts either.
+17. **`device_auth_routes` does not take `session_minter` and `session_store`**, though section 1 says it does. Every handler reads the minter and both stores from `app.state`, where `create_confirm_app` puts them, so the two parameters would be accepted and never read. **Plan:** the function takes `store` and `settings`, as before, and loses `read_minter`; its docstring says why.
 
 ## Validation
 
-Every task above was applied in order to a clone of this repository at `3c852d6` with the pairing-network-signal plan applied mechanically first (its eight tasks, `make ci` exit 0 with 3436 passed; the result was byte-identical to that plan's own validated scratch tree), in a scratch directory outside the worktree, and committed there. The code blocks in this plan were generated from those commits (`git show <commit>:<path>` for new files, exact unique replacements computed from the diff for modified ones), and the whole plan was then re-applied mechanically from this document to a second fresh clone and compared with the first: `git diff` between the two was empty after the pairing-network-signal plan and after each of the thirteen tasks below, and `uv run ruff format packages services tests` changed nothing at any of them.
+Every task above was applied in order to a fresh clone of `origin/main` at `41a1701`, in a scratch directory outside the worktree, and committed there. (A first validation ran against the pairing-network-signal plan applied mechanically to `3c852d6`; the four review follow-ups merged since then applied under every task without a conflict, and the only code change on the rebase is discrepancy 17.) The code blocks in this plan were generated from those commits (`git show <commit>:<path>` for new files, exact unique replacements computed from the diff for modified ones), and the whole plan was then re-applied mechanically from this document to a second fresh clone and compared with the first: `git diff` between the two was empty after each of the thirteen tasks below, and `uv run ruff format packages services tests` changed nothing at any of them.
 
-With this plan file tracked, `tools/check_citations.py` passes at `3c852d6`, on the tree the pairing-network-signal plan leaves, and after each of the thirteen tasks.
+With this plan file tracked, `tools/check_citations.py` passes at `41a1701` and after each of the thirteen tasks.
 
 `make ci` results in the scratch copy, Docker up, each on its own fresh clone of the task's commit:
 
 | After task | `make ci` exit | Tests |
 |---|---|---|
-| 1 | 0 | 3501 passed, 0 failed |
-| 2 | 0 | 3525 passed, 0 failed |
-| 3 | 0 | 3577 passed, 0 failed |
-| 4 | 0 | 3593 passed, 0 failed |
-| 5 | 0 | 3603 passed, 0 failed |
-| 6 | 0 | 3630 passed, 0 failed |
-| 7 | 0 | 3659 passed, 0 failed |
-| 8 | 0 | 3666 passed, 0 failed |
-| 9 | 0 | 3667 passed, 0 failed |
-| 10 | 0 | 3683 passed, 0 failed |
-| 11 | 0 | 3687 passed, 0 failed |
-| 12 | 0 | 3692 passed, 0 failed |
-| 13 | 0 | 3692 passed, 0 failed |
+| 1 | 0 | 3552 passed, 0 failed |
+| 2 | 0 | 3576 passed, 0 failed |
+| 3 | 0 | 3628 passed, 0 failed |
+| 4 | 0 | 3644 passed, 0 failed |
+| 5 | 0 | 3654 passed, 0 failed |
+| 6 | 0 | 3681 passed, 0 failed |
+| 7 | 0 | 3710 passed, 0 failed |
+| 8 | 0 | 3717 passed, 0 failed |
+| 9 | 0 | 3718 passed, 0 failed |
+| 10 | 0 | 3734 passed, 0 failed |
+| 11 | 0 | 3738 passed, 0 failed |
+| 12 | 0 | 3743 passed, 0 failed |
+| 13 | 0 | 3743 passed, 0 failed |
 
-The baseline, the pairing-network-signal plan applied to `3c852d6` before Task 1, was exit 0 with 3436 passed. Every run is the full `make ci`: lint, fmt-check, type, imports, lock, citations, test.
+The baseline, `41a1701` before Task 1, was exit 0 with 3487 passed. Every run is the full `make ci`: lint, fmt-check, type, imports, lock, citations, test.
 
 ## Concerns for the reviewer
 
 - **The compose stack was not brought up.** `docker compose config -q` accepts the file and `tests/test_vault_live.py` bootstraps the same Vault objects, but no run of `docker compose up` exercised the repointed `api`, the `redis` service or a real pairing through the containers.
 - **`SessionTokenVerifier` overrides a private method of a pinned dependency.** The signature pin and the counting-server test through `build_server` are the guard; both must be re-run on any `fastmcp` bump.
 - **Redis script replication.** `revoke_customer_client` reads `TIME` inside `EVAL` and then writes; it runs on the suite's `redis:7-alpine`, and whether the operator's Redis replicates it by effects is unverified, as the spec says.
-- **`device_auth_routes` takes `session_minter` and `session_store` and does not use them**, as it took `read_minter` before: the handlers read `app.state`. The parameters document the dependency; they are not wiring.
 - **The recall's store step catches every `Exception`.** That is the spec's fail-closed 503, but a programming error in `_recall` would also surface as a 503 the app retries, not as a 500.
 - **`POSTERN_REDIS_DEVICE_CODE_TTL` is not bounded by the new 900-second ceiling** (discrepancy 11).
 - **Tasks 6 and 13 edit design documents.** Task 6 rewrites one sentence of `dev-docs/device-grant-session-token-spec.md` so the citation gate stays green, and Task 13 edits `CLAUDE.md`, decisions 0010 and 0012 and `dev-docs/qr-page-spec.md`, as spec section 11 and its "Docs that go stale" list ask. The dated records under `docs/verification/` are left alone.
 - **Task 6 is large** (twelve test files, one of them new and one the shared helper module, five production files and one sentence of the spec), because inverting the hotfix's assertions, adding `session_id` to every `consume_device_code` call and issuing the session cannot be split without a commit whose `make ci` fails. A reviewer may prefer to read its test changes by file.
-- **This plan file, committed alone on `3c852d6`, passes `make ci`** (3260 passed), run on a clone of the worktree with the file added.
+- **Task 5's first `make ci` run failed two tests it does not touch**, `test_update_challenge_status_unexpired_refuses_a_row_past_its_deadline` and `test_update_challenge_status_expired_accepts_a_row_past_its_deadline` in `tests/test_store_challenges.py`, while a second `make ci` ran in parallel on the same Docker host. Both compare `expires_at` with PostgreSQL's `now()`. Task 5 changes no store code; `tests/test_store_challenges.py` then passed three times in a row at that commit, and a solo re-run of the full `make ci` exited 0 with 3654 passed, which is the number the table carries. It reads as a timing flake already on `main`, and this plan does not fix it.
+- **This plan file, committed alone on `41a1701`, passes `make ci`** (3487 passed), run on a clone of the rebased worktree.
 - **The end-to-end api tests fetch confirm's JWKS over an in-process ASGI transport.** The only socket-level JWKS fetch is `tests/test_session_verifier.py`'s counting server on `127.0.0.1`.
