@@ -171,6 +171,16 @@ class TestTheComparisonItself:
             KeySet([again]).as_dict()
         )
 
+    def test_the_thumbprint_lives_in_the_shared_library(self) -> None:
+        """Moved on 2 October 2026 so ``services/api`` can use it too, which
+        ``.importlinter`` forbids it from importing out of this service."""
+        from postern_core.auth import jwk_thumbprint
+
+        from services.confirm import session_token
+
+        assert session_token.jwk_thumbprints is jwk_thumbprint.jwk_thumbprints
+        assert session_token.THUMBPRINT_MEMBERS is jwk_thumbprint.THUMBPRINT_MEMBERS
+
 
 class TestNonRsaKeys:
     """RFC 7638 section 3.2's required members per ``kty``; anything else is skipped."""

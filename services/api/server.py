@@ -36,7 +36,7 @@ backend itself, only passes it through to tools registered in later tasks.
 """
 
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthContext, AuthProvider
@@ -149,6 +149,7 @@ def build_server(
     db: Database | None = None,
     auth_override: AuthProvider | None = None,
     read_modules: Sequence[ReadModule] | None = None,
+    forbidden_session_thumbprints: Iterable[str] = (),
 ) -> FastMCP:
     has_jwks_uri = settings.customer_jwks_uri is not None
     has_issuer = settings.customer_token_issuer is not None
@@ -201,6 +202,9 @@ def build_server(
             audience=settings.audience,
             required_scopes=None,
             cache_ttl_seconds=settings.customer_jwks_ttl_seconds,
+            # This process's own READ key, by RFC 7638 thumbprint: never a
+            # session key, whatever the key set at `customer_jwks_uri` says.
+            forbidden_thumbprints=forbidden_session_thumbprints,
         )
         auth = verifier
     if auth_override is not None:

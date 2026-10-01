@@ -55,6 +55,7 @@ import httpx2
 from fastmcp.server.auth import AuthProvider
 from fastmcp.server.http import StarletteWithLifespan
 from postern_core.auth.internal_jwt import _LIFETIME, InternalTokenMinter
+from postern_core.auth.jwk_thumbprint import jwk_thumbprints
 from postern_core.auth.keys import (
     GeneratedKeySource,
     KeySource,
@@ -490,6 +491,10 @@ def create_app(
         backend,
         db=consent_db,
         auth_override=auth_override,
+        # The session-token verifier drops any fetched key that is this READ
+        # key (`services/api/session_verifier.py`), so a token the read key
+        # signs is never accepted as a layer-1 session.
+        forbidden_session_thumbprints=jwk_thumbprints(read_key_source.public_jwks()),
     )
     # Task 6: an audit row per tool call, success or failure, regardless of
     # whether consent enforcement itself is active -- see the module

@@ -15,10 +15,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import httpx2
@@ -26,9 +28,15 @@ import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from joserfc import jwt
 from joserfc.jwk import KeySet, RSAKey
+from postern_core.auth.jwk_thumbprint import jwk_thumbprints
 
+from services.api.main import create_app
 from services.api.server import build_server
-from services.api.session_verifier import MIN_REFETCH_INTERVAL_SECONDS, SessionTokenVerifier
+from services.api.session_verifier import (
+    MIN_REFETCH_INTERVAL_SECONDS,
+    READ_KEY_PUBLISHED_WARNING,
+    SessionTokenVerifier,
+)
 from services.api.settings import Settings
 from tests.conftest import TEST_CUSTOMER
 
@@ -66,26 +74,62 @@ class CountingJwks:
         self.jwks = jwks
         self.delay = delay
         self.fail = fail
+        # When set, answers every request in place of the key set: a
+        # malformed 200, or an exception such as a timeout.
+        self.answer: Callable[[httpx2.Request], httpx2.Response] | None = None
         self.fetches = 0
 
     async def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.fetches += 1
         if self.delay:
             await asyncio.sleep(self.delay)
+        if self.answer is not None:
+            return self.answer(request)
         if self.fail:
             return httpx2.Response(503, json={})
         return httpx2.Response(200, json=self.jwks)
 
 
-def _verifier(handler: CountingJwks, *, ttl: float = 300.0) -> SessionTokenVerifier:
+def _verifier(
+    handler: CountingJwks, *, ttl: float = 300.0, forbidden: frozenset[str] = frozenset()
+) -> SessionTokenVerifier:
     return SessionTokenVerifier(
         jwks_uri=JWKS_URI,
         issuer=ISSUER,
         audience=AUDIENCE,
         required_scopes=None,
         cache_ttl_seconds=ttl,
+        forbidden_thumbprints=forbidden,
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
+
+
+def _claims() -> dict[str, Any]:
+    now = int(time.time())
+    return {
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "sub": "cust_7f3a",
+        "client_id": "claude-code",
+        "jti": f"j-{now}",
+        "iat": now,
+        "exp": now + 600,
+    }
+
+
+def _timeout(request: httpx2.Request) -> httpx2.Response:
+    raise httpx2.ReadTimeout("timed out", request=request)
+
+
+#: Every way a fetch can fail after the transport answered, or instead of it.
+#: The first two reach the parent's parser after it has emptied its cache.
+MALFORMED_ANSWERS = [
+    pytest.param(lambda _r: httpx2.Response(200, json={"keys": 5}), id="keys-not-a-list"),
+    pytest.param(lambda _r: httpx2.Response(200, json=[]), id="a-json-list"),
+    pytest.param(lambda _r: httpx2.Response(200, text="<html>"), id="not-json"),
+    pytest.param(lambda _r: httpx2.Response(503, json={}), id="http-503"),
+    pytest.param(_timeout, id="timeout"),
+]
 
 
 class Clock:
@@ -105,6 +149,12 @@ class TestThePinnedParent:
         ``from __future__ import annotations``; measured against fastmcp 4.0.3."""
         signature = str(inspect.signature(JWTVerifier._get_jwks_key))
         assert signature == "(self, kid: 'str | None') -> 'str'"
+
+    def test_the_second_overridden_private_method_keeps_its_signature(self) -> None:
+        """``_fetch_jwks`` is where the read-key guard drops keys, before the
+        parent's parser caches them; measured against fastmcp 4.0.3."""
+        signature = str(inspect.signature(JWTVerifier._fetch_jwks))
+        assert signature == "(self) -> 'dict[str, Any]'"
 
     def test_the_parent_caches_for_an_hour_which_is_why_this_exists(self) -> None:
         parent = JWTVerifier(jwks_uri=JWKS_URI, issuer=ISSUER, audience=AUDIENCE)
@@ -200,6 +250,93 @@ class TestTheCache:
             assert await verifier.verify_token(_token(stranger)) is None
         assert handler.fetches == 2
         assert await verifier.verify_token(_token(key)) is not None, "the fresh cache survived"
+
+
+class TestAFailedFetchKeepsTheCache:
+    """Any failed fetch leaves the cache as it was (2 October 2026).
+
+    The parent empties its cache BEFORE it parses the answer, so until this
+    date a 200 whose body was not a key set erased every cached key, and a
+    genuine token was refused until the floor allowed another fetch.
+    """
+
+    @pytest.mark.parametrize("answer", MALFORMED_ANSWERS)
+    async def test_a_genuine_token_verifies_right_after_a_failed_fetch(
+        self, answer: Callable[[httpx2.Request], httpx2.Response], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = Clock(monkeypatch)
+        key, stranger = _key("session-1.v1"), _key("forged-1")
+        handler = CountingJwks(_jwks(key))
+        verifier = _verifier(handler)
+        assert await verifier.verify_token(_token(key)) is not None
+        handler.answer = answer
+        clock.advance(MIN_REFETCH_INTERVAL_SECONDS + 1)
+        assert await verifier.verify_token(_token(stranger)) is None
+        assert handler.fetches == 2
+        assert await verifier.verify_token(_token(key)) is not None, "the cache was erased"
+        for _ in range(5):
+            assert await verifier.verify_token(_token(stranger)) is None
+        assert handler.fetches == 2, "a failed fetch is held to the floor"
+
+    @pytest.mark.parametrize("answer", MALFORMED_ANSWERS)
+    async def test_a_failed_refetch_at_ttl_expiry_keeps_the_stale_set_and_the_floor(
+        self, answer: Callable[[httpx2.Request], httpx2.Response], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The stale set is kept as it was, and it is not served as fresh:
+        once the floor passes and the endpoint answers again, it is refetched."""
+        clock = Clock(monkeypatch)
+        key = _key("session-1.v1")
+        handler = CountingJwks(_jwks(key))
+        verifier = _verifier(handler, ttl=300.0)
+        assert await verifier.verify_token(_token(key)) is not None
+        handler.answer = answer
+        clock.advance(301)
+        assert await verifier.verify_token(_token(key)) is None, "a stale set is not fresh"
+        assert handler.fetches == 2
+        handler.answer = None
+        clock.advance(MIN_REFETCH_INTERVAL_SECONDS + 1)
+        assert await verifier.verify_token(_token(key)) is not None
+        assert handler.fetches == 3
+
+
+class TestTheReadKeyGuard:
+    """No key the api signs its own read tokens with is ever trusted as a
+    session key, whatever ``POSTERN_JWKS_URI`` publishes (2 October 2026)."""
+
+    async def test_a_published_read_key_is_dropped_and_the_session_key_still_verifies(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        read, session = _key("read-1"), _key("session-1.v1")
+        handler = CountingJwks(_jwks(read, session))
+        verifier = _verifier(handler, forbidden=frozenset(jwk_thumbprints(_jwks(read))))
+        with caplog.at_level(logging.WARNING, logger="services.api.session_verifier"):
+            for _ in range(5):
+                assert await verifier.verify_token(_token(read)) is None
+            assert await verifier.verify_token(_token(session)) is not None
+        assert handler.fetches == 1, "the dropped kid is held to the floor like any unknown kid"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].getMessage() == READ_KEY_PUBLISHED_WARNING
+        assert str(_jwks(read)["keys"][0]["n"]) not in caplog.text
+
+    async def test_the_same_key_under_another_kid_is_still_dropped(self) -> None:
+        """The thumbprint ignores the kid, so renaming the key changes nothing."""
+        read = _key("read-1")
+        renamed = RSAKey.import_key(
+            read.as_pem(private=True), parameters={"kid": "session-1.v9", "alg": "RS256"}
+        )
+        handler = CountingJwks(_jwks(renamed))
+        verifier = _verifier(handler, forbidden=frozenset(jwk_thumbprints(_jwks(read))))
+        assert await verifier.verify_token(_token(renamed)) is None
+
+    async def test_no_forbidden_thumbprint_drops_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        session = _key("session-1.v1")
+        verifier = _verifier(CountingJwks(_jwks(session)))
+        with caplog.at_level(logging.WARNING):
+            assert await verifier.verify_token(_token(session)) is not None
+        assert READ_KEY_PUBLISHED_WARNING not in caplog.text
 
 
 class TestTheSettings:
@@ -338,3 +475,45 @@ async def test_the_assembled_app_fetches_only_what_the_override_allows(served: _
     assert served.fetches == 1, "the second miss inside 30 seconds fetched again"
     assert genuine.status_code == 200, genuine.text
     assert served.fetches == 1, "a published kid on a fresh cache fetched again"
+
+
+def _api_settings(served: _Served, **overrides: Any) -> Settings:
+    return Settings(
+        backend_base_url="https://backend.test",
+        customer_jwks_uri=served.url,
+        customer_token_issuer=ISSUER,
+        audience=AUDIENCE,
+        **overrides,
+    )
+
+
+async def _assert_the_read_key_is_never_a_session_key(app: Any, served: _Served) -> None:
+    """``served`` publishes the api's own read public key beside a genuine
+    session key; a token the read key signs is refused, the session one is not."""
+    read_source = app.state.postern_read_key_source
+    served.jwks = {"keys": [*read_source.public_jwks()["keys"], *_jwks(served.key)["keys"]]}
+    verifier = app.state.postern_server.auth
+    assert isinstance(verifier, SessionTokenVerifier)
+    forged = read_source.sign(_claims())
+    for _ in range(3):
+        assert await verifier.verify_token(forged) is None
+    assert await verifier.verify_token(_token(served.key)) is not None
+    assert served.fetches == 1
+
+
+class TestCreateAppWiresTheReadKeyGuard:
+    """``create_app`` hands its own read key source's thumbprints to the verifier.
+
+    Startup cannot fetch confirm's key set, so the guard holds at fetch time;
+    these drive it against a real HTTP endpoint publishing the api's read key.
+    """
+
+    async def test_the_generated_read_key(self, served: _Served) -> None:
+        app = create_app(_api_settings(served))
+        await _assert_the_read_key_is_never_a_session_key(app, served)
+
+    async def test_a_read_key_from_a_pem_file(self, served: _Served, tmp_path: Path) -> None:
+        pem = tmp_path / "read.pem"
+        pem.write_bytes(_key("read-1").as_pem(private=True))
+        app = create_app(_api_settings(served, read_key_pem_path=str(pem)))
+        await _assert_the_read_key_is_never_a_session_key(app, served)
