@@ -254,6 +254,8 @@ A new `_refresh` beside `_exchange`, returning `(response, detail)` so the row i
 9. **Sign.** A raise leaves the family rotated and the client's token retained; its retry is reuse and revokes the family. Fail-closed; the customer re-pairs.
 10. **Row**, `audit.minted()`, committed before the response is returned.
 
+**Note, 1 October 2026: a signature that fails after the rotation.** Step 9 raising leaves the family rotated and the client's token retained, so the client's retry is reuse, the family is revoked and the customer re-pairs. This spec accepts that as fail-closed. Option for the spec owner: prepare, sign, then rotate and return the token only if the rotation succeeds; the invariant (no externally visible token whose jti is unrecorded) still holds; it changes this section's stated order of steps 8 and 9; not taken.
+
 **Response (200)**: §5's five keys with the new refresh token and granted scope, and the same two headers. Any other `grant_type` still answers 404 `unsupported_grant_type` (Discrepancies).
 
 ### 7. Session-swap recall at `POST /scan`

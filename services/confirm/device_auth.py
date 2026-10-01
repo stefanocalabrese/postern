@@ -276,6 +276,12 @@ APPROVAL_CLOCK_TOLERANCE_MS = 2_000
 UNKNOWN_REFRESH_LOG_INTERVAL_SECONDS = 60
 UNKNOWN_REFRESH_LOG_ENTRIES = 4_096
 
+#: What the refresh-family store raises when it cannot answer: redis-py's
+#: errors, a socket error, a timeout. The refresh grant answers each with a
+#: retryable 503 (or, where the family is refused anyway, with the refusal);
+#: anything else is a fault, propagates and is a 500.
+SESSION_STORE_OUTAGES: tuple[type[Exception], ...] = (RedisError, OSError, TimeoutError)
+
 # ---------------------------------------------------------------------------
 # Error responses — RFC 8628 §3.3 and §3.4 error codes.
 # ---------------------------------------------------------------------------
@@ -759,12 +765,10 @@ async def _token_response(request: Request) -> JSONResponse:
     started = time.monotonic()
 
     form = await request.form()
-    grant_type_raw = form.get("grant_type", "")
-    grant_type: str = (
-        grant_type_raw.file.read().decode()
-        if hasattr(grant_type_raw, "file")
-        else str(grant_type_raw)
-    )
+    try:
+        grant_type = _form_value(form, "grant_type") or ""
+    except MalformedParameter as exc:
+        return _error(400, "invalid_request", str(exc))
 
     if grant_type == "refresh_token":
         return await _refresh_grant(request, form, at=at, started=started)
@@ -1130,12 +1134,30 @@ async def _exchange(
 # ---------------------------------------------------------------------------
 
 
+class MalformedParameter(ValueError):
+    """A ``/token`` parameter that is repeated, or a file part that is not UTF-8."""
+
+
 def _form_value(form: Any, name: str) -> str | None:
-    """A form field as a string, ``None`` when absent. A file part is read."""
-    raw = form.get(name)
-    if raw is None:
+    """A form field as a string, ``None`` when absent. A file part is read.
+
+    Raises `MalformedParameter` when the parameter occurs more than once
+    (RFC 6749 section 3.2: "Request and response parameters MUST NOT be
+    included more than once"), where ``form.get`` would silently keep the
+    last value, and when a file part does not decode as UTF-8.
+    """
+    values = form.getlist(name)
+    if not values:
         return None
-    return raw.file.read().decode() if hasattr(raw, "file") else str(raw)
+    if len(values) > 1:
+        raise MalformedParameter(f"{name} must not be repeated")
+    raw = values[0]
+    if not hasattr(raw, "file"):
+        return str(raw)
+    try:
+        return str(raw.file.read().decode("utf-8"))
+    except UnicodeDecodeError:
+        raise MalformedParameter(f"{name} is not UTF-8") from None
 
 
 def _unrefreshable_response() -> JSONResponse:
@@ -1198,7 +1220,12 @@ async def _refresh_grant(
     and ``session_id``.
     """
     settings: ConfirmSettings = request.app.state.settings
-    presented = _form_value(form, "refresh_token")
+    try:
+        presented = _form_value(form, "refresh_token")
+        client_id = _form_value(form, "client_id")
+        requested_scope = _form_value(form, "scope")
+    except MalformedParameter as exc:
+        return _error(400, "invalid_request", str(exc))
     if not presented:
         return _error(400, "invalid_request", "refresh_token is required")
     unserved = _resource_refusal(form, settings)
@@ -1208,7 +1235,15 @@ async def _refresh_grant(
     if sid is None:
         return _unrefreshable_response()
     sessions: RefreshSessionStoreBase = request.app.state.refresh_session_store
-    family = await sessions.get(sid)
+    try:
+        family = await sessions.get(sid)
+    except SESSION_STORE_OUTAGES as exc:
+        # NO ROW: nothing is proven yet. Retryable, with the 503s' header.
+        logger.warning(
+            "refresh grant: refresh-family store unavailable (%s); refusing to look up",
+            type(exc).__name__,
+        )
+        return store_unavailable_response(settings.device_poll_interval_seconds)
     if family is None:
         return _unrefreshable_response()
 
@@ -1234,7 +1269,12 @@ async def _refresh_grant(
     audit.names(session_id=sid, paired_client_id=family.client_id)
     try:
         response, detail = await _refresh(
-            request, form=form, family=family, presented_hash=presented_hash, retained=retained
+            request,
+            client_id=client_id,
+            requested_scope=requested_scope,
+            family=family,
+            presented_hash=presented_hash,
+            retained=retained,
         )
     except Exception as exc:
         try:
@@ -1267,7 +1307,8 @@ async def _refresh_grant(
 async def _refresh(
     request: Request,
     *,
-    form: Any,
+    client_id: str | None,
+    requested_scope: str | None,
     family: RefreshSession,
     presented_hash: str,
     retained: bool,
@@ -1295,13 +1336,12 @@ async def _refresh(
         return _unrefreshable_response(), DETAIL_SESSION_GENERATIONS_EXHAUSTED
     if family.is_expired(now):
         return _unrefreshable_response(), DETAIL_SESSION_EXPIRED
-    client_id = _form_value(form, "client_id")
     if client_id is not None and client_id != family.client_id:
         return _unrefreshable_response(), DETAIL_CLIENT_ID_MISMATCH
 
     # STEP 5: SCOPE. Absent or empty after canonicalization is "the scope
     # originally granted" (RFC 6749 section 6); wider is refused.
-    requested = canonical_scope(_form_value(form, "scope") or "")
+    requested = canonical_scope(requested_scope or "")
     granted = family.scopes
     if requested:
         if not set(requested.split(" ")) <= set(family.scopes.split(" ")):
@@ -1323,9 +1363,27 @@ async def _refresh(
         return _unrefreshable_response(), DETAIL_REVOKED
     if stamp is not None and stamp >= family.created_ms:
         # ISSUED BEFORE A CUSTOMER REVOCATION: refused, and the family is
-        # revoked for good, so no later restore can revive it.
+        # revoked for good, so no later restore can revive it. Its live access
+        # tokens go on the ZT-7 list now, not at the client's next refresh: the
+        # api would otherwise honour them for up to their remaining lifetime.
         log_refusal("a session refresh of a family issued before a revocation")
-        await sessions.revoke(family.sid, reason="issued_before_revocation")
+        try:
+            jtis = await sessions.revoke(family.sid, reason="issued_before_revocation")
+        except SESSION_STORE_OUTAGES as exc:
+            # Still refused: the stamp refuses this family on every
+            # presentation for the rest of its life, which the stamp's TTL
+            # covers, so the outage costs only the revocation's permanence.
+            logger.warning(
+                "refresh grant: could not revoke family %s issued before a revocation: %s",
+                family.sid,
+                type(exc).__name__,
+            )
+            return _unrefreshable_response(), type(exc).__name__
+        try:
+            await _reassert(revocations, jtis or ())
+        except RevocationStoreUnavailable as exc:
+            # The family is revoked, so the next presentation re-asserts.
+            return store_unavailable_response(retry_after), type(exc).__name__
         return _unrefreshable_response(), DETAIL_ISSUED_BEFORE_REVOCATION
 
     # STEP 7: DRAW.
@@ -1426,12 +1484,14 @@ async def _answer_reuse(
 ) -> tuple[JSONResponse, str | None]:
     """A retained token on a live family: revoke it, then list its jtis.
 
-    A store raising answers 503 under its type name; the next presentation of
-    either token lands in the revoked branch and re-asserts.
+    A store outage (`SESSION_STORE_OUTAGES`) answers 503 under its type
+    name and leaves the family unrevoked, so the retained token is reuse
+    again on its next presentation; any other exception is a fault and
+    propagates.
     """
     try:
         jtis = await sessions.revoke(family.sid, reason="reuse")
-    except Exception as exc:  # noqa: BLE001 -- any store failure is a retryable 503
+    except SESSION_STORE_OUTAGES as exc:
         return store_unavailable_response(retry_after), type(exc).__name__
     return await _reuse_detected(revocations, family, jtis or (), retry_after)
 

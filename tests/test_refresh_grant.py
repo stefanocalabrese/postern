@@ -32,6 +32,7 @@ from postern_core.auth.refresh_sessions import (
 from postern_core.auth.revocation import InMemoryRevocationStore, RevocationStoreUnavailable
 from postern_core.store.engine import Database
 from postern_core.store.models import OUTCOME_RAISED, OUTCOME_RETURNED, AuditEntry
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import select
 from starlette.applications import Starlette
 
@@ -92,6 +93,28 @@ async def _refresh(app: Starlette, refresh_token: str | None, **extra: str) -> h
         base_url="http://t",
     ) as client:
         return await client.post("/token", data=data)
+
+
+async def _post(app: Starlette, **kwargs: Any) -> httpx2.Response:
+    """``POST /token`` with whatever body ``kwargs`` describes."""
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as client:
+        return await client.post("/token", **kwargs)
+
+
+def _invalid_request(response: httpx2.Response) -> None:
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "invalid_request"
+    assert response.headers["cache-control"] == "no-store"
+
+
+def _retryable(app: Starlette, response: httpx2.Response) -> None:
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "temporarily_unavailable"
+    assert response.headers["retry-after"] == str(app.state.settings.device_poll_interval_seconds)
+    assert response.headers["cache-control"] == "no-store"
 
 
 async def _rows(db: Database) -> list[AuditEntry]:
@@ -230,6 +253,72 @@ class TestNothingIsRecordedBeforeTheProof:
         assert not await revocations.is_revoked({"jti": _jti(first)})
 
 
+class TestTheRequestShape:
+    @pytest.mark.parametrize("name", ["refresh_token", "client_id", "scope", "grant_type"])
+    async def test_a_repeated_parameter_is_invalid_request_and_writes_nothing(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database, name: str
+    ) -> None:
+        first = await _session(app, key_pair)
+        values = {
+            "refresh_token": first["refresh_token"],
+            "client_id": "claude-code",
+            "scope": "accounts:read",
+            "grant_type": "refresh_token",
+        }
+        body = list(values.items())
+        body.append((name, values[name]))
+        response = await _post(
+            app,
+            content="&".join(f"{key}={value}" for key, value in body),
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        _invalid_request(response)
+        assert await _rows(clean) == []
+        assert (await _family(app, first)).generation == 0
+
+    @pytest.mark.parametrize("name", ["refresh_token", "client_id", "scope", "grant_type"])
+    async def test_a_file_part_that_is_not_utf8_is_invalid_request(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database, name: str
+    ) -> None:
+        first = await _session(app, key_pair)
+        data = {"grant_type": "refresh_token", "refresh_token": first["refresh_token"]}
+        data.pop(name, None)
+        response = await _post(
+            app, data=data, files={name: ("value", b"\xff\xfe\xfd", "text/plain")}
+        )
+        _invalid_request(response)
+        assert await _rows(clean) == []
+        assert (await _family(app, first)).generation == 0
+
+    async def test_a_utf8_file_part_is_read(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        response = await _post(
+            app,
+            data={"grant_type": "refresh_token"},
+            files={"refresh_token": ("value", first["refresh_token"].encode(), "text/plain")},
+        )
+        session_claims(response, app)
+
+    async def test_a_family_store_outage_at_the_lookup_is_a_retryable_503_with_no_row(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def down(sid: str) -> RefreshSession | None:
+            raise RedisConnectionError("simulated outage")
+
+        monkeypatch.setattr(sessions, "get", down)
+        _retryable(app, await _refresh(app, first["refresh_token"]))
+        assert await _rows(clean) == []
+
+
 class TestReuse:
     async def test_a_retained_token_revokes_the_family_and_lists_every_live_jti(
         self,
@@ -289,6 +378,53 @@ class TestReuse:
             "RevocationStoreUnavailable",
             DETAIL_SESSION_REVOKED,
         ]
+
+    async def test_a_family_store_outage_at_reuse_is_a_retryable_503(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        await _refresh(app, first["refresh_token"])
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        real = sessions.revoke
+
+        async def down(sid: str, *, reason: str) -> tuple[str, ...] | None:
+            raise RedisConnectionError("simulated outage")
+
+        monkeypatch.setattr(sessions, "revoke", down)
+        _retryable(app, await _refresh(app, first["refresh_token"]))
+        assert (await _family(app, first)).revoked_at is None
+
+        monkeypatch.setattr(sessions, "revoke", real)
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert (await _family(app, first)).revoked_reason == "reuse"
+        assert [r.detail for r in await _rows(clean)] == [
+            None,
+            "ConnectionError",
+            DETAIL_REFRESH_REUSED,
+        ]
+
+    async def test_a_store_fault_that_is_not_an_outage_at_reuse_is_a_500(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        await _refresh(app, first["refresh_token"])
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def broken(sid: str, *, reason: str) -> tuple[str, ...] | None:
+            raise ValueError("a programming error, not an outage")
+
+        monkeypatch.setattr(sessions, "revoke", broken)
+        response = await _refresh(app, first["refresh_token"])
+        assert response.status_code == 500
+        assert [r.detail for r in await _rows(clean)] == [None, "ValueError"]
 
 
 class TestTheFamilysLimits:
@@ -424,9 +560,66 @@ class TestZt7:
         await store.revoke_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
         await store.restore_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
         _refused(await _refresh(app, first["refresh_token"]))
+        assert await store.is_revoked({"jti": _jti(first)}), "the live access token is cut now"
         family = await _family(app, first)
         assert family.revoked_reason == "issued_before_revocation"
         assert [r.detail for r in await _rows(clean)] == [DETAIL_ISSUED_BEFORE_REVOCATION]
+
+    async def test_a_failed_zt7_write_after_issued_before_revocation_converges(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.revoke_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+        await store.restore_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+        real = store.revoke_session
+
+        async def down(*, jti: str) -> None:
+            raise RevocationStoreUnavailable("simulated outage")
+
+        monkeypatch.setattr(store, "revoke_session", down)
+        _retryable(app, await _refresh(app, first["refresh_token"]))
+        assert (await _family(app, first)).revoked_reason == "issued_before_revocation"
+        assert not await store.is_revoked({"jti": _jti(first)})
+
+        monkeypatch.setattr(store, "revoke_session", real)
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert await store.is_revoked({"jti": _jti(first)})
+        assert [r.detail for r in await _rows(clean)] == [
+            "RevocationStoreUnavailable",
+            DETAIL_SESSION_REVOKED,
+        ]
+
+    async def test_a_family_store_outage_revoking_an_issued_before_family_still_refuses(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The family stays unrevoked, but the stamp refuses it on every
+        presentation for the rest of its life."""
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.revoke_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+        await store.restore_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def down(sid: str, *, reason: str) -> tuple[str, ...] | None:
+            raise TimeoutError("simulated outage")
+
+        monkeypatch.setattr(sessions, "revoke", down)
+        with caplog.at_level(logging.WARNING, logger="services.confirm.device_auth"):
+            _refused(await _refresh(app, first["refresh_token"]))
+            _refused(await _refresh(app, first["refresh_token"]))
+        assert "TimeoutError" in caplog.text and _sid(first) in caplog.text
+        assert (await _family(app, first)).generation == 0
+        assert [r.detail for r in await _rows(clean)] == ["TimeoutError", "TimeoutError"]
 
     @pytest.mark.parametrize(("offset_ms", "refused"), [(700, True), (0, True), (-1, False)])
     async def test_milliseconds_decide_at_the_edge(
@@ -519,4 +712,7 @@ class TestTheRotationItself:
         monkeypatch.setattr(sessions, "rotate", raced)
         _refused(await _refresh(app, first["refresh_token"]))
         assert (await _family(app, first)).revoked_reason == "reuse"
+        revocations: InMemoryRevocationStore = app.state.postern_revocation_store
+        assert await revocations.is_revoked({"jti": "winner"})
+        assert await revocations.is_revoked({"jti": _jti(first)})
         assert [r.detail for r in await _rows(clean)] == [DETAIL_REFRESH_REUSED]
