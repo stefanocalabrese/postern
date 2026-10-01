@@ -113,6 +113,7 @@ from postern_core.auth.refresh_sessions import (
     MAX_GENERATIONS,
     RefreshSession,
     RefreshSessionStoreBase,
+    RefreshSessionStoreContended,
     RefreshSessionStoreFull,
     Rotation,
     canonical_scope,
@@ -2306,12 +2307,21 @@ async def scan_callback(request: Request) -> JSONResponse:
         malformed, forged or future rotation token.
     Response (401): no verified assertion.
     Response (403): ``invalid_subject`` or ``access_revoked`` (ZT-7).
+    Response (503): ``temporarily_unavailable`` with ``Retry-After: 1``, when
+        a scan that found the pairing already exchanged could not complete
+        the recall because a store was out or contended; see ``_recall``.
+    Response (500): a row that could not be written, and any other raise,
+        recorded under the exception's type where the row can still be written.
 
     ONE ROW PER RECORDED CALL, through ``PairingAudit`` with
     ``SCAN_TOOL_NAME`` and ``SCAN_ROUTE``, fail-closed per decision 0006: a
     claim whose row cannot be written is withdrawn exactly as
     ``_withdraw_pairing`` withdraws an unrecorded approval. The malformed-body
     exits write nothing, by ``PairingAudit``'s rule, as on ``POST /approve``.
+    THE ONE EXCEPTION is a scan that finds the pairing already exchanged
+    (``ScanClaim.CONFLICT_EXCHANGED``): ``_recall`` writes a recall row
+    first, naming the recalled family's customer, and this row follows it
+    with the same ``call_id``, so that call writes two rows.
     """
     at = datetime.now(UTC)
     started = time.monotonic()
@@ -2351,9 +2361,11 @@ async def scan_callback(request: Request) -> JSONResponse:
         # A RAISE MAY FOLLOW A COMMITTED CLAIM. On Redis `claim_scan`'s
         # `pipe.execute()` can raise after the server ran `EXEC`, so `_scan`
         # withdraws the pairing before that exception reaches this branch,
-        # exactly as `_pair` does for `approve_scanned`. Nothing else in
-        # `_scan` writes, and nothing after a successful claim can raise, so
-        # there is nothing left to withdraw here.
+        # exactly as `_pair` does for `approve_scanned`. Nothing after a
+        # `CLAIMED` claim can raise. A raise after a `CONFLICT_EXCHANGED`
+        # claim comes from `_recall`, which claimed nothing: what it may
+        # leave behind is a revoked family or listed tokens, and that recall
+        # is safe to keep. So there is nothing left to withdraw here.
         try:
             await audit.refused(type(exc).__name__)
         except Exception as audit_exc:
@@ -2569,6 +2581,15 @@ async def _scan(
     return _Scanned(_unpairable_response(), DETAIL_USER_CODE_NOT_FOUND)
 
 
+#: What a recall answers 503 for: a store that was out or contended, which an
+#: immediate retry can get past. Anything else is a 500 (see `_recall`).
+_RECALL_FAILURES: tuple[type[Exception], ...] = (
+    *SESSION_STORE_OUTAGES,
+    RevocationStoreUnavailable,
+    RefreshSessionStoreContended,
+)
+
+
 async def _recall(request: Request, scan_audit: PairingAudit, *, code: DeviceCode) -> bool:
     """Recall the session a session swap produced, write its row, and say if it held.
 
@@ -2586,11 +2607,21 @@ async def _recall(request: Request, scan_audit: PairingAudit, *, code: DeviceCod
 
     The row names the family's customer (B), shares the scan row's
     ``call_id``, and is ``returned`` only when the family was revoked and
-    every ``jti`` reached a shared store. Returns ``False`` when a step
-    raised, and the caller answers a 503 the app retries at once; ``True``
-    otherwise, including the rows that record nothing to recall. An audit
-    write failure raises: a revocation that happened is the safe state, so
+    every ``jti`` reached a shared store. Returns ``False`` when a store was
+    out or contended (``SESSION_STORE_OUTAGES``, ``RevocationStoreUnavailable``,
+    ``RefreshSessionStoreContended``), and the caller answers a 503 the app
+    retries at once; ``True`` otherwise, including the rows that record
+    nothing to recall. ANY OTHER EXCEPTION PROPAGATES, unrecorded here, to the
+    500 ``scan_callback`` records under its type: a programming error is not
+    an outage, and a retry would only repeat it. An audit write failure
+    raises the same way: a revocation that happened is the safe state, so
     nothing is withdrawn.
+
+    A CANCELLATION INSIDE THE STEPS ESCAPES every handler and leaves no row,
+    and possibly a half-done recall. Accepted: the family is revoked before
+    any ``jti`` is listed, so the state left is either untouched or revoked
+    with tokens still to list, and the app's retry repeats ``revoke`` on the
+    revoked family, gets the same jtis back and finishes the listing.
     """
     settings: ConfirmSettings = request.app.state.settings
     subject = code.scanned_by
@@ -2610,7 +2641,8 @@ async def _recall(request: Request, scan_audit: PairingAudit, *, code: DeviceCod
             await _reassert(revocation_store(request), jtis)
             if request.app.state.process_local_sessions:
                 detail = DETAIL_RECALL_LOCAL_ONLY
-    except Exception as exc:  # noqa: BLE001 -- recorded and answered 503; the app retries
+    except _RECALL_FAILURES as exc:
+        # Recorded and answered 503; the app retries.
         detail = type(exc).__name__
         held = False
         logger.error(

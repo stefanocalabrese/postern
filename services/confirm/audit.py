@@ -900,7 +900,10 @@ REFRESH_TOOL_NAME = "device_grant.refresh"
 #: second customer's scan finds the pairing already exchanged: the session
 #: the exchange issued is revoked. ``route`` stays ``SCAN_ROUTE``, the row
 #: names the recalled family's customer, and it shares the scan row's
-#: ``call_id``.
+#: ``call_id``. Only the customer columns are the family's: ``client_ip`` is
+#: the SCANNER's address, read from the request that triggered the recall,
+#: and ``claims`` is empty, so no client id is recorded. Do not attribute
+#: that address to the customer the row names.
 RECALL_TOOL_NAME = "device_grant.recall"
 
 #: The stored ``customer_ref`` on an approved device code will not parse as a

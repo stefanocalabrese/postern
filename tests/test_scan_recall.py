@@ -23,10 +23,14 @@ import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from postern_core.auth.device_codes import DeviceCode
 from postern_core.auth.device_keys import no_enrolled_devices
-from postern_core.auth.refresh_sessions import RefreshSessionStoreBase
-from postern_core.auth.revocation import RevocationStoreBase
+from postern_core.auth.refresh_sessions import (
+    RefreshSessionStoreBase,
+    RefreshSessionStoreContended,
+)
+from postern_core.auth.revocation import RevocationStoreBase, RevocationStoreUnavailable
 from postern_core.store.engine import Database
 from postern_core.store.models import OUTCOME_RAISED, OUTCOME_RETURNED, AuditEntry
+from redis.exceptions import RedisError
 from sqlalchemy import select
 from starlette.applications import Starlette
 
@@ -39,6 +43,7 @@ from services.confirm.audit import (
     RECALL_TOOL_NAME,
     SCAN_ROUTE,
     SCAN_TOOL_NAME,
+    PairingAudit,
 )
 from services.confirm.main import create_confirm_app
 from services.confirm.settings import ConfirmSettings
@@ -289,3 +294,136 @@ class TestFailure:
         family = await app.state.refresh_session_store.get(_sid(session))
         assert family is not None and family.revoked_at is None
         assert (await _rows(clean))[-1].detail == DETAIL_QR_STALE
+
+    @pytest.mark.parametrize(
+        "outage",
+        [RedisError, ConnectionError, TimeoutError, RefreshSessionStoreContended],
+    )
+    async def test_a_store_outage_or_contention_at_the_revoke_is_a_503(
+        self,
+        shared_app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+        outage: type[Exception],
+    ) -> None:
+        app = shared_app
+        code, _ = await _swapped(app, key_pair)
+
+        async def down(sid: str, *, reason: str) -> tuple[str, ...] | None:
+            raise outage("store trouble")
+
+        monkeypatch.setattr(app.state.refresh_session_store, "revoke", down)
+        failed = await scan(app, key_pair, ALICE, code)
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "1"
+        recall, conflict = (await _rows(clean))[-2:]
+        assert (recall.tool_name, recall.detail) == (RECALL_TOOL_NAME, outage.__name__)
+        assert (conflict.tool_name, conflict.detail) == (SCAN_TOOL_NAME, DETAIL_SCAN_CONFLICT)
+
+    @pytest.mark.parametrize("bug", [ValueError, AttributeError])
+    async def test_a_recall_that_raises_a_non_outage_is_a_recorded_500_not_a_503(
+        self,
+        shared_app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+        bug: type[Exception],
+    ) -> None:
+        """A programming error is not an outage the app should retry: it
+        propagates to the 500 ``scan_callback`` records under its type, and
+        no recall row is written for it."""
+        app = shared_app
+        code, session = await _swapped(app, key_pair)
+        before = len(await _rows(clean))
+
+        async def broken(sid: str, *, reason: str) -> tuple[str, ...] | None:
+            raise bug("a bug, not an outage")
+
+        monkeypatch.setattr(app.state.refresh_session_store, "revoke", broken)
+        failed = await scan(app, key_pair, ALICE, code, as_a_server_would=True)
+        assert failed.status_code == 500
+        written = await _rows(clean)
+        assert len(written) == before + 1
+        assert (written[-1].tool_name, written[-1].outcome, written[-1].detail) == (
+            SCAN_TOOL_NAME,
+            OUTCOME_RAISED,
+            bug.__name__,
+        )
+        family = await app.state.refresh_session_store.get(_sid(session))
+        assert family is not None and family.revoked_at is None
+
+    async def test_a_listing_that_fails_after_the_revoke_converges_on_the_retry(
+        self,
+        shared_app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Step 2 held and step 3 did not: the family is revoked and its token
+        is not yet listed. The retry's ``revoke`` on the already revoked family
+        returns the same jtis, so the listing completes then."""
+        app = shared_app
+        code, session = await _swapped(app, key_pair)
+        revocations: RevocationStoreBase = app.state.postern_revocation_store
+        real = revocations.revoke_session
+
+        async def down(**kwargs: Any) -> None:
+            raise RevocationStoreUnavailable("the revocation store is gone")
+
+        monkeypatch.setattr(revocations, "revoke_session", down)
+        failed = await scan(app, key_pair, ALICE, code)
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "1"
+        recall = (await _rows(clean))[-2]
+        assert (recall.tool_name, recall.detail) == (
+            RECALL_TOOL_NAME,
+            "RevocationStoreUnavailable",
+        )
+        family = await app.state.refresh_session_store.get(_sid(session))
+        assert family is not None and family.revoked_reason == "recall"
+        assert not await revocations.is_revoked({"jti": _jti(session)})
+
+        monkeypatch.setattr(revocations, "revoke_session", real)
+        retried = await scan(app, key_pair, ALICE, code)
+        assert retried.json()["error"] == "scan_conflict"
+        assert await revocations.is_revoked({"jti": _jti(session)})
+        recall = (await _rows(clean))[-2]
+        assert (recall.tool_name, recall.outcome, recall.detail) == (
+            RECALL_TOOL_NAME,
+            OUTCOME_RETURNED,
+            None,
+        )
+
+    async def test_a_recall_row_that_cannot_be_written_is_a_500_and_the_recall_stands(
+        self,
+        shared_app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Spec section 7: an audit write failure answers 500 and nothing is
+        withdrawn, because a revocation that happened is the safe state."""
+        app = shared_app
+        code, session = await _swapped(app, key_pair)
+        row_before = await device_store_of(app).get_device_code(code.device_code)
+        before = len(await _rows(clean))
+
+        async def audit_down(self: PairingAudit) -> None:
+            raise RuntimeError("audit store down")
+
+        monkeypatch.setattr(PairingAudit, "recalled", audit_down)
+        failed = await scan(app, key_pair, ALICE, code, as_a_server_would=True)
+        assert failed.status_code == 500
+        written = await _rows(clean)
+        assert len(written) == before + 1
+        assert (written[-1].tool_name, written[-1].outcome, written[-1].detail) == (
+            SCAN_TOOL_NAME,
+            OUTCOME_RAISED,
+            "RuntimeError",
+        )
+        assert written[-1].customer_ref == ALICE
+        family = await app.state.refresh_session_store.get(_sid(session))
+        assert family is not None and family.revoked_reason == "recall"
+        assert await app.state.postern_revocation_store.is_revoked({"jti": _jti(session)})
+        assert await device_store_of(app).get_device_code(code.device_code) == row_before

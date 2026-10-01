@@ -28,7 +28,7 @@ Two more defects this spec removes on the way:
 
 Rotation stops **static** relays: a screenshot in an email, a QR image on a forum, a photo passed along later. §4's hotlink refusal stops the cheapest dynamic form of the same thing, an `<img>` pointing at this server from someone else's page. They do not stop the two forms above.
 
-**Session swap is closed only until the victim's client has exchanged the code.** Attacker B, any customer of the operator, sees victim A's QR on a screen share or over a shoulder, scans it and approves first. Without §5's conflict rule, A's AI client would then receive a read token for B's accounts, and every transaction memo in it would be text B wrote, which is A1 delivered through A's own client. §5 revokes the pairing when A's scan arrives second and the code has not been exchanged. When A's client has already polled `/token` and exchanged it (a 5-second poll interval makes that window a few seconds wide), `/scan` refuses and records `scan_conflict`, and **the token already issued is not recalled by this spec.** A's client holds B's read token until it expires.
+**Session swap is closed only until the victim's client has exchanged the code.** Attacker B, any customer of the operator, sees victim A's QR on a screen share or over a shoulder, scans it and approves first. Without §5's conflict rule, A's AI client would then receive a read token for B's accounts, and every transaction memo in it would be text B wrote, which is A1 delivered through A's own client. §5 revokes the pairing when A's scan arrives second and the code has not been exchanged. When A's client has already polled `/token` and exchanged it (a 5-second poll interval makes that window a few seconds wide), `/scan` refuses and records `scan_conflict`, and **the token already issued is not recalled by this spec.** A's client holds B's read token until it expires. (Superseded 2 October 2026: see `dev-docs/device-grant-session-token-spec.md` §7.)
 
 The "rich context" mitigation in §7.3 is also weaker than it reads. `client_id` is supplied unauthenticated at `POST /device_authorization`, so an attacker can make the app's confirmation screen say "Claude". This spec marks it unverified in the `/scan` response; CIMD verification is what would fix it, and that is not in scope.
 
@@ -160,7 +160,7 @@ Requires the banking-app assertion, like `/approve`: it is **not** in `PUBLIC_PA
    - `claimed` or `already_mine`: continue to step 6.
    - `approved_mine`: 400 `invalid_grant` (superseded on 30 September 2026, see the dated note below).
    - `conflict_revoked`: the pairing is already revoked; 400 `scan_conflict`. The AI client's next `/token` poll finds no code, and `/verify/state` answers 404, so the page shows closed.
-   - `conflict_exchanged`: 400 `scan_conflict`. Nothing is revoked, and the read token already issued to the other customer's pairing stays valid until it expires; see "Session swap" above.
+   - `conflict_exchanged`: 400 `scan_conflict`. Nothing is revoked, and the read token already issued to the other customer's pairing stays valid until it expires; see "Session swap" above. (Superseded 2 October 2026: see `dev-docs/device-grant-session-token-spec.md` §7.)
    - `gone`: 400 `invalid_grant`.
 
    A stale token from a different customer against a scanned code answers `qr_stale`, revokes nothing and is not recorded as `scan_conflict`, because the MAC check in step 4 runs before `claim_scan`. Only a scan inside the token window reaches session-swap detection.
