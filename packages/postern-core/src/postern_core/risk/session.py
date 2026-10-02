@@ -45,7 +45,6 @@ import hashlib
 import logging
 import math
 import os
-import time
 from abc import ABC, abstractmethod
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -215,7 +214,7 @@ class InMemorySessionStore(SessionStoreBase):
         ctx = self._contexts.get(key.value)
         if ctx is None:
             return None
-        if time.time() - ctx.started_at >= self._ttl:
+        if ctx.session_age_seconds >= self._ttl:
             del self._contexts[key.value]
             logger.info("risk context %s expired after %ds", key.log_ref, self._ttl)
             return None

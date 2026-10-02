@@ -354,15 +354,34 @@ async def test_the_in_memory_store_ages_a_context_out() -> None:
     assert await store.load(KEY) is ctx
 
     # Age the context by moving its own start instant back, rather than by
-    # patching a clock: `time.time` is one module attribute shared by this
-    # store and `RiskContext.started_at`, so patching it moves both readings
-    # together and the elapsed time between them never changes.
+    # patching a clock: `time.time` is one module attribute shared by every
+    # reader, so patching it moves all readings together and the elapsed
+    # time between them never changes.
     _age(ctx, 61)
     assert await store.load(KEY) is None
 
     fresh = await store.context_for(KEY)
     assert fresh is not ctx
     assert fresh.record_count.total == 0
+
+
+async def test_the_in_memory_store_reads_one_clock_at_the_ttl_boundary() -> None:
+    """A context exactly `ttl` old is dropped; one just short of it is kept.
+
+    The skewed clock freezes monotonic time and advances the wall clock 1
+    microsecond per read, so a two-wall-read age comes out 1 microsecond
+    short of the true one. Exactly `ttl` old, the old `time.time() -
+    ctx.started_at` line kept the context and `session_age_seconds` drops it.
+    """
+    store = SessionStore(ttl_seconds=60)
+    _, context_patch = _skewed_clock()
+    with context_patch:
+        kept = await store.context_for(KEY)
+        _age(kept, 59)
+        assert await store.load(KEY) is kept
+
+        _age(kept, 1)  # now exactly 60 s old
+        assert await store.load(KEY) is None
 
 
 # --- Serialization tests (Redis persistence) ---
@@ -547,11 +566,11 @@ async def test_redis_store_sets_a_ttl_on_a_new_context() -> None:
 class _SkewedClock:
     """A `time` stand-in: wall clock +1 microsecond per call, monotonic frozen.
 
-    The real code reads the wall clock twice for one age (once in the store,
-    once inside `RiskContext.started_at`), and the second read is later. With
-    a frozen monotonic clock the true age of a just-created context is
-    exactly zero, so any age the store computes other than zero is an artefact
-    of how many wall-clock reads it took.
+    It reproduces the old two-read artefact: with monotonic time frozen, a
+    just-created context's true age is exactly zero, so code that derives an
+    age from two wall-clock reads comes out a microsecond or so wrong. A store
+    that reads `session_age_seconds` (one monotonic reading) is unaffected,
+    which is what the tests using it assert.
     """
 
     def __init__(self) -> None:
@@ -569,12 +588,11 @@ class _SkewedClock:
         return self._mono
 
 
-def _skewed_clock() -> tuple[_SkewedClock, Any, Any]:
+def _skewed_clock() -> tuple[_SkewedClock, Any]:
     clock = _SkewedClock()
     return (
         clock,
         patch("postern_core.risk.context.time", clock),
-        patch("postern_core.risk.session.time", clock),
     )
 
 
@@ -582,8 +600,8 @@ async def test_a_fresh_context_never_gets_more_than_its_lifetime() -> None:
     """Two wall-clock reads in the wrong order made a new context's age
     slightly negative, and `ceil` turned 600.000001 into 601."""
     store = _fake_store(ttl=600)
-    _, context_patch, session_patch = _skewed_clock()
-    with context_patch, session_patch:
+    _, context_patch = _skewed_clock()
+    with context_patch:
         await store.context_for(KEY)
     pttl = await store._redis.pttl(f"test:risk:{KEY.value}")
     assert 0 < pttl <= 600_000, f"key outlives its context's lifetime: {pttl} ms"
@@ -592,12 +610,12 @@ async def test_a_fresh_context_never_gets_more_than_its_lifetime() -> None:
 async def test_a_load_never_extends_the_key_beyond_the_remaining_lifetime() -> None:
     store = _fake_store(ttl=600)
     redis_key = f"test:risk:{KEY.value}"
-    clock, context_patch, session_patch = _skewed_clock()
+    clock, context_patch = _skewed_clock()
     # A context stored at exactly the clock's first reading: the load's first
     # read then gives an elapsed of zero and its later reads are all later.
     stored = json.loads(RiskContext(session_id=KEY.value).to_json())
     stored["started_at"] = clock.start
-    with context_patch, session_patch:
+    with context_patch:
         await store._redis.set(redis_key, json.dumps(stored), ex=1000)
         assert await store.load(KEY) is not None
     pttl = await store._redis.pttl(redis_key)
@@ -632,8 +650,8 @@ async def test_real_redis_gives_a_fresh_context_its_full_lifetime(
 async def test_real_redis_a_fresh_context_never_gets_more_than_its_lifetime(
     real_store: RedisSessionStore,
 ) -> None:
-    _, context_patch, session_patch = _skewed_clock()
-    with context_patch, session_patch:
+    _, context_patch = _skewed_clock()
+    with context_patch:
         await real_store.context_for(KEY)
     pttl = await real_store._redis.pttl(real_store._key(KEY))
     assert 0 < pttl <= 600_000, f"key outlives its context's lifetime: {pttl} ms"
@@ -643,10 +661,10 @@ async def test_real_redis_a_load_never_extends_the_key_beyond_the_remaining_life
     real_store: RedisSessionStore,
 ) -> None:
     redis_key = real_store._key(KEY)
-    clock, context_patch, session_patch = _skewed_clock()
+    clock, context_patch = _skewed_clock()
     stored = json.loads(RiskContext(session_id=KEY.value).to_json())
     stored["started_at"] = clock.start
-    with context_patch, session_patch:
+    with context_patch:
         await real_store._redis.set(redis_key, json.dumps(stored), ex=1000)
         assert await real_store.load(KEY) is not None
     pttl = await real_store._redis.pttl(redis_key)
@@ -656,8 +674,8 @@ async def test_real_redis_a_load_never_extends_the_key_beyond_the_remaining_life
 async def test_real_redis_a_second_context_for_never_extends_the_key(
     real_store: RedisSessionStore,
 ) -> None:
-    _, context_patch, session_patch = _skewed_clock()
-    with context_patch, session_patch:
+    _, context_patch = _skewed_clock()
+    with context_patch:
         await real_store.context_for(KEY)
         assert await real_store.context_for(KEY) is not None
     pttl = await real_store._redis.pttl(real_store._key(KEY))

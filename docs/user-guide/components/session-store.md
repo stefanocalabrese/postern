@@ -174,6 +174,8 @@ writes instead of evicting; reads continue to work normally. Write failures rais
 the middleware refuses the call (fail-closed). Verify the setting with `redis-cli
 CONFIG GET maxmemory-policy`.
 
+**Clock skew under 2 seconds.** Keep the offset between the confirm service host and this Redis under 2 seconds (NTP or chrony on both, with monitoring). The approval check (`APPROVAL_CLOCK_TOLERANCE_MS`) and the per-pair revocation floor (`PAIR_IAT_TOLERANCE_MS`) compare confirm's clock with Redis `TIME` and allow 2000 ms. Beyond that, a revocation stamp can miss an approval it should refuse, and tokens minted just before a per-pair stamp pass the api's floor, so a restore revives them.
+
 ## ContextVar Pattern (Per-Call Access)
 
 Each subsystem uses a `ContextVar` for per-call access to the current session context:
