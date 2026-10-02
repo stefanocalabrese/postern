@@ -314,7 +314,10 @@ class RedisSessionStore(SessionStoreBase):
             if data is None:
                 return None
             ctx = RiskContext.from_json(data)
-            elapsed = time.time() - ctx.started_at
+            # One monotonic reading, not two wall-clock ones: `started_at`
+            # takes its own wall-clock read after this one, which made a
+            # fresh context's age slightly negative and `ceil` round it up.
+            elapsed = ctx.session_age_seconds
             # CEIL, not `int`: truncating throws away the fraction of a
             # second every read, so a context re-read often enough would lose
             # a second of its lifetime per read rather than keeping the
@@ -360,7 +363,9 @@ class RedisSessionStore(SessionStoreBase):
         lifetime into an idle one, and a caller that keeps calling would hold
         one context, and one budget window, open indefinitely.
         """
-        remaining = math.ceil(self._ttl - (time.time() - ctx.started_at))
+        # One monotonic reading: two wall-clock reads in the wrong order gave a
+        # negative age for a fresh context, and `ceil` made it lifetime + 1.
+        remaining = math.ceil(self._ttl - ctx.session_age_seconds)
         return max(1, remaining)
 
     async def close(self) -> None:

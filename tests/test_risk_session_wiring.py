@@ -11,7 +11,9 @@ middleware does with a context; this file covers the store that holds it.
 """
 
 import dataclasses
+import json
 import time
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -538,6 +540,66 @@ async def test_redis_store_sets_a_ttl_on_a_new_context() -> None:
     await store.context_for(KEY)
     ttl = await store._redis.ttl(f"test:risk:{KEY.value}")
     assert 599 <= ttl <= 600, "a fresh context gets its full lifetime, not one second less"
+
+
+class _SkewedClock:
+    """A `time` stand-in: wall clock +1 microsecond per call, monotonic frozen.
+
+    The real code reads the wall clock twice for one age (once in the store,
+    once inside `RiskContext.started_at`), and the second read is later. With
+    a frozen monotonic clock the true age of a just-created context is
+    exactly zero, so any age the store computes other than zero is an artefact
+    of how many wall-clock reads it took.
+    """
+
+    def __init__(self) -> None:
+        self.start = 1_800_000_000.0
+        self._wall = self.start
+        self._mono = 5_000.0
+
+    def time(self) -> float:
+        """The current reading, then one microsecond on: the first call is `start`."""
+        reading = self._wall
+        self._wall += 1e-6
+        return reading
+
+    def monotonic(self) -> float:
+        return self._mono
+
+
+def _skewed_clock() -> tuple[_SkewedClock, Any, Any]:
+    clock = _SkewedClock()
+    return (
+        clock,
+        patch("postern_core.risk.context.time", clock),
+        patch("postern_core.risk.session.time", clock),
+    )
+
+
+async def test_a_fresh_context_never_gets_more_than_its_lifetime() -> None:
+    """Two wall-clock reads in the wrong order made a new context's age
+    slightly negative, and `ceil` turned 600.000001 into 601."""
+    store = _fake_store(ttl=600)
+    _, context_patch, session_patch = _skewed_clock()
+    with context_patch, session_patch:
+        await store.context_for(KEY)
+    pttl = await store._redis.pttl(f"test:risk:{KEY.value}")
+    assert 0 < pttl <= 600_000, f"key outlives its context's lifetime: {pttl} ms"
+
+
+async def test_a_load_never_extends_the_key_beyond_the_remaining_lifetime() -> None:
+    store = _fake_store(ttl=600)
+    redis_key = f"test:risk:{KEY.value}"
+    clock, context_patch, session_patch = _skewed_clock()
+    # A context stored at exactly the clock's first reading: the load's first
+    # read then gives an elapsed of zero and its later reads are all later.
+    stored = json.loads(RiskContext(session_id=KEY.value).to_json())
+    stored["started_at"] = clock.start
+    with context_patch, session_patch:
+        await store._redis.set(redis_key, json.dumps(stored), ex=1000)
+        assert await store.load(KEY) is not None
+    pttl = await store._redis.pttl(redis_key)
+    assert 0 < pttl <= 600_000, f"load extended the key past the lifetime: {pttl} ms"
 
 
 async def test_a_context_older_than_the_ttl_is_dropped_and_not_returned() -> None:
