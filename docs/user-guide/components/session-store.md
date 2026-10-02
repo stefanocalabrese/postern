@@ -162,6 +162,18 @@ of Redis 7.0, verbatim replication is no longer supported." The script cache is
 volatile, which needs no action: redis-py's `eval` sends the script body on
 every call.
 
+**`maxmemory-policy noeviction`.** The Redis behind Postern holds session-store
+contexts with TTLs, device codes with TTLs, refresh families with TTLs, and
+revocation entries without TTLs. Under eviction policies (`allkeys-lru`,
+`allkeys-lfu`, `allkeys-random`) Redis can silently evict any keys when memory
+is constrained, including revocation entries (per-session, per-customer+client,
+kill-switch) whose loss means a revoked session or customer becomes valid again
+(ZT-7 bypass). Set `maxmemory-policy noeviction` so Redis returns an error on
+writes instead of evicting; reads continue to work normally. Write failures raise
+`SessionStoreUnavailable` or `RevocationStoreUnavailable` in the application, and
+the middleware refuses the call (fail-closed). Verify the setting with `redis-cli
+CONFIG GET maxmemory-policy`.
+
 ## ContextVar Pattern (Per-Call Access)
 
 Each subsystem uses a `ContextVar` for per-call access to the current session context:
