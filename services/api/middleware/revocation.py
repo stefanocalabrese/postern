@@ -47,11 +47,11 @@ revoked call is still audited -- a refusal is exactly the event an operator
 wants a row for -- and is refused before it spends any risk budget or touches
 the risk session store.
 
-WHAT THIS DOES NOT COVER, PLAINLY. `services/confirm` consults no revocation
-store. Revoking a session does not stop a payment approval: a challenge
-already created can still be approved on the customer's device, and the
-approval callback still reaches the backend write endpoint. The RFC 8628
-device-grant token exchange is uncovered for the same reason.
+WHAT THIS COVERS ON THE WRITE PATH. `services/confirm` checks revocation via
+`is_customer_revoked` on scan, approve, and challenge-approval paths. On the
+token exchange (device_code grant) it checks customer revocation only. On refresh
+it checks the customer under any client, the customer-client pair, the kill switch,
+and each live access token (services/confirm/revocation.py, device_auth.py).
 """
 
 from __future__ import annotations

@@ -98,3 +98,7 @@ The page does not stop consent phishing: the URL itself can be the lure, and a
 live relay can proxy the QR. `dev-docs/qr-page-spec.md`'s "What this does not
 fix" is the record of that, and `creator_ip` is recorded on every pairing for
 the later spec that will compare it with the scanner's network.
+
+> **Amended 2 October 2026:** line 17 says "the grant mints the browser's read
+> token", which now means the layer-1 session token, signed by the SESSION key
+> and verified against `/session/jwks.json` (dev-docs/device-grant-session-token-spec.md).

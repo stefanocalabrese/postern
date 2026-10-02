@@ -114,3 +114,7 @@ or memory rather than Postgres -- unusable, because approving it needs a row,
 but state that outlived the blind window. And if `_withdraw_pairing` cannot
 reach the device-code store either, an approved code is left with no row, which
 is the one shape the design cannot close.
+
+> **Amended 2 October 2026:** references to "read token" on line 27 now mean the
+> layer-1 session token, signed by the SESSION key held by `services/confirm`
+> and verified by `services/api` (dev-docs/device-grant-session-token-spec.md).
