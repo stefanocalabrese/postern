@@ -22,6 +22,7 @@ from typing import Any
 import httpx2
 import pytest
 from fastmcp.server.auth.providers.jwt import RSAKeyPair
+from postern_core.auth import refresh_sessions
 from postern_core.auth.refresh_sessions import (
     MAX_GENERATIONS,
     InMemoryRefreshSessionStore,
@@ -47,6 +48,7 @@ from services.confirm.audit import (
     DETAIL_SESSION_REVOKED,
     REFRESH_TOOL_NAME,
     TOKEN_ROUTE,
+    TOKEN_TOOL_NAME,
 )
 from tests.device_grant_helpers import session_claims
 from tests.fixtures.append_only_bypass import (
@@ -692,6 +694,91 @@ class TestZt7:
         assert response.headers["cache-control"] == "no-store"
         assert (await _family(app, first)).generation == 0
         assert [r.detail for r in await _rows(clean)] == ["RevocationStoreUnavailable"]
+
+
+class TestARevocationBetweenTheCheckAndTheStamp:
+    async def test_a_revocation_landing_inside_create_is_not_lost_to_a_later_restore(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A customer-client revocation stamped S with the exchange's step-0
+        check before it and the family's ``created_ms`` after it (S < created_ms)
+        is seen by neither check, and a later restore revives the family. The
+        exchange must stamp the family first and check after, so it refuses."""
+        revocations: InMemoryRevocationStore = app.state.postern_revocation_store
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        real_create = sessions.create
+
+        async def create_with_a_revocation_inside(session: RefreshSession) -> RefreshSession:
+            await revocations.revoke_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+            stamp = await revocations.customer_revoked_at(CUSTOMER)
+            assert stamp is not None
+            # Strictly later, so S and created_ms cannot share a millisecond.
+            monkeypatch.setattr(refresh_sessions, "now_ms", lambda: stamp + 1)
+            return await real_create(session)
+
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        monkeypatch.setattr(sessions, "create", create_with_a_revocation_inside)
+        response = await _exchange(app, device["device_code"])
+        monkeypatch.setattr(sessions, "create", real_create)
+        await revocations.restore_customer_client(customer_ref=CUSTOMER, client_id="claude-code")
+
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "access_denied"
+        assert "refresh_token" not in response.json()
+        assert sessions._sessions == {}, "the family is discarded, not left to be revived"
+        async with clean.sessionmaker() as s:
+            result = await s.execute(
+                select(AuditEntry).where(AuditEntry.tool_name == TOKEN_TOOL_NAME)
+            )
+            (row,) = result.scalars().all()
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, DETAIL_REVOKED)
+
+    async def test_a_revocation_store_outage_discards_the_family_and_leaves_the_code_unspent(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        revocations: InMemoryRevocationStore = app.state.postern_revocation_store
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        real = revocations.is_customer_revoked
+
+        async def down(customer_ref: str) -> bool:
+            raise RevocationStoreUnavailable("simulated outage")
+
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        monkeypatch.setattr(revocations, "is_customer_revoked", down)
+        _retryable(app, await _exchange(app, device["device_code"]))
+        assert sessions._sessions == {}
+
+        monkeypatch.setattr(revocations, "is_customer_revoked", real)
+        app.state._approved_poll_times.clear()  # the poll pacing, not under test
+        again = await _exchange(app, device["device_code"])
+        session_claims(again, app)
+
+    async def test_any_other_raise_from_the_revocation_check_discards_the_family(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        revocations: InMemoryRevocationStore = app.state.postern_revocation_store
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+
+        async def broken(customer_ref: str) -> bool:
+            raise RuntimeError("simulated fault")
+
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        monkeypatch.setattr(revocations, "is_customer_revoked", broken)
+        with pytest.raises(RuntimeError, match="simulated fault"):
+            await _exchange(app, device["device_code"])
+        assert sessions._sessions == {}, "the family must not outlive the raise"
 
 
 class TestTheRotationItself:

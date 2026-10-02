@@ -988,11 +988,13 @@ async def _exchange(
     503 ``temporarily_unavailable``, which tells the browser to come back for a
     grant no retry will ever redeem.
 
-    THEN ZT-7, THEN THE MINT, in spec section 5's order: a customer revoked
-    now, or revoked at or after the approval (step 0, which a restore does not
-    undo); then the family is drawn and created BEFORE the code is spent, so a
-    recall at ``POST /scan`` that sees the code exchanged always finds the
-    family and its first ``jti``; then the claim; then the signature.
+    THEN THE FAMILY, THEN ZT-7, in spec section 5's order: the family is drawn
+    and created BEFORE the code is spent, so a recall at ``POST /scan`` that
+    sees the code exchanged always finds the family and its first ``jti``;
+    then a customer revoked now, or revoked at or after the approval (step 0,
+    which a restore does not undo), checked AFTER the family's ``created_ms``
+    is stamped so a revocation landing in between is not lost, and refused by
+    discarding the family; then the claim; then the signature.
     """
     if code.exchanged_at is not None:
         return _unredeemable_response(), DETAIL_DEVICE_CODE_SPENT
@@ -1018,55 +1020,8 @@ async def _exchange(
             DETAIL_STORED_IDENTITY_MALFORMED,
         )
 
-    # ZT-7: refuse the MINT, not only the use.
-    #
-    # `services/api` would refuse this token on every call anyway, so the
-    # practical exposure of minting it is narrow -- but ZT-7's acceptance bar
-    # is that a revoked identity stops obtaining access, and handing out a
-    # freshly signed token for a customer the operator has cut is obtaining
-    # it. Keyed on the customer STORED on the device code, written from a
-    # verified assertion at ``POST /approve`` and by nothing else; never on
-    # ``code.client_id``, which the browser supplies unauthenticated at
-    # ``/device_authorization`` and can set to anything.
-    #
-    # ``access_denied`` is RFC 8628 §3.5's code for an authorization that was
-    # refused, and this endpoint's own docstring already documents it as "user
-    # explicitly denied on mobile app". That collision is the point rather
-    # than an accident: the browser cannot tell a revocation from the customer
-    # declining on their phone, so a party holding only a ``device_code``
-    # learns nothing about anyone's revocation state. It holds a code this
-    # same customer already approved, so it is not a third party either.
-    #
-    # The store failing is NOT a denial. `store_unavailable_response` answers
-    # 503 so the browser retries rather than treating an outage as a refusal;
-    # either way no token is minted, which is the fail-closed half.
-    #
-    # BOTH OUTCOMES NOW LEAVE A ROW, and the refusal's is the only durable
-    # trace either way: this endpoint has no client id to put in a log line
-    # the way `services/api/middleware/revocation.py` does, which is exactly
-    # what `services/confirm/revocation.py`'s `log_refusal` says. The refusal
-    # keeps `DETAIL_REVOKED`, shared with the challenge path and the pairing
-    # path, so `WHERE detail = 'revoked'` stays the whole answer to "did my
-    # revocation take effect on the write path". The outage records the
-    # exception's own type instead, which is how an operator tells an outage
-    # from a refusal -- the caller cannot, and must not.
     settings: ConfirmSettings = request.app.state.settings
     retry_after = settings.device_poll_interval_seconds
-    try:
-        revoked = await customer_revoked(request, customer.value)
-        # STEP 0: REVOKED SINCE THE APPROVAL. The approval predates a
-        # revocation, so a later restore must not make it redeemable. The one
-        # comparison across two clocks -- the approval is this process's, the
-        # stamp Redis's -- so it carries `APPROVAL_CLOCK_TOLERANCE_MS` and
-        # errs toward refusal.
-        stamp = await customer_revoked_since(request, customer.value)
-    except RevocationStoreUnavailable as exc:
-        logger.warning("device grant: revocation store unavailable, refusing to mint")
-        return store_unavailable_response(retry_after), type(exc).__name__
-    approved_ms = ms_of(code.approved_at) if code.approved_at is not None else 0
-    if revoked or (stamp is not None and stamp >= approved_ms - APPROVAL_CLOCK_TOLERANCE_MS):
-        log_refusal("a device-grant token exchange")
-        return _error(400, "access_denied", "authorization was refused"), DETAIL_REVOKED
 
     # STEP 1: DRAW the family id, the first refresh token and the access
     # token's claims. The `jti` is drawn here, before anything is written, so
@@ -1109,6 +1064,70 @@ async def _exchange(
             type(exc).__name__,
         )
         return _session_store_unavailable_response(retry_after), type(exc).__name__
+
+    # STEP 0 (RUN AFTER STEP 2): ZT-7, AFTER THE FAMILY IS STAMPED. These checks used to run
+    # before `create`, which stamps `created_ms` from the store clock. A
+    # customer-client revocation stamped S with (the check) < S < `created_ms`
+    # was then seen by neither the check nor the refresh comparison
+    # (`stamp >= created_ms`, S < created_ms reads as "before the family
+    # existed"), and a later restore revived the family for its hour. Run after
+    # `create`, every revocation with S < `created_ms` has already executed on
+    # the single-threaded store and is seen here; every S >= `created_ms` is
+    # caught at refresh. A refusal, an outage or any other raise discards the
+    # family just made.
+    #
+    # ZT-7: refuse the MINT, not only the use.
+    #
+    # `services/api` would refuse this token on every call anyway, so the
+    # practical exposure of minting it is narrow -- but ZT-7's acceptance bar
+    # is that a revoked identity stops obtaining access, and handing out a
+    # freshly signed token for a customer the operator has cut is obtaining
+    # it. Keyed on the customer STORED on the device code, written from a
+    # verified assertion at ``POST /approve`` and by nothing else; never on
+    # ``code.client_id``, which the browser supplies unauthenticated at
+    # ``/device_authorization`` and can set to anything.
+    #
+    # ``access_denied`` is RFC 8628 §3.5's code for an authorization that was
+    # refused, and this endpoint's own docstring already documents it as "user
+    # explicitly denied on mobile app". That collision is the point rather
+    # than an accident: the browser cannot tell a revocation from the customer
+    # declining on their phone, so a party holding only a ``device_code``
+    # learns nothing about anyone's revocation state. It holds a code this
+    # same customer already approved, so it is not a third party either.
+    #
+    # The store failing is NOT a denial. `store_unavailable_response` answers
+    # 503 so the browser retries rather than treating an outage as a refusal;
+    # either way no token is minted, which is the fail-closed half.
+    #
+    # BOTH OUTCOMES NOW LEAVE A ROW, and the refusal's is the only durable
+    # trace either way: this endpoint has no client id to put in a log line
+    # the way `services/api/middleware/revocation.py` does, which is exactly
+    # what `services/confirm/revocation.py`'s `log_refusal` says. The refusal
+    # keeps `DETAIL_REVOKED`, shared with the challenge path and the pairing
+    # path, so `WHERE detail = 'revoked'` stays the whole answer to "did my
+    # revocation take effect on the write path". The outage records the
+    # exception's own type instead, which is how an operator tells an outage
+    # from a refusal -- the caller cannot, and must not.
+    try:
+        revoked = await customer_revoked(request, customer.value)
+        # REVOKED SINCE THE APPROVAL (spec section 5 step 0). The approval predates a
+        # revocation, so a later restore must not make it redeemable. The one
+        # comparison across two clocks -- the approval is this process's, the
+        # stamp Redis's -- so it carries `APPROVAL_CLOCK_TOLERANCE_MS` and
+        # errs toward refusal.
+        stamp = await customer_revoked_since(request, customer.value)
+    except RevocationStoreUnavailable as exc:
+        logger.warning("device grant: revocation store unavailable, refusing to mint")
+        await _discard_orphan(sessions, sid, "a revocation store outage")
+        return store_unavailable_response(retry_after), type(exc).__name__
+    except Exception:
+        await _discard_orphan(sessions, sid, "a revocation check that raised")
+        raise
+    approved_ms = ms_of(code.approved_at) if code.approved_at is not None else 0
+    if revoked or (stamp is not None and stamp >= approved_ms - APPROVAL_CLOCK_TOLERANCE_MS):
+        log_refusal("a device-grant token exchange")
+        await _discard_orphan(sessions, sid, "a revocation")
+        return _error(400, "access_denied", "authorization was refused"), DETAIL_REVOKED
 
     # NAMED ONLY ONCE IT EXISTS, so a full-store or outage row never carries
     # the id of a family that was never stored (amended 1 October 2026).

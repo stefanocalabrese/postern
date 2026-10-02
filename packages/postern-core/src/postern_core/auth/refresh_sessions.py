@@ -374,7 +374,8 @@ class RefreshSessionStoreBase(ABC):
 
     @abstractmethod
     async def discard(self, sid: str) -> None:
-        """Delete a family nobody holds a token for (spec section 5 step 3)."""
+        """Delete a family nobody holds a token for (spec section 5 step 3, and step 0 when
+        the revocation check refuses or fails after the family was created)."""
 
     @abstractmethod
     async def rotate(
