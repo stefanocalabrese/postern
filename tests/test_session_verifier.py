@@ -302,6 +302,44 @@ class TestTheCache:
         assert await verifier.verify_token(_token(key)) is not None, "the fresh cache survived"
 
 
+class TestAFetchInFlightStallsNoKnownKid:
+    """An unknown kid's fetch must not hold up a token whose kid the fresh
+    cache already holds (2 October 2026). Until then the fetch zeroed the
+    shared cache time before it awaited, so every concurrent known-kid caller
+    found the cache stale and queued on the lock behind it."""
+
+    async def test_a_known_kid_verifies_while_an_unknown_kid_fetch_is_held_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = Clock(monkeypatch)
+        key, stranger = _key("session-1.v1"), _key("forged-1")
+        handler = CountingJwks(_jwks(key))
+        verifier = _verifier(handler)
+        assert await verifier.verify_token(_token(key)) is not None
+        release = asyncio.Event()
+
+        async def held_open(_request: httpx2.Request) -> httpx2.Response:
+            await release.wait()
+            return httpx2.Response(200, json=_jwks(key))
+
+        handler.answer = held_open
+        clock.advance(MIN_REFETCH_INTERVAL_SECONDS + 1)  # past the floor, inside the TTL
+        unknown = asyncio.create_task(verifier.verify_token(_token(stranger)))
+        for _ in range(100):
+            if handler.fetches == 2:
+                break
+            await asyncio.sleep(0)
+        assert handler.fetches == 2, "the unknown kid's fetch never started"
+        try:
+            known = await asyncio.wait_for(verifier.verify_token(_token(key)), timeout=1.0)
+            assert known is not None
+            assert not release.is_set() and not unknown.done(), "it waited for the fetch"
+        finally:
+            release.set()
+        assert await unknown is None
+        assert handler.fetches == 2
+
+
 class TestAFailedFetchKeepsTheCache:
     """Any failed fetch leaves the cache as it was (2 October 2026).
 

@@ -95,8 +95,10 @@ MIN_REFETCH_INTERVAL_SECONDS = 30.0
 
 #: The bound on one JWKS fetch, in seconds, connect to parsed body. Below the
 #: parent's own 10-second client timeout, which bounds each phase and not the
-#: whole, so a server dripping one byte a second never trips it. Every caller
-#: with an unknown kid waits on the lock behind this fetch.
+#: whole, so a server dripping one byte a second never trips it. A caller
+#: waits on the lock behind this fetch only when the fresh cache cannot answer
+#: it: an unknown kid, or any kid once the cache is past its TTL. A caller whose
+#: kid the fresh cache holds is served without the lock (2 October 2026).
 FETCH_TIMEOUT_SECONDS = 5.0
 
 #: Logged once per fetch that dropped a key, and fixed: no kid, no key bytes.
@@ -155,6 +157,11 @@ class SessionTokenVerifier(JWTVerifier):
         self._refetch_floor = min_refetch_interval_seconds
         self._forbidden_thumbprints = forbidden_thumbprints
         self._fetch_timeout = fetch_timeout_seconds
+        # The parent serves from its cache while `now - _jwks_cache_time <
+        # _cache_ttl`; at zero that never holds on a clock that does not run
+        # backwards, so `super()._get_jwks_key` always fetches. Every cache
+        # decision is this class's, in `_get_jwks_key` below.
+        self._cache_ttl = 0
         self._last_fetch = float("-inf")
         self._last_fetch_failed = False
         self._fetch_lock = asyncio.Lock()
@@ -242,10 +249,11 @@ class SessionTokenVerifier(JWTVerifier):
             # erase every cached key (2 October 2026). Holding the old dict
             # here is enough to put it back: the parent never mutates it.
             previous_keys = self._jwks_cache
-            # Force the parent past its own cache check, whose TTL is an hour:
-            # this method has already decided a fetch is owed. The parent
-            # stamps the cache time only after a fetch that succeeded.
-            self._jwks_cache_time = 0
+            # The parent's own cache check cannot serve: `__init__` set its
+            # TTL to zero, so it fetches whenever it is called. The shared
+            # cache time is NOT zeroed here, which it was until 2 October
+            # 2026: that made every concurrent caller whose kid the fresh
+            # cache held find it stale and queue on this lock behind the fetch.
             try:
                 async with asyncio.timeout(self._fetch_timeout):
                     return await super()._get_jwks_key(kid)
@@ -257,8 +265,13 @@ class SessionTokenVerifier(JWTVerifier):
             finally:
                 # Zero usable keys where there were some is a failure too: a
                 # key set confirm meant to empty still expires with the TTL.
+                # The parent stamps the cache time, with the clock it read
+                # before fetching, only after a fetch that parsed. That stamp
+                # cannot equal `previous`: a refetch comes at least the floor
+                # after the last fetch, or once the cache is past its TTL.
                 emptied = bool(previous_keys) and not self._jwks_cache
-                self._last_fetch_failed = self._jwks_cache_time == 0 or emptied
+                stamped = self._jwks_cache_time != previous
+                self._last_fetch_failed = not stamped or emptied
                 if self._last_fetch_failed:
                     self._jwks_cache = previous_keys
                     self._jwks_cache_time = previous
