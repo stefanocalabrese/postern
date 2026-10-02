@@ -8,9 +8,11 @@ QR: the ``user_code`` and the rotation token come out of the ``app_link`` the
 state endpoint serves, which is the string the QR encodes, and the
 ``device_code`` never leaves the browser.
 
-``POST /token`` ends the flow with a layer-1 session: an access token whose
-audience is the MCP server, signed by the SESSION key, and a refresh token. A
-replay of the spent code is refused. The regression this file was written for
+``POST /token`` ends the pairing with a layer-1 session: an access token
+whose audience is the MCP server, signed by the SESSION key, and a refresh
+token. A replay of the spent code is refused. ``services/api``, configured as
+spec section 8 says, then lists its tools for that access token, the browser
+refreshes, and the api lists them again for the new one. The regression this file was written for
 still runs: before 30 September 2026 ``/token`` returned a layer-2 backend
 token, signed with the read key ``services/api`` publishes, so this test
 builds ``services/api`` over a read key of its own and asserts that no
@@ -18,7 +20,8 @@ builds ``services/api`` over a read key of its own and asserts that no
 JWT-shaped string in one is a session token.
 
 The audit trail is read back at the end: one row each for the scan and the
-approval, the mint, and the replay, joined on the device code's handle.
+approval, the mint, the replay and the refresh, the first four joined on the
+device code's handle.
 """
 
 from __future__ import annotations
@@ -42,11 +45,13 @@ from sqlalchemy import select
 from starlette.applications import Starlette
 
 from services.api.main import create_app as create_api_app
+from services.api.session_verifier import SessionTokenVerifier
 from services.api.settings import Settings as ApiSettings
 from services.confirm.audit import (
     DETAIL_DEVICE_CODE_SPENT,
     DETAIL_NOT_SCANNED,
     PAIRING_TOOL_NAME,
+    REFRESH_TOOL_NAME,
     SCAN_TOOL_NAME,
     TOKEN_TOOL_NAME,
 )
@@ -66,6 +71,12 @@ ISSUER = "https://app.test.invalid"
 AUDIENCE = "postern-confirm"
 CUSTOMER = "cust_7f3a"
 SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
+#: The MCP server's resource URI, on both services, as spec section 8 asks.
+RESOURCE = "https://mcp.postern.test/mcp"
+_META = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {},
+}
 
 
 async def _wipe(db: Database) -> None:
@@ -96,11 +107,36 @@ def app(pg_url: str) -> tuple[Starlette, RSAKeyPair]:
     key_pair = RSAKeyPair.generate()
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
     built = create_confirm_app(
-        replace(ConfirmSettings.for_testing(), database_url=pg_url),
+        replace(
+            ConfirmSettings.for_testing(),
+            database_url=pg_url,
+            session_token_audience=RESOURCE,
+            allow_non_uri_audience=False,
+        ),
         assertion_verifier=verifier,
         device_key_store=no_enrolled_devices(),
     )
     return built, key_pair
+
+
+async def _tools_listed(api: Any, access_token: str) -> set[str]:
+    """``tools/list`` on ``services/api`` with a bearer; the names it returns."""
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=api), base_url="http://api.test"
+    ) as client:
+        response = await client.post(
+            "/mcp",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json, text/event-stream",
+                "Mcp-Method": "tools/list",
+                "Mcp-Name": "",
+                "MCP-Protocol-Version": "2026-07-28",
+            },
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": _META}},
+        )
+    assert response.status_code == 200, response.text
+    return {tool["name"] for tool in response.json()["result"]["tools"]}
 
 
 @pytest.fixture()
@@ -122,7 +158,10 @@ async def api(read_key_pem: str) -> tuple[Any, dict[str, Any]]:
 
 
 async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
-    app: tuple[Starlette, RSAKeyPair], clean: Database, api: tuple[Any, dict[str, Any]]
+    app: tuple[Starlette, RSAKeyPair],
+    clean: Database,
+    api: tuple[Any, dict[str, Any]],
+    pg_url: str,
 ) -> None:
     confirm, key_pair = app
     api_app, api_jwks = api
@@ -204,6 +243,39 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
         session_jwks = (await browser.get("/session/jwks.json")).json()
         write_jwks = (await browser.get("/.well-known/jwks.json")).json()
 
+        # THE API, CONFIGURED PER SPEC SECTION 8: its customer JWKS is this
+        # confirm's /session/jwks.json (fetched in process), its issuer the
+        # session issuer, its audience the same resource URI.
+        settings = confirm.state.settings
+        jwks_uri = "https://auth.test/session/jwks.json"
+        verified_api = create_api_app(
+            replace(
+                ApiSettings.for_testing(),
+                database_url=pg_url,
+                customer_jwks_uri=jwks_uri,
+                customer_token_issuer=settings.session_token_issuer,
+                audience=RESOURCE,
+            ),
+            auth_override=SessionTokenVerifier(
+                jwks_uri=jwks_uri,
+                issuer=settings.session_token_issuer,
+                audience=RESOURCE,
+                required_scopes=None,
+                cache_ttl_seconds=300.0,
+                http_client=httpx2.AsyncClient(transport=transport),
+            ),
+        )
+        async with verified_api.router.lifespan_context(verified_api):
+            first_listing = await _tools_listed(verified_api, token.json()["access_token"])
+            refreshed = await browser.post(
+                "/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": token.json()["refresh_token"],
+                },
+            )
+            second_listing = await _tools_listed(verified_api, refreshed.json()["access_token"])
+
     # THE CONTROL THAT MAKES THE REGRESSION MEAN SOMETHING. A token the api's
     # own read minter signs verifies against the api's published JWKS: that is
     # exactly the layer-2 token /token used to hand out. If this stopped
@@ -219,7 +291,7 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
     # on the property that matters rather than on a status code.
     settings = confirm.state.settings
     assert_no_body_carries_a_token_the_api_trusts(
-        [token.text, replay.text],
+        [token.text, replay.text, refreshed.text],
         api_jwks,
         session_jwks,
         issuer=settings.session_token_issuer,
@@ -243,9 +315,16 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
     assert stored is not None
     assert stored.exchanged_at is not None
     assert stored.session_id == claims["sid"]
+    # Accepted, not 401: the customer has granted no consent in this test, so
+    # the catalog is the one tool that needs none.
+    assert first_listing == second_listing == {"start_session"}
+    renewed = session_claims(refreshed, confirm)
+    assert renewed["sid"] == claims["sid"]
+    assert renewed["jti"] != claims["jti"]
 
     async with clean.sessionmaker() as s:
-        written = list((await s.execute(select(AuditEntry).order_by(AuditEntry.id))).scalars())
+        rows = list((await s.execute(select(AuditEntry).order_by(AuditEntry.id))).scalars())
+    written = [r for r in rows if r.tool_name.startswith("device_grant.")]
     everything = [(r.tool_name, r.outcome, r.detail) for r in written]
     assert everything == [
         (PAIRING_TOOL_NAME, OUTCOME_RAISED, DETAIL_NOT_SCANNED),
@@ -253,15 +332,22 @@ async def test_a_browser_and_a_phone_complete_a_pairing_through_every_route(
         (PAIRING_TOOL_NAME, OUTCOME_RETURNED, None),
         (TOKEN_TOOL_NAME, OUTCOME_RETURNED, None),
         (TOKEN_TOOL_NAME, OUTCOME_RAISED, DETAIL_DEVICE_CODE_SPENT),
+        (REFRESH_TOOL_NAME, OUTCOME_RETURNED, None),
     ]
-    successes = [r for r in written if r.outcome == OUTCOME_RETURNED]
+    successes = [
+        r for r in written if r.outcome == OUTCOME_RETURNED and r.tool_name != REFRESH_TOOL_NAME
+    ]
     assert [(r.tool_name, r.detail) for r in successes] == [
         (SCAN_TOOL_NAME, None),
         (PAIRING_TOOL_NAME, None),
         (TOKEN_TOOL_NAME, None),
     ]
     chain = [
-        r for r in written if r.tool_name != PAIRING_TOOL_NAME or r.outcome == OUTCOME_RETURNED
+        r
+        for r in written
+        if r.tool_name in {SCAN_TOOL_NAME, TOKEN_TOOL_NAME}
+        or (r.tool_name == PAIRING_TOOL_NAME and r.outcome == OUTCOME_RETURNED)
     ]
     assert len({r.arguments["device_code_handle"] for r in chain}) == 1
     assert successes[2].arguments["session_id"] == claims["sid"]
+    assert written[-1].arguments["session_id"] == claims["sid"]
