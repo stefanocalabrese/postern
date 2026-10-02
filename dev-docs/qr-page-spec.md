@@ -4,6 +4,7 @@
 **Status:** specification, approved in design review on 29 September 2026. Built on 30 September 2026, by `docs/superpowers/plans/postern-qr-page-and-scan-2026-09-30.md`. The sections below still read as the specification they were written as, so where they say "today" or describe the absent page, they describe `58ad120`.
 **Against:** `services/confirm/device_auth.py` and `packages/postern-core/src/postern_core/auth/device_codes.py` at `58ad120`.
 **Reviewed by:** a security review and a code-fit review, both on 29 September 2026, and a spec review on 30 September 2026, all folded in below.
+**Superseded in part** by `dev-docs/device-grant-session-token-spec.md`: `/token` now issues a layer-1 session rather than a read token, and a session swap noticed after the exchange (`conflict_exchanged`) now recalls the session the exchange issued. The "Session swap" residual below, §5's `conflict_exchanged` line and §6's "`/token` is unchanged" describe the tree before that change.
 
 ---
 

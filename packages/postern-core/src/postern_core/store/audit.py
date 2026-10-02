@@ -33,7 +33,7 @@ here is trading, and it splits cleanly in two.
   both fail closed, so a store that cannot take a row cannot be passed. For
   the duration of a total outage, no `tools/call` reaches a backend read
   endpoint, no approval reaches a backend write endpoint, no money moves, no
-  read token is returned by `POST /token` (the mint is fail-closed on its
+  session is returned by `POST /token` (the mint is fail-closed on its
   row), and no device pairing survives -- `services/confirm/device_auth.py`'s
   `_withdraw_pairing` revokes a pairing whose row could not be written. The
   regulator-facing question "did customer data leave, or did money move,

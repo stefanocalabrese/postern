@@ -13,6 +13,33 @@
 > accepts is wider than this document said: `dev-docs/postern-zero-trust-plan.md`
 > 5.5 states it.
 
+> **Amended with the layer-1 session token (`dev-docs/device-grant-session-token-spec.md`).**
+> The table below counts a 60-second lifetime, and that describes the layer-2
+> delegation token only. The token a client holds is now a layer-1 access
+> token that lives **10 minutes** inside a refresh family that lives **1
+> hour**, so the bearer-theft window is 10 minutes for a stolen access token
+> and up to 1 hour for a stolen refresh token nobody has noticed. What
+> replaces the short lifetime as a compensating control for those two:
+>
+> - **The per-call `jti` check.** `services/api/middleware/revocation.py`'s
+>   `RevocationMiddleware` asks the ZT-7 store about the access token's `jti`
+>   on every `tools/call` and `tools/list`, so a token is cut on its next call
+>   once anything lists it. Recall at `POST /scan` and reuse detection both
+>   list every live `jti` of the family they revoke.
+> - **Refresh-token rotation with reuse detection** (RFC 9700 §4.14.2). A
+>   rotated token presented again revokes the whole family. It detects, it
+>   does not prevent: until both parties have presented, the thief refreshes
+>   freely.
+> - **The revocation checks at every refresh**: the customer, the
+>   customer-client pair, the kill switch, every live access `jti`, and a
+>   family created at or before a customer revocation is refused and revoked
+>   for good.
+>
+> Not built, and needed before a revoked-`jti` set can be pruned: neither
+> revocation store records when a revoked `jti` expires, so the set only grows.
+> A companion sorted set scored by `exp` beside the `SADD` would let a sweep
+> remove expired members.
+
 ## Question
 
 Bearer tokens are the classic zero-trust weakness: possession is authorization.

@@ -1,7 +1,7 @@
 # Mobile app pairing contract
 
 **For:** the operator's mobile team, and whoever runs the app backend that mints the app's assertions.
-**Against:** `services/confirm` as of commit `31103cf`, 30 September 2026.
+**Against:** `services/confirm` as of commit `31103cf`, 30 September 2026. What the layer-1 session token changed (section 1 step 6, the scopes note and the refusal table in section 4, the approval's last paragraph in section 6, the retry rules in section 7, the audit lines in section 9) was re-checked against commit `f4a861d`, 2 October 2026.
 **Status:** the server half is built. The app half (the `POST /scan` call and the confirmation screen) is not in this repository, and until it exists a pairing completes only in tests. Handoff §10.10 is the open question this answers from the server side.
 
 Every statement below was checked against the code named beside it. Where the code does not decide something, this document says "not specified" instead of guessing.
@@ -15,7 +15,7 @@ Every statement below was checked against the code named beside it. Where the co
 3. On 200, the app shows the pairing confirmation screen built from the `/scan` response (section 5). The user confirms the pairing code matches their computer and answers "Did you start this on your own computer just now?".
 4. Only after that confirmation does the app run app identity verification, if the operator requires it for pairing.
 5. The app calls `POST /approve` with the `user_code` (section 6).
-6. The AI client's own poll of `POST /token` then receives no token: since 30 September 2026 it answers 503 `temporarily_unavailable` ("session token issuance is not enabled") until a layer-1 session token exists, because the read token it used to return was one the accounts backend accepts. The app plays no part in that step.
+6. The AI client's own poll of `POST /token` then receives a layer-1 session: an access token that only this deployment's MCP server accepts (10 minutes, `aud` = the MCP server), and a refresh token whose family lasts one hour from the exchange. The app plays no part in that step. The session can be ended from the server side: a recall (section 4's `scan_conflict`), ZT-7 revocation of the customer, or reuse of a rotated refresh token. The AI client must send the short literal `grant_type=device_code`: `/token` answers RFC 8628 §3.4's `urn:ietf:params:oauth:grant-type:device_code` with 404 `unsupported_grant_type` (`services/confirm/device_auth.py`, `_token_response`), so a client that follows RFC 8628 to the letter never receives a session.
 
 Steps 3 and 4 are the app's alone: the server cannot see whether either happened (section 9).
 
@@ -151,7 +151,7 @@ Content-Type: application/json
 | `expires_at` | When the pairing expires, ISO 8601 with a UTC offset, possibly with fractional seconds. Set at creation, `POSTERN_DEVICE_CODE_TTL_SECONDS` after it (default 900 seconds). | Show the remaining time, and do not call `/approve` after it. |
 | `user_code` | The stored pairing code in `XXX-XXX` form. | Show this one, not the one parsed from the link, as the code the user compares. |
 
-**The scopes shown are not the scopes enforced.** Read from `services/confirm/device_auth.py`: `POST /token` issues no token after approval since 30 September 2026, and the one it issued before that was always `aud=accounts.svc`, `scope=accounts:read`, 60-second expiry, whatever the pairing's `scopes` string said. The string is what the client asked for, stored and echoed back, and no code path in this repository reads it after `/scan`. The app can show it faithfully; it cannot promise the user that it describes any token.
+**The scopes shown are recorded on the token, not enforced by it.** `POST /token` copies the pairing's `scopes` string, canonicalized (split on spaces, de-duplicated, sorted), into the access token's `scope` claim and the refresh family. Nothing validates the values against a vocabulary, and `services/api` enforces no scope from the token: what a client can read is decided by the customer's consents in the database. The app can show the scopes faithfully as what the client asked for; it cannot promise the user they limit anything.
 
 **Refusals.** Every error body is `{"error": ..., "error_description": ...}` except the 500. The `error_description` text is the server's English and may change; branch on `error` and on the status.
 
@@ -160,7 +160,8 @@ Content-Type: application/json
 | 400 | `invalid_request` | Body is not JSON, not an object, or `user_code`/`qr` missing, empty or not strings. | An app bug. A generic failure message; report it. |
 | 400 | `invalid_grant` | One identical body (`"this pairing cannot be completed"`) for: an unknown or expired code, a malformed or forged `qr`, a `qr` for a different pairing, or a slot more than one ahead of the server's clock. | "This code can no longer be used. Start again from your AI client." The server deliberately does not say which case it was. |
 | 400 | `qr_stale` | A genuine token for this pairing, older than the window. | "The code on your screen has changed. Scan it again." The QR is still on the page if nobody has scanned it yet. |
-| 400 | `scan_conflict` | Another customer's app scanned this pairing first. The server has now cancelled the pairing, including one already approved, because `/token` issues nothing and so spends no code. A code spent by an earlier build is the one case where nothing is cancelled. | "This pairing was cancelled because another device scanned the same code. Start again from your AI client, and do not share your screen while pairing." Both cases give the same body. |
+| 400 | `scan_conflict` | Another customer's app scanned this pairing first. If the AI client had not yet exchanged the pairing, the server has cancelled it. If it had, the server has **recalled the session** that exchange issued: the refresh family is revoked and its access tokens are refused by the MCP server on their next call. | "This pairing was cancelled because another device scanned the same code. Start again from your AI client, and do not share your screen while pairing." Both cases give the same body. |
+| 503 | `temporarily_unavailable` | Only after a `scan_conflict` on an exchanged pairing, when the recall could not complete. Carries `Retry-After: 1`. | **Retry once, immediately, with the same body.** The `qr` token is valid for 10 to 12 seconds, so a later retry answers `qr_stale` and recalls nothing. If the retry fails too, tell the user the pairing may still be active and to contact the bank. |
 | 401 | `invalid_token` | No valid assertion (section 3). | Refresh the assertion once and retry; if it fails again, a generic failure. |
 | 403 | `invalid_subject` | The assertion verified but its `sub` is not a `cust_` / `cust:` reference. | An app-backend bug. A generic failure message; report it. |
 | 403 | `access_revoked` | This customer's AI access is revoked (ZT-7). | "AI client access is turned off for your account." Do not retry. |
@@ -168,7 +169,7 @@ Content-Type: application/json
 | 429 | `too_many_requests` | The per-address limit (section 7). Carries `Retry-After`. | "Too many attempts. Try again in a minute." |
 | 429 | `customer_rate_limited` | The per-customer limit (section 7). Carries `Retry-After`. | As above. |
 | 503 | `rate_limit_store_unavailable` | The shared per-customer counter cannot be reached. Carries `Retry-After`. | "Temporarily unavailable." |
-| 500 | none: `text/plain`, `Internal Server Error` | The revocation store could not answer, the audit row could not be written, or the device-code store failed. No exception handler is registered, so this is Starlette's default body. | "Something went wrong. Start again from your AI client." See section 7 on why a retry rarely helps. |
+| 500 | none: `text/plain`, `Internal Server Error` | The revocation store could not answer, the audit row could not be written, the device-code store failed, or a recall after `scan_conflict` raised something other than a store outage or contention. No exception handler is registered, so this is Starlette's default body. | "Something went wrong. Start again from your AI client." See section 7 on why a retry rarely helps. |
 
 **Repeating a successful scan.** A second `/scan` by the same customer with a token still inside its window returns the same 200 body and changes nothing (recorded, since 30 September 2026, as `returned` with `detail` `already_scanned`, so only a first scan has a NULL `detail`). After the window, the same request answers `qr_stale`, even though the pairing is still claimed by this customer. Once scanned, the page removes the QR, so there is no fresh token to fetch. An app that loses the `/scan` response and cannot retry inside the window has no way back to the confirmation context; the recovery is a new pairing from the AI client. The spec (`dev-docs/qr-page-spec.md`, "Out of scope") records this as deliberate.
 
@@ -219,7 +220,7 @@ Content-Type: application/json
 {"status": "approved"}
 ```
 
-The app can then tell the user to return to their computer, but the AI client gets nothing from its next poll yet: `POST /token` answers 503 `temporarily_unavailable` with a `Retry-After` header for an approved code and issues nothing, and does not spend the code. Issuance returns with the pending session-token change.
+The app can then tell the user to return to their computer: the AI client's next poll of `POST /token` is issued the session and spends the code.
 
 **Refusals:**
 
@@ -247,7 +248,8 @@ Every request counts, including refused ones. One pairing costs one `/scan` and 
 Retry guidance:
 
 - **400: never retry automatically.** Every 400 on these paths is a final answer about this request or this pairing. `qr_stale` is recovered by a new scan by the user, not by resending the same token.
-- **429 and 503: honour `Retry-After`** (seconds). `Retry-After` is the seconds left in a fixed 60-second window, so it can be anything from 1 to 60, and a `/scan` retry after a 429 will usually answer `qr_stale` because the 10-to-12-second `qr` window has passed; tell the user to scan again instead of retrying silently.
+- **503 `temporarily_unavailable` on `/scan`: retry once, immediately, with the same body.** It means a recall did not complete (section 4), and only a retry inside the `qr` window can complete it.
+- **429 and other 503s: honour `Retry-After`** (seconds). `Retry-After` is the seconds left in a fixed 60-second window, so it can be anything from 1 to 60, and a `/scan` retry after a 429 will usually answer `qr_stale` because the 10-to-12-second `qr` window has passed; tell the user to scan again instead of retrying silently.
 - **401:** fetch a fresh assertion and retry once.
 - **500:** the server may have withdrawn the pairing (it does so whenever a store write might have committed without its audit row). A retried `/scan` then answers `invalid_grant`. One retry is harmless; if it does not succeed, send the user back to the AI client.
 
@@ -279,7 +281,7 @@ Both endpoints write one `audit_log` row per recorded call through `services/con
 
 | Column or key | Value |
 |---|---|
-| `tool_name` | `device_grant.scan` or `device_grant.approve` |
+| `tool_name` | `device_grant.scan` or `device_grant.approve`; a recall (section 4's `scan_conflict` on an exchanged pairing) adds a `device_grant.recall` row before the scan row, naming the customer whose session was recalled and sharing the scan row's `call_id` |
 | `customer_ref` | The assertion's `sub` (NULL with a reason when it is not a customer reference) |
 | `client_id` | The assertion's `client_id` claim, else `azp`, else NULL |
 | `outcome`, `detail` | `returned` with NULL detail on success; `returned` with `already_approved` for the approver's repeated `/approve` or `/scan`; `returned` with `already_scanned` for a repeated `/scan` before approving; `raised` with a detail on refusal |
@@ -291,7 +293,7 @@ Both endpoints write one `audit_log` row per recorded call through `services/con
 
 Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not_found`, `qr_invalid`, `qr_stale`, `scan_conflict`. On `/approve`: `invalid_subject`, `revoked`, `user_code_not_found`, `not_scanned`, `scanned_by_other`, and `already_approved` for a code approved for another customer. An exception is recorded under its class name.
 
-**Not recorded, on purpose:** the `user_code`, the `qr` token, the scopes, and any request the server refused before reaching a pairing. A malformed body (400 `invalid_request`) leaves no row and no log line. A 401, 413, 429 or 503 leaves a log line and no row.
+**Not recorded, on purpose:** the `user_code`, the `qr` token, the scopes, and any request the server refused before reaching a pairing. A malformed body (400 `invalid_request`) leaves no row and no log line. A 401, 413, 429 or 503 leaves a log line and no row, except the recall's 503 `temporarily_unavailable` on `/scan`, which writes the recall row (`raised` under the exception's class name) and the scan row (`scan_conflict`).
 
 **What the app need not duplicate:** that a scan or an approval happened, for which customer, which pairing, from which address, and why it was refused.
 

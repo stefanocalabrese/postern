@@ -1328,13 +1328,14 @@ class PairingAudit:
     therefore withdraws the pairing when this writer raises, so an
     un-audited pairing does not survive its own audit failure. A 500 alone
     would have been fail-closed in the response and fail-open in substance --
-    the browser polls ``POST /token``, is handed a read token, and no row
+    the browser polls ``POST /token``, is handed a session, and no row
     anywhere names who authorised it.
 
     FAIL CLOSED AT A MINT, WHICH IS A THIRD SHAPE AGAIN. ``POST /token``
     signs a token, and once it has been returned nothing in this process can
-    unmint it: there is no revocation list for a 60-second read token and
-    ``services/api`` will accept it until it expires. So neither of the two
+    unmint it: ``services/api`` accepts a 10-minute access token until it
+    expires or something lists its ``jti``, and nothing lists a token no row
+    names. So neither of the two
     obvious orders is right. Writing the row first refuses a customer who did
     nothing wrong whenever the store blinks, and still allows a row that
     claims a mint the key source then failed to produce. Returning first and

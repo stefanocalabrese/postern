@@ -115,7 +115,16 @@ for the `build_model` wrapper that catches pydantic validation errors and re-rai
 ### Customer JWT Verification
 
 When `POSTERN_JWKS_URI` and `POSTERN_TOKEN_ISSUER` are both set, the server builds a
-`JWTVerifier` and requires every tool call to carry a validated customer access token.
+`SessionTokenVerifier` (`services/api/session_verifier.py`, a `JWTVerifier` subclass)
+and requires every tool call to carry a validated layer-1 session token: the access
+token `services/confirm` issues at `POST /token`, signed by its SESSION key and fetched
+from `POSTERN_JWKS_URI` (confirm's `/session/jwks.json`). On top of the parent's
+signature, `iss` and `aud` checks it requires `exp` and bounds `exp`, `iat` and `nbf`,
+bounds the JWKS cache, and drops any fetched key whose RFC 7638 thumbprint equals this
+service's own READ key. Startup refuses a `POSTERN_AUDIENCE` that is not an absolute
+`https` URI in normal form unless `POSTERN_ALLOW_NON_URI_AUDIENCE` is set. The fetch
+must run over TLS outside a local stack: whoever can answer it can plant a key and
+forge any customer's token.
 
 **Runbook (2 October 2026): the api's availability depends on `services/confirm`'s
 `/session/jwks.json`.** The verifier (`services/api/session_verifier.py`) trusts the key

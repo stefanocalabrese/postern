@@ -115,10 +115,29 @@ nobody and writes nothing. Each endpoint has its own `tool_name`, all under
 |---|---|---|
 | `POST /scan` | `device_grant.scan` | `/scan` |
 | `POST /approve` | `device_grant.approve` | `/approve` |
-| `POST /token` | `device_grant.token` | `/token` |
+| `POST /token` (`grant_type=device_code`) | `device_grant.token` | `/token` |
+| `POST /token` (`grant_type=refresh_token`) | `device_grant.refresh` | `/token` |
+| `POST /scan`, a recall | `device_grant.recall` | `/scan` |
 
 `WHERE tool_name LIKE 'device_grant.%'` returns the whole flow. An exception that
-ends any of the three is recorded as `raised` under its class name.
+ends any of them is recorded as `raised` under its class name. Rows from `/token`
+and the recall carry the refresh family's `session_id` in `arguments`; no token, no
+segment of one and no digest of one is ever written.
+
+**Count by `tool_name`, never by outcome and detail alone.** Several endpoints write
+`returned` with a NULL `detail` on success, so `WHERE tool_name LIKE
+'device_grant.%' AND outcome = 'returned' AND detail IS NULL` adds pairings, scans,
+sessions and refreshes together:
+
+| Question | Predicate |
+|---|---|
+| Pairings granted | `tool_name = 'device_grant.approve' AND outcome = 'returned' AND detail IS NULL` |
+| Repeat approvals | `tool_name = 'device_grant.approve' AND outcome = 'returned' AND detail = 'already_approved'` |
+| Pairings scanned (first scans only) | `tool_name = 'device_grant.scan' AND outcome = 'returned' AND detail IS NULL` |
+| Repeat scans | `tool_name = 'device_grant.scan' AND outcome = 'returned' AND detail IN ('already_scanned','already_approved')` |
+| Sessions issued | `tool_name = 'device_grant.token' AND outcome = 'returned' AND detail IS NULL` |
+| Refreshes issued | `tool_name = 'device_grant.refresh' AND outcome = 'returned' AND detail IS NULL` |
+| Recalls completed | `tool_name = 'device_grant.recall' AND outcome = 'returned'` |
 
 - `POST /scan` (the app claiming a pairing from the QR): `returned` with a NULL
   `detail` for a first scan only, so `WHERE tool_name = 'device_grant.scan' AND
@@ -142,15 +161,25 @@ ends any of the three is recorded as `raised` under its class name.
   store; `raised` with `invalid_subject`, `revoked`, `user_code_not_found`,
   `not_scanned`, `scanned_by_other`, or `already_approved` for a code approved for a
   different customer.
-- `POST /token` (the browser's poll): since 30 September 2026 nothing is issued. An
-  approved code for a customer who is not revoked is answered 503 and recorded `raised`
-  with `issuance_disabled`, at most one row per poll interval because a poll inside
-  the interval is answered `slow_down` and writes nothing. The other recorded exits are
-  `revoked`, `stored_identity_malformed` (the stored identity fails to parse), the
-  exception's class name when the revocation store could not answer, and
-  `device_code_spent` for a code an earlier build spent. An unknown or expired code,
-  `slow_down` and `authorization_pending` write nothing, because none of them has read
-  a customer off the code yet.
+- `POST /token`, `grant_type=device_code` (the browser's poll): `returned` with a
+  NULL `detail` for the exchange that issued a session. The other recorded exits are
+  `revoked` (now, or at or after the approval), `stored_identity_malformed` (the stored
+  identity fails to parse), the exception's class name when the revocation store could
+  not answer or the family store is full (`RefreshSessionStoreFull`) or unreachable, and
+  `device_code_spent` for a replay or a lost concurrent claim. An unknown or expired
+  code, an unserved `resource`, `slow_down` and `authorization_pending` write nothing,
+  because none of them has read a customer off the code yet.
+- `POST /token`, `grant_type=refresh_token`: written only once the caller presented a
+  refresh token the family issued. `returned` with NULL for a rotation; `raised` with
+  `refresh_reused`, `session_revoked`, `session_expired`,
+  `session_generations_exhausted`, `client_id_mismatch`, `scope_exceeded`, `revoked`,
+  `issued_before_revocation`, or a class name. A refresh token the family never issued
+  writes nothing and logs one line per family per minute.
+- A recall at `POST /scan` (a second customer's scan of a pairing already exchanged):
+  `returned` when the family was revoked and every access `jti` listed in a shared
+  store; `raised` with `recall_no_session`, `recall_local_only` or a class name
+  otherwise. It names the recalled family's customer and shares the scan row's
+  `call_id`; the scan row after it names the scanner.
 - `POST /device_authorization` (creating the code) writes nothing at all: it
   resolves no identity, ever.
 
@@ -159,8 +188,9 @@ ends any of the three is recorded as `raised` under its class name.
 pairing-code attempt budget) are defined in `services/confirm/audit.py` because
 `audit_log` is append-only and rows carrying them exist, but nothing writes them since
 30 September 2026: `/approve` takes a `user_code` and records `user_code_not_found`
-for a miss, and the budget was removed with the old lookup. The `minted` method has no
-caller until the session-token change.
+for a miss, and the budget was removed with the old lookup. `issuance_disabled` (an
+approved code answered 503 while issuance was disabled, on 30 September 2026) is
+historical the same way.
 
 `device_code_spent` covers two events on `POST /token`, and `arguments` separates
 them. A replay of a spent code is refused before any refresh family exists, so its row

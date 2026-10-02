@@ -2,6 +2,13 @@
 
 **Date:** 2026-09-26
 
+> **Since the layer-1 session token** the exchange issues a session (an access
+> token for the MCP server and a refresh token), not the read token this record
+> argues about, and spends the code in the same compare-and-set that records the
+> family's `session_id`. The single-use argument below is unchanged: one
+> approved code is worth one grant. Between 30 September 2026 and the session
+> token the exchange issued nothing and spent nothing.
+
 ## Question
 
 `services/confirm/device_auth.py`'s `token_endpoint` minted a read token for an

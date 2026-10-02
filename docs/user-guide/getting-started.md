@@ -94,7 +94,8 @@ the service refuses and names this variable as the one you meant.
 | `POSTERN_READ_TOKEN_ISSUER` | No | `https://mcp-read.internal` | `iss` claim on internal read tokens |
 | `POSTERN_JWKS_URI` | No | - | URL where customer JWTs were signed (for consent enforcement). Leave unset for no-auth mode |
 | `POSTERN_TOKEN_ISSUER` | No | - | Expected issuer of customer JWTs. Leave unset for no-auth mode |
-| `POSTERN_AUDIENCE` | No | `postern` | Expected `aud` claim on customer JWTs |
+| `POSTERN_AUDIENCE` | No | `postern` | Expected `aud` claim on customer JWTs: the MCP server's resource URI, equal to the confirm service's `POSTERN_SESSION_TOKEN_AUDIENCE`. **Refused at startup** when `POSTERN_JWKS_URI` is set and this is not an absolute `https` URI in normal form, unless `POSTERN_ALLOW_NON_URI_AUDIENCE` is set; the default therefore works only without customer authentication |
+| `POSTERN_ALLOW_NON_URI_AUDIENCE` | No | off | Local-stack flag: accept a non-URI `POSTERN_AUDIENCE`, with a warning. Read by both services |
 | `POSTERN_STRICT_HEADERS` | No | `0` | Enable strict MCP Streamable HTTP header validation (Mcp-Method/Mcp-Name must match body) |
 | `POSTERN_TRUSTED_PROXY_HOPS` | No | `0` | Proxies in front of this service that append to `X-Forwarded-For`; the risk engine reads the n-th entry from the right. **Zero or greater**; zero trusts the header for nothing and uses the socket peer |
 | `POSTERN_CACHE_TTL_SECONDS` | No | `60` | Consent domain cache TTL per request. **At least 1**; FastMCP refuses a cache TTL of zero when the server is built |
@@ -148,12 +149,17 @@ the service refuses and names this variable as the one you meant.
 | `POSTERN_CONFIRM_CUSTOMER_RATE_LIMIT_SCAN` | No | `10` | As above, for `/scan`, which precedes every pairing approval once. **At least 1** |
 | `POSTERN_DEVICE_VERIFICATION_URI` | No | `https://auth.postern.internal/verify` | URI of the browser's pairing page, which `verification_uri_complete` extends with `?d=<handle>`. The QR does not encode this: it encodes `POSTERN_DEVICE_APP_LINK_URI`. **Refused at startup** unless its path is exactly `/verify` (`/verify/` does not match the route) and it carries no `?` and no `#` |
 | `POSTERN_DEVICE_APP_LINK_URI` | **Yes, in any deployment** | `https://app.postern.internal/pair` | Base of the universal link / app link the pairing QR encodes, as `?user_code=...&qr=...`. The default is a local placeholder: a deployment must set its own host and publish the Apple associated-domains and Android asset-links files for it, or a phone camera will not open the bank app. **Refused at startup** when it contains `?` or `#` (the QR appends `?user_code=...&qr=...`, which a fragment would swallow), unless it is an `https` URL with a hostname, and when its host equals `POSTERN_DEVICE_VERIFICATION_URI`'s host (case-insensitive, port ignored) |
-| `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code. Refused at startup below 30 seconds — the Redis store cannot represent a shorter one |
+| `POSTERN_DEVICE_CODE_TTL_SECONDS` | No | `900` (15 min) | Lifetime of a device code. Refused at startup below 30 seconds, which the Redis store cannot represent, and above 900, the most the 4,800-second customer revocation stamp covers beside a one-hour session family |
 | `POSTERN_REDIS_DEVICE_CODE_TTL` | No | `900` (15 min) | Lifetime a device code gets when the caller passes no `expires_in`, on the Redis store. Refused below the same 30 seconds, and for the same reason: it sets the lifetime of the same object |
 | `POSTERN_DEVICE_POLL_INTERVAL_SECONDS` | No | `5` | Minimum seconds between token polls. **At least 1**; must also stay below `POSTERN_DEVICE_CODE_TTL_SECONDS`, which is not checked: an interval at or above the lifetime expires the code before the browser may poll once |
-| `POSTERN_READ_KEY_PEM_PATH` | No | - | Read key PEM path (needed for device grant token exchange) |
-| `POSTERN_READ_KEY_KID` | No | `read-1` | Read key ID (must match API service) |
-| `POSTERN_READ_TOKEN_ISSUER` | No | `https://mcp-read.internal` | Read token issuer (must match API service) |
+| `POSTERN_SESSION_KEY_PEM_PATH` | No | - | The SESSION key's PEM, which signs the layer-1 access tokens `/token` issues. Unset without Vault: an ephemeral key, with a warning. Refused together with `POSTERN_VAULT_ADDR` |
+| `POSTERN_SESSION_KEY_KID` | No | `session-1` | Its kid, or under Vault the kid prefix (`session-1.v<N>`) |
+| `POSTERN_VAULT_SESSION_KEY_NAME` | No | `postern-session` | The session transit key under Vault |
+| `POSTERN_SESSION_TOKEN_ISSUER` | No | `https://auth.postern.internal` | `iss` of every access token, and what `services/api`'s `POSTERN_TOKEN_ISSUER` must equal. **Refused at startup** unless `https` with a host and no query or fragment, and when it equals `POSTERN_WRITE_TOKEN_ISSUER` or `POSTERN_APP_ASSERTION_ISSUER` |
+| `POSTERN_SESSION_TOKEN_AUDIENCE` | **Yes, in any deployment** | `postern` | `aud` of every access token: the MCP server's resource URI, equal to `services/api`'s `POSTERN_AUDIENCE`. **Refused at startup** unless an absolute `https` URI in normal form (or `POSTERN_ALLOW_NON_URI_AUDIENCE` is set), and when it equals `POSTERN_APP_ASSERTION_AUDIENCE` |
+| `POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS` | No | off | Development flag: start without `POSTERN_REDIS_URL`, with refresh families and recalls in this process only. Without it the service **refuses to start** when `POSTERN_REDIS_URL` is unset |
+| `POSTERN_MAX_REFRESH_SESSIONS` | No | `40000` | Ceiling on live refresh families: `POSTERN_MAX_DEVICE_CODES` times the lifetime ratio (3,600 s against 900 s). **At least 1** |
+| `POSTERN_CONFIRM_RATE_LIMIT_SESSION_JWKS` | No | `300` | Per-address requests a minute to `/session/jwks.json`. **At least 1** |
 | `POSTERN_BACKEND_BASE_URL` | No | `https://backend.internal` | Base URL for backend write endpoints (payments.svc, cards.svc) |
 | `POSTERN_DATABASE_URL` | No | `postgresql+asyncpg://postern:postern@localhost:5432/postern` | Postgres connection string for challenges table |
 | `POSTERN_DATABASE_CONNECT_TIMEOUT_SECONDS` | No | `2.0` | Database connection timeout (seconds). **Greater than 0**; at zero every connection raises `TimeoutError` |

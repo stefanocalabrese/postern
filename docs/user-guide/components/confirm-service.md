@@ -41,10 +41,22 @@ Production starts the process with: `uvicorn services.confirm.main:app`.
    `POSTERN_APP_ASSERTION_ISSUER` and `POSTERN_APP_ASSERTION_AUDIENCE`
 2. **Write key source**, reads `POSTERN_WRITE_KEY_PEM_PATH` or generates ephemeral
 3. **Write minter**, `build_write_minter()` wraps the write key for token minting
-4. **Read key source**, reads `POSTERN_READ_KEY_PEM_PATH` (needed for device grant)
-5. **Read minter**, `InternalTokenMinter` with read key (device grant exception)
-6. **Device code store**, in-memory (dev) or Redis (production) via `create_device_code_store()`
+4. **Session key source and minter**, `build_session_minter()`: the SESSION key
+   (`POSTERN_SESSION_KEY_PEM_PATH`, `POSTERN_VAULT_SESSION_KEY_NAME`, or generated
+   with a warning), which signs the layer-1 access tokens `/token` issues and nothing else
+5. **Device code store**, in-memory (dev) or Redis (production) via `create_device_code_store()`
+6. **Refresh-family store**, in-memory or Redis via `create_refresh_session_store()`,
+   capped at `POSTERN_MAX_REFRESH_SESSIONS`
 7. **Database**, async SQLAlchemy engine for challenges table
+
+The service **refuses to start without `POSTERN_REDIS_URL`** unless
+`POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS` is set: without shared state a refresh token
+from one replica is refused at another, and a recall at `/scan` never reaches
+`services/api`. It also refuses a `POSTERN_SESSION_TOKEN_ISSUER` that is not an
+`https` URL or that equals another issuer it knows, and a
+`POSTERN_SESSION_TOKEN_AUDIENCE` that is not an absolute `https` URI in normal form
+(unless `POSTERN_ALLOW_NON_URI_AUDIENCE` is set) or that equals
+`POSTERN_APP_ASSERTION_AUDIENCE`.
 
 Step 1 **raises `ValueError` and the process does not start** if any of the three
 is unset. Unlike the API service, which may run with `auth=None` for local
@@ -58,13 +70,14 @@ customer token good enough to read a balance would be good enough to approve a
 payment. Neither process can detect the collision, so it is an operator
 requirement.
 
-### Key split exception
+### Keys
 
-The confirm service holds **both** read and write keys. This is a deliberate, documented
-exception: the device grant used the read key to mint the browser's token, and the key
-stays wired while that issuance is disabled (see "Token issuance is disabled" below). No
-other code path hands one process both keys for general use, the separation is preserved
-at startup.
+The confirm service holds the **write** key and the **session** key, and no read key.
+Until the layer-1 session token it also held the read key, as a recorded exception,
+because `/token` minted the browser a read token with it. No process holds READ and
+WRITE together now: `services/api` holds READ, this service holds WRITE and SESSION.
+The session key's public half is published at `/session/jwks.json`, and
+`/.well-known/jwks.json` stays write-only; the two sets share no kid and no modulus.
 
 The device grant does **not** touch the write key. `/token` used to return a
 write-scoped token alongside the read one; that was audit finding C-01 and it is
@@ -79,7 +92,8 @@ Implements RFC 8628 Device Authorization Grant with QR pairing codes.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `POST` | `/device_authorization` | public | Generate device code + user_code (pairing code) |
-| `POST` | `/token` | public | The browser's poll: an error until approved, then 503 (issuance disabled) |
+| `POST` | `/token` | public | `grant_type=device_code`: the browser's poll, an error until approved, then a layer-1 session. `grant_type=refresh_token`: rotate the refresh token for a fresh access token |
+| `GET` | `/session/jwks.json` | public | The session key's public half, which `services/api` verifies access tokens against |
 | `GET` | `/verify` | public | The browser's pairing page: pairing code, QR, app link |
 | `GET` | `/verify/qr.svg` | public, same-origin only | The QR the page embeds, rotated every two seconds |
 | `GET` | `/verify/state` | public, same-origin only | What the page's script polls: pending, scanned, or 404 |
@@ -91,7 +105,7 @@ Implements RFC 8628 Device Authorization Grant with QR pairing codes.
 because the caller is the **browser**, which holds no credential — that is the
 premise of RFC 8628, not an oversight. The `device_code` (43 characters from
 `secrets.token_urlsafe(32)`) is the authority at `/token` and never appears in
-the page, the QR or the page URL. All seven are listed in `PUBLIC_PATHS`, alongside `/.well-known/jwks.json` (eight entries in all), in
+the page, the QR or the page URL. All seven are listed in `PUBLIC_PATHS`, alongside `/.well-known/jwks.json` and `/session/jwks.json` (nine entries in all), in
 [`services/confirm/auth.py`](../../../services/confirm/auth.py); every other
 route on this service is denied by default. Decision record 0021 is why the page
 is served here rather than by `services/api`.
@@ -128,30 +142,46 @@ exchanged revokes it (`400 scan_conflict`).
 ```
 5. Browser → POST /token (grant_type=device_code, device_code=...)
    ← 400 authorization_pending (until approved)
-   ← 503 { "error": "temporarily_unavailable",
-           "error_description": "session token issuance is not enabled" }
-     (after approval)
+   ← 200 { "access_token": "<session token>", "token_type": "Bearer",
+           "expires_in": 600, "refresh_token": "prt1.<sid>.<secret>",
+           "scope": "<canonical scopes>" }
+     (after approval; Cache-Control: no-store, Pragma: no-cache)
+
+6. Browser → POST /token (grant_type=refresh_token, refresh_token=prt1...)
+   ← 200, the same five keys with a new refresh token
 ```
 
-### Token issuance is disabled
+### The layer-1 session
 
-Since 30 September 2026 `/token` returns no token. For an approved, unexpired
-code whose customer is not revoked it answers the 503 above with
-`Retry-After` set to the poll interval (`POSTERN_DEVICE_POLL_INTERVAL_SECONDS`,
-default 5), spends nothing, and writes one `audit_log` row with
-`detail = 'issuance_disabled'`. The code stays unspent, so the next poll gets
-the same answer; a poll that arrives inside the interval gets `400 slow_down`
-and writes no row, as a pending code's does. A revoked customer still
-gets `400 access_denied`, because the ZT-7 check runs first.
+`dev-docs/device-grant-session-token-spec.md` is the contract. The access token's
+`aud` is `POSTERN_SESSION_TOKEN_AUDIENCE` (the MCP server's resource URI, equal to
+`services/api`'s `POSTERN_AUDIENCE`), its `iss` is `POSTERN_SESSION_TOKEN_ISSUER`,
+it lives 600 seconds, carries `sub`, `client_id` (with `client_id_verified: false`),
+`scope`, `sid` and `jti`, and carries no `act`, so no domain service accepts it. The
+refresh token belongs to a **family** that lives one hour from the exchange; each
+refresh rotates it, and presenting a rotated one revokes the whole family and lists
+every live access `jti` on the ZT-7 store. The exchange spends the device code; a
+replay is `invalid_grant`.
 
-Until then it returned a read token: `aud=accounts.svc`, `scope=accounts:read`,
-`act.sub=svc:postern`, 60 seconds, signed with the read key. That is a layer-2
-backend token (handoff §7.1). Under Vault both services sign with transit key
-`postern-read`, which `services/api` publishes at its JWKS and Istio trusts, so
-any client that completed a pairing, a phishing client included, held a token
-the accounts backend accepts. The browser should get a layer-1 session token
-that only this deployment's MCP server accepts. That is a separate, later
-change; until it lands, a completed pairing yields nothing the browser can use.
+A `resource` parameter (RFC 8707), if sent, must name the audience after RFC 3986
+normalization, or the answer is `400 invalid_target`. The retryable answers, the
+revocation store's outage and a family store that is full or unreachable, are 503 with
+`Retry-After` set to the poll interval, and an approved code's polls are paced at that
+interval.
+
+**The grant type is the short literal, not the RFC 8628 URN.** `/token` dispatches on
+`grant_type=device_code` and `grant_type=refresh_token` exactly; anything else,
+including RFC 8628 §3.4's `urn:ietf:params:oauth:grant-type:device_code`, is answered
+`404 unsupported_grant_type` (`services/confirm/device_auth.py`, `_token_response`). A
+client that sends the URN, as RFC 8628 specifies, never receives a session from this
+service.
+
+**Recall.** When a second customer's `/scan` finds a pairing already exchanged
+(`conflict_exchanged`), the session that exchange issued is recalled: the family is
+revoked and its access tokens listed, so `services/api` refuses the next call. If
+a store needed for the recall is out or contended, `/scan` answers **503 with
+`Retry-After: 1`**, writes both rows, and the app retries once, immediately. Any other
+exception during the recall answers 500 and writes only the scan row.
 
 `/scan` and `/approve` return **401** for a missing or unverifiable assertion and
 **403** if the assertion's `sub` is not a `cust_...` reference or the customer is
@@ -252,13 +282,14 @@ class DeviceCode:
     approved: bool            # Whether mobile app has approved
     approved_at: datetime | None  # Approval timestamp
     customer_ref: str         # Verified assertion `sub`, empty until approved
-    exchanged_at: datetime | None  # When /token spent it (nothing spends it since 2026-09-30)
+    exchanged_at: datetime | None  # When /token spent it
     display_handle: str       # 128 random bits; keys the page, useless at /token
     qr_secret: bytes          # Per-pairing HMAC key for the QR's rotation token
     creator_ip: str | None    # Where /device_authorization came from
     scanned_by: str           # Customer whose app scanned first, empty until scanned
     scanned_at: datetime | None  # When
     scanner_ip: str | None    # Where the claiming /scan came from, set only by the claim
+    session_id: str           # The refresh family /token created, set with exchanged_at
 ```
 
 `customer_ref` used to be `client_id`, reused for two purposes. That overload was

@@ -125,8 +125,9 @@ MAX_ASSERTION_MAX_LIFETIME_SECONDS = 3600
 #:     authority at this endpoint -- 43 characters from
 #:     ``secrets.token_urlsafe(32)``, so 256 bits -- and since the write token
 #:     was deleted from this endpoint's response (audit finding C-01), the
-#:     most it can yield is the read token for the customer who approved that
-#:     exact code on their own phone.
+#:     most it can yield is one layer-1 session for the customer who approved
+#:     that exact code on their own phone. A refresh presents the refresh
+#:     token it issued, which is the credential there.
 #: THE FIVE BELOW ARE THE PAIRING PAGE, added 2026-09-30, and all five are
 #: the BROWSER again: it opened ``verification_uri_complete`` and holds no
 #: assertion. None sets a cookie or reads one, and every other path on this

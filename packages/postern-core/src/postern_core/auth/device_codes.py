@@ -19,7 +19,8 @@ The device authorization flow (§7.3 of the handoff):
    the app calls ``POST /approve`` with the ``user_code``, which approves by
    compare-and-set only for the customer who scanned (``approve_scanned``).
 5. After approval, the browser polls ``/token`` with
-   ``grant_type=device_code`` to receive a read token.
+   ``grant_type=device_code`` to receive a layer-1 session, and the code is
+   spent with the session's family id (``consume_device_code``).
 
 The pairing code (``user_code``) carries the anti-phishing control for
 A2 (QR relay), and it is worth being precise about which half lives where,

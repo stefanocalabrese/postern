@@ -89,8 +89,14 @@ Sessions expire after `default_ttl_seconds` (default 480 minutes = 8 hours, matc
 
 ## Redis Backend (`RedisSessionStore`)
 
-Compatible with any Redis-compatible service: AWS ElastiCache for Redis, Google
-Memorystore for Redis, Azure Cache for Redis, or a self-hosted Redis instance.
+`POSTERN_REDIS_URL` is shared with the revocation list, the device code store and the
+refresh-family store, so the Redis behind it must meet their requirements, not only
+this store's: Redis 5.0 or later (7.0 or later recommended) with scripting (`EVAL`)
+enabled, and **non-clustered**, a standalone instance or a single-shard primary with
+replicas, because several steps write more than one key at once and cluster mode
+refuses those with `CROSSSLOT` (`dev-docs/device-grant-session-token-spec.md` §6 step
+6). A managed service (AWS ElastiCache, Google Memorystore, Azure Cache for Redis)
+qualifies only in a configuration that meets all three.
 
 Sessions are stored as JSON with a TTL matching the session's expiry. The `_start_time`
 field is stored as a POSIX timestamp (not `time.monotonic()`), so sessions survive
