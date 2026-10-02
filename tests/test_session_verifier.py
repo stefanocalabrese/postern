@@ -485,6 +485,15 @@ class TestTheClaims:
     ) -> None:
         assert await verifier.verify_token(_signed(key, **overrides)) is None
 
+    async def test_an_expired_session_token_is_refused(
+        self, key: RSAKey, verifier: SessionTokenVerifier
+    ) -> None:
+        """Past ``exp`` by one second: refused. The same token one minute
+        ahead verifies, so expiry is the only difference."""
+        now = int(time.time())
+        assert await verifier.verify_token(_signed(key, exp=now - 1)) is None
+        assert await verifier.verify_token(_signed(key, exp=now + 60)) is not None
+
     async def test_exp_beyond_the_lifetime_and_skew_is_refused(
         self, key: RSAKey, verifier: SessionTokenVerifier
     ) -> None:
