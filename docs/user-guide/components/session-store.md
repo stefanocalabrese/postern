@@ -145,8 +145,8 @@ class RedisSessionStore(SessionStoreBase):
 
 **The Redis must be non-clustered**: a standalone instance, or a single-shard
 primary with replicas. Several steps span more than one key: the customer
-revocation script writes the pair set and the per-customer
-`revoked:customer-at:` key; `revoke_device_code` deletes a code's primary key,
+revocation script writes the pair set, the per-customer
+`revoked:customer-at:` key and the per-pair `revoked:pair-at:` key; `revoke_device_code` deletes a code's primary key,
 its index entry and its secondary keys in one `MULTI`/`EXEC`; the refresh-family
 store's `discard` deletes a family's key and its index entry in one
 `MULTI`/`EXEC`. Redis in cluster mode refuses any of those whose keys hash to

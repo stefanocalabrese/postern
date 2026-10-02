@@ -33,7 +33,7 @@ customer is this?", read through the resolver rather than from the token a
 second time so the identity that gets revoked and the identity whose data
 would have been returned cannot drift apart -- the same argument
 `services/api/middleware/risk.py`'s `_session_key` makes for the risk budget.
-``client_id`` and ``jti`` come from the validated access token.
+``client_id``, ``jti`` and ``iat`` come from the validated access token.
 
 FAIL CLOSED, TWICE OVER. A caller whose identity cannot be derived is refused
 (the production resolver raises). A store that cannot answer is refused
@@ -118,7 +118,11 @@ class RevocationMiddleware(Middleware):
     # --- Identity and decision ---------------------------------------------
 
     def _claims(self) -> dict[str, Any]:
-        """The three values the three revocation scopes are keyed on.
+        """The values the three revocation scopes are keyed on, plus ``iat``.
+
+        ``iat`` is not a scope. It is what lets the store refuse a token
+        minted before a customer-client revocation after that revocation was
+        restored (`postern_core.auth.revocation`'s ``pair-at`` floor).
 
         A CALLER WITH NO DERIVABLE CUSTOMER IS STILL CHECKED, on the two
         scopes that do not need one. `services/api/server.py`'s
@@ -145,13 +149,20 @@ class RevocationMiddleware(Middleware):
         token = get_access_token()
         client_id = NO_CLIENT
         jti: str | None = None
+        # The raw claim, `None` when absent. The key is ALWAYS present so the
+        # store applies the pair's `iat` floor, and a missing `iat` then fails
+        # closed whenever a stamp exists; the store, not this method, judges
+        # the value.
+        iat: Any = None
         if token is not None:
             if token.client_id:
                 client_id = str(token.client_id)
-            raw_jti = (token.claims or {}).get("jti")
+            token_claims = token.claims or {}
+            raw_jti = token_claims.get("jti")
             if isinstance(raw_jti, str):
                 jti = raw_jti
-        return {"sub": customer_ref, "client_id": client_id, "jti": jti}
+            iat = token_claims.get("iat")
+        return {"sub": customer_ref, "client_id": client_id, "jti": jti, "iat": iat}
 
     async def _refuse_if_revoked(self, claims: dict[str, Any], *, what: str) -> None:
         if not await self.store.is_revoked(claims):

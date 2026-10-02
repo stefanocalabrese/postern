@@ -116,6 +116,17 @@ after `CUSTOMER_REVOKED_AT_TTL_SECONDS`, the longest anything it could refuse
 can live, because keeping a record that a named customer was cut off beyond
 that serves nothing (GDPR Article 5(1)(e)).
 
+THE API HALF OF THE SAME RULE: ``pair-at``. The same script also stamps the
+PAIR (``revoked:pair-at:<pair member>``), expiring after
+`PAIR_REVOKED_AT_TTL_SECONDS` (930 s). `is_revoked` called with an ``iat`` in
+its claims, as `services/api/middleware/revocation.py` does on every call,
+reads that stamp in the same round trip and refuses a token whose ``iat`` is
+not past it by `PAIR_IAT_TOLERANCE_MS`, so a restore no longer revives the
+access tokens (up to 600 s) minted before the revocation. A missing or
+non-numeric ``iat`` refuses while a stamp exists. Claims with no ``iat`` key
+(`services/confirm`'s refresh check) are not floored. The kill switch and the
+per-``jti`` restore have no such floor and still revive.
+
 FAIL CLOSED. A store that cannot answer raises `RevocationStoreUnavailable`
 and the middleware refuses the call. Reporting an outage as "not revoked"
 would silently un-revoke every entry at exactly the moment the operator most
@@ -164,6 +175,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from abc import ABC, abstractmethod
@@ -173,6 +185,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from postern_core.auth.session_lifetime import (
+    ACCESS_TOKEN_LIFETIME_SECONDS,
+    SESSION_CLOCK_SKEW_SECONDS,
+)
 from postern_core.config import redis_url_from_env
 
 logger = logging.getLogger(__name__)
@@ -193,9 +209,40 @@ REVOKED_AT_MARGIN_SECONDS = 300
 #: device-code lifetime that would outgrow it.
 CUSTOMER_REVOKED_AT_TTL_SECONDS = 3_600 + 900 + REVOKED_AT_MARGIN_SECONDS
 
-#: The revocation of a customer-client pair and its timestamp, as ONE
+#: How long ``pair-at`` remembers a customer-client revocation for the api's
+#: ``iat`` floor, restored or not: access lifetime (600 s) +
+#: ``SESSION_CLOCK_SKEW_SECONDS`` (30 s) + ``REVOKED_AT_MARGIN_SECONDS``
+#: (300 s) = 930 s. The 30 s is there because confirm's clock, which stamps
+#: ``exp``, can run ahead of the api's, so a token can still verify that much
+#: longer on the api's clock. (FastMCP's `JWTVerifier` rejects ``exp <
+#: time.time()`` with no leeway; `SessionTokenVerifier`'s skew only bounds how
+#: far ``exp``, ``iat`` and ``nbf`` may lie in the future.) After that no
+#: access token minted before the revocation can still verify, so the stamp has
+#: nothing left to refuse. Far shorter than the customer's 4,800 s stamp
+#: because this one guards access tokens, not refresh families.
+PAIR_REVOKED_AT_TTL_SECONDS = (
+    ACCESS_TOKEN_LIFETIME_SECONDS + SESSION_CLOCK_SKEW_SECONDS + REVOKED_AT_MARGIN_SECONDS
+)
+
+#: How far an access token's ``iat`` may sit past the pair stamp and still be
+#: refused, in milliseconds. ``iat`` is read from the token confirm minted, on
+#: confirm's clock; the stamp is Redis ``TIME`` (or this process's clock in
+#: memory). Two clocks are compared, so the floor errs toward refusal by the
+#: same 2 s as `services.confirm.device_auth.APPROVAL_CLOCK_TOLERANCE_MS`,
+#: which is not imported because `postern_core` sits below `services`. ``iat``
+#: has one-second resolution, so ``iat * 1000`` is also up to 999 ms early.
+#: Cost: a token minted within about 2 s after the stamp is refused for its
+#: whole life, and the customer re-pairs. The floor assumes NTP-level skew
+#: between confirm's clock and Redis ``TIME``, as ``APPROVAL_CLOCK_TOLERANCE_MS``
+#: does; skew beyond 2 s lets tokens minted in that window before the stamp
+#: through. The 30 s in ``PAIR_REVOKED_AT_TTL_SECONDS`` is the verifier ceiling,
+#: used only to size the expiry, not this tolerance.
+PAIR_IAT_TOLERANCE_MS = 2_000
+
+#: The revocation of a customer-client pair and its timestamps, as ONE
 #: server-side step on ONE clock: ``TIME``, then the pair's ``SADD``, then the
-#: customer's stamp with its expiry. Returns the stamp in milliseconds.
+#: customer's stamp with its expiry, then the pair's own stamp (the api's
+#: ``iat`` floor) with its shorter expiry. Returns the stamp in milliseconds.
 #:
 #: A script that reads ``TIME`` and then writes must be replicated by its
 #: effects rather than by its body. Effects replication is the default from
@@ -208,8 +255,32 @@ _REVOKE_CUSTOMER_CLIENT = (
     "local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) "
     "redis.call('SADD', KEYS[1], ARGV[1]) "
     "redis.call('SET', KEYS[2], ms, 'EX', ARGV[2]) "
+    "redis.call('SET', KEYS[3], ms, 'EX', ARGV[3]) "
     "return ms"
 )
+
+
+def _iat_ms(iat: Any) -> int | None:
+    """An access token's ``iat`` in milliseconds, or ``None`` if it is unusable.
+
+    ``bool`` is excluded because ``True`` is an ``int`` to Python and an
+    ``iat`` to nobody; NaN and infinity cannot be compared with a stamp.
+    """
+    if isinstance(iat, bool) or not isinstance(iat, int | float):
+        return None
+    if isinstance(iat, float) and not math.isfinite(iat):
+        return None
+    return int(iat) * 1000
+
+
+def _below_pair_floor(iat: Any, stamp_ms: int) -> bool:
+    """Whether a token with this ``iat`` predates the pair stamp.
+
+    An unusable ``iat`` counts as predating it: a stamp exists, so the token
+    cannot be shown to postdate the revocation, and the check fails closed.
+    """
+    iat_ms = _iat_ms(iat)
+    return iat_ms is None or iat_ms <= stamp_ms + PAIR_IAT_TOLERANCE_MS
 
 
 def _now_ms() -> int:
@@ -454,6 +525,17 @@ class RevocationStoreBase(ABC):
     async def is_revoked(self, claims: Mapping[str, Any]) -> bool:
         """Whether these token claims are revoked under any of the three scopes.
 
+        THE ``iat`` CONTRACT. When ``claims`` carries an ``"iat"`` KEY (the api
+        passes the token's raw claim, ``None`` if absent), the pair's
+        ``pair-at`` stamp is consulted too: a token whose ``iat`` is not more
+        than `PAIR_IAT_TOLERANCE_MS` past the stamp is refused even though the
+        pair was restored, and an unusable ``iat`` is refused while a stamp
+        exists. With no stamp the key changes nothing. When the key is ABSENT
+        the floor is skipped entirely, which is what
+        `services/confirm/device_auth.py`'s `_refresh_revoked` relies on: it
+        asks about a family, not a token, and has its own ``customer-at``
+        comparison.
+
         Raises `RevocationStoreUnavailable` when the store cannot answer.
         """
 
@@ -569,9 +651,32 @@ class InMemoryRevocationStore(RevocationStoreBase):
         self._clients: set[str] = set()
         #: ``customer_ref -> (stamp ms, expiry ms)``, swept on read.
         self._revoked_at: dict[str, tuple[int, int]] = {}
+        #: ``(customer_ref, client_id) -> (stamp ms, expiry ms)``, swept on
+        #: read: the api's ``iat`` floor, on the same clock as ``_revoked_at``.
+        self._pair_revoked_at: dict[tuple[str, str], tuple[int, int]] = {}
 
     async def is_revoked(self, claims: Mapping[str, Any]) -> bool:
-        return self._list.is_revoked(claims)
+        """Applies the pair floor only when the claims carry an iat key.
+
+        See `RevocationStoreBase.is_revoked`.
+        """
+        if self._list.is_revoked(claims):
+            return True
+        customer_ref = claims.get("sub")
+        client_id = claims.get("client_id")
+        if "iat" not in claims or not isinstance(customer_ref, str):
+            return False
+        if not isinstance(client_id, str):
+            return False
+        pair = (customer_ref, client_id)
+        entry = self._pair_revoked_at.get(pair)
+        if entry is None:
+            return False
+        stamp, expires = entry
+        if _now_ms() >= expires:
+            del self._pair_revoked_at[pair]
+            return False
+        return _below_pair_floor(claims["iat"], stamp)
 
     async def revoke_session(self, *, jti: str) -> None:
         self._list.revoke_session(jti=jti)
@@ -586,6 +691,10 @@ class InMemoryRevocationStore(RevocationStoreBase):
         self._customer_clients.add((customer_ref, client_id))
         stamp = _now_ms()
         self._revoked_at[customer_ref] = (stamp, stamp + CUSTOMER_REVOKED_AT_TTL_SECONDS * 1000)
+        self._pair_revoked_at[(customer_ref, client_id)] = (
+            stamp,
+            stamp + PAIR_REVOKED_AT_TTL_SECONDS * 1000,
+        )
 
     async def customer_revoked_at(self, customer_ref: str) -> int | None:
         entry = self._revoked_at.get(customer_ref)
@@ -688,6 +797,9 @@ class RedisRevocationStore(RevocationStoreBase):
     def _revoked_at_key(self, customer_ref: str) -> str:
         return f"{self._prefix}revoked:customer-at:{customer_ref}"
 
+    def _pair_revoked_at_key(self, customer_ref: str, client_id: str) -> str:
+        return f"{self._prefix}revoked:pair-at:{_pair_member(customer_ref, client_id)}"
+
     async def is_revoked(self, claims: Mapping[str, Any]) -> bool:
         """Check every applicable scope in one round trip.
 
@@ -695,6 +807,10 @@ class RedisRevocationStore(RevocationStoreBase):
         no ``jti`` asks nothing of the session set. Claims that match no scope
         at all return False without touching Redis, because no entry could
         name them.
+
+        When the claims carry an ``"iat"`` key and name a customer and a
+        client, one ``GET`` of the pair's ``pair-at`` stamp rides in the same
+        pipeline; see `RevocationStoreBase.is_revoked` for the contract.
         """
         jti = claims.get("jti")
         customer_ref = claims.get("sub")
@@ -710,15 +826,34 @@ class RedisRevocationStore(RevocationStoreBase):
         if not checks:
             return False
 
+        floor_key: str | None = None
+        if "iat" in claims and isinstance(customer_ref, str) and isinstance(client_id, str):
+            floor_key = self._pair_revoked_at_key(customer_ref, client_id)
+
         try:
             pipe = self._redis.pipeline(transaction=False)
             for key, member in checks:
                 pipe.sismember(key, member)
+            if floor_key is not None:
+                pipe.get(floor_key)
             results = await pipe.execute()
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation list could not be read: {type(exc).__name__}"
             ) from exc
+        if floor_key is not None:
+            stamp_raw = results.pop()
+            if any(bool(result) for result in results):
+                return True
+            if stamp_raw is None:
+                return False
+            try:
+                stamp_ms = int(stamp_raw)
+            except (TypeError, ValueError) as exc:
+                raise RevocationStoreUnavailable(
+                    f"revocation timestamp is corrupt: {type(exc).__name__}"
+                ) from exc
+            return _below_pair_floor(claims["iat"], stamp_ms)
         return any(bool(result) for result in results)
 
     async def _add(self, key: str, member: str) -> None:
@@ -748,11 +883,13 @@ class RedisRevocationStore(RevocationStoreBase):
         try:
             await self._redis.eval(
                 _REVOKE_CUSTOMER_CLIENT,
-                2,
+                3,
                 self._pairs_key,
                 self._revoked_at_key(customer_ref),
+                self._pair_revoked_at_key(customer_ref, client_id),
                 _pair_member(customer_ref, client_id),
                 CUSTOMER_REVOKED_AT_TTL_SECONDS,
+                PAIR_REVOKED_AT_TTL_SECONDS,
             )
         except Exception as exc:
             raise RevocationStoreUnavailable(

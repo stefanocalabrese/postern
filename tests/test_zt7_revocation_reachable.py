@@ -32,6 +32,7 @@ import asyncio
 import io
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -570,7 +571,8 @@ async def test_the_cli_restores_a_revocation_and_the_replicas_serve_again(
     backend = RecordingBackend()
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
     app = _app(_settings(pg_url), backend, auth_override=verifier)
-    token = _token(key_pair, CUSTOMER, CLIENT)
+    now = int(time.time())
+    token = _token(key_pair, CUSTOMER, CLIENT, iat=now - 60, exp=now + 540)
 
     async with _consent(database, CUSTOMER):
         async with _serving(app) as client:
@@ -578,11 +580,78 @@ async def test_the_cli_restores_a_revocation_and_the_replicas_serve_again(
             refused = await _call(client, "accounts.list", token=token)
 
             assert (await _run_cli("restore-customer-client", CUSTOMER.value, CLIENT))[0] == 0
-            served = await _call(client, "accounts.list", token=token)
+            # The token minted before the revocation stays refused after the
+            # restore (M2); the replicas serve again a token minted after it.
+            # `iat` is explicit and past the 2 s tolerance, so the test never
+            # sleeps and never races the stamp.
+            still_refused = await _call(client, "accounts.list", token=token)
+            stamp_ms = await _revocation_store(app).customer_revoked_at(CUSTOMER.value)
+            assert stamp_ms is not None
+            issued = stamp_ms // 1000 + 10
+            after = _token(key_pair, CUSTOMER, CLIENT, iat=issued, exp=issued + 600)
+            served = await _call(client, "accounts.list", token=after)
 
     _refused(refused)
+    _refused(still_refused)
     _succeeded(served)
     assert backend.paths == ["/accounts"]
+
+
+@pytest.fixture(params=["memory", "redis"])
+def restore_backend(request: pytest.FixtureRequest) -> str:
+    """The revocation backend a restore test runs against.
+
+    ``redis`` pulls in `shared_redis`, which sets ``POSTERN_REDIS_URL`` so that
+    `create_app` builds a `RedisRevocationStore`; ``memory`` leaves it unset.
+    """
+    if request.param == "redis":
+        request.getfixturevalue("shared_redis")
+    return str(request.param)
+
+
+async def test_a_restore_does_not_revive_an_access_token_issued_before_the_revocation(
+    pg_url: str, database: Database, key_pair: RSAKeyPair, restore_backend: str
+) -> None:
+    """M2: the api half of "a restore must not revive pre-revocation grants".
+
+    The refresh path already refused a family older than the revocation. The
+    api asked only whether the pair was ON the list, so for up to 600 s after
+    `restore_customer_client` the token minted BEFORE the revocation was served
+    again. Deterministic, no sleeps: the old token's ``iat`` is set a minute in
+    the past, so it predates the stamp by far more than the 2 s tolerance, and
+    the fresh one is set 10 s past the stamp read back from the store.
+    """
+    backend = RecordingBackend()
+    verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
+    app = _app(_settings(pg_url), backend, auth_override=verifier)
+    store = _revocation_store(app)
+    assert isinstance(store, RedisRevocationStore) == (restore_backend == "redis")
+
+    now = int(time.time())
+    old = _token(key_pair, CUSTOMER, CLIENT, iat=now - 60, exp=now + 540)
+
+    async with _consent(database, CUSTOMER):
+        async with _serving(app) as client:
+            _succeeded(await _call(client, "accounts.list", token=old))
+            assert backend.paths == ["/accounts"], "the pre-revocation call is real"
+
+            await store.revoke_customer_client(customer_ref=CUSTOMER.value, client_id=CLIENT)
+            _refused(await _call(client, "accounts.list", token=old))
+
+            await store.restore_customer_client(customer_ref=CUSTOMER.value, client_id=CLIENT)
+            revived = await _call(client, "accounts.list", token=old)
+
+            stamp_ms = await store.customer_revoked_at(CUSTOMER.value)
+            assert stamp_ms is not None
+            issued = stamp_ms // 1000 + 10
+            fresh = _token(key_pair, CUSTOMER, CLIENT, iat=issued, exp=issued + 600)
+            served = await _call(client, "accounts.list", token=fresh)
+
+    _refused(revived)
+    _succeeded(served)
+    assert backend.paths == ["/accounts", "/accounts"], (
+        "the old token reached no backend after the restore; the fresh one did"
+    )
 
 
 async def test_the_cli_lists_every_scope_it_wrote(shared_redis: Any) -> None:
