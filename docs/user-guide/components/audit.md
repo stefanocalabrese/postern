@@ -115,7 +115,7 @@ nobody and writes nothing. Each endpoint has its own `tool_name`, all under
 |---|---|---|
 | `POST /scan` | `device_grant.scan` | `/scan` |
 | `POST /approve` | `device_grant.approve` | `/approve` |
-| `POST /token` (`grant_type=device_code`) | `device_grant.token` | `/token` |
+| `POST /token` (`grant_type=device_code`, or its RFC 8628 URN) | `device_grant.token` | `/token` |
 | `POST /token` (`grant_type=refresh_token`) | `device_grant.refresh` | `/token` |
 | `POST /scan`, a recall | `device_grant.recall` | `/scan` |
 

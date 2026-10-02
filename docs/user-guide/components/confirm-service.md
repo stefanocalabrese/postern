@@ -92,7 +92,7 @@ Implements RFC 8628 Device Authorization Grant with QR pairing codes.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `POST` | `/device_authorization` | public | Generate device code + user_code (pairing code) |
-| `POST` | `/token` | public | `grant_type=device_code`: the browser's poll, an error until approved, then a layer-1 session. `grant_type=refresh_token`: rotate the refresh token for a fresh access token |
+| `POST` | `/token` | public | `grant_type=device_code` or its RFC 8628 URN spelling: the browser's poll, an error until approved, then a layer-1 session. `grant_type=refresh_token`: rotate the refresh token for a fresh access token |
 | `GET` | `/session/jwks.json` | public | The session key's public half, which `services/api` verifies access tokens against |
 | `GET` | `/verify` | public | The browser's pairing page: pairing code, QR, app link |
 | `GET` | `/verify/qr.svg` | public, same-origin only | The QR the page embeds, rotated every two seconds |
@@ -169,12 +169,13 @@ revocation store's outage and a family store that is full or unreachable, are 50
 `Retry-After` set to the poll interval, and an approved code's polls are paced at that
 interval.
 
-**The grant type is the short literal, not the RFC 8628 URN.** `/token` dispatches on
-`grant_type=device_code` and `grant_type=refresh_token` exactly; anything else,
-including RFC 8628 §3.4's `urn:ietf:params:oauth:grant-type:device_code`, is answered
-`404 unsupported_grant_type` (`services/confirm/device_auth.py`, `_token_response`). A
-client that sends the URN, as RFC 8628 specifies, never receives a session from this
-service.
+**Two spellings of the device-code grant.** `/token` accepts RFC 8628 §3.4's
+`grant_type=urn:ietf:params:oauth:grant-type:device_code` and the short literal
+`grant_type=device_code`, with identical behaviour: the same response, the same audit
+row, and one shared pacing budget per device code, so alternating spellings does not
+buy extra polls. `grant_type=refresh_token` is already the RFC value. Matching is exact:
+a different case, a trailing space, a different URN or an empty value is answered
+`404 unsupported_grant_type` (`services/confirm/device_auth.py`, `token_endpoint`).
 
 **Recall.** When a second customer's `/scan` finds a pairing already exchanged
 (`conflict_exchanged`), the session that exchange issued is recalled: the family is

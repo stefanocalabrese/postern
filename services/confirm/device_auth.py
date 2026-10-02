@@ -574,6 +574,19 @@ async def device_authorization(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+#: RFC 8628 section 3.4's required ``grant_type`` for the device-code poll.
+#: ``token_endpoint`` also accepts the short literal ``device_code`` it has
+#: always served, and maps both to ``_DEVICE_CODE_GRANT`` once, so nothing
+#: downstream of the dispatch can see which spelling arrived.
+_DEVICE_CODE_GRANT_URN = "urn:ietf:params:oauth:grant-type:device_code"
+_DEVICE_CODE_GRANT = "device_code"
+_REFRESH_GRANT = "refresh_token"
+_GRANT_TYPES = {
+    _DEVICE_CODE_GRANT: _DEVICE_CODE_GRANT,
+    _DEVICE_CODE_GRANT_URN: _DEVICE_CODE_GRANT,
+    _REFRESH_GRANT: _REFRESH_GRANT,
+}
+
 #: Which ``app.state`` attribute holds which poll-time map. Two maps, not one,
 #: so the last PENDING poll never paces the first poll after approval: a
 #: browser that polled at t and whose customer approved at t+1 gets its answer
@@ -689,11 +702,12 @@ async def _token_response(request: Request) -> JSONResponse:
     ``dev-docs/decisions/0012-device-code-single-use.md`` exists and what it
     argues from.
 
-    Handles ``grant_type=device_code`` (RFC 8628 §3.4) and forwards all
-    other grant types to the existing JWKS-only app (which will 404).
+    Handles ``grant_type=device_code`` and RFC 8628 §3.4's
+    ``urn:ietf:params:oauth:grant-type:device_code``, which are one grant, and
+    ``grant_type=refresh_token``. Any other value is a 404.
 
     Request body:
-        grant_type: "device_code" (required for this path).
+        grant_type: "device_code" or the RFC 8628 URN (required for this path).
         device_code: The opaque device code from /device_authorization.
         resource: Optional, RFC 8707; see `_resource_refusal`.
 
@@ -779,9 +793,12 @@ async def _token_response(request: Request) -> JSONResponse:
     except MalformedParameter as exc:
         return _error(400, "invalid_request", str(exc))
 
-    if grant_type == "refresh_token":
+    # EXACT lookup, no case folding and no trimming: the URN and the literal
+    # become one canonical value here, and any other string is refused.
+    canonical = _GRANT_TYPES.get(grant_type)
+    if canonical == _REFRESH_GRANT:
         return await _refresh_grant(request, form, at=at, started=started)
-    if grant_type != "device_code":
+    if canonical != _DEVICE_CODE_GRANT:
         # Neither grant this endpoint serves. A 404, where RFC 6749 section
         # 5.2's error responses are 400; kept as it was (spec, Discrepancies).
         return _error(
