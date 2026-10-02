@@ -13,8 +13,10 @@ middleware does with a context; this file covers the store that holds it.
 import dataclasses
 import json
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from postern_core.risk.context import IpTracker, RiskContext
@@ -600,6 +602,66 @@ async def test_a_load_never_extends_the_key_beyond_the_remaining_lifetime() -> N
         assert await store.load(KEY) is not None
     pttl = await store._redis.pttl(redis_key)
     assert 0 < pttl <= 600_000, f"load extended the key past the lifetime: {pttl} ms"
+
+
+# --- The same TTL arithmetic against a real Redis ---
+#
+# fakeredis truncates an expiry to whole seconds, so it cannot show a
+# millisecond-level overshoot. These run the store against the session-wide
+# `redis_url` container. Only `time` in the risk modules is patched, so Redis
+# keeps its own clock and its PTTL is a real one.
+
+
+@pytest.fixture
+async def real_store(redis_url: str) -> AsyncIterator[RedisSessionStore]:
+    store = RedisSessionStore(url=redis_url, ttl=600, key_prefix=f"rs{uuid4().hex[:12]}:")
+    try:
+        yield store
+    finally:
+        await store.close()
+
+
+async def test_real_redis_gives_a_fresh_context_its_full_lifetime(
+    real_store: RedisSessionStore,
+) -> None:
+    await real_store.context_for(KEY)
+    ttl = await real_store._redis.ttl(real_store._key(KEY))
+    assert 599 <= ttl <= 600, f"a fresh context's lifetime on a real Redis: {ttl} s"
+
+
+async def test_real_redis_a_fresh_context_never_gets_more_than_its_lifetime(
+    real_store: RedisSessionStore,
+) -> None:
+    _, context_patch, session_patch = _skewed_clock()
+    with context_patch, session_patch:
+        await real_store.context_for(KEY)
+    pttl = await real_store._redis.pttl(real_store._key(KEY))
+    assert 0 < pttl <= 600_000, f"key outlives its context's lifetime: {pttl} ms"
+
+
+async def test_real_redis_a_load_never_extends_the_key_beyond_the_remaining_lifetime(
+    real_store: RedisSessionStore,
+) -> None:
+    redis_key = real_store._key(KEY)
+    clock, context_patch, session_patch = _skewed_clock()
+    stored = json.loads(RiskContext(session_id=KEY.value).to_json())
+    stored["started_at"] = clock.start
+    with context_patch, session_patch:
+        await real_store._redis.set(redis_key, json.dumps(stored), ex=1000)
+        assert await real_store.load(KEY) is not None
+    pttl = await real_store._redis.pttl(redis_key)
+    assert 0 < pttl <= 600_000, f"load extended the key past the lifetime: {pttl} ms"
+
+
+async def test_real_redis_a_second_context_for_never_extends_the_key(
+    real_store: RedisSessionStore,
+) -> None:
+    _, context_patch, session_patch = _skewed_clock()
+    with context_patch, session_patch:
+        await real_store.context_for(KEY)
+        assert await real_store.context_for(KEY) is not None
+    pttl = await real_store._redis.pttl(real_store._key(KEY))
+    assert 0 < pttl <= 600_000, f"a second context_for extended the key: {pttl} ms"
 
 
 async def test_a_context_older_than_the_ttl_is_dropped_and_not_returned() -> None:
