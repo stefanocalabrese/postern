@@ -194,6 +194,16 @@ owns everything below. These are the concrete items to implement there:
 **Status:** deploy workflow + tests are ready. The Terraform repo needs the
 items above to make this a live deploy pipeline.
 
+## Amended 2 October 2026: Cosign v3 semantics
+
+The deploy workflow was upgraded from cosign v2.5.2 to v3.0.6 on 2 October 2026. Under cosign v3:
+
+- `cosign sign --yes` writes a Sigstore bundle in the OCI Image 1.1 referrer format, containing all verification material (certificate, timestamp proof, transparency log entry).
+- When the image carries a Sigstore bundle, `cosign verify` does not build a Rekor client from `--rekor-url` (see https://github.com/sigstore/cosign/blob/v3.0.6/cmd/cosign/cli/verify/common.go line 133: `if !ignoreTlog && !co.NewBundleFormat && rekorURL != "" { co.RekorClient, err = rekor.NewClient(rekorURL) ...}`, so the client is built only when NOT using the new bundle format). Instead, it verifies the bundle's signatures against the Sigstore TUF trusted root, using the transparency log entry embedded in the bundle.
+- The `--rekor-url` flag is retained in the workflow for backward compatibility but is not used when the bundle format is present (the new default in v3).
+
+No workflow steps changed: the `cosign sign` invocation uses `--yes` (unchanged), and the `cosign verify` steps retain `--rekor-url=https://rekor.sigstore.dev` (unchanged). The behavioral difference is that v3 defaults to the bundle format, which contains all verification material inline.
+
 ## References
 
 - Zero-trust plan §ZT-3, §6.1 (gate 7)
@@ -201,3 +211,4 @@ items above to make this a live deploy pipeline.
 - Cosign keyless signing: https://docs.sigstore.dev/cosign/signing/
 - syft SBOM generation: https://github.com/anchore/syft
 - Trivy vulnerability scanning: https://github.com/aquasecurity/trivy
+- Cosign v3.0.1 release notes: https://github.com/sigstore/cosign/releases/tag/v3.0.1

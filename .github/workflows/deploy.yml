@@ -83,8 +83,8 @@ jobs:
       # This job assumes an IAM role and holds ECR push credentials, so a
       # repointed `aws-actions/configure-aws-credentials@v4` would run
       # attacker-chosen code with live AWS credentials in scope. The trailing
-      # comment names the release tag each SHA was resolved from on
-      # 25 September 2026, and is what dependabot matches on to bump it.
+      # comment names the release tag each SHA was re-verified against upstream
+      # tags on 2 October 2026, and is what dependabot matches on to bump it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # ── CI gates (must pass before build) ───────────────────────

@@ -65,8 +65,9 @@ jobs:
       # Actions are pinned to a full commit SHA, not a major tag. `@v4` is a
       # mutable ref the upstream maintainer can repoint, and so can anyone who
       # takes their account; the SHA is what the runner actually executes.
-      # Each trailing comment names the release tag the SHA was resolved from
-      # on 25 September 2026, which is what `dependabot` matches on to bump it.
+      # Each trailing comment names the release tag the SHA was re-verified
+      # against upstream tags on 2 October 2026, which is what `dependabot`
+      # matches on to bump it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
