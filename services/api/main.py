@@ -63,6 +63,7 @@ from postern_core.auth.keys import (
 )
 from postern_core.auth.minter_probe import refuse_unverifiable_minter
 from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
+from postern_core.auth.redis_preflight import run_redis_preflight
 from postern_core.auth.revocation import create_revocation_store, decision_scope
 from postern_core.config import bool_from_env, enforce_redis_requirement
 from postern_core.env_inventory import enforce_known_environment
@@ -268,6 +269,14 @@ def create_app(
     # the third refuses, and why the escape hatch cannot be the hole.
     enforce_known_environment(service="api")
     settings = settings or Settings.from_env()
+
+    # REDIS PREFLIGHT, once per process, BEFORE any key, Vault probe, backend client or
+    # database exists (nothing is left open when it refuses), and only with POSTERN_REDIS_URL set:
+    # clock skew against Redis TIME beyond 2 s, or a maxmemory-policy other
+    # than noeviction, refuses to start. One client on that one URL speaks for
+    # the session and revocation stores. Boot-time only; see
+    # `postern_core.auth.redis_preflight` for what it cannot see.
+    run_redis_preflight()
 
     # Plan 3 Task 2: one minter, built over the READ key only. `BackendClient`
     # calls a `TokenMinter` (`customer, audience -> str`); `ReadTokenMinter`

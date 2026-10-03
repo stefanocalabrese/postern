@@ -190,7 +190,24 @@ writes instead of evicting; reads continue to work normally. Write failures rais
 the middleware refuses the call (fail-closed). Verify the setting with `redis-cli
 CONFIG GET maxmemory-policy`.
 
+Both services check this at startup when `POSTERN_REDIS_URL` is set and
+**refuse to start** (`RedisPreflightError`, from `postern_core.auth.redis_preflight`)
+unless `CONFIG GET maxmemory-policy` answers exactly `noeviction`. If the server
+refuses `CONFIG`, as managed Redis often does, the policy cannot be verified: one
+warning is logged and the service starts, so check the setting by hand there. The
+check runs once at boot; a later `CONFIG SET` is not detected.
+
 **Clock skew under 2 seconds.** Keep the offset between the confirm service host and this Redis under 2 seconds (NTP or chrony on both, with monitoring). The approval check (`APPROVAL_CLOCK_TOLERANCE_MS`) and the per-pair revocation floor (`PAIR_IAT_TOLERANCE_MS`) compare confirm's clock with Redis `TIME` and allow 2000 ms. Beyond that, a revocation stamp can miss an approval it should refuse, and tokens minted just before a per-pair stamp pass the api's floor, so a restore revives them.
+
+Both services measure this at startup when `POSTERN_REDIS_URL` is set and
+**refuse to start** (`RedisPreflightError`) when the skew is past 2000 ms. The
+check calls Redis `TIME` once, brackets it with the local clock, and refuses
+only when the skew minus half the round trip still exceeds the tolerance, so a
+slow round trip cannot refuse a healthy deployment. There is no setting that
+skips it. It runs at boot only: drift after boot is not detected, so the NTP
+monitoring above is still yours.
+
+Accept the startup failure mode: with `POSTERN_REDIS_URL` set, Redis must be reachable before either service will start (connection refused fails in about 0.02 s, a blackholed host after the 5 s socket timeout, once per worker process), so deploy Redis before the services.
 
 ## ContextVar Pattern (Per-Call Access)
 

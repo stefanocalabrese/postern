@@ -85,6 +85,8 @@ class TestSharedStateIsRequired:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         monkeypatch.setenv("POSTERN_REDIS_URL", "redis://127.0.0.1:6379/0")
+        # The startup preflight connects; this case is about the flag, not Redis.
+        monkeypatch.setattr("services.confirm.main.run_redis_preflight", lambda: None)
         with caplog.at_level(logging.WARNING, logger="services.confirm.main"):
             assert _confirm(key_pair, allow_process_local_sessions=False) is not None
         assert "POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS" not in caplog.text

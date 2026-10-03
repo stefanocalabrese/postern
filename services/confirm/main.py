@@ -77,6 +77,7 @@ from pathlib import Path
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.auth.device_codes import create_device_code_store
 from postern_core.auth.device_keys import DeviceKeyStoreBase, FileDeviceKeyStore
+from postern_core.auth.redis_preflight import run_redis_preflight
 from postern_core.auth.refresh_sessions import create_refresh_session_store
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement, redis_url_from_env
@@ -377,6 +378,13 @@ def create_confirm_app(
     # in `ConfirmSettings.__post_init__` so a settings object built by hand is
     # refused exactly where a deployment would be.
     check_session_token_settings(settings)
+
+    # REDIS PREFLIGHT, once per process, before any key is built and only with
+    # POSTERN_REDIS_URL set: clock skew against Redis TIME beyond 2 s, or a
+    # maxmemory-policy other than noeviction, refuses to start. One client on
+    # that URL speaks for the revocation, device code, refresh family and rate
+    # limit stores. Boot-time only; see `postern_core.auth.redis_preflight`.
+    run_redis_preflight()
 
     # THE PAIRING NETWORK ENRICHER, LOADED ONCE AND BEFORE ANY KEY IS BUILT,
     # so a refused installed set lands at composition like every other

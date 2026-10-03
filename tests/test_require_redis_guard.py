@@ -200,6 +200,9 @@ class TestTheWritePathNowRefuses:
         No connection is made here -- every factory constructs its client
         lazily -- so this asserts the guard passes, not that Redis answers.
         """
+        # The startup preflight (tests/test_redis_preflight.py) does connect;
+        # this case is about the guard, so it is switched off here.
+        monkeypatch.setattr("services.confirm.main.run_redis_preflight", lambda: None)
         monkeypatch.setenv(REQUIRE_REDIS_ENV, "1")
         monkeypatch.setenv(REDIS_URL_ENV, A_URL)
         assert _confirm(key_pair) is not None
@@ -291,6 +294,9 @@ class TestTheReadPathIsUnchanged:
         assert str(raised.value) == API_MESSAGE
 
     def test_required_and_present_builds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The startup preflight (tests/test_redis_preflight.py) does connect;
+        # this case is about the guard, so it is switched off here.
+        monkeypatch.setattr("services.api.main.run_redis_preflight", lambda: None)
         monkeypatch.setenv(REQUIRE_REDIS_ENV, "1")
         monkeypatch.setenv(REDIS_URL_ENV, A_URL)
         assert create_app(Settings.for_testing()) is not None
