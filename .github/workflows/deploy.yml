@@ -398,7 +398,7 @@ jobs:
             sbom-confirm-linux-arm64.spdx.json
             sbom-migrate-linux-amd64.spdx.json
             sbom-migrate-linux-arm64.spdx.json
-          retention-days: 2555  # ~7 years for regulated compliance
+          retention-days: 90  # upload-artifact maximum; operators needing longer retention copy to their storage
 
   # ── Deploy stage ───────────────────────────────────────────────
 

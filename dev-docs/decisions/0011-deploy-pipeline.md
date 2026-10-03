@@ -204,6 +204,10 @@ The deploy workflow was upgraded from cosign v2.5.2 to v3.0.6 on 2 October 2026.
 
 No workflow steps changed: the `cosign sign` invocation uses `--yes` (unchanged), and the `cosign verify` steps retain `--rekor-url=https://rekor.sigstore.dev` (unchanged). The behavioral difference is that v3 defaults to the bundle format, which contains all verification material inline.
 
+## Amended 3 October 2026: SBOM artifact retention
+
+Open question 1 (SBOM retention policy) is now decided: SBOM artifacts are retained for 90 days, the documented maximum of the `actions/upload-artifact` action (README: "The retention period must be between 1 and 90 inclusive"). The suggested 7 years is not met by Actions artifacts; operators with a longer retention requirement must copy the SBOM to their own storage (S3, GCS, or equivalent) with a lifecycle rule matching their compliance obligation. The earlier workflow value of 2555 (approximately 7 years) exceeded the action's documented range; what GitHub Actions does with an out-of-range value is not established, and operators should not rely on it.
+
 ## References
 
 - Zero-trust plan §ZT-3, §6.1 (gate 7)

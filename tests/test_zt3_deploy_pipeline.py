@@ -736,8 +736,8 @@ def test_each_sbom_filename_names_the_platform_it_describes() -> None:
 def test_every_generated_sbom_is_uploaded_and_presence_checked() -> None:
     """Each SBOM produced is retained, and the deploy job gates on it.
 
-    Generating a per-platform SBOM that no step uploads leaves the seven-year
-    artifact short, and one the deploy job does not check for is a gate that
+    Generating a per-platform SBOM that no step uploads leaves the retained
+    artifact incomplete, and one the deploy job does not check for is a gate that
     passes on a missing document.
     """
     doc = _parse(_WORKFLOW_PATH)
@@ -811,6 +811,31 @@ def test_every_sha_pin_names_its_version_in_a_trailing_comment() -> None:
                 f"{path.name}: `uses: {action}@...` has no trailing version comment. "
                 "The SHA alone is unreadable and dependabot matches on the comment."
             )
+
+
+def test_artifact_retention_days_within_valid_range() -> None:
+    """Every `actions/upload-artifact` step with `retention-days` uses 1-90 inclusive.
+
+    The GitHub Actions `upload-artifact` action documents retention period range
+    as 1 to 90 days inclusive. Specifying a value outside this range is not
+    validated by the action or by GitHub Actions itself, and the behavior is
+    undefined. This test asserts that all retention-days values are within spec.
+    """
+    doc = _parse(_WORKFLOW_PATH)
+    for job, step in _steps(doc):
+        if step.get("uses", "").startswith("actions/upload-artifact"):
+            retention = step.get("with", {}).get("retention-days")
+            if retention is not None:
+                try:
+                    days = int(retention)
+                except (ValueError, TypeError) as e:
+                    raise AssertionError(
+                        f"Job {job!r}: retention-days value is not an integer: {retention!r}"
+                    ) from e
+                assert 1 <= days <= 90, (
+                    f"Job {job!r}: retention-days={days} is outside the documented range [1, 90]. "
+                    "The actions/upload-artifact action does not accept values outside this range."
+                )
 
 
 # ── Structural gates ─────────────────────────────────────────────
