@@ -409,7 +409,9 @@ jobs:
     environment: ${{ github.event.inputs.environment }}  # branch policy only -- not a human gate, see below
     # Same two scopes, for one fewer reason. `id-token: write` is here for
     # `aws-actions/configure-aws-credentials` only: `cosign verify` checks a
-    # Fulcio certificate against the Rekor log and mints no OIDC token, so
+    # Fulcio certificate (inclusion proof from the bundle; under cosign v3
+    # bundle mode `--rekor-url` repeats the default and is not consulted) and
+    # mints no OIDC token, so
     # signature verification would pass without it while the AWS role
     # assumption above it would not.
     #
@@ -530,6 +532,23 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # cosign reads registry credentials from the Docker config keychain
+      # (`--k8s-keychain` is off by default), which only this action writes.
+      # `configure-aws-credentials` above sets AWS environment variables and
+      # no registry login. Without this step each `cosign verify` below fails
+      # with a registry auth error, which the `::error::` text would report
+      # as an unsigned or tampered image. Reasoned from this file and cosign's
+      # documented behaviour, not run: no AWS account was available.
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd  # v2.1.7
+
+      # Network the verify steps need, beyond ECR: egress to
+      # tuf-repo-cdn.sigstore.dev, from which cosign v3 fetches the Sigstore
+      # trusted root for a bundle (measured offline in
+      # tests/test_cosign_v3_local.py: without it verify fails with "trusted
+      # root is required"). A self-hosted runner under a ZT-8 default-deny
+      # egress policy must allow both hosts.
       - name: Verify cosign signature — api
         env:
           COSIGN_EXPERIMENTAL: "1"

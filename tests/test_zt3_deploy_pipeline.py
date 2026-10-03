@@ -283,6 +283,31 @@ def test_workflow_verifies_cosign_before_deploy() -> None:
     )
 
 
+def test_every_job_that_runs_cosign_logs_in_to_ecr_first() -> None:
+    """A job that signs or verifies an ECR image must log in to ECR before it.
+
+    cosign reads registry credentials from the Docker config keychain, which
+    `aws-actions/amazon-ecr-login` writes. `configure-aws-credentials` only
+    sets AWS environment variables, which cosign does not use for a registry.
+    The deploy job carried no login until 3 October 2026, so its three
+    `cosign verify` steps would have failed with an auth error whose message
+    blames "unsigned, tampered" images. Reasoned from the workflow and cosign's
+    documented keychain behaviour; no AWS is available to run it.
+    """
+    doc = _parse(_WORKFLOW_PATH)
+    for job_name, job in doc["jobs"].items():
+        login_at: int | None = None
+        for index, step in enumerate(job.get("steps", [])):
+            if str(step.get("uses", "")).startswith("aws-actions/amazon-ecr-login@"):
+                login_at = login_at if login_at is not None else index
+            script = str(step.get("run", ""))
+            if "cosign verify" in script or "cosign sign" in script:
+                assert login_at is not None and login_at < index, (
+                    f"job {job_name!r} step {step.get('name')!r} runs cosign "
+                    "with no earlier aws-actions/amazon-ecr-login step in the job"
+                )
+
+
 def test_workflow_verifies_api_signature() -> None:
     """Cosign verification targets the api image."""
     scripts = _run_scripts_containing(_parse(_WORKFLOW_PATH), "cosign verify")
