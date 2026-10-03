@@ -9,9 +9,16 @@ sentences were read out of cosign's source. This file runs the binary.
 WHAT RUNS. A registry that implements the OCI 1.1 referrers API (zot, pinned
 by digest; `registry:3`, distribution 3.1.2, was run by hand on 3 October
 2026 and answers 404 on `/v2/<name>/referrers/<digest>`, so cosign falls back to
-the `sha256-<digest>` tag schema there), two throwaway images pushed to it,
-and cosign v3.0.6 from the official `ghcr.io/sigstore/cosign/cosign` image,
-pinned by index digest. Every cosign call runs in a container on a docker
+the `sha256-<digest>` tag schema there), two throwaway images pushed to it by
+crane (see below), and cosign v3.0.6 from the official
+`ghcr.io/sigstore/cosign/cosign` image, pinned by index digest. The images are
+pushed by crane, from a container on the registry's network, and never by the
+host's `docker push`: zot answers a Docker schema2 manifest, which is what an
+engine on the classic overlay2 image store pushes, with 415 `manifest invalid`
+(measured 3 October 2026 on Docker 28.5.2 overlay2; a containerd image store
+pushes an OCI manifest and passes), so a host push made the file depend on the
+engine. crane's `--oci-empty-base` writes an OCI manifest whatever the engine.
+Every cosign call runs in a container on a docker
 network created with `internal=True`, which has no route off the host, so a
 call that needed Rekor, Fulcio or the TUF mirror would fail by name
 resolution, not by luck.
@@ -80,6 +87,14 @@ from docker.models.networks import Network
 COSIGN_IMAGE = (
     "ghcr.io/sigstore/cosign/cosign@sha256:"
     "de9c65609e6bde17e6b48de485ee788407c9502fa08b8f4459f595b21f56cd00"
+)
+
+#: crane v0.22.1, the official `gcr.io/go-containerregistry/crane` image. Index
+#: digest resolved 3 October 2026; the manifests in it are linux/amd64 and
+#: linux/arm64.
+CRANE_IMAGE = (
+    "gcr.io/go-containerregistry/crane@sha256:"
+    "1f968817b95790bed063f71175aa6b8ff879fa17064020415f3e18bb6e6a36e1"
 )
 
 #: zot-minimal v2.1.21, an OCI-conformant registry that serves the 1.1
@@ -170,35 +185,55 @@ class Lab:
         return json.loads(body)["tags"] or []
 
 
-def _image_tar(payload: bytes) -> bytes:
+def _layer_tar(payload: bytes) -> bytes:
+    """One-file layer, with fixed metadata so the same payload gives the same digest."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        dockerfile = b"FROM scratch\nCOPY payload /payload\n"
-        for name, data in (("Dockerfile", dockerfile), ("payload", payload)):
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
+        info = tarfile.TarInfo("payload")
+        info.size = len(payload)
+        info.mode = 0o644
+        info.mtime = 0
+        tar.addfile(info, io.BytesIO(payload))
     return buf.getvalue()
 
 
-def _push(client: docker.DockerClient, base_url: str, payload: bytes, tag: str) -> str:
-    """Build a one-file FROM-scratch image, push it, return the registry's digest."""
-    # The daemon allows plain HTTP for 127.0.0.0/8 only. The name `localhost`
-    # can resolve to ::1, where the published port is not bound, and then the
-    # push times out on an HTTPS probe.
-    repo = f"{base_url.removeprefix('http://')}/lab/img"
-    client.images.build(
-        fileobj=io.BytesIO(_image_tar(payload)), custom_context=True, tag=f"{repo}:{tag}"
+def _push(
+    client: docker.DockerClient, net: Network, base_url: str, payload: bytes, tag: str
+) -> str:
+    """Push a one-file OCI image with crane, return the registry's digest.
+
+    crane runs in a container on `net`, so it talks to the registry by its
+    alias and the host engine's image store and push code are not involved.
+    """
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as outer:
+        layer = _layer_tar(payload)
+        info = tarfile.TarInfo("layer.tar")
+        info.size = len(layer)
+        info.mode = 0o644
+        outer.addfile(info, io.BytesIO(layer))
+    box = client.containers.create(
+        CRANE_IMAGE,
+        [
+            "append",
+            "--oci-empty-base",
+            "--insecure",
+            "-f",
+            "/layer.tar",
+            "-t",
+            f"{REGISTRY_ALIAS}:{REGISTRY_PORT}/lab/img:{tag}",
+        ],
+        network=net.name,
     )
-    # The daemon decides HTTP-versus-HTTPS from one probe, and a probe sent in
-    # the first second after the container starts has been refused; retry.
-    for attempt in range(6):
-        pushed = client.images.push(repo, tag=tag)
-        if '"error"' not in pushed:
-            break
-        time.sleep(1 + attempt)
-    assert '"error"' not in pushed, pushed
-    req = urllib.request.Request(  # noqa: S310
+    try:
+        box.put_archive("/", archive.getvalue())
+        box.start()
+        result = box.wait(timeout=60)
+        out = box.logs(stdout=True, stderr=True).decode(errors="replace")
+        assert result["StatusCode"] == 0, out
+    finally:
+        box.remove(force=True)
+    req = urllib.request.Request(  # noqa: S310 - fixed http URL to the local registry
         f"{base_url}/v2/lab/img/manifests/{tag}",
         method="HEAD",
         headers={
@@ -209,7 +244,6 @@ def _push(client: docker.DockerClient, base_url: str, payload: bytes, tag: str) 
     )
     with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
         digest = resp.headers["Docker-Content-Digest"]
-    client.images.remove(f"{repo}:{tag}", force=True)
     return str(digest)
 
 
@@ -265,7 +299,7 @@ def lab() -> Iterator[Lab]:
     volumes = [f"{prefix}-keys", f"{prefix}-other-keys"]
     net: Network | None = None
     try:
-        for image in (COSIGN_IMAGE, REGISTRY_IMAGE):
+        for image in (COSIGN_IMAGE, REGISTRY_IMAGE, CRANE_IMAGE):
             _ensure_image(client, image)
 
         # Cosign containers join only this network: no route off the host.
@@ -294,13 +328,10 @@ def lab() -> Iterator[Lab]:
                     pytest.fail("registry did not come up within 30 s")
                 time.sleep(0.3)
 
-        signed = _push(client, base_url, b"signed image payload\n", "signed")
-        unsigned = _push(client, base_url, b"a different, unsigned payload\n", "unsigned")
-
-        # Attached only after the pushes: connecting the registry to an
-        # internal network first made the daemon's push to the published port
-        # fail with "connection refused" (measured 3 October 2026).
         net.connect(registry, aliases=[REGISTRY_ALIAS])
+        signed = _push(client, net, base_url, b"signed image payload\n", "signed")
+        unsigned = _push(client, net, base_url, b"a different, unsigned payload\n", "unsigned")
+
         for volume in volumes:
             client.volumes.create(volume)
         built = Lab(client, net, base_url, volumes[0], volumes[1], signed, unsigned)
