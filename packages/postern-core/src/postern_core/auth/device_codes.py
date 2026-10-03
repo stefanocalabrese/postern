@@ -78,7 +78,7 @@ from datetime import UTC, datetime, timedelta
 from datetime import UTC as _UTC
 from typing import Any
 
-from postern_core.config import int_arg_or_env, redis_url_from_env
+from postern_core.config import int_arg_or_env, redact_url, redis_url_from_env
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -1554,7 +1554,7 @@ def create_device_code_store(
     """
     redis_url = redis_url_from_env()
     if redis_url:
-        logger.info("Using Redis device code store (url=%s)", redis_url)
+        logger.info("Using Redis device code store (url=%s)", redact_url(redis_url))
         return RedisDeviceCodeStore(url=redis_url, max_codes=max_codes)
     logger.info("Using in-memory device code store (set POSTERN_REDIS_URL for Redis)")
     return InMemoryDeviceCodeStore(max_codes=max_codes)

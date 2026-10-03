@@ -209,6 +209,77 @@ monitoring above is still yours.
 
 Accept the startup failure mode: with `POSTERN_REDIS_URL` set, Redis must be reachable before either service will start (connection refused fails in about 0.02 s, a blackholed host after the 5 s socket timeout, once per worker process), so deploy Redis before the services.
 
+## The local stack's Redis: TLS, ACL users, no published port
+
+Since 3 October 2026 `docker compose up` runs Redis the way operator checklist item 6
+in `CLAUDE.md` asks a deployment to, with the limits stated below.
+
+- **TLS only.** Redis starts with `--port 0 --tls-port 6379`, so there is no plaintext
+  listener. The `redis-certs` one-shot (`dev-redis/gen-certs.sh`, an `alpine/openssl`
+  image) writes a 30-day dev CA and a server certificate whose SANs are `DNS:redis` and
+  `DNS:localhost` to named volumes at `up` time. Nothing is committed. The services
+  mount only the CA certificate (`redis-ca`) and trust it through the URL:
+  `rediss://...@redis:6379/0?ssl_ca_certs=/redis-ca/ca.crt&ssl_check_hostname=true`.
+  Every Redis client in the code is built by `redis.from_url` or
+  `redis.Redis.from_url`, the startup preflight included, so those query parameters
+  reach all of them.
+- **AUTH with one ACL user per service.** `dev-redis/users.acl` turns the `default` user
+  off and defines `postern_api`, `postern_confirm` and a ping-only `postern_health`
+  for the healthcheck. `tests/test_redis_acl_users.py` loads that file into a throwaway
+  Redis and drives the real stores through each user, so a command the code issues and
+  the file does not grant fails `make ci`.
+- **No published port.** `redis` has no `ports:` mapping. Reach it from the host with
+  `docker compose exec redis redis-cli --tls --cacert /tls/ca.crt --user ... --pass ...`.
+
+What it is not: the certificates are throwaway dev certificates, not an operator's PKI;
+`--tls-auth-clients no` means Redis does not ask a client for a certificate (the ACL
+password is the credential, so mutual TLS is not exercised); the passwords are plaintext
+in `dev-redis/users.acl` and `docker-compose.yml`; the `api` fetch of `confirm`'s JWKS is
+still plain HTTP inside the compose network. `create_device_code_store` logs the Redis
+URL at INFO on startup with the password replaced by `***` (`postern_core.config.redact_url`),
+so the username, host, port and query stay in the log line and the password does not.
+If you log the URL anywhere else, redact it the same way.
+
+### Which service touches which keys, and with which commands
+
+Derived from the code, not from a command category. The key patterns assume the default
+`POSTERN_REDIS_KEY_PREFIX` of `postern:`; set another prefix and the patterns in
+`dev-redis/users.acl` must follow.
+
+| User | Key pattern | Commands | Issued by |
+|------|-------------|----------|-----------|
+| `postern_api` | `postern:revoked:*` (read-only, `%R~`) | `SISMEMBER`, `GET` | `RedisRevocationStore.is_revoked`, called by `RevocationMiddleware` |
+| `postern_api` | `postern:risk:*` | `GET`, `SETEX`, `DEL`, `EXPIRE` | `RedisSessionStore.load`, `save`, `remove` |
+| `postern_confirm` | `postern:device:*` | `SET` (NX EX, KEEPTTL), `SETEX`, `GET`, `DEL`, `ZADD`, `ZREM`, `ZREMRANGEBYSCORE`, `ZCARD`, `WATCH`, `EVAL` (script runs `GET` and `DEL`) | `RedisDeviceCodeStore` |
+| `postern_confirm` | `postern:refresh:*` | `SET` (NX EX, KEEPTTL), `GET`, `DEL`, `ZADD`, `ZREM`, `ZREMRANGEBYSCORE`, `ZCARD`, `WATCH` | `RedisRefreshSessionStore` |
+| `postern_confirm` | `postern:revoked:sessions`, `postern:revoked:sessions:exp` (write) | `EVAL` (scripts run `SADD`, `ZSCORE`, `ZADD`, `ZRANGEBYSCORE`, `SREM`, `ZREM`) | `RedisRevocationStore.revoke_session`, `prune_sessions` |
+| `postern_confirm` | `postern:revoked:*` (read-only, `%R~`) | `SISMEMBER`, `SMEMBERS`, `GET` | `is_revoked`, `is_customer_revoked`, `customer_revoked_at` |
+| `postern_confirm` | `postern:ratelimit:*` | `SET` (NX EX), `INCRBY` (what redis-py sends for `incr`), `TTL` | `RedisCustomerRateLimitStore.charge` |
+| both | none | `TIME`, `CONFIG GET`, `CLIENT SETINFO` | `run_redis_preflight`; redis-py on connect |
+| `postern_confirm` | none | `MULTI`, `EXEC`, `UNWATCH` | the transaction envelope redis-py wraps around `WATCH` |
+
+`api` cannot touch device codes, refresh families or rate-limit counters, and `confirm`
+cannot touch `postern:risk:*`. `api` cannot write the revocation list at all, and
+`confirm` writes only the two session keys: the kill-switch set (`revoked:clients`) and
+the customer-client set (`revoked:customer-clients`) are operator-owned and `confirm`
+can read them but not `SADD` or `SREM` them. Neither user holds `+@all`, `KEYS`, `SCAN`,
+`FLUSHALL`, `CONFIG SET` or `ACL`.
+
+**The cost of `CONFIG GET`.** Redis 7 cannot narrow it to one parameter:
+`+config|get|maxmemory-policy` is rejected ("Allowing first-arg of a subcommand is not
+supported", measured against `redis:7-alpine`), so granting it lets both service users
+run `CONFIG GET *`. That reads every configuration value, including `masterauth` and
+`tls-key-file-pass` in clear on a deployment that sets them (empty in this stack, which
+sets neither). The choice is yours. Grant `+config|get` only if you keep the preflight's
+`maxmemory-policy` check working; or deny it and accept that the check then logs its
+"cannot be verified" warning and the service starts, leaving you to check `noeviction`
+by hand. The compose stack grants it.
+
+Not granted, deliberately: `revoke_customer_client`, `kill_switch`, `restore_*`,
+`entries` and `unindexed_session_count` need write access to the
+operator-owned revocation keys, `SET`, `SCARD` and `ZCARD` and are called only by the operator CLI (`tools/revoke.py`), never
+by a service. Run the CLI as its own ACL user holding those, from outside the stack.
+
 ## ContextVar Pattern (Per-Call Access)
 
 Each subsystem uses a `ContextVar` for per-call access to the current session context:

@@ -55,25 +55,96 @@ services:
       timeout: 3s
       retries: 15
 
+  # The dev CA and Redis server certificate, generated at `up` time by
+  # `dev-redis/gen-certs.sh` and written to named volumes, never to the working
+  # tree. A one-shot like `migrate`: `redis` waits for it to exit 0.
+  redis-certs:
+    # alpine/openssl 3.5.9, pinned by digest: the stack's other images carry no
+    # openssl binary (checked: postgres:17-alpine, redis:7-alpine).
+    image: alpine/openssl@sha256:59c5cb51e536d40587667229468b007a2a6cae1705397e59e5f7774c08b74029
+    entrypoint: ["sh", "/gen-certs.sh"]
+    restart: "no"
+    volumes:
+      - ./dev-redis/gen-certs.sh:/gen-certs.sh:ro
+      - redis-tls:/redis-tls
+      - redis-ca:/redis-ca
+
   # The shared state both services need: the ZT-7 list, device codes, refresh
   # families and the risk session store. `services/confirm` refuses to start
   # without POSTERN_REDIS_URL unless POSTERN_ALLOW_PROCESS_LOCAL_SESSIONS is
   # set, and this stack does not set it, so a recall at `/scan` reaches `api`.
-  # The same image `tests/conftest.py`'s `redis_url` fixture runs.
+  # OPERATOR CHECKLIST ITEM 6, applied here rather than described. Until 3
+  # October 2026 this was `redis:7-alpine` with no password, no TLS and a
+  # default user open to the whole network; it now does what item 6 asks:
   #
-  # DEV ONLY: no password, no TLS, reachable by every container on this
-  # network. A deployment owes `rediss://` (TLS), AUTH with a per-service ACL
-  # user, and no public exposure, since this store holds live device codes and
-  # refresh-token families. Persistence is off (`--save ""`, no AOF) so those
-  # are never snapshotted to the container's anonymous `/data` volume.
+  #   TLS ONLY     `--port 0` closes the plaintext listener, `--tls-port 6379`
+  #                opens the TLS one. A plain-TCP client gets a
+  #                connection reset (measured from the api container).
+  #   AUTH + ACL   `dev-redis/users.acl`: the `default` user is OFF, `api` and
+  #                `confirm` each hold their own user, limited to the key
+  #                prefixes and commands their code issues (the derivation
+  #                is the table in
+  #                docs/user-guide/components/session-store.md), and
+  #                tests/test_redis_acl_users.py drives the real stores
+  #                through it. An ACL file takes no comments, which is why
+  #                the explanation is here and not there.
+  #   NO PORTS     no `ports:` mapping. The host cannot reach this Redis; only
+  #                containers on the compose network can, by the name `redis`.
+  #                Reach it from the host with
+  #                `docker compose exec redis redis-cli --tls --cacert /tls/ca.crt ...`.
+  #
+  # WHAT THIS STILL IS NOT. The certificates are throwaway dev certificates
+  # from `redis-certs` above, not an operator's PKI. `--tls-auth-clients no`
+  # means Redis does not ask a client for a certificate: the credential is the
+  # ACL user's password, and mutual TLS is not exercised here. The passwords
+  # sit in plaintext in `dev-redis/users.acl` and this file. The JWKS fetch between
+  # the services is still plain HTTP (see `api` below). Persistence stays off
+  # (`--save ""`, no AOF) so live device codes and refresh families are never
+  # snapshotted to disk.
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --aclfile
+      - /etc/redis/users.acl
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /tls/server.crt
+      - --tls-key-file
+      - /tls/server.key
+      - --tls-ca-cert-file
+      - /tls/ca.crt
+      - --tls-auth-clients
+      - "no"
+    volumes:
+      - ./dev-redis/users.acl:/etc/redis/users.acl:ro
+      - redis-tls:/tls:ro
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        - CMD
+        - redis-cli
+        - --tls
+        - --cacert
+        - /tls/ca.crt
+        - --user
+        - postern_health
+        - --pass
+        - postern-health-dev
+        - --no-auth-warning
+        - ping
       interval: 2s
       timeout: 3s
       retries: 15
+    depends_on:
+      redis-certs:
+        condition: service_completed_successfully
 
   # OPERATOR CHECKLIST ITEM 11, applied here rather than described. Until
   # 29 September 2026 every container in this file connected as `postern`, the
@@ -152,6 +223,10 @@ services:
       VAULT_DEV_ROOT_TOKEN_ID: postern-dev-root
       VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
     ports: ["8200:8200"]
+    # The audit device's log file (enabled by `vault-init`). /vault/logs is the
+    # directory the image's entrypoint chowns to the `vault` user.
+    volumes:
+      - vault-audit:/vault/logs
     # IPC_LOCK is how Vault keeps its memory out of swap. Dev mode does not need
     # it and warns without it; granting it here keeps the warning out of the log
     # an operator reads while bringing this stack up for the first time.
@@ -162,11 +237,30 @@ services:
       timeout: 3s
       retries: 15
 
-  # The objects an operator creates (transit, three keys, two policies, two
-  # tokens), executed. This is
-  # `tests/test_vault_live.py`'s `vault` fixture as a shell script, and the two
-  # must stay in step: if they disagree, one of them is wrong about what a
-  # deployment needs.
+  # The objects an operator creates (transit, a file audit device, three keys,
+  # two policies, two tokens), executed.
+  #
+  # THE AUDIT DEVICE IS DEV-GRADE. `file` writes one JSON line per request and
+  # response to `/vault/logs/audit.log` on the `vault-audit` volume, with
+  # secrets HMAC-salted by Vault, so a sign call leaves a record here that the
+  # signing process cannot edit. It is not a production control: the log sits
+  # on the same Docker host as the Vault it audits, it has no rotation, no
+  # shipping and no retention, and dev mode's root token can disable it.
+  # Read it with `docker compose exec vault cat /vault/logs/audit.log`. A
+  # deployment owes its own device (a socket or syslog sink off the host) and
+  # its own retention. It is enabled first, ahead of the keys, so the key
+  # creation below is recorded as well. Only "already enabled" is
+  # tolerated: any other failure of `vault audit enable` fails this service, and
+  # so the stack, and the last check before the closing echo fails it if the
+  # device is not listed.
+  #
+  # The rest of this is `tests/test_vault_live.py`'s `vault` fixture as a shell
+  # script, and those two must stay in step, with one deliberate difference:
+  # that fixture enables NO audit device, because the test asserts on signing
+  # behaviour and a file device on a throwaway container would only add a
+  # path to clean up. This service enables one because the stack is what an
+  # operator reads. If they disagree about keys, policies or tokens, one of
+  # them is wrong about what a deployment needs.
   #
   # THE TWO POLICIES ARE THE READ/WRITE SPLIT. `postern-read` grants `update` on
   # ONE sign path and `read` on ONE key path. It grants nothing on the write
@@ -195,6 +289,7 @@ services:
     command: >
       sh -ec '
       vault secrets enable transit || true;
+      vault audit list | grep -q "^file/" || vault audit enable file file_path=/vault/logs/audit.log;
       vault write -f transit/keys/postern-read type=rsa-2048;
       vault write -f transit/keys/postern-write type=rsa-2048;
       vault write -f transit/keys/postern-session type=rsa-2048;
@@ -207,7 +302,8 @@ services:
       vault token create -policy=postern-read -period=24h -field=token > /vault-tokens/read.token;
       vault token create -policy=postern-write -period=24h -field=token > /vault-tokens/write.token;
       chmod 0444 /vault-tokens/read.token /vault-tokens/write.token;
-      echo "vault-init: transit enabled, three keys, two policies, two tokens";
+      vault audit list | grep -q "^file/";
+      echo "vault-init: transit enabled, file audit device, three keys, two policies, two tokens";
       '
     depends_on:
       vault:
@@ -296,7 +392,15 @@ services:
       POSTERN_JWKS_URI: http://confirm:8080/session/jwks.json
       POSTERN_TOKEN_ISSUER: "https://auth.postern.internal"
       POSTERN_AUDIENCE: "https://mcp.postern.internal/mcp"
-      POSTERN_REDIS_URL: redis://redis:6379/0
+      #
+      # TLS AND A PER-SERVICE ACL USER. `rediss://` with the dev CA from the
+      # `redis-ca` volume (`ssl_ca_certs`) and certificate hostname checking
+      # on (`ssl_check_hostname=true`; the server certificate's SAN is
+      # `redis`). Every Redis client in the code is built by `redis.from_url`
+      # or `redis.Redis.from_url`, so these query parameters apply to all of
+      # them, the startup preflight included. This user is the one named
+      # `postern_api` in `dev-redis/users.acl`.
+      POSTERN_REDIS_URL: "rediss://postern_api:postern-api-dev@redis:6379/0?ssl_ca_certs=/redis-ca/ca.crt&ssl_check_hostname=true"
       POSTERN_STRICT_HEADERS: "0"
       # THE SIGNING KEY IS NOT IN THIS CONTAINER. With these three set,
       # `postern_core.auth.keys.choose_key_source` builds a
@@ -315,6 +419,7 @@ services:
       POSTERN_VAULT_READ_KEY_NAME: postern-read
     volumes:
       - vault-tokens:/vault-tokens:ro
+      - redis-ca:/redis-ca:ro
     ports: ["8080:8080"]
     depends_on:
       backend-stub:
@@ -387,6 +492,7 @@ services:
     volumes:
       - ./stub/device-keys.json:/etc/postern/device-keys.json:ro
       - vault-tokens:/vault-tokens:ro
+      - redis-ca:/redis-ca:ro
     environment:
       # THE WRITE KEY AND THE SESSION KEY THROUGH ONE VAULT TOKEN, and no
       # read key: `POST /token` issues a layer-1 session signed by
@@ -401,7 +507,11 @@ services:
       # and equal to `api`'s POSTERN_AUDIENCE above.
       POSTERN_SESSION_TOKEN_AUDIENCE: "https://mcp.postern.internal/mcp"
       # Refresh families and recalls must reach `api`: the same Redis.
-      POSTERN_REDIS_URL: redis://redis:6379/0
+      #
+      # `rediss://` and `confirm`'s own ACL user, `postern_confirm`; see the
+      # note on `api`'s URL and `dev-redis/users.acl`. Same Redis as `api`, a
+      # different user and different keys.
+      POSTERN_REDIS_URL: "rediss://postern_confirm:postern-confirm-dev@redis:6379/0?ssl_ca_certs=/redis-ca/ca.crt&ssl_check_hostname=true"
       POSTERN_APP_ASSERTION_JWKS_URI: http://backend-stub:8081/.well-known/jwks.json
       POSTERN_APP_ASSERTION_ISSUER: "https://postern-local-dev.invalid"
       POSTERN_APP_ASSERTION_AUDIENCE: "postern-confirm"
@@ -430,5 +540,14 @@ services:
 # than any data. Named rather than a bind mount so nothing lands in the working
 # tree: a Vault token in a repository is a Vault token in every clone of it, the
 # same argument `db-roles` above makes for the two database passwords.
+#
+# Four more since 3 October 2026: `redis-tls` (the server's certificate and
+# private key, mounted by `redis` only), `redis-ca` (the CA certificate, which
+# `api` and `confirm` mount read-only and which holds no secret) and
+# `vault-audit` (the audit log). Named for the same reason: no key material or
+# log lands in the working tree.
 volumes:
   vault-tokens:
+  redis-tls:
+  redis-ca:
+  vault-audit:

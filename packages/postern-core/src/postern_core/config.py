@@ -84,6 +84,8 @@ __all__ = [
     "int_arg_or_env",
     "int_from_env",
     "redis_url_from_env",
+    "redact_url",
+    "UNPARSEABLE_URL",
 ]
 
 #: The smallest TTL any Redis-backed store in this repository can represent.
@@ -426,6 +428,38 @@ def bool_from_env(name: str, default: bool, *, because: str) -> bool:
         f"surrounding whitespace are ignored, and an empty value means unset. "
         f"{because}"
     )
+
+
+#: What `redact_url` returns for anything it cannot take apart. A fixed string,
+#: so a malformed value that happens to hold a credential is never echoed.
+UNPARSEABLE_URL = "<unparseable url>"
+
+
+def redact_url(url: str) -> str:
+    """``url`` with the password replaced by ``***``, safe to put in a log line.
+
+    The scheme, username, host, port, path and query are kept, so the line still
+    says where the process connected and as whom. A URL with no password comes
+    back unchanged. Anything that is not a string, has no ``scheme://``, has an
+    empty scheme or fails to parse (an unbalanced IPv6 bracket) returns
+    `UNPARSEABLE_URL` and never the input.
+    """
+    from urllib.parse import urlsplit
+
+    if not isinstance(url, str) or "://" not in url:
+        return UNPARSEABLE_URL
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return UNPARSEABLE_URL
+    if not parts.scheme or not parts.netloc:
+        return UNPARSEABLE_URL
+    userinfo, at, hostport = parts.netloc.rpartition("@")
+    if not at or ":" not in userinfo:
+        return url.strip()
+    username = userinfo.split(":", 1)[0]
+    netloc = f"{username}:***@{hostport}"
+    return url.strip().replace(parts.netloc, netloc, 1)
 
 
 def redis_url_from_env() -> str | None:

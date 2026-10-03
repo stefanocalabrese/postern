@@ -356,6 +356,15 @@ The project ships a `docker-compose.yml` that brings up:
 | `backend-stub` | 8081 | Stub operator backend with local IdP (JWKS + token minting) |
 | `api` | 8080 | MCP read path: tools, OAuth endpoints |
 | `confirm` | 8082 (mapped to 8080 inside container) | Write path: device auth, approval callback |
+| `redis` | none (not published) | Shared state. TLS only, AUTH with one ACL user per service; see [Session Store](components/session-store.md) |
+| `vault` (dev mode) | 8200 | Transit signing keys, with a `file` audit device writing to `/vault/logs/audit.log` |
+
+The Redis and the Vault are hardened as far as a local stack can be: `rediss://` with a
+throwaway CA generated at `up` time, ACL users in place of the default user, and a Vault
+audit device. What it still does not do: the `api` fetches `confirm`'s JWKS over plain
+HTTP inside the compose network, Redis does not ask clients for a certificate, the
+certificates and passwords are dev values, and dev-mode Vault's audit log sits on the same
+host as the Vault, with no rotation and no retention. A deployment owes its own for each.
 
 ### Start the stack
 
