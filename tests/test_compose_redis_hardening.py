@@ -109,7 +109,9 @@ class TestAclFile:
             assert parts.username in users
             assert f">{parts.password}" in users[parts.username]
 
-    @pytest.mark.parametrize("user", ["postern_health", "postern_api", "postern_confirm"])
+    @pytest.mark.parametrize(
+        "user", ["postern_health", "postern_api", "postern_confirm", "postern_operator"]
+    )
     def test_no_user_holds_a_broad_grant(self, user: str) -> None:
         tokens = _acl_users()[user]
         assert "nopass" not in tokens
@@ -120,6 +122,35 @@ class TestAclFile:
         body = " ".join(tokens)
         for bad in ("+@all", "~*", "+@dangerous", "+@admin", "+keys", "+flushall", "+acl"):
             assert bad not in body
+
+    def test_operator_holds_only_the_revocation_keys(self) -> None:
+        tokens = _acl_users()["postern_operator"]
+        patterns = [t for t in tokens if t.startswith(("~", "%", "&", "("))]
+        assert patterns == ["~postern:revoked:*"]
+        commands = {t for t in tokens if t.startswith("+")}
+        assert not {"+flushall", "+flushdb", "+keys", "+scan", "+config|set", "+acl", "+del"} & (
+            commands
+        )
+        assert not any(t.startswith("+@") for t in tokens)
+        assert "-@all" in tokens
+        assert "+eval" in commands
+        assert "+get" not in commands  # no CLI verb issues a plain GET
+
+    def test_operator_is_a_profiled_one_shot_on_the_api_image_not_a_service_user(self) -> None:
+        revoke = SERVICES["revoke"]
+        assert revoke["profiles"] == ["operator"]
+        assert revoke["build"]["target"] == "api"
+        assert "ports" not in revoke
+        assert "redis-ca:/redis-ca:ro" in revoke["volumes"]
+        assert not any("redis-tls" in m for m in revoke["volumes"])
+        parts = urlsplit(revoke["environment"]["POSTERN_REDIS_URL"])
+        assert parts.scheme == "rediss"
+        assert parts.hostname == "redis"
+        assert parts.username == "postern_operator"
+        assert f">{parts.password}" in _acl_users()["postern_operator"]
+        for service in ("api", "confirm"):
+            assert "postern_operator" not in str(SERVICES[service]["environment"])
+            assert "revoke" not in SERVICES[service].get("depends_on", {})
 
     def test_api_cannot_write_the_revocation_list(self) -> None:
         body = " ".join(_acl_users()["postern_api"])
@@ -155,6 +186,55 @@ class TestVaultAuditDevice:
         assert "|| true" not in enable[0]
         assert enable[0].startswith('vault audit list | grep -q "^file/" ||')
         assert 'vault audit list | grep -q "^file/"' in statements
+
+    def test_vault_init_is_safe_to_run_twice(self) -> None:
+        """Every enable and create is guarded by an existence check, never `|| true`.
+
+        A second run against a live Vault answered ``path is already in use``
+        for transit. Only the already-exists condition may be tolerated, and it
+        is tolerated by looking first, so any other failure still fails the
+        service.
+        """
+        command = _command_text("vault-init")
+        assert "|| true" not in command
+        statements = [st.strip() for st in command.split(";")]
+        guarded = {
+            "vault secrets enable transit": 'vault secrets list | grep -q "^transit/" ||',
+            "vault audit enable": 'vault audit list | grep -q "^file/" ||',
+            "vault write -f transit/keys/": "vault read transit/keys/",
+        }
+        for action, guard in guarded.items():
+            hits = [st for st in statements if action in st]
+            assert len(hits) == 1, action
+            assert guard in hits[0], action
+            assert hits[0].index(guard) < hits[0].index(action), action
+        # Policies are written with `vault policy write`, an upsert by design.
+        assert command.count("vault policy write") == 2
+        # A token is minted only when the one on the volume is not live for its policy.
+        assert command.count("vault token create") == 1
+        assert "vault token lookup" in command
+        assert "exportable=true" not in command
+
+    def test_vault_init_verifies_every_key_it_did_not_create(self) -> None:
+        """An existing key is checked, not trusted: exportable or wrong type fails the service.
+
+        Creating a key only when it is missing means a key somebody made
+        exportable (or with another type) passes silently and `transit/export`
+        then returns its private half. The loop reads both attributes back for
+        every key, created now or earlier, and exits non-zero on a mismatch.
+        """
+        command = _command_text("vault-init")
+        assert '"$$(vault read -field=exportable transit/keys/$$key)" != "false"' in command
+        assert '"$$(vault read -field=type transit/keys/$$key)" != "rsa-2048"' in command
+        loop = command[command.index("for key in") : command.index("done;")]
+        assert "exit 1" in loop
+        assert loop.index("vault write -f") < loop.index("-field=exportable")
+
+    def test_a_reused_token_is_matched_exactly_and_renewed(self) -> None:
+        command = _command_text("vault-init")
+        assert 'grep -q "postern-$$role"' not in command
+        assert '= "[default postern-$$1]"' in command
+        assert "vault token renew" in command
 
     def test_vault_writes_the_log_to_a_named_volume(self) -> None:
         mounts = [m for m in SERVICES["vault"]["volumes"] if isinstance(m, str)]

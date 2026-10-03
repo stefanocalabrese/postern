@@ -316,6 +316,8 @@ Derived from the code, not from a command category. The key patterns assume the 
 | `postern_confirm` | `postern:ratelimit:*` | `SET` (NX EX), `INCRBY` (what redis-py sends for `incr`), `TTL` | `RedisCustomerRateLimitStore.charge` |
 | both | none | `TIME`, `CONFIG GET`, `CLIENT SETINFO` | `run_redis_preflight`; redis-py on connect |
 | `postern_confirm` | none | `MULTI`, `EXEC`, `UNWATCH` | the transaction envelope redis-py wraps around `WATCH` |
+| `postern_operator` | `postern:revoked:*` (read and write) | direct: `EVAL`, `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `ZREM`, `ZCARD`, `MULTI`, `EXEC`; inside the Lua scripts only: `TIME`, `SADD`, `SREM`, `SET`, `ZADD`, `ZSCORE`, `ZREM`, `ZRANGEBYSCORE` | the `RedisRevocationStore` methods `postern_core.auth.revoke_cli` calls: `revoke_session`, `restore_session`, `prune_sessions`, `unindexed_session_count`, `revoke_customer_client`, `restore_customer_client`, `kill_switch`, `restore_client`, `entries` |
+| `postern_operator` | none | `CLIENT SETINFO` | redis-py on connect |
 
 `api` cannot touch device codes, refresh families or rate-limit counters, and `confirm`
 cannot touch `postern:risk:*`. `api` cannot write the revocation list at all, and
@@ -334,10 +336,39 @@ sets neither). The choice is yours. Grant `+config|get` only if you keep the pre
 "cannot be verified" warning and the service starts, leaving you to check `noeviction`
 by hand. The compose stack grants it.
 
-Not granted, deliberately: `revoke_customer_client`, `kill_switch`, `restore_*`,
-`entries` and `unindexed_session_count` need write access to the
-operator-owned revocation keys, `SET`, `SCARD` and `ZCARD` and are called only by the operator CLI (`tools/revoke.py`), never
-by a service. Run the CLI as its own ACL user holding those, from outside the stack.
+Not granted to either service, deliberately: `revoke_customer_client`, `kill_switch`,
+`restore_*`, `entries` and `unindexed_session_count` need write access to the
+operator-owned revocation keys, `SET`, `SCARD` and `ZCARD`, and are called only by the
+operator CLI (`tools/revoke.py`, which is `postern_core.auth.revoke_cli`), never by a
+service. Run as a service user the CLI is partly or wholly refused:
+`postern_api` can run none of its verbs, because it holds only `SISMEMBER` and `GET`
+on the revocation keys. `postern_confirm` can run `session`, `restore-session` and
+`list` (its grants on the two session keys and its `SMEMBERS` read), cannot finish
+`prune-sessions` (the prune script runs, but the `SCARD` and `ZCARD` count that follows
+is refused and the CLI reports a failure), and cannot run `customer-client`,
+`restore-customer-client`, `kill-switch` or `restore-kill-switch`. That is read off the
+ACL file, not measured for each verb.
+
+**The operator user.** `dev-redis/users.acl` carries a third user, `postern_operator`
+(dev password `postern-operator-dev`), with the commands in the table on
+`~postern:revoked:*` and nothing else: no `KEYS`, `SCAN`, `FLUSH*`, `CONFIG` or `ACL`,
+and no key outside that prefix (`tests/test_redis_acl_users.py::TestOperatorUser` runs
+every store method the CLI calls as this user except the plain `GET` of
+`customer_revoked_at`, which no verb issues, and shows each refusal). Neither service is configured with it. Redis is not published,
+so the supported way to run the CLI against the compose stack is the `revoke` one-shot,
+which sits in the `operator` profile, so `docker compose up` does not start it, builds
+the `api` target (the same layers under its own image tag), joins the compose network
+and mounts the CA volume read-only:
+
+```bash
+docker compose run --rm revoke session <jti>
+docker compose run --rm revoke prune-sessions
+docker compose run --rm revoke list
+```
+
+In a deployment, give the operator's own ACL user the same grants, a real password and
+`rediss://`, and run the CLI from a bastion or one-off task that can reach Redis. The
+patterns follow `POSTERN_REDIS_KEY_PREFIX` if you change it.
 
 ## ContextVar Pattern (Per-Call Access)
 

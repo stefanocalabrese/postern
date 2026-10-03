@@ -72,7 +72,7 @@ import json
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -450,7 +450,8 @@ class VaultSettings:
     """
 
     address: str
-    token: str | None
+    # repr=False: a static Vault token must not print from a formatted settings object.
+    token: str | None = field(repr=False)
     token_path: str | None
     mount: str
     timeout_seconds: float

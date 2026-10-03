@@ -66,7 +66,7 @@ forbids reading its settings — so the requirement is stated in
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -417,7 +417,10 @@ class ConfirmSettings:
     device_poll_interval_seconds: int = 5
     # Approval callback (§6.3, §8.3): backend write endpoints + challenges DB.
     backend_base_url: str = "https://backend.internal"  # noqa: S105
-    database_url: str = "postgresql+asyncpg://postern:postern@localhost:5432/postern"
+    # repr=False: the URL carries the database password (see services/api/settings.py).
+    database_url: str = field(
+        default="postgresql+asyncpg://postern:postern@localhost:5432/postern", repr=False
+    )
     database_connect_timeout_seconds: float = 2.0
     database_command_timeout_seconds: float = 3.0
     database_pool_timeout_seconds: float = 1.0

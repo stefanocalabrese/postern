@@ -2,3 +2,4 @@ user default off
 user postern_health on >postern-health-dev resetkeys -@all +ping
 user postern_api on >postern-api-dev resetkeys -@all +time +config|get +client|setinfo (%R~postern:revoked:* +sismember +get) (~postern:risk:* +get +setex +del +expire)
 user postern_confirm on >postern-confirm-dev resetkeys -@all +time +config|get +client|setinfo +multi +exec +unwatch (~postern:device:* +get +set +setex +del +eval +zadd +zrem +zremrangebyscore +zcard +watch) (~postern:refresh:* +get +set +del +zadd +zrem +zremrangebyscore +zcard +watch) (~postern:revoked:sessions ~postern:revoked:sessions:exp +eval +sadd +srem +zadd +zrem +zscore +zrangebyscore) (%R~postern:revoked:* +sismember +smembers +get) (~postern:ratelimit:* +set +incrby +ttl)
+user postern_operator on >postern-operator-dev resetkeys -@all +time +client|setinfo +multi +exec ~postern:revoked:* +eval +set +sadd +srem +smembers +scard +zadd +zrem +zscore +zcard +zrangebyscore

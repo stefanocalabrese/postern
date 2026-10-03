@@ -6,12 +6,13 @@ reading was complete. It starts a throwaway ``redis:7-alpine`` with that same
 file (plus one extra line, a test-only admin, so ``ACL LOG`` can be read),
 builds every Redis-backed store through ``__init__`` with the credentials
 ``docker-compose.yml`` gives each service, and calls the store methods the
-services' code paths call. That is not every method of every store: the
-operator-CLI-only revocation methods are left out on purpose, and a few
-branches (a lost WATCH race) cannot be forced from here. What is covered is
-checked by deleting grants from the ACL file one at a time and watching a test
-fail; ``+discard`` is absent from the file because redis-py never sends
-``DISCARD`` from any code path this repository uses. A command the code issues and the file does not
+services' code paths call, and every revocation method the operator CLI
+(`postern_core.auth.revoke_cli`) calls as `postern_operator`. That is not every
+method of every store: a few branches (a lost WATCH race) cannot be forced
+from here. What is covered is checked by deleting grants from the ACL file one
+at a time and watching a test fail; ``+discard`` is absent from the file because
+redis-py never sends ``DISCARD`` from any code path this repository uses. A
+command the code issues and the file does not
 grant raises ``NOPERM`` here, in ``make ci``, and not in a deployment.
 
 THE ASSERTION THAT CATCHES AN INCOMPLETE GRANT IS TWO-SIDED. Each flow runs
@@ -71,7 +72,10 @@ KEY = SessionKey(customer_ref="cust_7f3a", client_id="vendor-a")
 
 
 def _creds(service: str) -> tuple[str, str]:
-    """The user and password ``docker-compose.yml`` hands ``service``."""
+    """The user and password ``docker-compose.yml`` hands ``service``.
+
+    ``revoke`` is the profiled one-shot for the operator CLI, not a server.
+    """
     parts = urlsplit(COMPOSE["services"][service]["environment"]["POSTERN_REDIS_URL"])
     assert parts.username is not None
     assert parts.password is not None
@@ -472,3 +476,87 @@ class TestHealthUser:
         with pytest.raises(redis.exceptions.NoPermissionError):
             await client.execute_command("GET", "postern:revoked:sessions")
         await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# operator: every store method the revoke CLI calls, then nothing else.
+# ---------------------------------------------------------------------------
+
+
+class TestOperatorUser:
+    async def test_every_store_method_the_revoke_cli_calls_is_granted(
+        self, acl_redis: tuple[str, int], admin: Any
+    ) -> None:
+        store = RedisRevocationStore(url=_url(acl_redis, _creds("revoke")))
+        try:
+            # session / restore-session / prune-sessions / list
+            await store.revoke_session(jti="tok-1")
+            assert await store.unindexed_session_count() >= 0
+            await store.revoke_session(jti="tok-2")
+            assert await store.prune_sessions(limit=10) >= 0
+            snapshot = await store.entries()
+            assert {"tok-1", "tok-2"} <= set(snapshot.sessions)
+            await store.restore_session(jti="tok-1")
+            await store.restore_session(jti="tok-2")
+            # customer-client / restore-customer-client
+            await store.revoke_customer_client(customer_ref="cust_7f3a", client_id="vendor-a")
+            assert await store.is_customer_revoked("cust_7f3a") is True
+            await store.restore_customer_client(customer_ref="cust_7f3a", client_id="vendor-a")
+            # kill-switch / restore-kill-switch
+            await store.kill_switch(client_id="vendor-a")
+            assert "vendor-a" in (await store.entries()).clients
+            await store.restore_client(client_id="vendor-a")
+            final = await store.entries()
+            assert "vendor-a" not in final.clients
+            assert not {"tok-1", "tok-2"} & set(final.sessions)
+        finally:
+            await store.close()
+        assert await _denials(admin) == []
+
+    async def test_operator_cannot_run_destructive_or_administrative_commands(
+        self, acl_redis: tuple[str, int]
+    ) -> None:
+        client = _client(_url(acl_redis, _creds("revoke")))
+        for command in (
+            ("FLUSHALL",),
+            ("FLUSHDB",),
+            ("KEYS", "*"),
+            ("SCAN", "0"),
+            ("CONFIG", "SET", "maxmemory-policy", "allkeys-lru"),
+            ("CONFIG", "GET", "*"),
+            ("ACL", "LIST"),
+            ("SHUTDOWN", "NOSAVE"),
+            ("DEL", "postern:revoked:sessions"),
+            # No CLI verb issues a plain GET; only the services read the stamps.
+            ("GET", "postern:revoked:customer-at:cust_7f3a"),
+        ):
+            with pytest.raises(redis.exceptions.NoPermissionError):
+                await client.execute_command(*command)
+        await client.aclose()
+
+    async def test_operator_is_confined_to_the_revocation_keys(
+        self, acl_redis: tuple[str, int]
+    ) -> None:
+        client = _client(_url(acl_redis, _creds("revoke")))
+        for command in (
+            ("GET", "postern:device:abc"),
+            ("GET", "postern:refresh:abc"),
+            ("GET", "postern:risk:abc"),
+            ("SET", "postern:ratelimit:abc", "1"),
+            ("SADD", "postern:other", "x"),
+            ("SMEMBERS", "unprefixed"),
+        ):
+            with pytest.raises(redis.exceptions.NoPermissionError):
+                await client.execute_command(*command)
+        await client.aclose()
+
+    async def test_the_services_cannot_log_in_as_the_operator(
+        self, acl_redis: tuple[str, int]
+    ) -> None:
+        _, operator_password = _creds("revoke")
+        for service in ("api", "confirm"):
+            user, _ = _creds(service)
+            client = _connect(_url(acl_redis, (user, operator_password)))
+            with pytest.raises(redis.exceptions.AuthenticationError):
+                await client.ping()
+            await client.aclose()

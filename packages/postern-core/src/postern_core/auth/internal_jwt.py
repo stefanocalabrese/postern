@@ -35,7 +35,7 @@ infrastructure property rather than a code-review promise.
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from joserfc.jwt import Claims
@@ -56,7 +56,8 @@ class MintedToken:
     mistake unwritable.
     """
 
-    token: str
+    # repr=False: a bearer value, which a formatted exception or log line would print.
+    token: str = field(repr=False)
     jti: str
 
 

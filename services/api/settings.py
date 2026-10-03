@@ -25,7 +25,7 @@ bound refuses what is UNREPRESENTABLE, not what is unwise.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from postern_core.auth.vault import (
     DEFAULT_PUBLIC_KEY_TTL_SECONDS,
@@ -39,7 +39,11 @@ from postern_core.config import bool_from_env, float_from_env, int_from_env
 @dataclass(frozen=True)
 class Settings:
     backend_base_url: str
-    database_url: str = "postgresql+asyncpg://postern:postern@localhost:5432/postern"
+    # repr=False: the URL carries the database password, and the default
+    # dataclass repr would print it from any log line that formatted this object.
+    database_url: str = field(
+        default="postgresql+asyncpg://postern:postern@localhost:5432/postern", repr=False
+    )
     # Plan 3 Task 2: the key this process signs internal tokens with. A path
     # left unset means `create_app` generates an RSA key in process, which is
     # what `Settings.for_testing()` and the local docker-compose stack want:

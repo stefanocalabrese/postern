@@ -254,6 +254,19 @@ services:
   # so the stack, and the last check before the closing echo fails it if the
   # device is not listed.
   #
+  # IT IS SAFE TO RUN AGAIN against a Vault that already has these objects
+  # (`docker compose run --rm vault-init`). Each enable and each key is guarded
+  # by looking first, so only the already-exists case is skipped and any other
+  # error fails the service; policies are upserts. EVERY KEY IS THEN READ BACK,
+  # created now or earlier: one that is exportable, or not rsa-2048, fails the
+  # service with a non-zero exit, because an existing exportable key would
+  # otherwise pass and switch off the control this stack demonstrates. A token
+  # already on the volume is kept only when its policy list is exactly
+  # `[default postern-<role>]`, and is renewed (its period reset) so a re-run
+  # near the end of the 24h period does not keep one about to lapse; a token
+  # that fails either test, or no longer looks up (a Vault that was reset), is
+  # replaced by a fresh one.
+  #
   # The rest of this is `tests/test_vault_live.py`'s `vault` fixture as a shell
   # script, and those two must stay in step, with one deliberate difference:
   # that fixture enables NO audit device, because the test asserts on signing
@@ -288,19 +301,25 @@ services:
       - vault-tokens:/vault-tokens
     command: >
       sh -ec '
-      vault secrets enable transit || true;
+      vault secrets list | grep -q "^transit/" || vault secrets enable transit;
       vault audit list | grep -q "^file/" || vault audit enable file file_path=/vault/logs/audit.log;
-      vault write -f transit/keys/postern-read type=rsa-2048;
-      vault write -f transit/keys/postern-write type=rsa-2048;
-      vault write -f transit/keys/postern-session type=rsa-2048;
+      for key in postern-read postern-write postern-session; do
+      vault read transit/keys/$$key > /dev/null 2>&1 || vault write -f transit/keys/$$key type=rsa-2048;
+      if [ "$$(vault read -field=exportable transit/keys/$$key)" != "false" ] || [ "$$(vault read -field=type transit/keys/$$key)" != "rsa-2048" ]; then echo "vault-init: key $$key is exportable or not rsa-2048, refusing to continue" >&2; exit 1; fi;
+      done;
       echo "path \"transit/sign/postern-read\" { capabilities = [\"update\"] }
       path \"transit/keys/postern-read\" { capabilities = [\"read\"] }" | vault policy write postern-read -;
       echo "path \"transit/sign/postern-write\" { capabilities = [\"update\"] }
       path \"transit/keys/postern-write\" { capabilities = [\"read\"] }
       path \"transit/sign/postern-session\" { capabilities = [\"update\"] }
       path \"transit/keys/postern-session\" { capabilities = [\"read\"] }" | vault policy write postern-write -;
-      vault token create -policy=postern-read -period=24h -field=token > /vault-tokens/read.token;
-      vault token create -policy=postern-write -period=24h -field=token > /vault-tokens/write.token;
+      live() { [ -s /vault-tokens/$$1.token ] || return 1; t="$$(cat /vault-tokens/$$1.token)"; [ "$$(VAULT_TOKEN=$$t vault token lookup | grep -E "^policies " | tr -s " " | cut -d" " -f2-)" = "[default postern-$$1]" ] && VAULT_TOKEN=$$t vault token renew > /dev/null; };
+      for role in read write; do
+      if live $$role;
+      then echo "vault-init: reusing and renewing the $$role token";
+      else vault token create -policy=postern-$$role -period=24h -field=token > /vault-tokens/$$role.token;
+      fi;
+      done;
       chmod 0444 /vault-tokens/read.token /vault-tokens/write.token;
       vault audit list | grep -q "^file/";
       echo "vault-init: transit enabled, file audit device, three keys, two policies, two tokens";
@@ -432,6 +451,37 @@ services:
         condition: service_healthy
       vault-init:
         condition: service_completed_successfully
+
+  # THE OPERATOR'S REVOCATION CLI, as a one-shot that is never started by
+  # `docker compose up` (the profile keeps it out). Redis is not published, so
+  # the supported way to run `postern_core.auth.revoke_cli` against this stack
+  # is a container on the compose network that mounts the CA read-only:
+  #
+  #   docker compose run --rm revoke session <jti>
+  #   docker compose run --rm revoke prune-sessions
+  #   docker compose run --rm revoke list
+  #
+  # It signs in as `postern_operator` from `dev-redis/users.acl`, which holds
+  # what the CLI issues on `postern:revoked:*` and nothing else; neither
+  # `api` nor `confirm` holds that user. It builds the `api` target only because
+  # that target already carries `postern_core`; it is the same layers under its
+  # own image tag, not the api image. No service reads this URL.
+  revoke:
+    profiles: ["operator"]
+    build:
+      context: .
+      target: api
+    entrypoint:
+      - python
+      - -c
+      - import sys; from postern_core.auth.revoke_cli import main; sys.exit(main(sys.argv[1:]))
+    environment:
+      POSTERN_REDIS_URL: "rediss://postern_operator:postern-operator-dev@redis:6379/0?ssl_ca_certs=/redis-ca/ca.crt&ssl_check_hostname=true"
+    volumes:
+      - redis-ca:/redis-ca:ro
+    depends_on:
+      redis:
+        condition: service_healthy
 
   # Plan 3 Task 6: the write path, brought up alongside `api` to verify the
   # read/write key split against a running stack rather than only in-process.

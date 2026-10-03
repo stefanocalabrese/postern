@@ -340,7 +340,8 @@ class DeviceCode:
     a half-written approval therefore mints nothing at all.
     """
 
-    device_code: str
+    # repr=False: the polling secret `/token` exchanges, never to be printed.
+    device_code: str = field(repr=False)
     user_code: str
     verification_uri: str
     expires_at: datetime
