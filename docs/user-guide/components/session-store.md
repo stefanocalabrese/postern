@@ -95,7 +95,8 @@ this store's: Redis 5.0 or later (7.0 or later recommended) with scripting (`EVA
 enabled, and **non-clustered**, a standalone instance or a single-shard primary with
 replicas, because several steps write more than one key at once and cluster mode
 refuses those with `CROSSSLOT` (`dev-docs/device-grant-session-token-spec.md` §6 step
-6). A managed service (AWS ElastiCache, Google Memorystore, Azure Cache for Redis)
+6; measured, with the operations that fail and those that do not, in
+`tests/test_redis_cluster_mode.py` and "Topology and version" below). A managed service (AWS ElastiCache, Google Memorystore, Azure Cache for Redis)
 qualifies only in a configuration that meets all three.
 
 Sessions are stored as JSON with a TTL matching the session's expiry. The `_start_time`
@@ -152,6 +153,64 @@ store's `discard` deletes a family's key and its index entry in one
 `MULTI`/`EXEC`. Redis in cluster mode refuses any of those whose keys hash to
 different slots with `CROSSSLOT`, and none of the key names this code builds
 carries a hash tag.
+
+**Measured on 3 October 2026** against `redis:7-alpine` as a single-node cluster
+owning all 16384 slots (`tests/test_redis_cluster_mode.py`; a single node enforces
+the same-slot rule but never answers `MOVED`, and multi-node resharding and managed
+cluster endpoints were not measured):
+
+- **Refused with `CROSSSLOT`, writing nothing:** `revoke_customer_client` (3 keys),
+  `revoke_session`, `prune_sessions`, `restore_session` and
+  `unindexed_session_count` (2 keys each; for `revoke_session` this means the
+  opportunistic prune after it never runs, because the revoke itself raised), the
+  refresh-family store's `discard`, the conflict revoke inside `claim_scan`, and
+  `revoke_device_code`. This is not slot luck: the keys of the default prefix
+  `postern:` have pinned slots (for example 9931, 4183, 11233 and 2420 for the
+  session set, its index, the pairs set and a customer stamp), asserted against
+  `CLUSTER KEYSLOT` in the test.
+- **Refused with `CROSSSLOT`, after writing something:** `create_device_code`
+  (primary and index in one `MULTI`). The `user_code` and display-handle keys are
+  claimed first with `SET NX EX` and stay until their TTL; no primary and no index
+  entry exist afterwards.
+- **Work, because each command touches one key:** `kill_switch`, `entries`,
+  `is_revoked` (a non-transactional pipeline), `customer_revoked_at`,
+  `is_customer_revoked`, the refresh store's `create`, `get`, `rotate` and
+  `revoke` (`WATCH`/`MULTI` on one key), the device-code store's lookups,
+  `claim_scan` (first scan), `approve_scanned` and `consume_device_code`, the
+  risk session store, and the customer rate limiter.
+- **Not fail-closed everywhere.** The revocation store wraps the refusal in
+  `RevocationStoreUnavailable`. The refresh-family and device-code stores wrap
+  nothing, so the raw `redis.exceptions.ResponseError` reaches the caller;
+  `services/confirm/device_auth.py` catches only `DeviceCodeStoreFull` and
+  `DeviceCodeStoreContended` around `create_device_code` (the HTTP path was not
+  driven).
+- **The A2 second-scanner defence does not happen.** When a second customer scans
+  an already-scanned pairing, `claim_scan` is meant to revoke it in one
+  transaction. On a cluster that transaction is refused (measured at the store:
+  the pairing survives and stays approvable by the first customer). Reading
+  `services/confirm/device_auth.py`, not driving it: `_withdraw_pairing` swallows
+  the failure and logs at ERROR, and `scan_callback` records a
+  `refused("ResponseError")` audit row and re-raises, so the second scanner gets a
+  500 and the pairing is not withdrawn.
+- **Refresh-family `discard` fails no request.** Its only production caller,
+  `_discard_orphan`, catches the exception, logs a warning and lets the request
+  succeed, so the refusal leaves an orphaned family until its TTL (read from the
+  code, not driven).
+- **The startup preflight passes.** `run_redis_preflight` (`TIME`, `CONFIG GET`)
+  takes no key and succeeded on the cluster. Only that function was run, not the
+  services' composition roots, so "the service boots" is an inference from it. On
+  that inference a cluster deployment starts, serves reads, and fails the first
+  revocation write or pairing create. A `POSTERN_REDIS_URL` ending in a database
+  other than `/0` fails earlier: `SELECT is not allowed in cluster mode`.
+- **A hash tag works.** With a prefix such as `{postern}:` in
+  `POSTERN_REDIS_KEY_PREFIX` every key lands in one slot. Driven with a tagged
+  prefix: both revocation scripts, `prune_sessions`, `restore_session`,
+  `unindexed_session_count`, `is_revoked`, the refresh `create` and `discard`, and
+  the whole device-code lifecycle (create, first scan, conflict revoke). The
+  single-key operations were not re-run tagged; they work by inference, since
+  they worked untagged. A tag makes one shard hold all of it, so a cluster buys
+  no capacity, only failover. It is measured on one node; it is not a supported
+  configuration.
 
 The session revocation set `revoked:sessions` has a companion sorted set,
 `revoked:sessions:exp` (member `jti`, score the instant after which the entry

@@ -318,8 +318,9 @@ PAIR_IAT_TOLERANCE_MS = 2_000
 #: effects rather than by its body. Effects replication is the default from
 #: Redis 5.0 and the only mode from 7.0 (the Redis scripting introduction,
 #: read 1 October 2026), so the operator's Redis must be 5.0 or later. The
-#: two keys must share a slot, so it must not be a cluster. It runs as
-#: written on the suite's ``redis:7-alpine``.
+#: three keys must share a slot, so it must not be a cluster: measured
+#: ``CROSSSLOT`` on a single-node cluster in tests/test_redis_cluster_mode.py.
+#: It runs as written on the suite's ``redis:7-alpine``.
 _REVOKE_CUSTOMER_CLIENT = (
     "local t = redis.call('TIME') "
     "local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) "
