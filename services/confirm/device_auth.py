@@ -1133,6 +1133,15 @@ async def _exchange(
         # stamp Redis's -- so it carries `APPROVAL_CLOCK_TOLERANCE_MS` and
         # errs toward refusal.
         stamp = await customer_revoked_since(request, customer.value)
+        # THE KILL SWITCH, while it stands (3 October 2026). Keyed on
+        # ``code.client_id``, the browser's unauthenticated choice, which is
+        # the very value the api's kill switch keys on: refusing here only
+        # narrows access, and a client that declares another id gains nothing
+        # it did not already have at the api. Claims with ONLY ``client_id``
+        # (no ``sub``, ``jti`` or ``iat``) so both stores ask the kill-switch
+        # set and nothing else. A restore makes the unspent code redeemable;
+        # the family it creates is then issued after the kill.
+        killed = await revocation_store(request).is_revoked({"client_id": code.client_id})
     except RevocationStoreUnavailable as exc:
         logger.warning("device grant: revocation store unavailable, refusing to mint")
         await _discard_orphan(sessions, sid, "a revocation store outage")
@@ -1141,7 +1150,11 @@ async def _exchange(
         await _discard_orphan(sessions, sid, "a revocation check that raised")
         raise
     approved_ms = ms_of(code.approved_at) if code.approved_at is not None else 0
-    if revoked or (stamp is not None and stamp >= approved_ms - APPROVAL_CLOCK_TOLERANCE_MS):
+    if (
+        revoked
+        or killed
+        or (stamp is not None and stamp >= approved_ms - APPROVAL_CLOCK_TOLERANCE_MS)
+    ):
         log_refusal("a device-grant token exchange")
         await _discard_orphan(sessions, sid, "a revocation")
         return _error(400, "access_denied", "authorization was refused"), DETAIL_REVOKED
@@ -1437,17 +1450,21 @@ async def _refresh(
     try:
         refused = await _refresh_revoked(revocations, family, now)
         stamp = await revocations.customer_revoked_at(family.customer_ref)
+        client_stamp = await revocations.client_revoked_at(family.client_id)
     except RevocationStoreUnavailable as exc:
         logger.warning("refresh grant: revocation store unavailable, refusing to rotate")
         return store_unavailable_response(retry_after), type(exc).__name__
     if refused:
         log_refusal("a session refresh")
         return _unrefreshable_response(), DETAIL_REVOKED
-    if stamp is not None and stamp >= family.created_ms:
-        # ISSUED BEFORE A CUSTOMER REVOCATION: refused, and the family is
-        # revoked for good, so no later restore can revive it. Its live access
-        # tokens go on the ZT-7 list now, not at the client's next refresh: the
-        # api would otherwise honour them for up to their remaining lifetime.
+    if any(s is not None and s >= family.created_ms for s in (stamp, client_stamp)):
+        # ISSUED BEFORE A CUSTOMER REVOCATION OR A KILL SWITCH (the latter
+        # since 3 October 2026): refused, and the family is revoked for good,
+        # so no later restore can revive it. Reached only once the revocation
+        # is restored; while it stands the check above refuses without
+        # revoking. Its live access tokens go on the ZT-7 list now, not at the
+        # client's next refresh: the api would otherwise honour them for up to
+        # their remaining lifetime.
         log_refusal("a session refresh of a family issued before a revocation")
         outage: str | None = None
         try:

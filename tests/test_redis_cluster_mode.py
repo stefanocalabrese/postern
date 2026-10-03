@@ -74,6 +74,8 @@ EXPECTED_SLOTS = {
     "revoked:customer-clients": 11233,
     "revoked:customer-at:cust_7f3a": 2420,
     "revoked:pair-at:PAIR": 10323,
+    "revoked:clients": 2773,
+    "revoked:client-at:vendor-x": 8708,
     "refresh:index": 10176,
     "refresh:session:fixedsid1": 7202,
 }
@@ -211,9 +213,11 @@ class TestTheServerIsReallyACluster:
             "revoked:pair-at:PAIR": slot(admin, store._pair_revoked_at_key(CUSTOMER, CLIENT)),
             "revoked:sessions": slot(admin, store._sessions_key),
             "revoked:sessions:exp": slot(admin, store._sessions_exp_key),
+            "revoked:clients": slot(admin, store._clients_key),
+            "revoked:client-at:vendor-x": slot(admin, store._client_revoked_at_key("vendor-x")),
         }
         assert measured == {key: EXPECTED_SLOTS[key] for key in measured}
-        assert len(set(measured.values())) == 5
+        assert len(set(measured.values())) == 7
 
 
 class TestRevocationStore:
@@ -248,6 +252,20 @@ class TestRevocationStore:
         assert admin.keys(f"{prefix}*") == []
         assert await store.is_revoked({"jti": "j1"}) is False
 
+    async def test_the_two_key_kill_switch_script_is_crossslot_and_writes_nothing(
+        self,
+        store: RedisRevocationStore,
+        admin: Any,
+        prefix: str,
+    ) -> None:
+        """Since 3 October 2026 the kill switch is one script over the clients set and
+        ``client-at:<id>`` (slots 2773 and 8708), no longer a single-key ``SADD``."""
+        exc = await refused(store.kill_switch(client_id="vendor-x"))
+        assert_crossslot_wrapped(exc, RevocationStoreUnavailable)
+        assert admin.keys(f"{prefix}*") == []
+        assert await store.is_revoked({"client_id": "vendor-x"}) is False
+        assert await store.client_revoked_at("vendor-x") is None
+
     async def test_prune_restore_and_count_are_crossslot(self, store: RedisRevocationStore) -> None:
         assert_crossslot_wrapped(await refused(store.prune_sessions()), RevocationStoreUnavailable)
         assert_crossslot_wrapped(
@@ -261,17 +279,25 @@ class TestRevocationStore:
         self,
         store: RedisRevocationStore,
         admin: Any,
+        prefix: str,
     ) -> None:
-        await store.kill_switch(client_id="vendor-x")
+        # `kill_switch` cannot seed the entry on a cluster (see the test above),
+        # so it is written the way an operator's own backend might: a plain
+        # SADD, plus a restored switch's stamp under its own slot.
+        admin.sadd(f"{prefix}revoked:clients", "vendor-x")
+        admin.set(f"{prefix}revoked:client-at:{CLIENT}", "5000", ex=60)
         snapshot = await store.entries()
         assert snapshot.clients == ("vendor-x",)
         # `is_revoked` is a NON-transactional pipeline, so each command is
         # its own single-slot request, and the kill-switch is seen.
         assert await store.is_revoked({"client_id": "vendor-x"}) is True
-        assert (
-            await store.is_revoked({"sub": CUSTOMER, "client_id": CLIENT, "jti": "j", "iat": 1})
-            is False
-        )
+        # With an `iat` the pipeline also GETs `client-at` and `pair-at`, each a
+        # single-key request in its own slot: the client floor refuses
+        # `iat` 1 (1000 ms <= 5000 + 2000) and passes a later token.
+        claims = {"sub": CUSTOMER, "client_id": CLIENT, "jti": "j"}
+        assert await store.is_revoked({**claims, "iat": 1}) is True
+        assert await store.is_revoked({**claims, "iat": 1_000_000}) is False
+        assert await store.client_revoked_at(CLIENT) == 5000
         assert await store.customer_revoked_at(CUSTOMER) is None
         assert await store.is_customer_revoked(CUSTOMER) is False
         await store.restore_client(client_id="vendor-x")
@@ -295,6 +321,13 @@ class TestRevocationStore:
             assert await store.customer_revoked_at(CUSTOMER) is not None
             await store.restore_session(jti="j1")
             assert await store.is_revoked({"jti": "j1"}) is False
+            await store.kill_switch(client_id="vendor-x")  # the two-key script
+            assert await store.is_revoked({"client_id": "vendor-x"}) is True
+            await store.restore_client(client_id="vendor-x")
+            stamp = await store.client_revoked_at("vendor-x")
+            assert stamp is not None
+            old = {"sub": OTHER, "client_id": "vendor-x", "jti": "j2", "iat": stamp // 1000 - 60}
+            assert await store.is_revoked(old) is True, "the restore left the floor"
             assert len({slot(admin, key) for key in admin.keys(f"{tagged}*")}) == 1
         finally:
             await store.close()

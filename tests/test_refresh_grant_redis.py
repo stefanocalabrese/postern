@@ -262,3 +262,126 @@ class TestAnExchangeAgainstRealRedis:
         assert await _family_keys(app, prefix) == []
         app.state._approved_poll_times.clear()
         session_claims(await _exchange(app, device["device_code"]), app)
+
+
+class TestAnExchangeUnderAKillSwitchAgainstRealRedis:
+    """The exchange's kill-switch gate on the Redis stores (in-memory twin in
+    ``tests/test_refresh_grant.py``'s ``TestAnExchangeUnderAKillSwitch``)."""
+
+    async def test_refused_while_it_stands_then_the_same_code_exchanges_after_the_restore(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database, prefix: str
+    ) -> None:
+        revocations: RedisRevocationStore = app.state.postern_revocation_store
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        await revocations.kill_switch(client_id="claude-code")
+
+        response = await _exchange(app, device["device_code"])
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "access_denied"
+        assert await _family_keys(app, prefix) == []
+        code = await app.state.device_code_store.get_device_code(device["device_code"])
+        assert code is not None and code.exchanged_at is None, "the code is left unspent"
+        (row,) = await _rows_of(clean, TOKEN_TOOL_NAME)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, DETAIL_REVOKED)
+
+        await revocations.restore_client(client_id="claude-code")
+        app.state._approved_poll_times.clear()
+        session_claims(await _exchange(app, device["device_code"]), app)
+
+    async def test_another_clients_kill_switch_does_not_touch_this_exchange(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        revocations: RedisRevocationStore = app.state.postern_revocation_store
+        await revocations.kill_switch(client_id="some-other-client")
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        session_claims(await _exchange(app, device["device_code"]), app)
+
+    async def test_a_kill_straight_after_create_is_seen_and_discards_the_family(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        prefix: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        revocations: RedisRevocationStore = app.state.postern_revocation_store
+        sessions: RedisRefreshSessionStore = app.state.refresh_session_store
+        real_create = sessions.create
+
+        async def create_then_kill(session: RefreshSession) -> RefreshSession:
+            stamped = await real_create(session)
+            await revocations.kill_switch(client_id="claude-code")
+            return stamped
+
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        monkeypatch.setattr(sessions, "create", create_then_kill)
+        response = await _exchange(app, device["device_code"])
+        monkeypatch.setattr(sessions, "create", real_create)
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "access_denied"
+        assert await _family_keys(app, prefix) == []
+
+    async def test_an_outage_on_the_kill_switch_read_is_a_503_with_no_family(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        prefix: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        revocations: RedisRevocationStore = app.state.postern_revocation_store
+
+        async def down(claims: Any) -> bool:
+            raise RevocationStoreUnavailable("simulated outage")
+
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        monkeypatch.setattr(revocations, "is_revoked", down)
+        _retryable(app, await _exchange(app, device["device_code"]))
+        assert await _family_keys(app, prefix) == []
+        (row,) = await _rows_of(clean, TOKEN_TOOL_NAME)
+        assert row.detail == "RevocationStoreUnavailable"
+
+
+class TestARestoredKillSwitchAgainstRealRedis:
+    """The kill-switch stamp and the family's ``created_ms`` are both Redis ``TIME``."""
+
+    async def test_a_family_created_before_the_kill_is_revoked_at_refresh_after_the_restore(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        revocations: RedisRevocationStore = app.state.postern_revocation_store
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        response = await _exchange(app, device["device_code"])
+        session_claims(response, app)
+        body = response.json()
+
+        await revocations.kill_switch(client_id="claude-code")
+        _refused(await _refresh(app, body["refresh_token"]))
+        assert (await _family(app, body)).revoked_at is None, "while it stands: refused only"
+
+        await revocations.restore_client(client_id="claude-code")
+        stamp = await revocations.client_revoked_at("claude-code")
+        family = await _family(app, body)
+        assert stamp is not None and stamp >= family.created_ms
+        _refused(await _refresh(app, body["refresh_token"]))
+        family = await _family(app, body)
+        assert family.revoked_reason == "issued_before_revocation"
+        jti = family.access_tokens[0][0]
+        assert await revocations.is_revoked({"jti": jti}), "its live access token is listed"
+        assert [row.detail for row in await _rows_of(clean, REFRESH_TOOL_NAME)] == [
+            DETAIL_REVOKED,
+            DETAIL_ISSUED_BEFORE_REVOCATION,
+        ]
+
+    async def test_a_family_created_after_the_restore_refreshes(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        revocations: RedisRevocationStore = app.state.postern_revocation_store
+        await revocations.kill_switch(client_id="claude-code")
+        await revocations.restore_client(client_id="claude-code")
+        stamp = await revocations.client_revoked_at("claude-code")
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        response = await _exchange(app, device["device_code"])
+        session_claims(response, app)
+        body = response.json()
+        assert stamp is not None and (await _family(app, body)).created_ms > stamp
+        session_claims(await _refresh(app, body["refresh_token"]), app)

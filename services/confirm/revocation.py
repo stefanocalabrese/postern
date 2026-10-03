@@ -36,7 +36,10 @@ of the operator:
 - ``customer-client`` stops a challenge approval and a device-grant mint,
   through EVERY client and not only the one named.
 - ``session`` stops reads only.
-- ``kill-switch`` stops reads only.
+- ``kill-switch`` stops no challenge approval. Since 3 October 2026 it stops
+  the device-grant exchange (and, as before, the refresh) for the
+  ``client_id`` the pairing declared; `services/confirm/device_auth.py`'s
+  `_exchange` asks `is_revoked` with that id alone.
 
 **TO STOP THE WRITE PATH, NAME THE CUSTOMER.**
 

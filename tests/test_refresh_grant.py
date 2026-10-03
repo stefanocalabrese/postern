@@ -567,6 +567,90 @@ class TestZt7:
         assert family.revoked_reason == "issued_before_revocation"
         assert [r.detail for r in await _rows(clean)] == [DETAIL_ISSUED_BEFORE_REVOCATION]
 
+    async def test_a_family_created_before_a_since_restored_kill_switch_is_refused_and_revoked(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        """While the switch stands the family is refused and left unrevoked
+        (``test_the_kill_switch``); once restored, its first presentation
+        revokes it for good and lists its live access token."""
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.kill_switch(client_id="claude-code")
+        await store.restore_client(client_id="claude-code")
+        assert await store.customer_revoked_at(CUSTOMER) is None, "no customer stamp in play"
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert await store.is_revoked({"jti": _jti(first)}), "the live access token is cut now"
+        family = await _family(app, first)
+        assert family.revoked_reason == "issued_before_revocation"
+        assert family.revoked_at is not None
+        # Revoked in the family store, so the stamp expiring could not revive it.
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert [r.detail for r in await _rows(clean)] == [
+            DETAIL_ISSUED_BEFORE_REVOCATION,
+            DETAIL_SESSION_REVOKED,
+        ]
+
+    async def test_a_family_created_after_a_restored_kill_switch_refreshes(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.kill_switch(client_id="claude-code")
+        await store.restore_client(client_id="claude-code")
+        stamp = await store.client_revoked_at("claude-code")
+        assert stamp is not None
+        first = await _session(app, key_pair)
+        assert (await _family(app, first)).created_ms > stamp
+        session_claims(await _refresh(app, first["refresh_token"]), app)
+
+    @pytest.mark.parametrize(("offset_ms", "refused"), [(700, True), (0, True), (-1, False)])
+    async def test_the_client_stamp_decides_in_milliseconds_at_the_edge(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        offset_ms: int,
+        refused: bool,
+    ) -> None:
+        first = await _session(app, key_pair)
+        family = await _family(app, first)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        store._client_revoked_at["claude-code"] = (family.created_ms + offset_ms, 2**62)
+        response = await _refresh(app, first["refresh_token"])
+        if refused:
+            _refused(response)
+            assert (await _family(app, first)).revoked_reason == "issued_before_revocation"
+        else:
+            session_claims(response, app)
+
+    async def test_only_the_client_stamp_read_failing_is_a_503_with_nothing_revoked(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+
+        async def down(client_id: str) -> int | None:
+            raise RevocationStoreUnavailable("simulated outage")
+
+        monkeypatch.setattr(store, "client_revoked_at", down)
+        _retryable(app, await _refresh(app, first["refresh_token"]))
+        family = await _family(app, first)
+        assert (family.generation, family.revoked_at) == (0, None), "nothing half-revoked"
+        assert not await store.is_revoked({"jti": _jti(first)}), "nothing listed"
+        assert [r.detail for r in await _rows(clean)] == ["RevocationStoreUnavailable"]
+
+    async def test_another_clients_kill_switch_stamp_does_not_touch_this_family(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.kill_switch(client_id="some-other-client")
+        await store.restore_client(client_id="some-other-client")
+        session_claims(await _refresh(app, first["refresh_token"]), app)
+
     async def test_a_failed_zt7_write_after_issued_before_revocation_converges(
         self,
         app: Starlette,
@@ -694,6 +778,159 @@ class TestZt7:
         assert response.headers["cache-control"] == "no-store"
         assert (await _family(app, first)).generation == 0
         assert [r.detail for r in await _rows(clean)] == ["RevocationStoreUnavailable"]
+
+
+async def _unspent(app: Starlette, device_code: str) -> bool:
+    code = await app.state.device_code_store.get_device_code(device_code)
+    return code is not None and code.exchanged_at is None
+
+
+async def _token_rows(db: Database) -> list[AuditEntry]:
+    async with db.sessionmaker() as s:
+        query = select(AuditEntry).where(AuditEntry.tool_name == TOKEN_TOOL_NAME)
+        result = await s.execute(query.order_by(AuditEntry.id))
+        return list(result.scalars())
+
+
+def _access_denied(response: httpx2.Response) -> None:
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "access_denied"
+    assert "refresh_token" not in response.json()
+
+
+class TestAnExchangeUnderAKillSwitch:
+    """The device-code exchange refuses a client whose kill switch stands.
+
+    Keyed on the code's ``client_id``, the browser's own unauthenticated
+    choice, which is the same value the api's kill switch already keys on: the
+    gate only narrows access, and a client that lies about its id gains
+    nothing it did not have. Refused like a customer revocation: 400
+    ``access_denied``, the family discarded, the code left unspent.
+    """
+
+    async def test_an_exchange_while_the_switch_stands_is_refused_and_the_code_survives(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        device = await _approved(app, key_pair, scopes=SCOPES)  # approved before the kill
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.kill_switch(client_id="claude-code")
+
+        _access_denied(await _exchange(app, device["device_code"]))
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        assert sessions._sessions == {}, "no family left behind"
+        assert await _unspent(app, device["device_code"])
+        (row,) = await _token_rows(clean)
+        assert (row.outcome, row.detail) == (OUTCOME_RAISED, DETAIL_REVOKED)
+
+        # The restore lets the client back in: the unspent code now exchanges.
+        await store.restore_client(client_id="claude-code")
+        app.state._approved_poll_times.clear()  # the poll pacing, not under test
+        session_claims(await _exchange(app, device["device_code"]), app)
+
+    async def test_an_exchange_after_the_restore_works(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.kill_switch(client_id="claude-code")
+        await store.restore_client(client_id="claude-code")
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        session_claims(await _exchange(app, device["device_code"]), app)
+
+    async def test_another_clients_exchange_is_unaffected(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.kill_switch(client_id="some-other-client")
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        session_claims(await _exchange(app, device["device_code"]), app)
+
+    async def test_an_outage_on_the_kill_switch_read_is_a_503_and_leaves_no_family(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+
+        async def down(claims: Any) -> bool:
+            raise RevocationStoreUnavailable("simulated outage")
+
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        monkeypatch.setattr(store, "is_revoked", down)
+        _retryable(app, await _exchange(app, device["device_code"]))
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        assert sessions._sessions == {}
+        assert await _unspent(app, device["device_code"])
+        (row,) = await _token_rows(clean)
+        assert row.detail == "RevocationStoreUnavailable"
+
+    async def test_a_kill_landing_between_create_and_the_check_is_caught(
+        self,
+        app: Starlette,
+        key_pair: RSAKeyPair,
+        clean: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        sessions: InMemoryRefreshSessionStore = app.state.refresh_session_store
+        real_create = sessions.create
+
+        async def create_then_kill(session: RefreshSession) -> RefreshSession:
+            stamped = await real_create(session)
+            await store.kill_switch(client_id="claude-code")
+            return stamped
+
+        device = await _approved(app, key_pair, scopes=SCOPES)
+        monkeypatch.setattr(sessions, "create", create_then_kill)
+        response = await _exchange(app, device["device_code"])
+        monkeypatch.setattr(sessions, "create", real_create)
+        _access_denied(response)
+        assert sessions._sessions == {}
+        assert await _unspent(app, device["device_code"])
+
+
+class TestRestoringASession:
+    """``restore_session`` is the undo of one ``jti`` and nothing wider.
+
+    What the verb means, pinned: it removes that ``jti`` from the ZT-7 set and
+    touches no family record. A family the refresh store revoked (reuse,
+    recall, ``issued_before_revocation``) stays revoked, and its next
+    presentation lists the ``jti`` again. A family that was only refused
+    because an operator listed one of its live ``jti`` values refreshes again,
+    which it would also do on its own once that token expired.
+    """
+
+    async def test_restoring_a_reuse_listed_jti_leaves_the_family_revoked_and_relists_it(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        second = (await _refresh(app, first["refresh_token"])).json()
+        _refused(await _refresh(app, first["refresh_token"]))  # reuse
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        jti = _jti(second)
+        assert await store.is_revoked({"jti": jti})
+
+        await store.restore_session(jti=jti)
+        assert not await store.is_revoked({"jti": jti}), "the named token alone is revived"
+        family = await _family(app, first)
+        assert (family.revoked_at is not None, family.revoked_reason) == (True, "reuse")
+
+        # The family is not refreshable, and presenting it re-lists the jti.
+        _refused(await _refresh(app, second["refresh_token"]))
+        assert await store.is_revoked({"jti": jti})
+
+    async def test_restoring_an_operator_listed_live_jti_lets_its_family_refresh(
+        self, app: Starlette, key_pair: RSAKeyPair, clean: Database
+    ) -> None:
+        first = await _session(app, key_pair)
+        store: InMemoryRevocationStore = app.state.postern_revocation_store
+        await store.revoke_session(jti=_jti(first))
+        _refused(await _refresh(app, first["refresh_token"]))
+        assert (await _family(app, first)).revoked_at is None
+
+        await store.restore_session(jti=_jti(first))
+        session_claims(await _refresh(app, first["refresh_token"]), app)
 
 
 class TestARevocationBetweenTheCheckAndTheStamp:

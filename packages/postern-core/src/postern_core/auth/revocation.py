@@ -61,9 +61,10 @@ which matches ANY pair naming that customer, and the coverage is:
   declared compromised, and ``restore-customer-client`` undoes it.
 - ``session`` stops reads only. The ``jti`` an operator names belongs to the
   AI client's access token, and no request on the write path carries it.
-- ``kill-switch`` stops reads only. ``challenges`` records no client id, so
-  enforcing a kill switch there would mean refusing every customer's
-  approvals rather than that client's.
+- ``kill-switch`` stops reads, and (since 3 October 2026) the device-grant
+  exchange for that declared ``client_id``, but no challenge approval.
+  ``challenges`` records no client id, so enforcing a kill switch there
+  would mean refusing every customer's approvals rather than that client's.
 
 **TO STOP THE WRITE PATH, NAME THE CUSTOMER.** `postern_core.auth.revoke_cli`
 says the same where an operator will meet it, and
@@ -101,18 +102,19 @@ until 2026-09-26, which meant the read path refused to start and
 `services/confirm` -- holding this list, the device code store and the
 per-customer approval counters -- started anyway.
 
-NO TTL. Revocation keys never expire. A kill switch that silently lapsed
-after thirty minutes, the way a risk context does, would be worse than no
-kill switch: the operator would have acted once and been un-acted on by a
-timer. Every scope has an explicit restore command instead.
+NO TTL. Revocation keys never expire (the stamps below are not revocations).
+A kill switch that silently lapsed after thirty minutes, the way a risk
+context does, would be worse than no kill switch: the operator would have
+acted once and been un-acted on by a timer. Every scope has an explicit restore command instead.
 
 ONE SET IS PRUNED, BECAUSE ITS ENTRIES DIE ON THEIR OWN. Keys (all under the
 configured prefix): ``revoked:sessions`` (SET of access-token ``jti``),
 ``revoked:sessions:exp`` (ZSET index, member ``jti``, score the prune-after
 instant in ms), ``revoked:customer-clients`` (SET), ``revoked:clients`` (SET),
-``revoked:customer-at:<customer>`` and ``revoked:pair-at:<pair>`` (stamps with
-TTLs). A ``jti`` in ``revoked:sessions`` names a layer-1 access token that is
-useless once it expires, so `revoke_session` writes the SET member and the
+``revoked:customer-at:<customer>``, ``revoked:pair-at:<pair>`` and
+``revoked:client-at:<client>`` (stamps with TTLs). A ``jti`` in
+``revoked:sessions`` names a layer-1 access token that is useless once it
+expires, so `revoke_session` writes the SET member and the
 index entry in one script and `prune_sessions` removes both after
 `SESSION_REVOKED_RETENTION_SECONDS`. ``is_revoked`` still reads only the SET.
 A SET member with no index entry (the operator's own backend writing a plain
@@ -120,7 +122,7 @@ A SET member with no index entry (the operator's own backend writing a plain
 ``revoke.py prune-sessions`` prints how many exist. The other two sets hold
 operator decisions, not token ids, and are never pruned.
 
-ONE KEY THAT DOES EXPIRE, AND IT IS NOT A REVOCATION. Every customer-plus-client
+KEYS THAT DO EXPIRE, AND THEY ARE NOT REVOCATIONS. Every customer-plus-client
 revocation also stamps WHEN it was written, per customer, in milliseconds:
 ``customer_revoked_at``. The layer-1 session token compares that instant with
 when a refresh family was created and when a device code was approved, so a
@@ -138,8 +140,26 @@ reads that stamp in the same round trip and refuses a token whose ``iat`` is
 not past it by `PAIR_IAT_TOLERANCE_MS`, so a restore no longer revives the
 access tokens (up to 600 s) minted before the revocation. A missing or
 non-numeric ``iat`` refuses while a stamp exists. Claims with no ``iat`` key
-(`services/confirm`'s refresh check) are not floored. The kill switch and the
-per-``jti`` restore have no such floor and still revive.
+(`services/confirm`'s refresh check) are not floored.
+
+THE KILL SWITCH HAS THE SAME RULE, SINCE 3 OCTOBER 2026: ``client-at``.
+`kill_switch` writes ``revoked:client-at:<client_id>`` in the same script and
+on the same Redis ``TIME`` as its ``SADD``, expiring after
+`CLIENT_REVOKED_AT_TTL_SECONDS` (3,900 s), and `restore_client` leaves it.
+`is_revoked` with an ``iat`` key floors on it exactly as on ``pair-at`` (one
+more ``GET`` in the same pipeline, same tolerance, same fail-closed ``iat``),
+and confirm's refresh refuses and revokes for good a family whose creation is
+at or before it. A restore lets the client back in for what is issued after
+the kill, which is what restoring a client means; what existed at the kill is
+what the switch exists to stop.
+
+A PER-``jti`` RESTORE IS NOT A RESIDUAL, IT IS THE VERB. `restore_session`
+revives exactly the token it names, for what remains of its 600 s, and
+nothing else: no stamp, no family record. A family the refresh store revoked
+(reuse, recall, ``issued_before_revocation``) stays revoked there, and if the
+family is presented again, its live ``jti`` values are listed again (this one
+included while it lives); a family refused only because the
+``jti`` was listed refreshes again, as it would once the token expired.
 
 FAIL CLOSED. A store that cannot answer raises `RevocationStoreUnavailable`
 and the middleware refuses the call. Reporting an outage as "not revoked"
@@ -199,6 +219,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from postern_core.auth.refresh_sessions import SESSION_ABSOLUTE_LIFETIME
 from postern_core.auth.session_lifetime import (
     ACCESS_TOKEN_LIFETIME_SECONDS,
     SESSION_CLOCK_SKEW_SECONDS,
@@ -236,6 +257,22 @@ CUSTOMER_REVOKED_AT_TTL_SECONDS = 3_600 + 900 + REVOKED_AT_MARGIN_SECONDS
 #: because this one guards access tokens, not refresh families.
 PAIR_REVOKED_AT_TTL_SECONDS = (
     ACCESS_TOKEN_LIFETIME_SECONDS + SESSION_CLOCK_SKEW_SECONDS + REVOKED_AT_MARGIN_SECONDS
+)
+
+#: How long ``client-at`` remembers a kill switch, restored or not. It guards
+#: two things: refresh families created at or before the kill (confirm refuses
+#: and revokes them), which live at most `SESSION_ABSOLUTE_LIFETIME` (3,600 s)
+#: on the same Redis clock, so that plus ``REVOKED_AT_MARGIN_SECONDS``; and the
+#: api's ``iat`` floor, which needs `PAIR_REVOKED_AT_TTL_SECONDS` (930 s). The
+#: larger of the two: 3,900 s. No device-code term, unlike the customer's
+#: 4,800 s: the device-code exchange consults the kill switch only while it
+#: STANDS (the set, not this stamp), so a code approved before a kill and
+#: exchanged after the restore is allowed and creates a family after the
+#: stamp. Nothing compares an approval with this stamp, so no approval
+#: lifetime needs covering.
+CLIENT_REVOKED_AT_TTL_SECONDS = max(
+    int(SESSION_ABSOLUTE_LIFETIME.total_seconds()) + REVOKED_AT_MARGIN_SECONDS,
+    PAIR_REVOKED_AT_TTL_SECONDS,
 )
 
 #: How long a revoked session ``jti`` stays in ``revoked:sessions`` before a
@@ -306,7 +343,8 @@ _PRUNE_SESSIONS = (
 #: between confirm's clock and Redis ``TIME``, as ``APPROVAL_CLOCK_TOLERANCE_MS``
 #: does; skew beyond 2 s lets tokens minted in that window before the stamp
 #: through. The 30 s in ``PAIR_REVOKED_AT_TTL_SECONDS`` is the verifier ceiling,
-#: used only to size the expiry, not this tolerance.
+#: used only to size the expiry, not this tolerance. The kill switch's
+#: ``client-at`` floor uses this same tolerance; the name predates it.
 PAIR_IAT_TOLERANCE_MS = 2_000
 
 #: The revocation of a customer-client pair and its timestamps, as ONE
@@ -330,6 +368,18 @@ _REVOKE_CUSTOMER_CLIENT = (
     "return ms"
 )
 
+#: A kill switch and its stamp, as ONE server-side step on ONE clock, the same
+#: shape and the same replication argument as `_REVOKE_CUSTOMER_CLIENT`:
+#: ``TIME``, the client's ``SADD``, then ``client-at`` with its expiry.
+#: KEYS: clients set, client stamp. ARGV: client id, TTL in seconds.
+_KILL_SWITCH = (
+    "local t = redis.call('TIME') "
+    "local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) "
+    "redis.call('SADD', KEYS[1], ARGV[1]) "
+    "redis.call('SET', KEYS[2], ms, 'EX', ARGV[2]) "
+    "return ms"
+)
+
 
 def _iat_ms(iat: Any) -> int | None:
     """An access token's ``iat`` in milliseconds, or ``None`` if it is unusable.
@@ -344,14 +394,24 @@ def _iat_ms(iat: Any) -> int | None:
     return int(iat) * 1000
 
 
-def _below_pair_floor(iat: Any, stamp_ms: int) -> bool:
-    """Whether a token with this ``iat`` predates the pair stamp.
+def _below_floor(iat: Any, stamp_ms: int) -> bool:
+    """Whether a token with this ``iat`` predates a ``pair-at`` or ``client-at`` stamp.
 
     An unusable ``iat`` counts as predating it: a stamp exists, so the token
     cannot be shown to postdate the revocation, and the check fails closed.
     """
     iat_ms = _iat_ms(iat)
     return iat_ms is None or iat_ms <= stamp_ms + PAIR_IAT_TOLERANCE_MS
+
+
+def _parse_stamp(raw: Any) -> int:
+    """A stored stamp as an ``int``; a corrupt one fails closed, never crashes."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RevocationStoreUnavailable(
+            f"revocation timestamp is corrupt: {type(exc).__name__}"
+        ) from exc
 
 
 def _now_ms() -> int:
@@ -597,15 +657,16 @@ class RevocationStoreBase(ABC):
         """Whether these token claims are revoked under any of the three scopes.
 
         THE ``iat`` CONTRACT. When ``claims`` carries an ``"iat"`` KEY (the api
-        passes the token's raw claim, ``None`` if absent), the pair's
-        ``pair-at`` stamp is consulted too: a token whose ``iat`` is not more
-        than `PAIR_IAT_TOLERANCE_MS` past the stamp is refused even though the
-        pair was restored, and an unusable ``iat`` is refused while a stamp
-        exists. With no stamp the key changes nothing. When the key is ABSENT
-        the floor is skipped entirely, which is what
-        `services/confirm/device_auth.py`'s `_refresh_revoked` relies on: it
-        asks about a family, not a token, and has its own ``customer-at``
-        comparison.
+        passes the token's raw claim, ``None`` if absent), two stamps are
+        consulted too: the pair's ``pair-at`` and the client's ``client-at``
+        (the kill switch's, since 3 October 2026). A token whose ``iat`` is
+        not more than `PAIR_IAT_TOLERANCE_MS` past either stamp is refused
+        even though the pair or the client was restored, and an unusable
+        ``iat`` is refused while either stamp exists. With no stamp the key
+        changes nothing. When the key is ABSENT both floors are skipped
+        entirely, which is what `services/confirm/device_auth.py`'s
+        `_refresh_revoked` relies on: it asks about a family, not a token,
+        and has its own ``customer-at`` and ``client-at`` comparisons.
 
         Raises `RevocationStoreUnavailable` when the store cannot answer.
         """
@@ -616,7 +677,18 @@ class RevocationStoreBase(ABC):
 
     @abstractmethod
     async def restore_session(self, *, jti: str) -> None:
-        """Undo `revoke_session` for this ``jti``."""
+        """Undo `revoke_session` for this ``jti``, and nothing wider.
+
+        WHAT A RESTORE REVIVES IS THE MEANING OF THE VERB, not a residual. It
+        removes this one ``jti`` from the session set, so that one access
+        token is served again for what remains of its 600 s. It writes no
+        stamp and touches no refresh family. A family the refresh store
+        revoked (reuse, recall, ``issued_before_revocation``) stays revoked
+        there, and if the family is presented again, its live ``jti`` values
+        are listed again, this one included while it lives. A family
+        that was only refused because this ``jti`` was listed refreshes again,
+        as it would anyway once the token expired.
+        """
 
     @abstractmethod
     async def revoke_customer_client(self, *, customer_ref: str, client_id: str) -> None:
@@ -632,7 +704,11 @@ class RevocationStoreBase(ABC):
 
     @abstractmethod
     async def restore_client(self, *, client_id: str) -> None:
-        """Undo `kill_switch` for this client."""
+        """Undo `kill_switch` for this client, for what is issued after it.
+
+        Leaves the ``client-at`` stamp, so an access token or a refresh
+        family that existed at the kill stays refused (`client_revoked_at`).
+        """
 
     @abstractmethod
     async def entries(self) -> RevocationSnapshot:
@@ -712,6 +788,20 @@ class RevocationStoreBase(ABC):
         """
         return None
 
+    async def client_revoked_at(self, client_id: str) -> int | None:
+        """When a kill switch last named this client, in ms since the epoch, or ``None``.
+
+        Written with the kill switch, in the same step, KEPT AFTER
+        ``restore_client`` and for `CLIENT_REVOKED_AT_TTL_SECONDS` only.
+        ``POST /token``'s refresh compares it with a family's creation, and
+        `is_revoked` with an access token's ``iat``, so neither a family nor a
+        token that existed at the kill is revived by the restore.
+
+        CONCRETE AND ``None`` BY DEFAULT, as `customer_revoked_at` is. Raises
+        `RevocationStoreUnavailable` when the store cannot answer.
+        """
+        return None
+
     async def close(self) -> None:  # noqa: B027 - concrete and empty on purpose
         """Release any connection this store holds. A no-op by default.
 
@@ -749,31 +839,41 @@ class InMemoryRevocationStore(RevocationStoreBase):
         #: ``(customer_ref, client_id) -> (stamp ms, expiry ms)``, swept on
         #: read: the api's ``iat`` floor, on the same clock as ``_revoked_at``.
         self._pair_revoked_at: dict[tuple[str, str], tuple[int, int]] = {}
+        #: ``client_id -> (stamp ms, expiry ms)``, swept on read: the kill
+        #: switch's stamp, for the api's ``iat`` floor and confirm's refresh.
+        self._client_revoked_at: dict[str, tuple[int, int]] = {}
         #: ``jti -> prune-after instant in ms``: the twin of the ``:exp`` index.
         self._session_expiry: dict[str, int] = {}
 
+    @staticmethod
+    def _live_stamp(stamps: dict[Any, tuple[int, int]], key: Any) -> int | None:
+        """The stamp under ``key`` if it has not expired; an expired one is swept."""
+        entry = stamps.get(key)
+        if entry is None:
+            return None
+        stamp, expires = entry
+        if _now_ms() >= expires:
+            del stamps[key]
+            return None
+        return stamp
+
     async def is_revoked(self, claims: Mapping[str, Any]) -> bool:
-        """Applies the pair floor only when the claims carry an iat key.
+        """Applies the pair and client floors only when the claims carry an iat key.
 
         See `RevocationStoreBase.is_revoked`.
         """
         if self._list.is_revoked(claims):
             return True
+        if "iat" not in claims:
+            return False
         customer_ref = claims.get("sub")
         client_id = claims.get("client_id")
-        if "iat" not in claims or not isinstance(customer_ref, str):
-            return False
         if not isinstance(client_id, str):
             return False
-        pair = (customer_ref, client_id)
-        entry = self._pair_revoked_at.get(pair)
-        if entry is None:
-            return False
-        stamp, expires = entry
-        if _now_ms() >= expires:
-            del self._pair_revoked_at[pair]
-            return False
-        return _below_pair_floor(claims["iat"], stamp)
+        stamps = [self._live_stamp(self._client_revoked_at, client_id)]
+        if isinstance(customer_ref, str):
+            stamps.append(self._live_stamp(self._pair_revoked_at, (customer_ref, client_id)))
+        return any(stamp is not None and _below_floor(claims["iat"], stamp) for stamp in stamps)
 
     async def revoke_session(self, *, jti: str) -> None:
         await self._revoke_session_for(jti, SESSION_REVOKED_RETENTION_SECONDS * 1000)
@@ -825,14 +925,10 @@ class InMemoryRevocationStore(RevocationStoreBase):
         )
 
     async def customer_revoked_at(self, customer_ref: str) -> int | None:
-        entry = self._revoked_at.get(customer_ref)
-        if entry is None:
-            return None
-        stamp, expires = entry
-        if _now_ms() >= expires:
-            del self._revoked_at[customer_ref]
-            return None
-        return stamp
+        return self._live_stamp(self._revoked_at, customer_ref)
+
+    async def client_revoked_at(self, client_id: str) -> int | None:
+        return self._live_stamp(self._client_revoked_at, client_id)
 
     async def restore_customer_client(self, *, customer_ref: str, client_id: str) -> None:
         self._list.restore_customer_client(customer_ref=customer_ref, client_id=client_id)
@@ -841,6 +937,11 @@ class InMemoryRevocationStore(RevocationStoreBase):
     async def kill_switch(self, *, client_id: str) -> None:
         self._list.kill_switch(client_id=client_id)
         self._clients.add(client_id)
+        stamp = _now_ms()
+        self._client_revoked_at[client_id] = (
+            stamp,
+            stamp + CLIENT_REVOKED_AT_TTL_SECONDS * 1000,
+        )
 
     async def restore_client(self, *, client_id: str) -> None:
         self._list.restore_client(client_id=client_id)
@@ -933,6 +1034,10 @@ class RedisRevocationStore(RevocationStoreBase):
     def _pair_revoked_at_key(self, customer_ref: str, client_id: str) -> str:
         return f"{self._prefix}revoked:pair-at:{_pair_member(customer_ref, client_id)}"
 
+    def _client_revoked_at_key(self, client_id: str) -> str:
+        """One component after a fixed prefix, so no delimiter can alias another client."""
+        return f"{self._prefix}revoked:client-at:{client_id}"
+
     async def is_revoked(self, claims: Mapping[str, Any]) -> bool:
         """Check every applicable scope in one round trip.
 
@@ -941,9 +1046,10 @@ class RedisRevocationStore(RevocationStoreBase):
         at all return False without touching Redis, because no entry could
         name them.
 
-        When the claims carry an ``"iat"`` key and name a customer and a
-        client, one ``GET`` of the pair's ``pair-at`` stamp rides in the same
-        pipeline; see `RevocationStoreBase.is_revoked` for the contract.
+        When the claims carry an ``"iat"`` key and name a client, one ``GET``
+        of the client's ``client-at`` stamp, and one of the pair's ``pair-at``
+        stamp if they also name a customer, ride in the same pipeline; see
+        `RevocationStoreBase.is_revoked` for the contract.
         """
         jti = claims.get("jti")
         customer_ref = claims.get("sub")
@@ -959,43 +1065,29 @@ class RedisRevocationStore(RevocationStoreBase):
         if not checks:
             return False
 
-        floor_key: str | None = None
-        if "iat" in claims and isinstance(customer_ref, str) and isinstance(client_id, str):
-            floor_key = self._pair_revoked_at_key(customer_ref, client_id)
+        floor_keys: list[str] = []
+        if "iat" in claims and isinstance(client_id, str):
+            floor_keys.append(self._client_revoked_at_key(client_id))
+            if isinstance(customer_ref, str):
+                floor_keys.append(self._pair_revoked_at_key(customer_ref, client_id))
 
         try:
             pipe = self._redis.pipeline(transaction=False)
             for key, member in checks:
                 pipe.sismember(key, member)
-            if floor_key is not None:
-                pipe.get(floor_key)
+            for key in floor_keys:
+                pipe.get(key)
             results = await pipe.execute()
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation list could not be read: {type(exc).__name__}"
             ) from exc
-        if floor_key is not None:
-            stamp_raw = results.pop()
-            if any(bool(result) for result in results):
-                return True
-            if stamp_raw is None:
-                return False
-            try:
-                stamp_ms = int(stamp_raw)
-            except (TypeError, ValueError) as exc:
-                raise RevocationStoreUnavailable(
-                    f"revocation timestamp is corrupt: {type(exc).__name__}"
-                ) from exc
-            return _below_pair_floor(claims["iat"], stamp_ms)
-        return any(bool(result) for result in results)
-
-    async def _add(self, key: str, member: str) -> None:
-        try:
-            await self._redis.sadd(key, member)
-        except Exception as exc:
-            raise RevocationStoreUnavailable(
-                f"revocation entry could not be written: {type(exc).__name__}"
-            ) from exc
+        members, stamps = results[: len(checks)], results[len(checks) :]
+        if any(bool(result) for result in members):
+            return True
+        return any(
+            _below_floor(claims["iat"], _parse_stamp(raw)) for raw in stamps if raw is not None
+        )
 
     async def _remove(self, key: str, member: str) -> None:
         try:
@@ -1087,27 +1179,40 @@ class RedisRevocationStore(RevocationStoreBase):
                 f"revocation entry could not be written: {type(exc).__name__}"
             ) from exc
 
-    async def customer_revoked_at(self, customer_ref: str) -> int | None:
+    async def _get_stamp(self, key: str) -> int | None:
+        """One stamp ``GET``; an outage or a corrupt value fails closed."""
         try:
-            raw = await self._redis.get(self._revoked_at_key(customer_ref))
+            raw = await self._redis.get(key)
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation timestamp could not be read: {type(exc).__name__}"
             ) from exc
-        if raw is None:
-            return None
-        try:
-            return int(raw)
-        except (TypeError, ValueError) as exc:
-            raise RevocationStoreUnavailable(
-                f"revocation timestamp is corrupt: {type(exc).__name__}"
-            ) from exc
+        return None if raw is None else _parse_stamp(raw)
+
+    async def customer_revoked_at(self, customer_ref: str) -> int | None:
+        return await self._get_stamp(self._revoked_at_key(customer_ref))
+
+    async def client_revoked_at(self, client_id: str) -> int | None:
+        return await self._get_stamp(self._client_revoked_at_key(client_id))
 
     async def restore_customer_client(self, *, customer_ref: str, client_id: str) -> None:
         await self._remove(self._pairs_key, _pair_member(customer_ref, client_id))
 
     async def kill_switch(self, *, client_id: str) -> None:
-        await self._add(self._clients_key, client_id)
+        """The client's ``SADD`` and its ``client-at`` stamp, in one script on Redis's clock."""
+        try:
+            await self._redis.eval(
+                _KILL_SWITCH,
+                2,
+                self._clients_key,
+                self._client_revoked_at_key(client_id),
+                client_id,
+                CLIENT_REVOKED_AT_TTL_SECONDS,
+            )
+        except Exception as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation entry could not be written: {type(exc).__name__}"
+            ) from exc
 
     async def restore_client(self, *, client_id: str) -> None:
         await self._remove(self._clients_key, client_id)

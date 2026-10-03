@@ -567,14 +567,20 @@ async def test_a_revocation_written_by_the_cli_reaches_a_second_replica(
 async def test_the_cli_restores_a_revocation_and_the_replicas_serve_again(
     pg_url: str, database: Database, key_pair: RSAKeyPair, shared_redis: Any
 ) -> None:
-    """Every scope has an explicit undo, because none of them has a TTL."""
+    """Every scope has an explicit undo, because none of them has a TTL.
+
+    An undo lets the identity back in for tokens minted after the revocation;
+    it does not revive a token minted before it. That held for the
+    customer-client scope since 2 October 2026 and for the kill switch since
+    3 October 2026, when this test gained its kill-switch half.
+    """
     backend = RecordingBackend()
     verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
     app = _app(_settings(pg_url), backend, auth_override=verifier)
     now = int(time.time())
     token = _token(key_pair, CUSTOMER, CLIENT, iat=now - 60, exp=now + 540)
 
-    async with _consent(database, CUSTOMER):
+    async with _consent(database, CUSTOMER), _consent(database, OTHER_CUSTOMER):
         async with _serving(app) as client:
             assert (await _run_cli("customer-client", CUSTOMER.value, CLIENT))[0] == 0
             refused = await _call(client, "accounts.list", token=token)
@@ -591,10 +597,29 @@ async def test_the_cli_restores_a_revocation_and_the_replicas_serve_again(
             after = _token(key_pair, CUSTOMER, CLIENT, iat=issued, exp=issued + 600)
             served = await _call(client, "accounts.list", token=after)
 
+            # The kill switch through the CLI (3 October 2026): its restore no
+            # longer revives a token minted before the kill either. Another
+            # customer of the same client, so no pair stamp is in play.
+            pre_kill = _token(key_pair, OTHER_CUSTOMER, CLIENT, iat=now - 60, exp=now + 540)
+            served_pre_kill = await _call(client, "accounts.list", token=pre_kill)
+            assert (await _run_cli("kill-switch", CLIENT))[0] == 0
+            killed = await _call(client, "accounts.list", token=pre_kill)
+            assert (await _run_cli("restore-kill-switch", CLIENT))[0] == 0
+            not_revived = await _call(client, "accounts.list", token=pre_kill)
+            client_ms = await _revocation_store(app).client_revoked_at(CLIENT)
+            assert client_ms is not None
+            later = client_ms // 1000 + 10
+            newest = _token(key_pair, CUSTOMER, CLIENT, iat=later, exp=later + 600)
+            served_again = await _call(client, "accounts.list", token=newest)
+
     _refused(refused)
     _refused(still_refused)
     _succeeded(served)
-    assert backend.paths == ["/accounts"]
+    _succeeded(served_pre_kill)
+    _refused(killed)
+    _refused(not_revived)
+    _succeeded(served_again)
+    assert backend.paths == ["/accounts"] * 3
 
 
 @pytest.fixture(params=["memory", "redis"])
@@ -651,6 +676,54 @@ async def test_a_restore_does_not_revive_an_access_token_issued_before_the_revoc
     _succeeded(served)
     assert backend.paths == ["/accounts", "/accounts"], (
         "the old token reached no backend after the restore; the fresh one did"
+    )
+
+
+async def test_a_restored_kill_switch_does_not_revive_an_access_token_issued_before_it(
+    pg_url: str, database: Database, key_pair: RSAKeyPair, restore_backend: str
+) -> None:
+    """The client-wide twin of the M2 test above, through the assembled app.
+
+    A kill switch exists to stop every token the client holds. Restoring it
+    lets the client back in, for tokens minted after the stamp; a token minted
+    before it stays refused for the rest of its life. Another client's token
+    of the same age is untouched. No sleeps: ``iat`` is explicit.
+    """
+    backend = RecordingBackend()
+    verifier = JWTVerifier(public_key=key_pair.public_key, issuer=ISSUER, audience=AUDIENCE)
+    app = _app(_settings(pg_url), backend, auth_override=verifier)
+    store = _revocation_store(app)
+    assert isinstance(store, RedisRevocationStore) == (restore_backend == "redis")
+
+    now = int(time.time())
+    old = _token(key_pair, CUSTOMER, CLIENT, iat=now - 60, exp=now + 540)
+    old_other_customer = _token(key_pair, OTHER_CUSTOMER, CLIENT, iat=now - 60, exp=now + 540)
+    old_other_client = _token(key_pair, CUSTOMER, OTHER_CLIENT, iat=now - 60, exp=now + 540)
+
+    async with _consent(database, CUSTOMER), _consent(database, OTHER_CUSTOMER):
+        async with _serving(app) as client:
+            _succeeded(await _call(client, "accounts.list", token=old))
+
+            await store.kill_switch(client_id=CLIENT)
+            _refused(await _call(client, "accounts.list", token=old))
+
+            await store.restore_client(client_id=CLIENT)
+            revived = await _call(client, "accounts.list", token=old)
+            revived_other_customer = await _call(client, "accounts.list", token=old_other_customer)
+            untouched = await _call(client, "accounts.list", token=old_other_client)
+
+            stamp_ms = await store.client_revoked_at(CLIENT)
+            assert stamp_ms is not None
+            issued = stamp_ms // 1000 + 10
+            fresh = _token(key_pair, CUSTOMER, CLIENT, iat=issued, exp=issued + 600)
+            served = await _call(client, "accounts.list", token=fresh)
+
+    _refused(revived)
+    _refused(revived_other_customer)
+    _succeeded(untouched)
+    _succeeded(served)
+    assert backend.paths == ["/accounts"] * 3, (
+        "before the kill, the other client, and the post-stamp token; nothing older"
     )
 
 

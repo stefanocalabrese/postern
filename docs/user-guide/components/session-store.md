@@ -147,7 +147,8 @@ class RedisSessionStore(SessionStoreBase):
 **The Redis must be non-clustered**: a standalone instance, or a single-shard
 primary with replicas. Several steps span more than one key: the customer
 revocation script writes the pair set, the per-customer
-`revoked:customer-at:` key and the per-pair `revoked:pair-at:` key; `revoke_device_code` deletes a code's primary key,
+`revoked:customer-at:` key and the per-pair `revoked:pair-at:` key; the kill-switch
+script writes the `revoked:clients` set and the per-client `revoked:client-at:` key; `revoke_device_code` deletes a code's primary key,
 its index entry and its secondary keys in one `MULTI`/`EXEC`; the refresh-family
 store's `discard` deletes a family's key and its index entry in one
 `MULTI`/`EXEC`. Redis in cluster mode refuses any of those whose keys hash to
@@ -160,7 +161,9 @@ the same-slot rule but never answers `MOVED`, and multi-node resharding and mana
 cluster endpoints were not measured):
 
 - **Refused with `CROSSSLOT`, writing nothing:** `revoke_customer_client` (3 keys),
-  `revoke_session`, `prune_sessions`, `restore_session` and
+  `kill_switch` (2 keys since 3 October 2026: the `revoked:clients` set, slot 2773,
+  and `revoked:client-at:<client_id>`, slot 8708 for `vendor-x`; it was a single-key
+  `SADD` before), `revoke_session`, `prune_sessions`, `restore_session` and
   `unindexed_session_count` (2 keys each; for `revoke_session` this means the
   opportunistic prune after it never runs, because the revoke itself raised), the
   refresh-family store's `discard`, the conflict revoke inside `claim_scan`, and
@@ -172,9 +175,10 @@ cluster endpoints were not measured):
   (primary and index in one `MULTI`). The `user_code` and display-handle keys are
   claimed first with `SET NX EX` and stay until their TTL; no primary and no index
   entry exist afterwards.
-- **Work, because each command touches one key:** `kill_switch`, `entries`,
-  `is_revoked` (a non-transactional pipeline), `customer_revoked_at`,
-  `is_customer_revoked`, the refresh store's `create`, `get`, `rotate` and
+- **Work, because each command touches one key:** `restore_client` (one `SREM`),
+  `entries`, `is_revoked` (a non-transactional pipeline, including its `GET`s of
+  the `client-at` and `pair-at` stamps, measured with a seeded entry and stamp),
+  `customer_revoked_at`, `client_revoked_at`, `is_customer_revoked`, the refresh store's `create`, `get`, `rotate` and
   `revoke` (`WATCH`/`MULTI` on one key), the device-code store's lookups,
   `claim_scan` (first scan), `approve_scanned` and `consume_device_code`, the
   risk session store, and the customer rate limiter.
@@ -204,7 +208,8 @@ cluster endpoints were not measured):
   other than `/0` fails earlier: `SELECT is not allowed in cluster mode`.
 - **A hash tag works.** With a prefix such as `{postern}:` in
   `POSTERN_REDIS_KEY_PREFIX` every key lands in one slot. Driven with a tagged
-  prefix: both revocation scripts, `prune_sessions`, `restore_session`,
+  prefix: all three revocation scripts (customer-client, session, kill switch),
+  `restore_client`, `client_revoked_at`, `prune_sessions`, `restore_session`,
   `unindexed_session_count`, `is_revoked`, the refresh `create` and `discard`, and
   the whole device-code lifecycle (create, first scan, conflict revoke). The
   single-key operations were not re-run tagged; they work by inference, since
@@ -227,6 +232,23 @@ token from some other issuer would be pruned after 930 seconds while that
 token could still verify. It also assumes confirm's clock is not ahead of the
 api's by more than about 330 seconds and that Redis `TIME` does not jump
 forward by more than about 330 seconds between a revoke and a prune.
+
+**`revoked:client-at:<client_id>` (3 October 2026).** A kill switch stamps when
+it was written, in milliseconds on Redis `TIME`, in the same script as its
+`SADD`. `restore-kill-switch` leaves the stamp, and it expires after 3,900
+seconds (`CLIENT_REVOKED_AT_TTL_SECONDS`: the 3,600-second refresh-family
+lifetime plus a 300-second margin, which also covers the 930 seconds the api's
+access-token floor needs). While it exists the api refuses an access token of
+that client whose `iat` is not more than 2 seconds past the stamp, and confirm
+refuses and permanently revokes a refresh family of that client created at or
+before it. While the switch stands, confirm also refuses to exchange a device
+code carrying that `client_id`; the code stays unspent and exchanges after the
+restore. So a restored kill switch lets the client back in for tokens and
+pairings issued after the kill, not for what existed at it. The kill switch
+keys on the `client_id` a pairing declares, which the browser chooses: a client
+that declares a different id is not stopped by it, at the api or at the
+exchange. Cut a specific customer with `customer-client` instead. `restore-session`
+writes no stamp: it serves the one named access token again and nothing else.
 
 **Redis 5.0 or later, 7.0 or later recommended, with scripting enabled.** The
 customer revocation script reads `TIME` and then writes, which is safe only
@@ -256,7 +278,7 @@ refuses `CONFIG`, as managed Redis often does, the policy cannot be verified: on
 warning is logged and the service starts, so check the setting by hand there. The
 check runs once at boot; a later `CONFIG SET` is not detected.
 
-**Clock skew under 2 seconds.** Keep the offset between the confirm service host and this Redis under 2 seconds (NTP or chrony on both, with monitoring). The approval check (`APPROVAL_CLOCK_TOLERANCE_MS`) and the per-pair revocation floor (`PAIR_IAT_TOLERANCE_MS`) compare confirm's clock with Redis `TIME` and allow 2000 ms. Beyond that, a revocation stamp can miss an approval it should refuse, and tokens minted just before a per-pair stamp pass the api's floor, so a restore revives them.
+**Clock skew under 2 seconds.** Keep the offset between the confirm service host and this Redis under 2 seconds (NTP or chrony on both, with monitoring). The approval check (`APPROVAL_CLOCK_TOLERANCE_MS`) and the per-pair and per-client revocation floors (`PAIR_IAT_TOLERANCE_MS`) compare confirm's clock with Redis `TIME` and allow 2000 ms. Beyond that, a revocation stamp can miss an approval it should refuse, and tokens minted just before a per-pair or per-client stamp pass the api's floor, so a restore revives them.
 
 Both services measure this at startup when `POSTERN_REDIS_URL` is set and
 **refuse to start** (`RedisPreflightError`) when the skew is past 2000 ms. The
@@ -312,7 +334,7 @@ Derived from the code, not from a command category. The key patterns assume the 
 | `postern_confirm` | `postern:device:*` | `SET` (NX EX, KEEPTTL), `SETEX`, `GET`, `DEL`, `ZADD`, `ZREM`, `ZREMRANGEBYSCORE`, `ZCARD`, `WATCH`, `EVAL` (script runs `GET` and `DEL`) | `RedisDeviceCodeStore` |
 | `postern_confirm` | `postern:refresh:*` | `SET` (NX EX, KEEPTTL), `GET`, `DEL`, `ZADD`, `ZREM`, `ZREMRANGEBYSCORE`, `ZCARD`, `WATCH` | `RedisRefreshSessionStore` |
 | `postern_confirm` | `postern:revoked:sessions`, `postern:revoked:sessions:exp` (write) | `EVAL` (scripts run `SADD`, `ZSCORE`, `ZADD`, `ZRANGEBYSCORE`, `SREM`, `ZREM`) | `RedisRevocationStore.revoke_session`, `prune_sessions` |
-| `postern_confirm` | `postern:revoked:*` (read-only, `%R~`) | `SISMEMBER`, `SMEMBERS`, `GET` | `is_revoked`, `is_customer_revoked`, `customer_revoked_at` |
+| `postern_confirm` | `postern:revoked:*` (read-only, `%R~`) | `SISMEMBER`, `SMEMBERS`, `GET` | `is_revoked`, `is_customer_revoked`, `customer_revoked_at`, `client_revoked_at` |
 | `postern_confirm` | `postern:ratelimit:*` | `SET` (NX EX), `INCRBY` (what redis-py sends for `incr`), `TTL` | `RedisCustomerRateLimitStore.charge` |
 | both | none | `TIME`, `CONFIG GET`, `CLIENT SETINFO` | `run_redis_preflight`; redis-py on connect |
 | `postern_confirm` | none | `MULTI`, `EXEC`, `UNWATCH` | the transaction envelope redis-py wraps around `WATCH` |
@@ -369,6 +391,15 @@ docker compose run --rm revoke list
 In a deployment, give the operator's own ACL user the same grants, a real password and
 `rediss://`, and run the CLI from a bastion or one-off task that can reach Redis. The
 patterns follow `POSTERN_REDIS_KEY_PREFIX` if you change it.
+
+Since 3 October 2026 `kill-switch` is one `EVAL` whose script runs `TIME`, `SADD` on
+`postern:revoked:clients` and `SET ... EX` on `postern:revoked:client-at:<client_id>`
+(before, it was a bare `SADD`). `postern_operator` already covers it: `+time`,
+`+eval`, `+sadd` and `+set` on `~postern:revoked:*`, and `TestOperatorUser` runs
+`kill_switch` as that user with no ACL denial. If you write your own operator user
+with narrower patterns, it needs `SET` on `revoked:client-at:*` as well as `SADD` on
+`revoked:clients`. `restore-kill-switch` is still a bare `SREM` on
+`postern:revoked:clients` and leaves the stamp.
 
 ## ContextVar Pattern (Per-Call Access)
 

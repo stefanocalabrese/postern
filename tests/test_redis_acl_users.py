@@ -213,15 +213,21 @@ class TestApiUser:
         await confirm_revocations.revoke_session(jti="tok-api-1")
         operator = RedisRevocationStore(url=_url(acl_redis, ADMIN))
         await operator.revoke_customer_client(customer_ref="cust_a", client_id="vendor")
+        # A restored kill switch leaves its client-at stamp, which the api reads.
+        # Its own client name, so the stamp reaches no other test's claims.
+        await operator.kill_switch(client_id="vendor-killed")
+        await operator.restore_client(client_id="vendor-killed")
         await operator.close()
         api_revocations = RedisRevocationStore(url=api_url)
-        # RevocationMiddleware.dispatch: SISMEMBER x3 and GET of the pair floor,
-        # in one non-transactional pipeline.
+        # RevocationMiddleware.dispatch: SISMEMBER x3 and GETs of the pair and
+        # client floors, in one non-transactional pipeline.
         claims = {"jti": "tok-api-1", "sub": "cust_a", "client_id": "vendor", "iat": 1}
         assert await api_revocations.is_revoked(claims) is True
         assert await api_revocations.is_revoked({"jti": "other", "sub": "z", "client_id": "q"}) is (
             False
         )
+        killed = {"jti": "other", "sub": "z", "client_id": "vendor-killed", "iat": 1}
+        assert await api_revocations.is_revoked(killed) is True, "the client floor was read"
 
         # The risk-session store: load (GET, EXPIRE), save (SETEX), remove (DEL).
         sessions = RedisSessionStore(url=api_url, ttl=1800)
@@ -247,6 +253,7 @@ class TestApiUser:
             ("SADD", "postern:revoked:sessions", "x"),
             ("SREM", "postern:revoked:sessions", "x"),
             ("SET", "postern:revoked:pair-at:x", "1"),
+            ("SET", "postern:revoked:client-at:x", "1"),
             ("ZADD", "postern:revoked:sessions:exp", "1", "x"),
             ("DEL", "postern:revoked:sessions"),
             ("SMEMBERS", "postern:revoked:sessions"),
@@ -382,6 +389,8 @@ class TestConfirmUser:
         claims = {"jti": "j", "sub": "cust_c", "client_id": "vendor", "iat": 1}
         assert await revocations.is_revoked(claims) is False
         assert await revocations.customer_revoked_at("cust_c") is None
+        # The refresh path's kill-switch stamp: GET on revoked:client-at.
+        assert await revocations.client_revoked_at("vendor") is None
 
         # ... and the prune that removes an entry past its retention: the
         # Lua script's ZRANGEBYSCORE, SREM and ZREM, which only run when
@@ -440,6 +449,7 @@ class TestConfirmUser:
         for command in (
             ("DEL", "postern:revoked:sessions"),
             ("SET", "postern:revoked:customer-at:cust", "1"),
+            ("SET", "postern:revoked:client-at:vendor", "1"),
             ("EXPIRE", "postern:revoked:sessions", "1"),
             ("SADD", "postern:revoked:clients", "vendor"),
             ("SREM", "postern:revoked:clients", "vendor"),
@@ -505,6 +515,8 @@ class TestOperatorUser:
             # kill-switch / restore-kill-switch
             await store.kill_switch(client_id="vendor-a")
             assert "vendor-a" in (await store.entries()).clients
+            # The script's SET of the stamp ran under the operator's ACL too.
+            assert await admin.get("postern:revoked:client-at:vendor-a") is not None
             await store.restore_client(client_id="vendor-a")
             final = await store.entries()
             assert "vendor-a" not in final.clients

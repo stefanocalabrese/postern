@@ -33,7 +33,14 @@
 > - **The revocation checks at every refresh**: the customer, the
 >   customer-client pair, the kill switch, every live access `jti`, and a
 >   family created at or before a customer revocation is refused and revoked
->   for good.
+>   for good. **Amended 3 October 2026:** the same now holds for a family
+>   created at or before a kill switch, once the switch is restored, and the
+>   api refuses an access token minted before a restored kill switch. Until
+>   then a restored kill switch revived both, an accepted residual in the
+>   session-token spec that is now closed. The device-code exchange also
+>   refuses a client whose kill switch stands, so no family is created during
+>   a kill. A client that declares a different `client_id` is still not
+>   stopped by any of this.
 >
 > Not built, and needed before a revoked-`jti` set can be pruned: neither
 > revocation store records when a revoked `jti` expires, so the set only grows.

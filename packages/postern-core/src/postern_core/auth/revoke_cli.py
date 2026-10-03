@@ -53,7 +53,16 @@ be pruned while that token could still verify.
 
 ``kill-switch`` does NOT stop a payment approval either. The ``challenges``
 row does not record which vendor created it, so enforcing a kill switch there
-would refuse every customer's approvals rather than that client's.
+would refuse every customer's approvals rather than that client's. It does
+stop, while it stands, the device-grant exchange and the refresh of any
+session declaring that ``client_id`` (since 3 October 2026 for the exchange).
+A client that declares a different ``client_id`` is not stopped by it.
+
+WHAT A RESTORE BRINGS BACK. ``restore-customer-client`` and
+``restore-kill-switch`` let the identity back in for what is issued AFTER the
+revocation; an access token or refresh family that existed at it stays
+refused (the stamps in `postern_core.auth.revocation`). ``restore-session``
+serves the one named access token again and nothing else.
 
 So an operator cutting a compromised session runs ``session`` AND
 ``customer-client``: the first stops the reads, the second stops the money.
@@ -125,14 +134,29 @@ def _parser() -> argparse.ArgumentParser:
     )
     kill.add_argument("client_id")
 
-    restore_session = sub.add_parser("restore-session", help="undo `session`")
+    restore_session = sub.add_parser(
+        "restore-session",
+        help=(
+            "undo `session`: serves that one access token again for the rest of its "
+            "600 s; a family revoked by reuse, recall or issued_before_revocation "
+            "stays revoked, and if the family is presented again, its live jtis "
+            "are listed again"
+        ),
+    )
     restore_session.add_argument("jti")
 
     restore_pair = sub.add_parser("restore-customer-client", help="undo `customer-client`")
     restore_pair.add_argument("customer_ref")
     restore_pair.add_argument("client_id")
 
-    restore_kill = sub.add_parser("restore-kill-switch", help="undo `kill-switch`")
+    restore_kill = sub.add_parser(
+        "restore-kill-switch",
+        help=(
+            "undo `kill-switch` for what is issued after it: access tokens and "
+            "refresh families that existed at the kill stay refused (the families "
+            "are revoked at their next refresh)"
+        ),
+    )
     restore_kill.add_argument("client_id")
 
     prune = sub.add_parser(
