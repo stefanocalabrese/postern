@@ -153,6 +153,22 @@ store's `discard` deletes a family's key and its index entry in one
 different slots with `CROSSSLOT`, and none of the key names this code builds
 carries a hash tag.
 
+The session revocation set `revoked:sessions` has a companion sorted set,
+`revoked:sessions:exp` (member `jti`, score the instant after which the entry
+may be removed, in milliseconds). Both are written by one script and pruned by
+another, so they must share a slot as well. The set itself has no TTL; entries
+older than 930 seconds are removed by the prune that each session revoke runs
+(up to 1,000 per call) and by `revoke.py prune-sessions`. A `revoked:sessions`
+member written by your own backend with a plain `SADD` has no `:exp` entry and
+is never pruned; `prune-sessions` prints a lower bound on how many such
+members exist. The 930-second retention assumes `POSTERN_JWKS_URI` names
+confirm's `/session/jwks.json`, so every revoked `jti` belongs to a token that
+lives 600 seconds. A `jti` revoked with the `session` verb for a longer-lived
+token from some other issuer would be pruned after 930 seconds while that
+token could still verify. It also assumes confirm's clock is not ahead of the
+api's by more than about 330 seconds and that Redis `TIME` does not jump
+forward by more than about 330 seconds between a revoke and a prune.
+
 **Redis 5.0 or later, 7.0 or later recommended, with scripting enabled.** The
 customer revocation script reads `TIME` and then writes, which is safe only
 under effects replication. The Redis scripting introduction

@@ -195,3 +195,10 @@ See also: `dev-docs/postern-zero-trust-plan.md` §4 (ZT-6 work item),
 `docs/superpowers/plans/postern-foundation-and-read-surface-2026-09-12.md`
 (DPoP investigation, line 44).
 
+> **Amended 3 October 2026.** Session-revocation pruning is now built, which
+> corrects the "Not built" paragraph in the layer-1 amendment above: a companion
+> sorted set `revoked:sessions:exp` (score: prune-after instant, ms) is written
+> beside the `SADD`, entries are removed 930 s after the write, and
+> `revoke.py prune-sessions` runs a batch on demand. Members written by a plain
+> `SADD` have no index entry and are never pruned. See
+> `dev-docs/device-grant-session-token-spec.md` section 11.

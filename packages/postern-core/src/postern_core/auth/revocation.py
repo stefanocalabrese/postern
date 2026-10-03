@@ -106,6 +106,20 @@ after thirty minutes, the way a risk context does, would be worse than no
 kill switch: the operator would have acted once and been un-acted on by a
 timer. Every scope has an explicit restore command instead.
 
+ONE SET IS PRUNED, BECAUSE ITS ENTRIES DIE ON THEIR OWN. Keys (all under the
+configured prefix): ``revoked:sessions`` (SET of access-token ``jti``),
+``revoked:sessions:exp`` (ZSET index, member ``jti``, score the prune-after
+instant in ms), ``revoked:customer-clients`` (SET), ``revoked:clients`` (SET),
+``revoked:customer-at:<customer>`` and ``revoked:pair-at:<pair>`` (stamps with
+TTLs). A ``jti`` in ``revoked:sessions`` names a layer-1 access token that is
+useless once it expires, so `revoke_session` writes the SET member and the
+index entry in one script and `prune_sessions` removes both after
+`SESSION_REVOKED_RETENTION_SECONDS`. ``is_revoked`` still reads only the SET.
+A SET member with no index entry (the operator's own backend writing a plain
+``SADD``, which the paragraph above sanctions) is never pruned, and
+``revoke.py prune-sessions`` prints how many exist. The other two sets hold
+operator decisions, not token ids, and are never pruned.
+
 ONE KEY THAT DOES EXPIRE, AND IT IS NOT A REVOCATION. Every customer-plus-client
 revocation also stamps WHEN it was written, per customer, in milliseconds:
 ``customer_revoked_at``. The layer-1 session token compares that instant with
@@ -222,6 +236,62 @@ CUSTOMER_REVOKED_AT_TTL_SECONDS = 3_600 + 900 + REVOKED_AT_MARGIN_SECONDS
 #: because this one guards access tokens, not refresh families.
 PAIR_REVOKED_AT_TTL_SECONDS = (
     ACCESS_TOKEN_LIFETIME_SECONDS + SESSION_CLOCK_SKEW_SECONDS + REVOKED_AT_MARGIN_SECONDS
+)
+
+#: How long a revoked session ``jti`` stays in ``revoked:sessions`` before a
+#: prune may remove it, counted from the write: access lifetime (600 s) +
+#: ``SESSION_CLOCK_SKEW_SECONDS`` (30 s) + ``REVOKED_AT_MARGIN_SECONDS`` (300 s)
+#: = 930 s, the same sum and the same reasoning as `PAIR_REVOKED_AT_TTL_SECONDS`.
+#: Every ``jti`` written there names a layer-1 access token, which confirm
+#: stamps ``exp = iat + 600`` and which the api's verifier refuses if its ``exp``
+#: lies more than 630 s ahead of its own clock, and the write happens at or
+#: after the mint, so ``exp <= write + 600``; the 30 s and the 300 s are slack.
+#: After this long the token cannot verify, so the entry protects nothing.
+#: ASSUMPTIONS, all operator-owned: (a) confirm is the only issuer the api
+#: trusts (``POSTERN_JWKS_URI`` names confirm's ``/session/jwks.json``); a
+#: foreign issuer's token living past about 930 s would be re-admitted by the
+#: prune. (b) confirm's clock is not ahead of the api's by more than about
+#: 330 s plus the mint-to-write gap. (c) Redis ``TIME`` does not step forward
+#: by more than about 330 s between the write and the prune (NTP step, or a
+#: failover to a replica with a fast clock).
+SESSION_REVOKED_RETENTION_SECONDS = (
+    ACCESS_TOKEN_LIFETIME_SECONDS + SESSION_CLOCK_SKEW_SECONDS + REVOKED_AT_MARGIN_SECONDS
+)
+
+#: How many expired entries one opportunistic prune (inside `revoke_session`)
+#: and one ``prune-sessions`` run remove at most, so a revoke is never slowed
+#: by a large backlog.
+SESSION_PRUNE_BATCH = 1_000
+
+#: A session revocation and its prune-after instant, as ONE server-side step on
+#: ONE clock: ``TIME``, ``SADD`` into the membership SET, then ``ZADD`` into the
+#: ``:exp`` index with a score that never goes DOWN (so re-asserting a ``jti``
+#: cannot shorten its retention). Done by hand and not with ``ZADD GT``, which
+#: needs Redis 6.2 while this module documents 5.0. KEYS: set, index. ARGV:
+#: jti, retention in milliseconds.
+_REVOKE_SESSION = (
+    "local t = redis.call('TIME') "
+    "local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) "
+    "local score = ms + tonumber(ARGV[2]) "
+    "redis.call('SADD', KEYS[1], ARGV[1]) "
+    "local cur = redis.call('ZSCORE', KEYS[2], ARGV[1]) "
+    "if (not cur) or tonumber(cur) < score then "
+    "redis.call('ZADD', KEYS[2], score, ARGV[1]) end "
+    "return score"
+)
+
+#: Remove up to ARGV[1] entries whose score is at or before Redis ``TIME``,
+#: from the index and from the SET, in one atomic step. Returns the count.
+#: Members of the SET with no index entry are not visible to it. KEYS: set,
+#: index.
+_PRUNE_SESSIONS = (
+    "local t = redis.call('TIME') "
+    "local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) "
+    "local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ms, 'LIMIT', 0, tonumber(ARGV[1])) "
+    "for _, id in ipairs(ids) do "
+    "redis.call('SREM', KEYS[1], id) "
+    "redis.call('ZREM', KEYS[2], id) end "
+    "return #ids"
 )
 
 #: How far an access token's ``iat`` may sit past the pair stamp and still be
@@ -567,6 +637,30 @@ class RevocationStoreBase(ABC):
     async def entries(self) -> RevocationSnapshot:
         """Everything currently revoked."""
 
+    async def prune_sessions(self, *, limit: int = SESSION_PRUNE_BATCH) -> int:
+        """Remove up to ``limit`` session entries past their retention; return how many.
+
+        Only ``jti`` values that `revoke_session` indexed are ever removed. A
+        member written by anything else (the operator's backend with a plain
+        ``SADD``, or this module before the index existed) has no expiry on
+        record and stays, as it did before pruning existed.
+
+        CONCRETE AND ``0`` BY DEFAULT, like `customer_revoked_at`, so a test
+        double that implements only the abstract methods keeps working: a store
+        with no index has nothing it may prune. Raises
+        `RevocationStoreUnavailable` when the store cannot answer.
+        """
+        return 0
+
+    async def unindexed_session_count(self) -> int:
+        """A lower bound on revoked ``jti`` values with no expiry record (never pruned).
+
+        Exact in memory. On Redis it is ``SCARD`` minus ``ZCARD``, which
+        understates if a backend ``SREM``s set members while their index
+        entries remain.
+        """
+        return 0
+
     async def is_customer_revoked(self, customer_ref: str) -> bool:
         """Whether ANY revocation names this customer, whatever the client.
 
@@ -654,6 +748,8 @@ class InMemoryRevocationStore(RevocationStoreBase):
         #: ``(customer_ref, client_id) -> (stamp ms, expiry ms)``, swept on
         #: read: the api's ``iat`` floor, on the same clock as ``_revoked_at``.
         self._pair_revoked_at: dict[tuple[str, str], tuple[int, int]] = {}
+        #: ``jti -> prune-after instant in ms``: the twin of the ``:exp`` index.
+        self._session_expiry: dict[str, int] = {}
 
     async def is_revoked(self, claims: Mapping[str, Any]) -> bool:
         """Applies the pair floor only when the claims carry an iat key.
@@ -679,12 +775,43 @@ class InMemoryRevocationStore(RevocationStoreBase):
         return _below_pair_floor(claims["iat"], stamp)
 
     async def revoke_session(self, *, jti: str) -> None:
+        await self._revoke_session_for(jti, SESSION_REVOKED_RETENTION_SECONDS * 1000)
+        try:
+            await self.prune_sessions()
+        except Exception:
+            logger.warning("session revocation prune failed; the revoke stands", exc_info=True)
+
+    async def _revoke_session_for(self, jti: str, retention_ms: int) -> None:
+        """Revoke ``jti`` and index it to be pruned ``retention_ms`` from now.
+
+        The index score only ever moves up. Split from `revoke_session` so a
+        test can write an instant that is already past without sleeping.
+        """
         self._list.revoke_session(jti=jti)
         self._sessions.add(jti)
+        score = _now_ms() + retention_ms
+        current = self._session_expiry.get(jti)
+        if current is None or current < score:
+            self._session_expiry[jti] = score
 
     async def restore_session(self, *, jti: str) -> None:
         self._list.restore_session(jti=jti)
         self._sessions.discard(jti)
+        self._session_expiry.pop(jti, None)
+
+    async def prune_sessions(self, *, limit: int = SESSION_PRUNE_BATCH) -> int:
+        now = _now_ms()
+        due = sorted((score, jti) for jti, score in self._session_expiry.items() if score <= now)[
+            :limit
+        ]
+        for _score, jti in due:
+            self._list.restore_session(jti=jti)
+            self._sessions.discard(jti)
+            del self._session_expiry[jti]
+        return len(due)
+
+    async def unindexed_session_count(self) -> int:
+        return len(self._sessions - self._session_expiry.keys())
 
     async def revoke_customer_client(self, *, customer_ref: str, client_id: str) -> None:
         self._list.revoke_customer_client(customer_ref=customer_ref, client_id=client_id)
@@ -787,6 +914,11 @@ class RedisRevocationStore(RevocationStoreBase):
         return f"{self._prefix}revoked:sessions"
 
     @property
+    def _sessions_exp_key(self) -> str:
+        """The ZSET index: member ``jti``, score its prune-after instant in ms."""
+        return f"{self._prefix}revoked:sessions:exp"
+
+    @property
     def _pairs_key(self) -> str:
         return f"{self._prefix}revoked:customer-clients"
 
@@ -873,10 +1005,68 @@ class RedisRevocationStore(RevocationStoreBase):
             ) from exc
 
     async def revoke_session(self, *, jti: str) -> None:
-        await self._add(self._sessions_key, jti)
+        """The SET member and its index entry, in one script; then a bounded prune.
+
+        The prune is best effort: its failure is logged and the revoke stands.
+        """
+        await self._revoke_session_for(jti, SESSION_REVOKED_RETENTION_SECONDS * 1000)
+        try:
+            await self.prune_sessions()
+        except Exception:
+            logger.warning("session revocation prune failed; the revoke stands", exc_info=True)
+
+    async def _revoke_session_for(self, jti: str, retention_ms: int) -> None:
+        """Revoke ``jti`` and index it to be pruned ``retention_ms`` after Redis ``TIME``."""
+        try:
+            await self._redis.eval(
+                _REVOKE_SESSION, 2, self._sessions_key, self._sessions_exp_key, jti, retention_ms
+            )
+        except Exception as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation entry could not be written: {type(exc).__name__}"
+            ) from exc
 
     async def restore_session(self, *, jti: str) -> None:
-        await self._remove(self._sessions_key, jti)
+        """Remove the member AND its index entry.
+
+        A stale index entry would NOT prune a later `revoke_session` of the
+        same ``jti`` early (the score only moves up, so the newer one wins).
+        The cleanup matters because the operator's backend may re-add the
+        ``jti`` with a plain ``SADD`` after the restore, and a stale entry
+        whose score is already past would then prune that member.
+        """
+        try:
+            pipe = self._redis.pipeline(transaction=True)
+            pipe.srem(self._sessions_key, jti)
+            pipe.zrem(self._sessions_exp_key, jti)
+            await pipe.execute()
+        except Exception as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation entry could not be removed: {type(exc).__name__}"
+            ) from exc
+
+    async def prune_sessions(self, *, limit: int = SESSION_PRUNE_BATCH) -> int:
+        try:
+            removed = await self._redis.eval(
+                _PRUNE_SESSIONS, 2, self._sessions_key, self._sessions_exp_key, limit
+            )
+        except Exception as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation list could not be pruned: {type(exc).__name__}"
+            ) from exc
+        return int(removed)
+
+    async def unindexed_session_count(self) -> int:
+        try:
+            pipe = self._redis.pipeline(transaction=True)
+            pipe.scard(self._sessions_key)
+            pipe.zcard(self._sessions_exp_key)
+            members, indexed = await pipe.execute()
+        except Exception as exc:
+            raise RevocationStoreUnavailable(
+                f"revocation list could not be counted: {type(exc).__name__}"
+            ) from exc
+        return max(0, int(members) - int(indexed))
 
     async def revoke_customer_client(self, *, customer_ref: str, client_id: str) -> None:
         """The pair's ``SADD`` and the customer's stamp, in one script on Redis's clock."""

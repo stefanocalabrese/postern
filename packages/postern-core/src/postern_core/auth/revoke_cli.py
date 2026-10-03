@@ -17,6 +17,13 @@ applies to all of them on their next call, with no deploy and no restart::
     POSTERN_REDIS_URL=rediss://... uv run python tools/revoke.py \\
         customer-client cust_7f3a vendor-claude
     POSTERN_REDIS_URL=rediss://... uv run python tools/revoke.py session tok-9f2a
+    POSTERN_REDIS_URL=rediss://... uv run python tools/revoke.py prune-sessions [--limit N]
+
+``prune-sessions`` removes revoked session ``jti`` values whose access token
+has expired (one batch of at most ``--limit``, default 1000) and prints the
+count removed, then how many revoked sessions have no expiry index and are
+therefore never pruned (at least that many; members written by a plain
+``SADD`` rather than by ``session``). Every ``session`` revoke also prunes one batch itself.
 
 WITHOUT ``POSTERN_REDIS_URL`` THIS COMMAND DOES NOTHING USEFUL.
 `create_revocation_store` falls back to an in-process store, so the entry is
@@ -38,6 +45,11 @@ tell the clients apart.
 ``session`` does NOT stop a payment approval. The ``jti`` you name is the AI
 client's access token, and the write path is called by the banking app
 holding an assertion from a different issuer, which carries no such value.
+
+``session`` entries are pruned 930 s after they are written, which is safe
+only because POSTERN_JWKS_URI names confirm's ``/session/jwks.json`` and
+confirm's tokens live 600 s. A ``jti`` of a longer-lived foreign token would
+be pruned while that token could still verify.
 
 ``kill-switch`` does NOT stop a payment approval either. The ``challenges``
 row does not record which vendor created it, so enforcing a kill switch there
@@ -62,7 +74,12 @@ import sys
 from collections.abc import Sequence
 from typing import TextIO
 
-from postern_core.auth.revocation import RevocationStoreBase, create_revocation_store
+from postern_core.auth.revocation import (
+    SESSION_PRUNE_BATCH,
+    RevocationStoreBase,
+    RevocationStoreUnavailable,
+    create_revocation_store,
+)
 from postern_core.config import redis_url_from_env
 
 _NO_REDIS_WARNING = (
@@ -72,6 +89,13 @@ _NO_REDIS_WARNING = (
 )
 
 
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="revoke",
@@ -79,7 +103,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    session = sub.add_parser("session", help="revoke one session by the access token's jti")
+    session = sub.add_parser(
+        "session",
+        help=(
+            "revoke one session by the access token's jti (pruned 930 s later; "
+            "supported only for tokens confirm issued)"
+        ),
+    )
     session.add_argument("jti")
 
     pair = sub.add_parser(
@@ -105,11 +135,40 @@ def _parser() -> argparse.ArgumentParser:
     restore_kill = sub.add_parser("restore-kill-switch", help="undo `kill-switch`")
     restore_kill.add_argument("client_id")
 
+    prune = sub.add_parser(
+        "prune-sessions",
+        help="remove revoked session jtis whose token has expired; print how many",
+    )
+    prune.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=SESSION_PRUNE_BATCH,
+        help=f"most entries to remove in this run (default {SESSION_PRUNE_BATCH})",
+    )
+
     sub.add_parser("list", help="print every entry currently revoked")
     return parser
 
 
-async def _run(args: argparse.Namespace, store: RevocationStoreBase, out: TextIO) -> int:
+async def _run(
+    args: argparse.Namespace,
+    store: RevocationStoreBase,
+    out: TextIO,
+    err: TextIO | None = None,
+) -> int:
+    if args.command == "prune-sessions":
+        try:
+            removed = await store.prune_sessions(limit=args.limit)
+            unindexed = await store.unindexed_session_count()
+        except RevocationStoreUnavailable as exc:
+            print(f"prune-sessions failed: {exc}", file=err or sys.stderr)
+            return 1
+        print(f"pruned {removed} expired session entries", file=out)
+        print(
+            f"at least {unindexed} revoked sessions without an expiry index (never pruned)",
+            file=out,
+        )
+        return 0
     if args.command == "session":
         await store.revoke_session(jti=args.jti)
         print(f"revoked session {args.jti}", file=out)
@@ -145,7 +204,7 @@ async def _run(args: argparse.Namespace, store: RevocationStoreBase, out: TextIO
 
 
 async def _main_async(
-    args: argparse.Namespace, store: RevocationStoreBase | None, out: TextIO
+    args: argparse.Namespace, store: RevocationStoreBase | None, out: TextIO, err: TextIO
 ) -> int:
     """One event loop for the command AND the close.
 
@@ -159,7 +218,7 @@ async def _main_async(
     owned = store is None
     store = store or create_revocation_store()
     try:
-        return await _run(args, store, out)
+        return await _run(args, store, out, err)
     finally:
         if owned:
             await store.close()
@@ -188,7 +247,7 @@ def main(
     err = err or sys.stderr
     args = _parser().parse_args(argv)
     owned = store is None
-    code = asyncio.run(_main_async(args, store, out))
+    code = asyncio.run(_main_async(args, store, out, err))
     if owned and not redis_url_from_env():
         print(_NO_REDIS_WARNING, file=err)
         return 1
