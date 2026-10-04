@@ -42,6 +42,7 @@ from postern_core.domain.verification import VerificationTier
 # services.confirm`, and this is neither.
 from postern_core.facade.client import BackendRequestHook
 from postern_core.modules.write import WriteOperation, WriteSeamViolation, load_write_modules
+from postern_core.payments import CREATE_PAYMENT_TOOL, PAYMENT_TIER
 
 from services.confirm.minter import WRITE_SCOPES, WriteTokenMinter
 
@@ -114,11 +115,11 @@ class _MinterProtocol(Protocol):
 #: limit increases, and tier 1 is the default for everything else a write does.
 BUILTIN_WRITE_OPERATIONS: tuple[WriteOperation, ...] = (
     WriteOperation(
-        tool_name="payments.create_payment",
+        tool_name=CREATE_PAYMENT_TOOL,
         audience="payments.svc",
         path_template="/payments",
         method="POST",
-        tier=VerificationTier.APP_IDENTITY_VERIFICATION,
+        tier=PAYMENT_TIER,
     ),
     WriteOperation(
         tool_name="accounts.rename",
