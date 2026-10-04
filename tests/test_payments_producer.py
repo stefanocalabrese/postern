@@ -15,6 +15,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from decimal import Decimal
+from typing import Any
 
 import httpx2
 import pytest
@@ -40,7 +41,7 @@ from postern_core.payments import (
 from postern_core.store import challenges as store
 from postern_core.store.engine import Database
 from postern_core.store.models import ChallengeRecord
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 
 from services.api.server import build_server
 from services.api.settings import Settings
@@ -48,6 +49,7 @@ from services.api.tools.payments import (
     ACCOUNT_NOT_FOUND,
     AMOUNT_INVALID,
     CHALLENGE_NOT_FOUND,
+    CHALLENGE_UNREADABLE,
     NOT_RECORDED,
     PAYEE_NOT_FOUND,
     REFERENCE_NOT_PRINTABLE,
@@ -561,6 +563,24 @@ async def test_without_payments_consent_the_tool_is_unlisted_and_unknown(
     assert await rows(produced) == []
 
 
+async def test_without_payments_consent_the_status_tool_is_unlisted_and_unknown(
+    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+) -> None:
+    await grant(produced, OWNER, "accounts")
+    expired = await insert_row(
+        produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
+    )
+    token = token_for(key_pair, OWNER)
+    assert PAYMENT_STATUS_TOOL not in await list_tool_names(pg_url, key_pair, token)
+    response = await call_tool(
+        pg_url, key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": expired}
+    )
+    assert [block["text"] for block in result_of(response)["content"]] == [
+        f"Unknown tool: '{PAYMENT_STATUS_TOOL}'"
+    ]
+    assert await status_of(produced, expired) == "pending"
+
+
 async def test_with_payments_consent_the_tool_is_listed(
     pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
 ) -> None:
@@ -600,15 +620,14 @@ async def test_a_proposal_completes_through_a_pool_of_one(
     assert result_of(response)["isError"] is False, response.text
 
 
+@pytest.mark.parametrize("tool_name", [CREATE_PAYMENT_TOOL, PAYMENT_STATUS_TOOL])
 async def test_the_registered_tool_declares_exactly_these_annotations(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP, tool_name: str
 ) -> None:
     await grant(produced, OWNER, "payments")
     app = producer_app(pg_url, key_pair)
     response = await post_rpc(app, token_for(key_pair, OWNER), "tools/list", {})
-    (tool,) = [
-        t for t in json.loads(response.text)["result"]["tools"] if t["name"] == CREATE_PAYMENT_TOOL
-    ]
+    (tool,) = [t for t in json.loads(response.text)["result"]["tools"] if t["name"] == tool_name]
     annotations = tool["annotations"]
     assert (
         annotations["readOnlyHint"],
@@ -637,10 +656,18 @@ def payment_status(database: Database, *, customer: str = OWNER) -> ToolHandler:
     )
 
 
-async def insert_row(database: Database, *, customer_ref: str, tool_name: str) -> str:
+async def insert_row(
+    database: Database,
+    *,
+    customer_ref: str,
+    tool_name: str,
+    payload: Any = None,
+    past_deadline: bool = False,
+) -> str:
     """A pending row the producer did not make through its handler: another
-    customer's, or another tool's. Fingerprinted, so the `produced` fixture
-    deletes it."""
+    customer's, or another tool's, or one with a payload of any shape.
+    Fingerprinted, so the `produced` fixture deletes it. `past_deadline` moves
+    `expires_at` into the past, still `pending`."""
     challenge_id = uuid.uuid4().hex
     async with database.sessionmaker() as s:
         await store.create_pending_challenge_once(
@@ -648,14 +675,34 @@ async def insert_row(database: Database, *, customer_ref: str, tool_name: str) -
             challenge_id=challenge_id,
             customer_ref=customer_ref,
             tool_name=tool_name,
-            payload={"amount": "1.00", "currency": "EUR"},
+            payload=(
+                {"amount": "1.00", "currency": "EUR", "payee_name": "Payee"}
+                if payload is None
+                else payload
+            ),
             tier=PAYMENT_TIER,
             request_fingerprint=challenge_id * 2,
             client_id=None,
             session_jti=None,
         )
+        if past_deadline:
+            await s.execute(
+                text(
+                    "UPDATE challenges SET expires_at = now() - interval '1 second' "
+                    "WHERE challenge_id = :c"
+                ),
+                {"c": challenge_id},
+            )
         await s.commit()
     return challenge_id
+
+
+async def status_of(database: Database, challenge_id: str) -> str:
+    async with database.sessionmaker() as s:
+        result = await s.execute(
+            text("SELECT status FROM challenges WHERE challenge_id = :c"), {"c": challenge_id}
+        )
+        return str(result.scalar_one())
 
 
 async def test_status_reports_a_pending_proposal_from_the_stored_row(
@@ -749,7 +796,10 @@ async def test_status_never_returns_the_approval_or_the_session_record(
         assert withheld not in rendered, withheld
 
 
-@pytest.mark.parametrize("case", ["unknown", "foreign", "not_a_payment", "malformed"])
+@pytest.mark.parametrize(
+    "case",
+    ["unknown", "foreign", "not_a_payment", "malformed", "nul", "traversal", "space"],
+)
 async def test_unknown_foreign_non_payment_and_malformed_ids_are_one_refusal(
     produced: Database, case: str
 ) -> None:
@@ -759,6 +809,12 @@ async def test_unknown_foreign_non_payment_and_malformed_ids_are_one_refusal(
         challenge_id = await insert_row(produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL)
     elif case == "not_a_payment":
         challenge_id = await insert_row(produced, customer_ref=OWNER, tool_name="accounts.rename")
+    elif case == "nul":
+        challenge_id = "a\x00b"
+    elif case == "traversal":
+        challenge_id = "../x"
+    elif case == "space":
+        challenge_id = "a b"
     else:
         challenge_id = "x" * 37
     with pytest.raises(ToolError) as refused:
@@ -766,15 +822,116 @@ async def test_unknown_foreign_non_payment_and_malformed_ids_are_one_refusal(
     assert str(refused.value) == CHALLENGE_NOT_FOUND
 
 
-async def test_status_on_an_unreachable_store_is_a_fixed_refusal() -> None:
+async def test_a_foreign_expired_row_is_refused_and_left_pending(produced: Database) -> None:
+    """The expiry UPDATE must not run for a row the caller does not own: it
+    would let one customer change another's row, and its outcome would differ
+    from an unknown id's."""
+    foreign = await insert_row(
+        produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
+    )
+    statements: list[str] = []
+
+    def record(conn: object, cursor: object, statement: str, *rest: object) -> None:
+        statements.append(statement.lstrip().split(None, 1)[0].upper())
+
+    sync_engine = produced.engine.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", record)
+    try:
+        with pytest.raises(ToolError) as refused:
+            await payment_status(produced)(challenge_id=foreign)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", record)
+    assert str(refused.value) == CHALLENGE_NOT_FOUND
+    assert statements
+    assert set(statements) == {"SELECT"}
+    assert await status_of(produced, foreign) == "pending"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        ["amount", "currency"],
+        "EUR 340.00",
+        {"amount": "EUR 340.00"},
+        {"amount": "340.00", "payee_name": "Payee"},
+        {"amount": "340.00", "currency": "EUR"},
+        {"amount": "340.00", "currency": "EUR", "payee_name": 7},
+        {"amount": 340, "currency": "EUR", "payee_name": "Payee"},
+    ],
+    ids=[
+        "list",
+        "string",
+        "legacy-amount-only",
+        "missing-currency",
+        "missing-payee-name",
+        "non-str-payee-name",
+        "non-str-amount",
+    ],
+)
+async def test_an_unreadable_stored_payload_is_one_fixed_refusal(
+    produced: Database, payload: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    challenge_id = await insert_row(
+        produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, payload=payload
+    )
+    with pytest.raises(ToolError) as refused:
+        await payment_status(produced)(challenge_id=challenge_id)
+    assert str(refused.value) == CHALLENGE_UNREADABLE
+    ours = [r for r in caplog.records if r.name == "services.api.tools.payments"]
+    assert len(ours) == 1
+    assert ours[0].levelno == logging.ERROR
+    assert ours[0].getMessage() == f"{PAYMENT_STATUS_TOOL} found an unreadable stored payment"
+
+
+async def test_over_http_an_unreadable_stored_payload_is_the_fixed_text(
+    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+) -> None:
+    await grant(produced, OWNER, "payments")
+    token = token_for(key_pair, OWNER)
+    ids = [
+        await insert_row(
+            produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, payload=payload
+        )
+        for payload in (["a"], "EUR 1.00", {"amount": "1.00", "payee_name": "P"})
+    ]
+    ids.append(
+        await insert_row(
+            produced,
+            customer_ref=OWNER,
+            tool_name=CREATE_PAYMENT_TOOL,
+            payload={"amount": "1.00", "currency": "EUR", "payee_name": 5},
+        )
+    )
+    for challenge_id in ids:
+        response = await call_tool(
+            pg_url, key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
+        )
+        result = result_of(response)
+        assert result["isError"] is True, response.text
+        assert [block["text"] for block in result["content"]] == [CHALLENGE_UNREADABLE]
+
+
+async def test_status_on_an_unreachable_store_is_a_fixed_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     runtime = offline_runtime()
+    caplog.set_level(logging.DEBUG)
     try:
         handler = build_get_payment_status(lambda: CustomerRef(value=OWNER), runtime)
         with pytest.raises(ToolError) as refused:
             await handler(challenge_id=uuid.uuid4().hex)
     finally:
         await runtime.db.close()
-    assert str(refused.value) == NOT_RECORDED
+    assert str(refused.value) == CHALLENGE_UNREADABLE
+    assert str(refused.value) != NOT_RECORDED
+    ours = [r for r in caplog.records if r.name == "services.api.tools.payments"]
+    assert len(ours) == 1
+    assert ours[0].getMessage().startswith(f"{PAYMENT_STATUS_TOOL} could not read its challenge: ")
+    assert ours[0].getMessage().rsplit(": ", 1)[1].isidentifier()
+    assert ours[0].exc_info is None
+    for forbidden in (OWNER, "cust_"):
+        assert forbidden not in caplog.text
 
 
 async def test_over_http_both_tools_are_listed_with_payments_consent(

@@ -73,6 +73,10 @@ REFERENCE_TOO_LONG = "reference is limited to 140 characters"
 REFERENCE_NOT_PRINTABLE = "reference may contain only printable characters"
 CHALLENGE_NOT_FOUND = "challenge not found"
 NOT_RECORDED = "the payment could not be recorded"
+#: One text for a stored row the status tool cannot answer from (a payload that
+#: is not an object, or lacks a text amount, currency or payee name) and for a
+#: database failure on the status read. Both mean "could not be read".
+CHALLENGE_UNREADABLE = "the payment status could not be read"
 
 #: The longest `reference` accepted, counted on what the agent sent.
 MAX_REFERENCE_LENGTH = 140
@@ -95,6 +99,8 @@ _AMOUNT = re.compile(r"[0-9]{1,15}(?:\.[0-9]{1,4})?")
 #: Not a `Ref`: the producer's ids are 32 hex characters, and other callers
 #: store ids such as `chal_int_001`.
 _CHALLENGE_ID = re.compile(r"[A-Za-z0-9_-]{1,36}")
+#: Payload keys the status answer cannot do without. `reference` is optional.
+_REQUIRED_PAYLOAD_KEYS = ("amount", "currency", "payee_name")
 _FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
 
 
@@ -314,6 +320,9 @@ def build_get_payment_status(resolver: CustomerResolver, runtime: PaymentsRuntim
                         expiry="expired",
                     )
                     if expired is None:
+                        # A race that makes the conditional UPDATE match
+                        # nothing re-reads the row, so the answer is never a
+                        # stale `pending`.
                         # Not past its deadline, or another transaction moved
                         # it first: the committed row is the answer.
                         refreshed = await store.get_challenge(session, challenge_id, refresh=True)
@@ -325,8 +334,16 @@ def build_get_payment_status(resolver: CustomerResolver, runtime: PaymentsRuntim
             logger.error(
                 "%s could not read its challenge: %s", PAYMENT_STATUS_TOOL, type(exc).__name__
             )
-            raise ToolError(NOT_RECORDED) from None
+            raise ToolError(CHALLENGE_UNREADABLE) from None
         payload = record.payload
+        # The row is this customer's own payment, but any caller may have
+        # written it: fail closed on a shape this tool did not produce. The log
+        # names the tool only, never the payload or the customer.
+        if not isinstance(payload, dict) or not all(
+            isinstance(payload.get(key), str) for key in _REQUIRED_PAYLOAD_KEYS
+        ):
+            logger.error("%s found an unreadable stored payment", PAYMENT_STATUS_TOOL)
+            raise ToolError(CHALLENGE_UNREADABLE)
         return {
             "challenge_id": record.challenge_id,
             "status": record.status,

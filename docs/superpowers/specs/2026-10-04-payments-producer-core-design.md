@@ -108,14 +108,15 @@ A repeat inside the pending window returns the same `challenge_id` and `expires_
 
 Annotations: `read_only_hint=False` (it may expire a row), `destructive_hint=False`, `idempotent_hint=True`, `open_world_hint=False`.
 
-Argument: `challenge_id`, a string matching `^[A-Za-z0-9_-]{1,36}$`. It is not a `Ref`: ids made by this slice are 32 hex characters, and other callers use ids such as `chal_int_001`.
+Argument: `challenge_id`, a string matching `^[A-Za-z0-9_-]{1,36}$`. It is not a `Ref`: ids made by this slice are 32 hex characters, and other callers use ids such as `chal_int_001`. The pattern is enforced in the handler on purpose, not in the tool's input schema, so that a malformed id and an unknown id get the same refusal and FastMCP's input-echoing validation text is never produced.
 
 Flow:
 
 1. Resolve the customer.
 2. `get_challenge`. If the row is missing, belongs to another customer, or has a `tool_name` other than `payments.create_payment`, raise `ToolError("challenge not found")`. The three cases are one code path and one message.
 3. If `status == "pending"`, apply the existing conditional update `pending -> expired` with `expiry="expired"` (the database clock decides), and report the resulting status.
-4. Return `{challenge_id, status, expires_at, amount, currency, payee_name, reference}` from the stored payload. Never the signature, `confirming_device`, `verification_result`, the fingerprint, `client_id`, `session_jti` or the raw payload.
+4. Fail closed on an unreadable payload: if it is not an object, or `amount`, `currency` or `payee_name` is missing or not a string, raise `ToolError("the payment status could not be read")` (`reference` stays optional).
+5. Return `{challenge_id, status, expires_at, amount, currency, payee_name, reference}` from the stored payload. Never the signature, `confirming_device`, `verification_result`, the fingerprint, `client_id`, `session_jti` or the raw payload.
 
 An approved row whose backend call failed (the callback answers 207) stays `approved`. No status is invented; the documentation says an `approved` payment may not have executed.
 
@@ -144,7 +145,9 @@ Tool errors in this stack are `isError` results inside an HTTP 200. Messages are
 | Reference with a control, format, surrogate, private-use or unassigned character, or U+2028 or U+2029 | `reference may contain only printable characters` | yes |
 | Reference over 140 characters | `reference is limited to 140 characters` | yes |
 | Challenge unknown, foreign, or not a payment | `challenge not found` | yes |
-| Database error on insert, select or update | `the payment could not be recorded` | yes, nothing created |
+| Database error on `create_payment`'s insert or its select | `the payment could not be recorded` | yes, nothing created |
+| Database error on `get_payment_status`'s select or update | `the payment status could not be read` | yes |
+| Stored row of the caller's own payment whose payload is not an object, or lacks a text `amount`, `currency` or `payee_name` | `the payment status could not be read`, logged at ERROR naming the tool only | yes |
 | Any other `BackendError` (5xx, timeout) | the facade's existing text | yes |
 | `payments` consent not granted | `Unknown tool: 'payments.create_payment'`, the existing consent behaviour; the tools are also absent from `tools/list` | yes |
 
