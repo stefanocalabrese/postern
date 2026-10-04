@@ -163,9 +163,14 @@ services. If you want replay detection, that is where to build it. See
 `dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md`.
 
 `READ_SCOPES` maps audiences to OAuth scopes, all of them read scopes. The
-`payments.svc` audience maps to `payments:read` for one call, the payee lookup the
-payments producer makes (decision 0022), and **never** to `payments:execute`: read
-tokens cannot reach write endpoints. An audience with no entry raises `KeyError`.
+`payments.svc` audience maps to `payments:read`, which the payments producer uses
+for its payee lookup (decision 0022), and **never** to `payments:execute`. The
+minter binds the scope to the audience, not to a path: any `get_json(<any GET
+path>, audience="payments.svc")`, a third-party `ReadModule`'s included, receives a
+read-signed token with scope `payments:read`. Read tokens cannot reach write
+endpoints provided your payments gateway or backend checks the signing key and the
+scope per path; the minter does not restrict the path. An audience with no entry
+raises `KeyError`.
 
 ### JWKS Endpoint
 

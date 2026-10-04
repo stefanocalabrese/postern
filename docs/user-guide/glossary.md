@@ -167,8 +167,10 @@ tools. Named after a "postern gate", a small, controlled entrance in a fortified
 ### Read Token Minter
 Wraps `InternalTokenMinter` with continuous authorization (revocation check + JTI
 replay cache). `READ_SCOPES` maps audiences to read scopes only. `payments.svc` maps
-to `payments:read`, for the payee lookup (decision 0022), never `payments:execute`, so
-read tokens cannot reach write endpoints.
+to `payments:read`, for the payee lookup (decision 0022), never `payments:execute`.
+The scope is bound to the audience, not to a path, so read tokens cannot reach write
+endpoints provided the payments gateway or backend checks the signing key and scope
+per path; the minter does not restrict the path.
 
 ### Record Count
 Immutable snapshot of how many records a session has returned (`RecordCount.total`).

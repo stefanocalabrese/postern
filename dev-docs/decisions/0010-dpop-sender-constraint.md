@@ -104,6 +104,9 @@ DPoP. Three are implemented; one is partially in place.
 | **Audience scoping** (Vault key split) | ✅ Complete | `READ_SCOPES` restricts the read minter to three audiences (`accounts.svc`, `transactions.svc`, `cards.svc`). A write audience (`payments.svc`) raises `KeyError`. The read/write key split means even holding the right key, a token from this minter carries the wrong scope for write endpoints. Istio matches on claims as well as signature. |
 | **Internal JWTs sender-constrained** (Vault key split) | ✅ Complete | Internal tokens (§7.2 of handoff) are signed with separate read/write keys. The MCP server process holds only the read key; the approval callback holds the write key. Istio enforces issuer-based routing — a read-signed token cannot reach write endpoints. |
 
+> **Amended by decision 0022 (4 October 2026):** `payments.svc` is now a READ
+> audience (`payments:read`); write audiences still raise `KeyError`.
+
 ### Partially in place
 
 | Control | Status | Details |

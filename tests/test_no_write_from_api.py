@@ -20,6 +20,14 @@ from services.api.server import build_server
 from services.api.settings import Settings
 from tests.conftest import TEST_CUSTOMER
 
+FORBIDDEN_HELPER_PREFIXES = (
+    "create_",
+    "update_",
+    "delete_",
+    "post_",
+    "execute_",
+    "submit_",
+)
 FORBIDDEN_NAME_PARTS = ("execute", "submit", "create_payment", "transfer", "pay")
 
 
@@ -56,10 +64,10 @@ async def test_every_registered_tool_is_annotated_read_only(server: FastMCP) -> 
 
 def test_the_facade_exposes_no_write_helpers() -> None:
     for module in (accounts, transactions, cards, payments):
-        for name, _obj in inspect.getmembers(module, inspect.iscoroutinefunction):
-            assert not name.startswith(("create_", "update_", "delete_", "post_")), (
-                f"{module.__name__}.{name}"
-            )
+        for name, obj in inspect.getmembers(module, inspect.isfunction):
+            if obj.__module__ != module.__name__:
+                continue
+            assert not name.startswith(FORBIDDEN_HELPER_PREFIXES), f"{module.__name__}.{name}"
 
 
 def test_the_api_service_does_not_import_the_confirm_service() -> None:

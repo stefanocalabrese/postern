@@ -7,6 +7,8 @@ from postern_core.auth.read_minter import READ_SCOPES, ReadTokenMinter
 from postern_core.auth.revocation import unchecked_revocation
 from postern_core.identity import CustomerRef
 
+from services.confirm.minter import WRITE_SCOPES
+
 CUST = CustomerRef(value="cust_7f3a")
 ISS = "https://mcp-read.internal"
 
@@ -71,4 +73,4 @@ def test_the_payments_audience_mints_the_read_scope_only(
     claims = jwt.decode(token, keyset, algorithms=["RS256"]).claims
     assert claims["aud"] == "payments.svc"
     assert claims["scope"] == "payments:read"
-    assert READ_SCOPES["payments.svc"] != "payments:execute"
+    assert set(READ_SCOPES.values()).isdisjoint(WRITE_SCOPES.values())

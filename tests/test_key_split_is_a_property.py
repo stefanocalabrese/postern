@@ -23,11 +23,17 @@ CUST = CustomerRef(value="cust_7f3a")
 WRITE_ISS = "https://mcp-write.internal"
 
 
-def istio_write_endpoint(token: str, write_jwks: KeySetSerialization) -> Claims:
+def istio_write_endpoint(
+    token: str, write_jwks: KeySetSerialization, *, require_scope: str | None = None
+) -> Claims:
     """What the gateway does: resolve the kid against THIS issuer's key set,
-    then check the issuer claim. Both halves matter."""
+    then check the issuer claim. Both halves matter. A route that names a scope
+    passes it as `require_scope`, as the payments write path does; the miswiring
+    tests below leave it off to isolate the key."""
     claims = jwt.decode(token, KeySet.import_key_set(write_jwks), algorithms=["RS256"]).claims
     jwt.JWTClaimsRegistry(iss={"essential": True, "value": WRITE_ISS}).validate(claims)
+    if require_scope is not None and claims.get("scope") != require_scope:
+        raise PermissionError(f"scope is not {require_scope}")
     return claims
 
 
@@ -105,8 +111,10 @@ def test_the_payments_read_audience_carries_no_write_scope_and_is_refused(
     write_jwks: KeySetSerialization,
 ) -> None:
     """Decision 0022 maps ``payments.svc`` to ``payments:read`` on this minter.
-    The token names the payments service and still fails at the write endpoint
-    twice over: the wrong key, and a scope that is not ``payments:execute``."""
+    The token names the payments service and is refused at the write endpoint
+    for the wrong key, which is checked first. The scope requirement is then
+    shown on its own: a token signed with the WRITE key but carrying the read
+    scope is refused too."""
     source = GeneratedKeySource(kid="read-1")
     minter = ReadTokenMinter(
         InternalTokenMinter(issuer="https://mcp-read.internal", key_source=source),
@@ -118,7 +126,16 @@ def test_the_payments_read_audience_carries_no_write_scope_and_is_refused(
     ).claims
     assert claims["scope"] == "payments:read"
     with pytest.raises(InvalidKeyIdError):
-        istio_write_endpoint(token, write_jwks)
+        istio_write_endpoint(token, write_jwks, require_scope="payments:execute")
+
+
+def test_the_write_endpoint_refuses_the_read_scope_even_with_the_write_key(
+    write_service: tuple[WriteTokenMinter, KeySource], write_jwks: KeySetSerialization
+) -> None:
+    minter, _ = write_service
+    token = minter.mint(subject_value="cust_7f3a", audience="payments.svc", scope="payments:read")
+    with pytest.raises(PermissionError):
+        istio_write_endpoint(token, write_jwks, require_scope="payments:execute")
 
 
 def test_the_api_cannot_even_ask_for_an_unmapped_audience(api_minter: ReadTokenMinter) -> None:

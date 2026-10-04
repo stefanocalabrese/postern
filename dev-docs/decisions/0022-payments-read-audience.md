@@ -34,10 +34,16 @@ account number (handoff §6.5: omit counterparty account numbers entirely). The
 facade for it has one function and no write helper, and the
 no-write-helper test is extended to cover it.
 
-The write audience keeps its property: the read minter signs `payments:read`
-only, with the read key, and a token carrying `payments:read` cannot reach
-`payments:execute` endpoints. Backends must validate the scope per endpoint;
-that is stated as an open dependency in the spec.
+The read minter signs `payments:read` only, with the read key, and
+`payments:execute` is still minted by `services/confirm` alone. What no longer
+holds is the invariant "no api-minted token names `aud` `payments.svc`": the
+minter binds the scope to the audience, not to a path, so any GET the api makes
+with that audience carries a read-signed `payments:read` token. The read/write
+separation at `payments.svc` now depends on the gateway or backend checking the
+signing key and the scope per path, `payments:read` from the read issuer on
+`GET /payees/*` only and `payments:execute` from the write issuer on write paths.
+That is a real loss of one layer, accepted, and it is stated as an open
+dependency in the spec.
 
 Accept one deviation from ZT-4: `payments.get_payment_status` may move a
 `pending` row to `expired` once its database-clock deadline has passed. The

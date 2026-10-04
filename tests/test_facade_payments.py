@@ -41,6 +41,35 @@ async def test_a_field_the_projection_does_not_name_is_dropped() -> None:
     assert set(payee.model_dump()) == {"payee_ref", "display_name"}
 
 
+async def test_a_backend_answering_a_different_payee_is_a_502() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"payee_ref": "pay_ll02", "name": "Landlord"})
+
+    with pytest.raises(BackendError) as failed:
+        await payments.get_payee(stub_backend(httpx2.MockTransport(handler)), OWNER, "pay_nw01")
+    assert failed.value.status == 502
+    assert "pay_nw01" not in str(failed.value)
+    assert "pay_ll02" not in str(failed.value)
+    assert "Landlord" not in str(failed.value)
+
+
+@pytest.mark.parametrize(
+    "payee_ref",
+    ["pay_x?all=1", "pay_a/b", "../accounts", "pay_ x", "pay_x\n", "pay_x#f", ""],
+)
+async def test_a_malformed_ref_is_refused_before_any_request(payee_ref: str) -> None:
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(200, json=fx.PAYEE)
+
+    with pytest.raises(ValueError, match="payee_ref is not a valid ref") as failed:
+        await payments.get_payee(stub_backend(httpx2.MockTransport(handler)), OWNER, payee_ref)
+    assert calls == []
+    assert payee_ref not in str(failed.value) or payee_ref == ""
+
+
 @pytest.mark.parametrize("payee_ref", ["pay_ll02", "pay_none"], ids=["foreign", "invented"])
 async def test_a_foreign_or_invented_payee_is_the_same_404(payee_ref: str) -> None:
     with pytest.raises(BackendError) as failed:

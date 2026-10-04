@@ -210,6 +210,7 @@ An RCE in the api with the flag on can insert arbitrary pending rows for any cus
 | Tier-2 enforcement at approval | `services/confirm` |
 | Delivery to the phone, and what the app displays | Another team (§10.4); the app team |
 | Consent-grant flow | Not assigned |
+| Payments gateway enforces `payments:read` (read issuer) only on `GET /payees/*`, and requires `payments:execute` from the write issuer on write paths | Backend and platform teams |
 
 ## 15. Facts relied on
 
