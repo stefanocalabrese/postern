@@ -4,7 +4,7 @@ Date: 4 October 2026
 
 ## Status
 
-Proposed. Becomes Accepted when capo approves the payments producer spec
+Accepted, 4 October 2026: capo approved the payments producer spec
 (`docs/superpowers/specs/2026-10-04-payments-producer-core-design.md`).
 
 ## Context

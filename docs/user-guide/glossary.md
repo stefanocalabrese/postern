@@ -260,7 +260,8 @@ Every tool call produces two audit rows (when it reaches the backend): an entry 
 
 ### Verification Challenge
 A stored record of a proposed write operation (payment, card write). Created when the
-model proposes a write via `payments.create_payment`. Contains the payload, tier, and
+model proposes a write via `payments.create_payment`, which is registered only with
+`POSTERN_PAYMENTS_ENABLED` on. Contains the payload, tier, and
 status. The customer approves on their mobile device; the confirm service executes
 server-side from the stored challenge row.
 

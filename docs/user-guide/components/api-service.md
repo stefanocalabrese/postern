@@ -5,9 +5,11 @@ MCP tools, OAuth endpoints, consent checks, the read-facing deployable.
 ## Overview
 
 The API service exposes MCP tools to AI clients over HTTP (Streamable HTTP transport).
-It is the **read path** of Postern: all registered tools are read-only. Write operations
-(proposed by the model via `payments.create_payment`) trigger a verification challenge
-that is executed server-side through the confirm service.
+It is the **read path** of Postern. With `POSTERN_PAYMENTS_ENABLED` off, the default,
+every registered tool is read-only. With it on, `payments.create_payment` records a
+payment proposal as a pending verification challenge and `payments.get_payment_status`
+reports it; the customer approves on their own device and the confirm service executes
+server-side. Neither tool can approve or execute.
 
 ```
 packages/postern-core/src/postern_core/facade/     HTTP client to operator backend
@@ -95,6 +97,23 @@ Postgres-backed consent check:
 | `accounts.get_balance` | accounts.svc | Yes | Returns balance for a specific account |
 | `transactions.list` | transactions.svc | Yes | Lists transactions with date range filter |
 | `cards.list` | cards.svc | Yes | Lists customer cards |
+
+### Payments producer (behind `POSTERN_PAYMENTS_ENABLED`)
+
+Two more tools, registered only with the flag on and always gated on the `payments`
+consent domain, even in a no-auth stack, where they are therefore listed to nobody.
+They live in `services/api/tools/payments.py` and are not a module.
+
+| Tool | Reads | Writes | Consent Required |
+|------|-------|--------|-----------------|
+| `payments.create_payment` | balance (`accounts.svc`), payee (`payments.svc`, `payments:read`) | one pending `challenges` row, or the one already pending for the same request | Yes, `payments` |
+| `payments.get_payment_status` | the caller's own payment challenge | `pending` to `expired` once the deadline has passed | Yes, `payments` |
+
+Refusals are fixed strings: `account not found`, `payee not found`, `amount must be a
+positive decimal with at most 4 decimal places`, `reference is limited to 140 characters`,
+`reference may contain only printable characters`, `challenge not found`,
+`the payment could not be recorded`, `the payment status could not be read`. An `approved`
+status means the customer approved; it does not mean the bank executed the payment.
 
 ### Tool handler pattern
 
