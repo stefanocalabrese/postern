@@ -301,7 +301,7 @@ Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not
 
 ## 10. Out of this contract
 
-`POST /challenges/{challenge_id}/approve` is the payment approval callback. It is separate from pairing, requires an Ed25519 signature from an enrolled device on top of the assertion, and today has no production caller that creates a challenge. It will get its own contract.
+`POST /challenges/{challenge_id}/approve` is the payment approval callback. It is separate from pairing, requires an Ed25519 signature from an enrolled device on top of the assertion, and is reachable in production only with `POSTERN_PAYMENTS_ENABLED` on, which the api leaves off by default, and nothing yet delivers the challenge to a phone. It will get its own contract.
 
 ## 11. What the server leaves unspecified
 

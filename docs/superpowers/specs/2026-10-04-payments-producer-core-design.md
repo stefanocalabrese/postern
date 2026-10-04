@@ -1,6 +1,6 @@
 # Payments producer core: design
 
-Date: 4 October 2026. Status: approved by capo on 4 October 2026; implemented by docs/superpowers/plans/2026-10-04-payments-producer-core.md. Slice 1 of the payments producer.
+Date: 4 October 2026. Status: Accepted 4 October 2026 (approved by capo); implemented by docs/superpowers/plans/2026-10-04-payments-producer-core.md. Slice 1 of the payments producer.
 
 ## 1. Purpose
 

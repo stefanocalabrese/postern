@@ -16,6 +16,7 @@ packages/postern-core/src/postern_core/facade/     HTTP client to operator backe
 services/api/main.py                                Composition root (create_app)
 services/api/server.py                              FastMCP server builder, module registration loop
 services/api/tools/                                 built-in read modules (start_session, accounts, transactions)
+services/api/tools/payments.py                      the payments producer, flag-gated, not a module
 packages/postern-cards/                             the cards module's read half, found by entry point
 services/api/asgi/request_deadline.py               Outermost ASGI middleware, request deadline
 services/api/asgi/header_validation.py              MCP Streamable HTTP header/body validation
@@ -87,7 +88,7 @@ Enforces MCP Streamable HTTP spec compliance:
 
 ## MCP Tools
 
-Five read-only tools are registered. Every one except `start_session` is gated by a
+With the flag off, five read-only tools are registered. Every one except `start_session` is gated by a
 Postgres-backed consent check:
 
 | Tool | Domain | Consent Required | Description |

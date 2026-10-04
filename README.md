@@ -43,7 +43,8 @@ work safely across machines:
 > **Status:** Postern inverts nearly all public Open Banking prior art. A survey of 24
 > public "open banking mcp server" repos in September 2026 found the read-only surface
 > crowded, the write surface essentially unbuilt, and nothing at all for the operator-internal
-> first-party case. Five read tools are registered: `start_session`, `accounts.list`,
+> first-party case. Five read tools are registered by default; `POSTERN_PAYMENTS_ENABLED`, off by default,
+> adds `payments.create_payment` and `payments.get_payment_status`. The five: `start_session`, `accounts.list`,
 > `accounts.get_balance`, `transactions.list` and `cards.list`. Every one but
 > `start_session` is gated by a Postgres-backed consent check.
 

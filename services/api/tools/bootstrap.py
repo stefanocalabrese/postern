@@ -15,7 +15,9 @@ backend-supplied value could fail -- there is nothing here for `build_model`
 to wrap. `consents`, `write_enabled` and `confirmation_note` below are
 server-side literals, not backend-derived: consent state is hardcoded to
 "granted" for the readable domains until Plan 2 replaces it with a
-Postgres-backed list, and no write tool exists at all (handoff §6.2). A
+Postgres-backed list, and with POSTERN_PAYMENTS_ENABLED off no write tool
+exists (handoff §6.2); with it on, the two payments producer tools are
+registered by `services/api/tools/payments.py`, not by this module. A
 literal built from this module's own source can only fail construction if
 the literal itself is wrong -- a bug for review or a test to catch, not a
 runtime condition -- so `build_model` does not apply to those three fields

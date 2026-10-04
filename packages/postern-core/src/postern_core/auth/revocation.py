@@ -70,14 +70,10 @@ which matches ANY pair naming that customer, and the coverage is:
 says the same where an operator will meet it, and
 `services/confirm/revocation.py` says it at the check site.
 
-THE EXACT KEYING IS THE RIGHT END STATE AND IS NOT BUILT. Recording the AI
-session's ``jti`` and ``client_id`` on the challenge row at creation would
-make all three scopes match precisely on both paths. It belongs to the
-payments tool rather than ahead of it: that tool's handler is the first code
-that will hold both values, and
-`packages/postern-core/src/postern_core/store/challenges.py`'s
-`create_challenge` has no production caller today, so the two columns would
-be a migration that nothing writes.
+THE EXACT KEYING IS THE RIGHT END STATE AND IS ONLY HALF BUILT. The producer
+(`services/api/tools/payments.py`) records the AI session's ``client_id`` and
+``session_jti`` on each challenge it creates (migration `b5d1e7a3c902`).
+Matching all three scopes precisely on the approval path is still not built.
 
 WHAT IS ALSO NOT BUILT. The zero-trust plan §4's fourth ZT-7 bullet -- the
 customer cutting their own sessions from inside the bank app, and seeing

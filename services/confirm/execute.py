@@ -98,9 +98,9 @@ class _MinterProtocol(Protocol):
 # never be derived from the HTTP verb, so a `WriteOperation` carries one; this
 # module needs only the triple, and `WriteOperation.as_registry_entry` is what
 # narrows it. The tier reaches ``tool-surface.json``, so raising or lowering one
-# is a reviewable diff, and it is what a future `create_challenge` producer will
-# read when it decides which tier a challenge row is created at. No code path
-# consumes it today, because no production caller creates a challenge at all.
+# is a reviewable diff. `payments.create_payment` stores `PAYMENT_TIER` on each
+# row it creates, when `POSTERN_PAYMENTS_ENABLED` is on; nothing in
+# `services/confirm` reads the tier.
 
 #: The write operations this repository ships without a distribution of its own.
 #:

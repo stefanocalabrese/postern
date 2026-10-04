@@ -83,8 +83,8 @@ key source or a token minter.
 `packages/postern-core/src/postern_core/auth/read_minter.py`, which maps it to the
 read scope the internal token carries; any other audience raises `KeyError` when the
 token is minted. The example above uses `payments.svc`, which maps to `payments:read`
-(decision 0022): a read module reaches only the routes that scope opens on your
-payments service, and never a `payments:execute` route.
+(decision 0022): a read module carries a `payments:read` token; whether it can
+reach only read routes depends on your gateway checking key and scope per path.
 
 Your handler is a plain async function. You never touch `@mcp.tool`,
 `mcp.types.ToolAnnotations` or the `auth=` parameter: the host does the
