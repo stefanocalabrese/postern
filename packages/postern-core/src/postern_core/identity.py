@@ -4,6 +4,7 @@
 Every tool resolves the customer through a `CustomerResolver`.
 """
 
+from dataclasses import dataclass
 from typing import Annotated, Protocol
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
@@ -46,3 +47,27 @@ class CustomerResolver(Protocol):
     """
 
     def __call__(self) -> CustomerRef: ...
+
+
+@dataclass(frozen=True)
+class TokenClaims:
+    """The verified token's ``client_id`` and ``jti``, kept on a write proposal.
+
+    Neither is an identity: `CustomerResolver` stays the only source of the
+    customer. Both are ``None`` when the token does not carry them, and the
+    caller stores ``None`` rather than failing, because they are a record for
+    later revocation matching and not a gate.
+    """
+
+    client_id: str | None
+    jti: str | None
+
+
+class TokenClaimsProvider(Protocol):
+    """Reads `TokenClaims` from ambient request state.
+
+    No argument, for the reason `CustomerResolver` takes none: nothing the
+    model can set may influence it.
+    """
+
+    def __call__(self) -> TokenClaims: ...

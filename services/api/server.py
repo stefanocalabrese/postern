@@ -44,7 +44,7 @@ from fastmcp.server.auth.providers.jwt import JWTVerifier
 from mcp.types import ToolAnnotations
 from postern_core.auth.resource_uri import is_normal_https_resource
 from postern_core.facade.protocol import BackendReader
-from postern_core.identity import CustomerRef, CustomerResolver
+from postern_core.identity import CustomerRef, CustomerResolver, TokenClaims
 from postern_core.modules.read import (
     ReadContext,
     ReadModule,
@@ -100,6 +100,25 @@ def token_customer_resolver() -> CustomerRef:
         raise PermissionError(
             "access token subject is not a recognized customer reference"
         ) from None
+
+
+def token_claims_provider() -> TokenClaims:
+    """Production claims provider: the verified token's ``client_id`` and ``jti``.
+
+    Read exactly as `services/api/middleware/revocation.py`'s
+    `RevocationMiddleware` reads them for its revocation scopes, so a value
+    stored on a challenge is the value a revocation would be keyed on. No token
+    answers ``None`` for both rather than raising: the customer resolver is
+    what refuses a call with no token, and it runs first.
+    """
+    from fastmcp.server.dependencies import get_access_token
+
+    token = get_access_token()
+    if token is None:
+        return TokenClaims(client_id=None, jti=None)
+    client_id = str(token.client_id) if token.client_id else None
+    raw_jti = (token.claims or {}).get("jti")
+    return TokenClaims(client_id=client_id, jti=raw_jti if isinstance(raw_jti, str) else None)
 
 
 async def _no_consent_required(ctx: AuthContext) -> bool:
