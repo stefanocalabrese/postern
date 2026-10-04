@@ -210,9 +210,10 @@ EVERYWHERE = ("api", "confirm", "migrations")
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 83 rows since
-#: 2026-09-30: 32 strings (30 settings plus this guard's own two lists), 46
-#: numbers, 5 flags. The eight ``POSTERN_VAULT_*`` rows below the device-code
+#: against it by `tests/test_settings_bounds.py` on every run. 84 rows since
+#: 2026-10-04: 32 strings (30 settings plus this guard's own two lists), 46
+#: numbers, 6 flags, the sixth being ``POSTERN_PAYMENTS_ENABLED``, which
+#: arrived with the payments producer. The eight ``POSTERN_VAULT_*`` rows below the device-code
 #: block arrived on 2026-09-29; ``POSTERN_DEVICE_APP_LINK_URI`` and the seven
 #: QR-page rate limits arrived on 2026-09-30, the day
 #: ``POSTERN_USER_CODE_MAX_ATTEMPTS`` left with the attempt budget it set, and
@@ -274,6 +275,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_MAX_DEVICE_CODES", "number", ("confirm",)),
     EnvVar("POSTERN_MAX_REFRESH_SESSIONS", "number", ("confirm",)),
     EnvVar("POSTERN_MAX_SCOPES_LENGTH", "number", ("confirm",)),
+    EnvVar("POSTERN_PAYMENTS_ENABLED", "flag", ("api",)),
     # ("api",) ONLY SINCE THE LAYER-1 SESSION TOKEN, which took the read key
     # out of `services/confirm`. A confirm environment still setting one gets
     # the "set but not read" warning, not a refusal.

@@ -68,6 +68,7 @@ def _clean_flag_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "POSTERN_REQUIRE_PEM_KEY",
         "POSTERN_STRICT_HEADERS",
+        "POSTERN_PAYMENTS_ENABLED",
         "POSTERN_READ_KEY_PEM_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -269,3 +270,56 @@ class TestAllThreeFlagsAgree:
         monkeypatch.setenv("POSTERN_REQUIRE_PEM_KEY", value)
         with pytest.raises(ValueError):
             create_app(Settings.for_testing())
+
+
+# ---------------------------------------------------------------------------
+# POSTERN_PAYMENTS_ENABLED, through Settings.from_env.
+# ---------------------------------------------------------------------------
+
+
+class TestPaymentsEnabled:
+    """Off unless asked for, and an unreadable value refuses.
+
+    The flag registers the payments producer's two tools. A value read as on
+    by accident would put a pay-named tool in front of clients nobody chose to
+    expose it to, so this flag uses the same reader as every other.
+    """
+
+    @pytest.mark.parametrize("value", ON)
+    def test_every_on_spelling_turns_it_on(
+        self, value: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("POSTERN_PAYMENTS_ENABLED", value)
+        assert Settings.from_env().payments_enabled is True
+
+    @pytest.mark.parametrize("value", OFF)
+    def test_every_off_spelling_leaves_it_off(
+        self, value: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("POSTERN_PAYMENTS_ENABLED", value)
+        assert Settings.from_env().payments_enabled is False
+
+    def test_unset_leaves_it_off(self) -> None:
+        assert Settings.from_env().payments_enabled is False
+
+    def test_the_testing_settings_leave_it_off(self) -> None:
+        assert Settings.for_testing().payments_enabled is False
+
+    @pytest.mark.parametrize("value", UNPARSEABLE)
+    def test_an_unparseable_value_refuses_the_parse(
+        self, value: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("POSTERN_PAYMENTS_ENABLED", value)
+        with pytest.raises(ValueError):
+            Settings.from_env()
+
+    def test_the_unparseable_refusal_says_what_the_flag_is_for(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("POSTERN_PAYMENTS_ENABLED", "maybe")
+        with pytest.raises(ValueError) as raised:
+            Settings.from_env()
+        message = str(raised.value)
+        assert "POSTERN_PAYMENTS_ENABLED" in message
+        assert "'maybe'" in message
+        assert "payments.create_payment" in message

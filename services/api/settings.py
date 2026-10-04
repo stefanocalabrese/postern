@@ -85,6 +85,14 @@ class Settings:
     # absolute URI, and the default above is not one.
     allow_non_uri_audience: bool = False
     strict_headers: bool = False
+    # THE PAYMENTS PRODUCER, OFF BY DEFAULT (spec
+    # docs/superpowers/specs/2026-10-04-payments-producer-core-design.md). On,
+    # `build_server` registers `payments.create_payment` and
+    # `payments.get_payment_status`, each behind the `payments` consent check.
+    # It stays off in production until the approval path enforces a
+    # challenge's tier, a delivery path to the phone exists and a `payments`
+    # consent can be granted (spec section 13).
+    payments_enabled: bool = False
     cache_ttl_seconds: int = 60
     # ZT-5: how many proxies in front of this process append to
     # `X-Forwarded-For`. `services/api/middleware/risk.py`'s `_client_ip`
@@ -344,6 +352,15 @@ class Settings:
                 because=(
                     "It enforces MCP Streamable HTTP header compliance. Left off, "
                     "a non-conforming client is served rather than refused."
+                ),
+            ),
+            payments_enabled=bool_from_env(
+                "POSTERN_PAYMENTS_ENABLED",
+                False,
+                because=(
+                    "It registers payments.create_payment and payments.get_payment_status, "
+                    "which record payment proposals a customer approves in their banking "
+                    "app. Left off, neither tool exists."
                 ),
             ),
             # NO CEILING here or on any number below, and the argument is the

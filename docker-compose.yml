@@ -421,6 +421,9 @@ services:
       # `postern_api` in `dev-redis/users.acl`.
       POSTERN_REDIS_URL: "rediss://postern_api:postern-api-dev@redis:6379/0?ssl_ca_certs=/redis-ca/ca.crt&ssl_check_hostname=true"
       POSTERN_STRICT_HEADERS: "0"
+      # The payments producer stays off here as it does in production: its two
+      # tools need a `payments` consent row, which nothing in this stack writes.
+      POSTERN_PAYMENTS_ENABLED: "0"
       # THE SIGNING KEY IS NOT IN THIS CONTAINER. With these three set,
       # `postern_core.auth.keys.choose_key_source` builds a
       # `VaultTransitKeySource` and every internal token is signed by Vault.

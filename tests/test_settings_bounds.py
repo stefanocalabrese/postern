@@ -25,10 +25,10 @@ read. Measured on 2026-09-27 against planted shapes: ``raw =
 os.environ.get(X)`` followed by ``int(raw)`` on the next line escapes the
 numeric rule completely, and it is the way a careless numeric read is most
 likely to be written. So the third rule keys on the one thing every spelling
-shares, the variable's NAME at the read site. The swept tree names 83
+shares, the variable's NAME at the read site. The swept tree names 84
 ``POSTERN_*`` variables in two disjoint populations: 32 read directly, all of
-them strings, and 51 handed to a reader, which are `BOUNDED`'s 42,
-`STORE_BOUNDED`'s 2, `VAULT_BOUNDED`'s 2 and `FLAGS`' 5. Nothing is in both,
+them strings, and 52 handed to a reader, which are `BOUNDED`'s 42,
+`STORE_BOUNDED`'s 2, `VAULT_BOUNDED`'s 2 and `FLAGS`' 6. Nothing is in both,
 nothing is in neither, and `TestEveryEnvironmentReadNamesAnInventoriedVariable`
 re-derives that from the tree on every run rather than trusting these numbers.
 
@@ -589,6 +589,7 @@ class TestEveryNumericSettingIsInTheInventory:
             "POSTERN_TOKEN_ISSUER",
             "POSTERN_AUDIENCE",
             "POSTERN_STRICT_HEADERS",
+            "POSTERN_PAYMENTS_ENABLED",
             "POSTERN_DEVICE_VERIFICATION_URI",
             "POSTERN_APP_ASSERTION_JWKS_URI",
             "POSTERN_APP_ASSERTION_ISSUER",
@@ -2115,13 +2116,13 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
     numeric read. A rule keyed on the CONSUMER can always be evaded by one
     assignment, because the consumer can be arbitrarily far from the read.
 
-    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 83 distinct
+    WHAT THE TREE ACTUALLY HOLDS, counted rather than assumed: 84 distinct
     ``POSTERN_*`` variables across the swept roots, in two disjoint
     populations. 32 are read directly, and all 32 are strings -- a URL, a
     path, a key id, an issuer, an audience, a key prefix, and the guard's own
-    two comma-separated lists of names. 51 are handed to a reader as its ``name``
+    two comma-separated lists of names. 52 are handed to a reader as its ``name``
     argument, and those are the 42 in `BOUNDED`, the 2 in `STORE_BOUNDED`, the
-    2 in `VAULT_BOUNDED` and the 5 in `FLAGS`. Nothing is in both and nothing is in neither, which
+    2 in `VAULT_BOUNDED` and the 6 in `FLAGS`. Nothing is in both and nothing is in neither, which
     `TestEveryEnvironmentReadNamesAnInventoriedVariable::test_the_two_inventories_are_the_whole_tree`
     re-derives on every run.
 
@@ -2205,7 +2206,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         )
 
     def test_the_two_inventories_are_the_whole_tree(self) -> None:
-        """83 variables, 32 read directly and 51 through a reader, disjoint."""
+        """84 variables, 32 read directly and 52 through a reader, disjoint."""
         direct = {s.name for s in _all_env_sites() if s.shape == "direct" and s.name}
         through = {s.name for s in _all_env_sites() if s.shape == "reader" and s.name}
         assert direct & through == set(), (
@@ -2222,7 +2223,7 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         # accepting one that arms nothing -- the defect it exists for,
         # reintroduced inside the control itself.
         assert direct | through == set(KNOWN_ENV)
-        assert len(KNOWN_ENV) == 83
+        assert len(KNOWN_ENV) == 84
 
     def test_the_counts_the_docstrings_quote(self) -> None:
         """Every number the prose in this file states, re-derived.
@@ -2231,14 +2232,14 @@ class TestEveryEnvironmentReadNamesAnInventoriedVariable:
         confidently as one that is right. A variable added anywhere fails here,
         which is the line that sends the author to the sentences.
         """
-        assert len(KNOWN_ENV) == 83
+        assert len(KNOWN_ENV) == 84
         assert len(READ_AS_STRING) == 32
-        assert len(FLAGS) == 5
+        assert len(FLAGS) == 6
         assert len(BOUNDED_NAMES) == 42
         assert len(STORE_BOUNDED_NAMES) == 2
         assert len(VAULT_BOUNDED_NAMES) == 2
-        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 51
-        assert len(names_read_by("api")) == 39
+        assert len(BOUNDED_NAMES | STORE_BOUNDED_NAMES | VAULT_BOUNDED_NAMES | FLAGS) == 52
+        assert len(names_read_by("api")) == 40
         assert len(names_read_by("confirm")) == 63
         assert len(names_read_by("migrations")) == 3
 
