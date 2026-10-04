@@ -20,12 +20,14 @@ from typing import Any
 import httpx2
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from fastmcp.server.http import StarletteWithLifespan
+from postern_core.identity import TokenClaims
 from postern_core.store.engine import Database
 from postern_core.store.models import ConsentRecord
 from sqlalchemy import delete, text
 
 from services.api.main import create_app
 from services.api.settings import Settings
+from services.api.tools.payments import PaymentsRuntime
 from stub import backend as stub
 
 ISSUER = "https://postern-test.invalid"
@@ -158,3 +160,21 @@ async def delete_produced_challenges(database: Database) -> None:
     async with database.sessionmaker() as session:
         await session.execute(text("DELETE FROM challenges WHERE request_fingerprint IS NOT NULL"))
         await session.commit()
+
+
+#: A database nothing connects to: port 9 on loopback, which refuses. Building
+#: a server and listing its tools opens no connection, and a consent check
+#: with no token refuses before it reaches the store.
+OFFLINE_DATABASE_URL = "postgresql+asyncpg://postern:postern@127.0.0.1:9/postern"
+
+
+def no_claims() -> TokenClaims:
+    return TokenClaims(client_id=None, jti=None)
+
+
+def offline_runtime() -> PaymentsRuntime:
+    """A runtime over `OFFLINE_DATABASE_URL`. Close it with `runtime.db.close()`."""
+    return PaymentsRuntime(
+        db=Database(OFFLINE_DATABASE_URL, null_pool=True, connect_timeout_seconds=0.5),
+        claims=no_claims,
+    )

@@ -1,0 +1,264 @@
+"""`payments.create_payment`, the payments producer (spec section 6.1).
+
+NOT A READ MODULE. Its tools write a `challenges` row, which no
+`postern_core.modules.read.ReadContext` can do, and widening that context is
+pinned against by `tests/test_module_seam.py`. They are built into the api's
+composition instead: `register` below is called by `build_server` when it is
+handed a `PaymentsRuntime`, which `create_app` builds only when
+`POSTERN_PAYMENTS_ENABLED` is on.
+
+WHAT IT DOES AND CANNOT DO. `create_payment` reads the payer account's balance
+(for its currency) and the payee (for a display name) through the read facade,
+builds the payload from those server-resolved values only, and inserts one
+pending challenge, or returns the one this customer already has pending for
+the same request. It cannot approve: that needs an enrolled device's signature
+in `services/confirm`. It cannot execute: that needs the write key, which this
+process does not hold.
+
+ALWAYS CONSENT-GATED on `payments`, with the real `services/api/consent.py`
+check, even where `build_server` gives the read tools its no-auth stand-in.
+With no verified token the check refuses, so a server without customer auth
+lists these tools to nobody.
+
+EVERY REFUSAL IS A FIXED STRING raised as `ToolError`, which FastMCP 4.0.3
+renders as an `isError` result whose one text block is exactly that string.
+Any other exception reaches the client as "Error calling tool" followed by its
+text, so nothing that could echo an input, a `ValidationError` included, is
+let out as one.
+"""
+
+import logging
+import re
+import uuid
+from dataclasses import dataclass
+from decimal import Decimal
+
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from postern_core.domain.masking import FreeText
+from postern_core.domain.models import Ref
+from postern_core.domain.money import Money
+from postern_core.facade import accounts as accounts_facade
+from postern_core.facade import payments as payments_facade
+from postern_core.facade.client import BackendError
+from postern_core.facade.protocol import BackendReader
+from postern_core.identity import CustomerResolver, TokenClaimsProvider
+from postern_core.modules.read import ToolHandler
+from postern_core.payments import CREATE_PAYMENT_TOOL, PAYMENT_TIER, request_fingerprint
+from postern_core.store import challenges as store
+from postern_core.store.engine import Database
+from pydantic import TypeAdapter, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
+
+from services.api.consent import consent_for
+
+logger = logging.getLogger(__name__)
+
+#: The consent domain the producer's tools are gated on.
+CONSENT_DOMAIN = "payments"
+
+#: The fixed refusals (spec section 9). Constants so tests assert the exact
+#: strings a client sees.
+ACCOUNT_NOT_FOUND = "account not found"
+PAYEE_NOT_FOUND = "payee not found"
+AMOUNT_INVALID = "amount must be a positive decimal with at most 4 decimal places"
+REFERENCE_TOO_LONG = "reference is limited to 140 characters"
+CHALLENGE_NOT_FOUND = "challenge not found"
+NOT_RECORDED = "the payment could not be recorded"
+
+#: The longest `reference` accepted, counted on what the agent sent.
+MAX_REFERENCE_LENGTH = 140
+
+#: The widest `client_id` or `jti` stored. Both columns are `String(128)`. A
+#: longer claim is stored as NULL rather than truncated: a truncated value
+#: would later match the wrong revocation, and NULL matches none.
+MAX_CLAIM_LENGTH = 128
+
+#: Annotations for both tools (spec sections 6.1 and 6.2). Neither is
+#: read-only: one inserts a challenge, the other may expire one.
+ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+_AMOUNT = re.compile(r"[0-9]{1,15}(?:\.[0-9]{1,4})?")
+_FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
+
+
+@dataclass(frozen=True)
+class PaymentsRuntime:
+    """What the producer holds beyond a read tool's resolver and backend.
+
+    Attributes:
+        db: The process's one `Database`. The challenge transaction uses its
+            application pool, and the consent check reads through it.
+        claims: The verified token's `client_id` and `jti`, stored on the row
+            for later revocation matching and never used as a gate.
+    """
+
+    db: Database
+    claims: TokenClaimsProvider
+
+
+def canonical_amount(value: Decimal) -> str:
+    """`value` with at least two and at most four decimals, and no exponent.
+
+    So "340.5", "340.50" and "340.5000" are one string, and therefore one
+    fingerprint. The caller has already matched `_AMOUNT`, so `value` has at
+    most fifteen integer digits and four decimals, inside the default
+    context's 28 digits of precision.
+    """
+    normalized = value.normalize()
+    exponent = normalized.as_tuple().exponent
+    if isinstance(exponent, int) and exponent > -2:
+        normalized = normalized.quantize(Decimal("0.01"))
+    return format(normalized, "f")
+
+
+def _amount(raw: str, currency: str) -> str:
+    """The canonical amount, or the fixed refusal.
+
+    `Money` is built for its own checks (finite, at most four decimals, a
+    three-letter currency) and then dropped: the payload holds strings only,
+    because `canonical_approval_message` refuses a float.
+    """
+    if not _AMOUNT.fullmatch(raw):
+        raise ToolError(AMOUNT_INVALID)
+    value = Decimal(raw)
+    if value <= 0:
+        raise ToolError(AMOUNT_INVALID)
+    canonical = canonical_amount(value)
+    try:
+        Money(amount=Decimal(canonical), currency=currency)
+    except ValidationError:
+        raise ToolError(AMOUNT_INVALID) from None
+    return canonical
+
+
+def _reference(raw: str | None) -> str | None:
+    """`raw` scrubbed by `FreeText`, after the length check on what was sent.
+
+    The stored text can differ from the input, because `FreeText` redacts PAN-
+    and IBAN-shaped runs and masks long alphanumeric runs. The stored text is
+    what the customer is later shown.
+    """
+    if raw is None:
+        return None
+    if len(raw) > MAX_REFERENCE_LENGTH:
+        raise ToolError(REFERENCE_TOO_LONG)
+    return _FREE_TEXT.validate_python(raw)
+
+
+def _claim(value: str | None) -> str | None:
+    if value is None or len(value) > MAX_CLAIM_LENGTH:
+        return None
+    return value
+
+
+def build_create_payment(
+    resolver: CustomerResolver, backend: BackendReader, runtime: PaymentsRuntime
+) -> ToolHandler:
+    async def create_payment(
+        from_account_ref: Ref,
+        payee_ref: Ref,
+        amount: str,
+        reference: str | None = None,
+    ) -> dict[str, str]:
+        """Propose a payment; the customer approves it in their banking app.
+
+        This moves no money. It records a proposal and returns a `challenge_id`.
+        `from_account_ref` comes from `accounts.list`; `payee_ref` is a payee the
+        customer already saved. `amount` is a decimal string such as "340.50" in
+        the payer account's currency. `reference` is optional, at most 140
+        characters. Relay `human_summary`, then check `payments.get_payment_status`.
+        """
+        customer = resolver()
+        try:
+            balance = await accounts_facade.get_balance(backend, customer, from_account_ref)
+        except BackendError as exc:
+            if exc.status == 404:
+                raise ToolError(ACCOUNT_NOT_FOUND) from None
+            raise
+        try:
+            payee = await payments_facade.get_payee(backend, customer, payee_ref)
+        except BackendError as exc:
+            if exc.status == 404:
+                raise ToolError(PAYEE_NOT_FOUND) from None
+            raise
+        currency = balance.amount.currency
+        canonical = _amount(amount, currency)
+        stored_reference = _reference(reference)
+        payload: dict[str, str] = {
+            "from_account_ref": from_account_ref,
+            "payee_ref": payee.payee_ref,
+            "payee_name": payee.display_name,
+            "amount": canonical,
+            "currency": currency,
+        }
+        if stored_reference is not None:
+            payload["reference"] = stored_reference
+        fingerprint = request_fingerprint(
+            customer_ref=customer.value, tool_name=CREATE_PAYMENT_TOOL, payload=payload
+        )
+        claims = runtime.claims()
+        try:
+            async with runtime.db.sessionmaker() as session:
+                await store.expire_stale_pending(
+                    session, customer_ref=customer.value, request_fingerprint=fingerprint
+                )
+                record = await store.create_pending_challenge_once(
+                    session,
+                    challenge_id=uuid.uuid4().hex,
+                    customer_ref=customer.value,
+                    tool_name=CREATE_PAYMENT_TOOL,
+                    payload=payload,
+                    tier=PAYMENT_TIER,
+                    request_fingerprint=fingerprint,
+                    client_id=_claim(claims.client_id),
+                    session_jti=_claim(claims.jti),
+                )
+                await session.commit()
+        except (SQLAlchemyError, OSError) as exc:
+            # The type and nothing else: a DBAPIError's text carries the bound
+            # parameters, which are this customer's payload.
+            logger.error(
+                "%s could not record its challenge: %s", CREATE_PAYMENT_TOOL, type(exc).__name__
+            )
+            raise ToolError(NOT_RECORDED) from None
+        if record is None:
+            raise ToolError(NOT_RECORDED)
+        return {
+            "challenge_id": record.challenge_id,
+            "status": record.status,
+            "expires_at": record.expires_at.isoformat(),
+            "human_summary": (
+                f"Approve {currency} {canonical} to {payee.display_name} in your banking app."
+            ),
+        }
+
+    return create_payment
+
+
+def register(
+    server: FastMCP,
+    resolver: CustomerResolver,
+    backend: BackendReader,
+    runtime: PaymentsRuntime,
+) -> None:
+    """Register the producer's tools, each behind `consent_for("payments", ...)`.
+
+    One check object for every producer tool, for the reason
+    `services/api/server.py`'s `build_server` gives for a domain's read tools.
+    Never the no-auth stand-in: a server without customer auth refuses these
+    tools to every caller, which is what the spec asks of it.
+    """
+    check = consent_for(CONSENT_DOMAIN, runtime.db)
+    server.tool(
+        build_create_payment(resolver, backend, runtime),
+        name=CREATE_PAYMENT_TOOL,
+        annotations=ANNOTATIONS,
+        auth=check,
+    )

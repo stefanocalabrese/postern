@@ -80,8 +80,9 @@ from services.api.jwks import jwks_route
 from services.api.middleware.audit import AuditMiddleware, record_data_touch
 from services.api.middleware.revocation import RevocationMiddleware
 from services.api.middleware.risk import RiskMiddleware
-from services.api.server import build_server, token_customer_resolver
+from services.api.server import build_server, token_claims_provider, token_customer_resolver
 from services.api.settings import Settings
+from services.api.tools.payments import PaymentsRuntime
 
 # Subject of the one token `create_app` mints to check its own minter. It is a
 # reference to nobody: `CustomerRef` accepts it (the pattern is `cust[:_]`
@@ -496,12 +497,22 @@ def create_app(
     # budget charged to a different customer than the one whose data was
     # returned is not a budget.
     customer_resolver = resolver or token_customer_resolver
+    # THE PAYMENTS PRODUCER, built only when POSTERN_PAYMENTS_ENABLED is on.
+    # Over `db` and not `consent_db`: the producer's tools are consent-gated on
+    # `payments` in every configuration, including the no-auth stack, where
+    # the check finds no token and refuses, which is the point. The claims
+    # provider reads `client_id` and `jti` off the same verified token the
+    # resolver reads the customer from.
+    payments = (
+        PaymentsRuntime(db=db, claims=token_claims_provider) if settings.payments_enabled else None
+    )
     server = build_server(
         settings,
         customer_resolver,
         backend,
         db=consent_db,
         auth_override=auth_override,
+        payments=payments,
         # The session-token verifier drops any fetched key that is this READ
         # key (`services/api/session_verifier.py`), so a token the read key
         # signs is never accepted as a layer-1 session. A reader, not a

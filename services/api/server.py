@@ -8,6 +8,13 @@ FastMCP feature a module cannot express, and the seam would be second-class from
 the first time someone reached for one. The cards family lives in the
 `postern_cards` distribution and reaches this module only through an entry point.
 
+THE ONE EXCEPTION IS BEHIND A FLAG. With `POSTERN_PAYMENTS_ENABLED` on,
+`create_app` hands `build_server` a payments runtime and the producer's
+`register` (services/api/tools/payments.py) adds its tools after the loop,
+because they write a challenge row and a `ReadContext` cannot carry the
+database. They are not a module, they are always consent-gated on `payments`,
+and with the flag off nothing here registers them.
+
 Three properties the loop is responsible for, each of which would be a quiet
 regression rather than a loud one:
 
@@ -46,12 +53,14 @@ from postern_core.auth.resource_uri import is_normal_https_resource
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerRef, CustomerResolver, TokenClaims
 from postern_core.modules.read import (
+    ModuleSeamViolation,
     ReadContext,
     ReadModule,
     ReadTool,
     load_read_modules,
     refuse_duplicate_tool_names,
 )
+from postern_core.payments import PRODUCER_TOOL_NAMES
 from postern_core.store.engine import Database
 from pydantic import ValidationError
 
@@ -59,6 +68,8 @@ from services.api.consent import consent_for
 from services.api.session_verifier import SessionTokenVerifier
 from services.api.settings import Settings
 from services.api.tools import BUILTIN_READ_MODULES
+from services.api.tools import payments as payments_tools
+from services.api.tools.payments import PaymentsRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +145,10 @@ def _annotations(tool: ReadTool) -> ToolAnnotations:
 
     CONSTRUCTED HERE AND NOT IN THE MODULE, so that `mcp.types.ToolAnnotations`
     -- whose import path CLAUDE.md records as a trap, since it is not
-    re-exported by fastmcp -- is named in exactly one place in the tree that a
-    FastMCP major would have to be reconciled with. A module declares two
-    booleans.
+    re-exported by fastmcp -- is named in only two places a FastMCP major would
+    have to reconcile: here, and the payments producer in
+    services/api/tools/payments.py, which is not a module and declares all four
+    hints. A module declares two booleans.
     """
     return ToolAnnotations(read_only_hint=tool.read_only, open_world_hint=tool.open_world)
 
@@ -160,6 +172,25 @@ def _read_modules(
     return modules
 
 
+def _refuse_producer_name_collisions(modules: Sequence[ReadModule]) -> None:
+    """A read module may not declare a name the payments producer registers.
+
+    FastMCP's registry is a dict keyed on the name, so a second registration
+    of ``payments.create_payment`` would silently replace the first. Checked
+    on the combined module list, for the reason `refuse_duplicate_tool_names`
+    is, and only when the producer is on, so that a server built with the flag
+    off accepts exactly the module set it accepted before.
+    """
+    claimed = sorted(
+        tool.name for module in modules for tool in module.tools if tool.name in PRODUCER_TOOL_NAMES
+    )
+    if claimed:
+        raise ModuleSeamViolation(
+            f"read modules declare {claimed}, which the payments producer registers "
+            "when POSTERN_PAYMENTS_ENABLED is on. A module cannot shadow a producer tool."
+        )
+
+
 def build_server(
     settings: Settings,
     resolver: CustomerResolver,
@@ -169,6 +200,7 @@ def build_server(
     auth_override: AuthProvider | None = None,
     read_modules: Sequence[ReadModule] | None = None,
     forbidden_session_thumbprints: Callable[[], Iterable[str]] = tuple,
+    payments: PaymentsRuntime | None = None,
 ) -> FastMCP:
     has_jwks_uri = settings.customer_jwks_uri is not None
     has_issuer = settings.customer_token_issuer is not None
@@ -248,7 +280,10 @@ def build_server(
         # objects. A closure per tool would still hit the request-scoped cache,
         # but that measurement would stop describing this code.
         checks: dict[str, Callable[[AuthContext], Awaitable[bool]]] = {}
-        for module in _read_modules(read_modules):
+        modules = _read_modules(read_modules)
+        if payments is not None:
+            _refuse_producer_name_collisions(modules)
+        for module in modules:
             for tool in module.tools:
                 handler = tool.build(context)
                 if tool.consent_domain is None:
@@ -270,4 +305,8 @@ def build_server(
                     annotations=_annotations(tool),
                     auth=checks[tool.consent_domain],
                 )
+        if payments is not None:
+            # The one registration that does not come from a module, and only
+            # with POSTERN_PAYMENTS_ENABLED on (see the module docstring).
+            payments_tools.register(server, resolver, backend, payments)
     return server
