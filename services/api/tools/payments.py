@@ -1,4 +1,4 @@
-"""`payments.create_payment`, the payments producer (spec section 6.1).
+"""`payments.create_payment` and `payments.get_payment_status`: the producer.
 
 NOT A READ MODULE. Its tools write a `challenges` row, which no
 `postern_core.modules.read.ReadContext` can do, and widening that context is
@@ -46,7 +46,12 @@ from postern_core.facade.client import BackendError
 from postern_core.facade.protocol import BackendReader
 from postern_core.identity import CustomerResolver, TokenClaimsProvider
 from postern_core.modules.read import ToolHandler
-from postern_core.payments import CREATE_PAYMENT_TOOL, PAYMENT_TIER, request_fingerprint
+from postern_core.payments import (
+    CREATE_PAYMENT_TOOL,
+    PAYMENT_STATUS_TOOL,
+    PAYMENT_TIER,
+    request_fingerprint,
+)
 from postern_core.store import challenges as store
 from postern_core.store.engine import Database
 from pydantic import TypeAdapter, ValidationError
@@ -87,6 +92,9 @@ ANNOTATIONS = ToolAnnotations(
 )
 
 _AMOUNT = re.compile(r"[0-9]{1,15}(?:\.[0-9]{1,4})?")
+#: Not a `Ref`: the producer's ids are 32 hex characters, and other callers
+#: store ids such as `chal_int_001`.
+_CHALLENGE_ID = re.compile(r"[A-Za-z0-9_-]{1,36}")
 _FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
 
 
@@ -178,6 +186,15 @@ def _claim(value: str | None) -> str | None:
     return value
 
 
+def _display(value: object) -> str | None:
+    """A stored payload value as the status tool shows it: text only, and
+    scrubbed again, because a row this tool reads may have been written by a
+    caller other than `create_payment`."""
+    if not isinstance(value, str):
+        return None
+    return _FREE_TEXT.validate_python(value)
+
+
 def build_create_payment(
     resolver: CustomerResolver, backend: BackendReader, runtime: PaymentsRuntime
 ) -> ToolHandler:
@@ -262,6 +279,67 @@ def build_create_payment(
     return create_payment
 
 
+def build_get_payment_status(resolver: CustomerResolver, runtime: PaymentsRuntime) -> ToolHandler:
+    async def get_payment_status(challenge_id: str) -> dict[str, str | None]:
+        """Status of a payment proposed with `payments.create_payment`.
+
+        `pending` until the customer acts in their banking app, then `approved`
+        or `executed`, or `expired` once the deadline passes. `approved` does not
+        mean the bank executed it: an approval whose execution failed stays
+        `approved`.
+        """
+        customer = resolver()
+        if not _CHALLENGE_ID.fullmatch(challenge_id):
+            raise ToolError(CHALLENGE_NOT_FOUND)
+        try:
+            async with runtime.db.sessionmaker() as session:
+                record = await store.get_challenge(session, challenge_id)
+                # Missing, another customer's, or not a payment: one path and
+                # one message, so the answer confirms nothing about which.
+                if (
+                    record is None
+                    or record.customer_ref != customer.value
+                    or record.tool_name != CREATE_PAYMENT_TOOL
+                ):
+                    raise ToolError(CHALLENGE_NOT_FOUND)
+                if record.status == "pending":
+                    # The approval callback's own conditional transition, with
+                    # the deadline decided by the database clock (decision 0022
+                    # records this one api-side UPDATE).
+                    expired = await store.update_challenge_status(
+                        session,
+                        challenge_id,
+                        status="expired",
+                        expected_status="pending",
+                        expiry="expired",
+                    )
+                    if expired is None:
+                        # Not past its deadline, or another transaction moved
+                        # it first: the committed row is the answer.
+                        refreshed = await store.get_challenge(session, challenge_id, refresh=True)
+                        record = refreshed if refreshed is not None else record
+                    else:
+                        record = expired
+                    await session.commit()
+        except (SQLAlchemyError, OSError) as exc:
+            logger.error(
+                "%s could not read its challenge: %s", PAYMENT_STATUS_TOOL, type(exc).__name__
+            )
+            raise ToolError(NOT_RECORDED) from None
+        payload = record.payload
+        return {
+            "challenge_id": record.challenge_id,
+            "status": record.status,
+            "expires_at": record.expires_at.isoformat(),
+            "amount": _display(payload.get("amount")),
+            "currency": _display(payload.get("currency")),
+            "payee_name": _display(payload.get("payee_name")),
+            "reference": _display(payload.get("reference")),
+        }
+
+    return get_payment_status
+
+
 def register(
     server: FastMCP,
     resolver: CustomerResolver,
@@ -279,6 +357,12 @@ def register(
     server.tool(
         build_create_payment(resolver, backend, runtime),
         name=CREATE_PAYMENT_TOOL,
+        annotations=ANNOTATIONS,
+        auth=check,
+    )
+    server.tool(
+        build_get_payment_status(resolver, runtime),
+        name=PAYMENT_STATUS_TOOL,
         annotations=ANNOTATIONS,
         auth=check,
     )

@@ -12,6 +12,7 @@ actually receives.
 import asyncio
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from decimal import Decimal
 
@@ -30,7 +31,12 @@ from postern_core.modules.read import (
     ReadTool,
     ToolHandler,
 )
-from postern_core.payments import CREATE_PAYMENT_TOOL, PAYMENT_TIER, request_fingerprint
+from postern_core.payments import (
+    CREATE_PAYMENT_TOOL,
+    PAYMENT_STATUS_TOOL,
+    PAYMENT_TIER,
+    request_fingerprint,
+)
 from postern_core.store import challenges as store
 from postern_core.store.engine import Database
 from postern_core.store.models import ChallengeRecord
@@ -41,16 +47,19 @@ from services.api.settings import Settings
 from services.api.tools.payments import (
     ACCOUNT_NOT_FOUND,
     AMOUNT_INVALID,
+    CHALLENGE_NOT_FOUND,
     NOT_RECORDED,
     PAYEE_NOT_FOUND,
     REFERENCE_NOT_PRINTABLE,
     REFERENCE_TOO_LONG,
     PaymentsRuntime,
     build_create_payment,
+    build_get_payment_status,
     canonical_amount,
 )
 from stub import backend as stub
 from tests.fixtures.payments_http import (
+    OTHER,
     OWNER,
     call_tool,
     delete_produced_challenges,
@@ -607,3 +616,189 @@ async def test_the_registered_tool_declares_exactly_these_annotations(
         annotations["idempotentHint"],
         annotations["openWorldHint"],
     ) == (False, False, True, False)
+
+
+# -- get_payment_status ------------------------------------------------------------
+
+STATUS_FIELDS = {
+    "challenge_id",
+    "status",
+    "expires_at",
+    "amount",
+    "currency",
+    "payee_name",
+    "reference",
+}
+
+
+def payment_status(database: Database, *, customer: str = OWNER) -> ToolHandler:
+    return build_get_payment_status(
+        lambda: CustomerRef(value=customer), PaymentsRuntime(db=database, claims=fixed_claims)
+    )
+
+
+async def insert_row(database: Database, *, customer_ref: str, tool_name: str) -> str:
+    """A pending row the producer did not make through its handler: another
+    customer's, or another tool's. Fingerprinted, so the `produced` fixture
+    deletes it."""
+    challenge_id = uuid.uuid4().hex
+    async with database.sessionmaker() as s:
+        await store.create_pending_challenge_once(
+            s,
+            challenge_id=challenge_id,
+            customer_ref=customer_ref,
+            tool_name=tool_name,
+            payload={"amount": "1.00", "currency": "EUR"},
+            tier=PAYMENT_TIER,
+            request_fingerprint=challenge_id * 2,
+            client_id=None,
+            session_jti=None,
+        )
+        await s.commit()
+    return challenge_id
+
+
+async def test_status_reports_a_pending_proposal_from_the_stored_row(
+    produced: Database,
+) -> None:
+    created = await create_payment(produced)(**ARGS, reference="Rent October")
+    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    assert status == {
+        "challenge_id": created["challenge_id"],
+        "status": "pending",
+        "expires_at": created["expires_at"],
+        "amount": "340.50",
+        "currency": "EUR",
+        "payee_name": "Northwind Energy DE•• •••• 3000",
+        "reference": "Rent October",
+    }
+
+
+async def test_status_without_a_reference_reports_none(produced: Database) -> None:
+    created = await create_payment(produced)(**ARGS)
+    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    assert status["reference"] is None
+
+
+async def test_status_expires_a_row_past_its_deadline(produced: Database) -> None:
+    created = await create_payment(produced)(**ARGS)
+    async with produced.sessionmaker() as s:
+        await s.execute(
+            text(
+                "UPDATE challenges SET expires_at = now() - interval '1 second' "
+                "WHERE challenge_id = :c"
+            ),
+            {"c": created["challenge_id"]},
+        )
+        await s.commit()
+    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    assert status["status"] == "expired"
+    (row,) = await rows(produced)
+    assert row.status == "expired"
+
+
+async def test_an_approved_row_whose_execution_failed_stays_approved(
+    produced: Database,
+) -> None:
+    """The callback answers 207 and leaves the row `approved` when the backend
+    write fails. No status is invented on top of that."""
+    created = await create_payment(produced)(**ARGS)
+    async with produced.sessionmaker() as s:
+        await store.update_challenge_status(
+            s,
+            created["challenge_id"],
+            status="approved",
+            expected_status="pending",
+            expiry="unexpired",
+        )
+        await s.commit()
+    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    assert status["status"] == "approved"
+
+
+async def test_status_never_returns_the_approval_or_the_session_record(
+    produced: Database,
+) -> None:
+    created = await create_payment(produced)(**ARGS)
+    async with produced.sessionmaker() as s:
+        await store.update_challenge_status(
+            s,
+            created["challenge_id"],
+            status="approved",
+            expected_status="pending",
+            expiry="unexpired",
+            confirming_device="dev_secret_1",
+            verification_result="vr_secret_1",
+            signature="sig_secret_1",
+        )
+        await s.commit()
+    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    assert set(status) == STATUS_FIELDS
+    (row,) = await rows(produced)
+    rendered = json.dumps(status)
+    for withheld in (
+        "dev_secret_1",
+        "vr_secret_1",
+        "sig_secret_1",
+        "claude-code",
+        "jti-handler-1",
+        str(row.request_fingerprint),
+        "from_account_ref",
+        "acc_7f3a",
+    ):
+        assert withheld not in rendered, withheld
+
+
+@pytest.mark.parametrize("case", ["unknown", "foreign", "not_a_payment", "malformed"])
+async def test_unknown_foreign_non_payment_and_malformed_ids_are_one_refusal(
+    produced: Database, case: str
+) -> None:
+    if case == "unknown":
+        challenge_id = uuid.uuid4().hex
+    elif case == "foreign":
+        challenge_id = await insert_row(produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL)
+    elif case == "not_a_payment":
+        challenge_id = await insert_row(produced, customer_ref=OWNER, tool_name="accounts.rename")
+    else:
+        challenge_id = "x" * 37
+    with pytest.raises(ToolError) as refused:
+        await payment_status(produced)(challenge_id=challenge_id)
+    assert str(refused.value) == CHALLENGE_NOT_FOUND
+
+
+async def test_status_on_an_unreachable_store_is_a_fixed_refusal() -> None:
+    runtime = offline_runtime()
+    try:
+        handler = build_get_payment_status(lambda: CustomerRef(value=OWNER), runtime)
+        with pytest.raises(ToolError) as refused:
+            await handler(challenge_id=uuid.uuid4().hex)
+    finally:
+        await runtime.db.close()
+    assert str(refused.value) == NOT_RECORDED
+
+
+async def test_over_http_both_tools_are_listed_with_payments_consent(
+    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+) -> None:
+    await grant(produced, OWNER, "payments")
+    names = await list_tool_names(pg_url, key_pair, token_for(key_pair, OWNER))
+    assert {CREATE_PAYMENT_TOOL, PAYMENT_STATUS_TOOL} <= names
+
+
+async def test_over_http_the_ownership_refusals_are_byte_identical(
+    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+) -> None:
+    """A foreign id, another tool's id and an invented id must answer the same
+    bytes: anything else confirms which ids exist to a holder of one valid
+    customer token."""
+    await grant(produced, OWNER, "payments")
+    foreign = await insert_row(produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL)
+    not_a_payment = await insert_row(produced, customer_ref=OWNER, tool_name="accounts.rename")
+    unknown = uuid.uuid4().hex
+    token = token_for(key_pair, OWNER)
+    responses = [
+        await call_tool(pg_url, key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": cid})
+        for cid in (foreign, not_a_payment, unknown)
+    ]
+    assert len({response.text for response in responses}) == 1
+    assert [block["text"] for block in result_of(responses[0])["content"]] == [CHALLENGE_NOT_FOUND]
