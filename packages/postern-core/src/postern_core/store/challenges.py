@@ -60,6 +60,8 @@ TIER_TTL_SECONDS: dict[VerificationTier, int] = {
 #: spells it. ON CONFLICT infers a partial index only from a WHERE clause that
 #: implies its predicate, and a bound parameter in its place does not.
 _PENDING_PREDICATE = "status = 'pending'"
+#: How many times `create_pending_challenge_once` runs expire, insert, select.
+_PRODUCER_PASSES = 2
 
 
 class ChallengeNotFoundError(Exception):
@@ -437,16 +439,23 @@ async def create_pending_challenge_once(
 
     One INSERT ... ON CONFLICT DO NOTHING against
     ``ix_challenges_pending_fingerprint``, then, when it inserted nothing, one
-    SELECT of the pending row it collided with. PostgreSQL decides the
-    collision under the index, so two concurrent callers produce one row: the
-    second INSERT waits for the first transaction, and once that commits it
-    inserts nothing and its SELECT, on a fresh READ COMMITTED snapshot, finds
-    the first caller's row.
+    SELECT of the pending row it collided with, which must also be inside its
+    deadline by the database clock. PostgreSQL decides the collision under the
+    index, so two concurrent callers produce one row: the second INSERT waits
+    for the first transaction, and once that commits it inserts nothing and
+    its SELECT, on a fresh READ COMMITTED snapshot, finds the first caller's
+    row.
 
-    Returns ``None`` in one case only: the row it collided with left
-    ``pending`` between the two statements. The caller reports a failure and
-    a retry makes a new challenge, which is correct for a row that has been
-    approved or expired.
+    The sequence (expire stale rows, insert, select) runs at most twice in
+    total. A second pass is needed only in a narrow race: the row the INSERT
+    collided with left ``pending`` or passed its deadline before the SELECT
+    ran, for instance because a concurrent transaction moved it to ``expired``
+    and rolled back while the INSERT waited. The second pass expires it,
+    inserts, and selects again.
+
+    Returns ``None`` when both passes found nothing to return. The caller
+    reports a failure and a retry makes a new challenge, which is correct for
+    a row that has been approved or expired. The function never commits.
 
     Both timestamps are stamped by the database, as in `create_challenge`.
     """
@@ -472,16 +481,34 @@ async def create_pending_challenge_once(
         )
         .returning(ChallengeRecord)
     )
-    inserted = (await session.scalars(insert_stmt)).one_or_none()
-    if inserted is not None:
-        return inserted
-    existing = (
+    for _ in range(_PRODUCER_PASSES):
+        await expire_stale_pending(
+            session, customer_ref=customer_ref, request_fingerprint=request_fingerprint
+        )
+        inserted = (await session.scalars(insert_stmt)).one_or_none()
+        if inserted is not None:
+            return inserted
+        existing = await _select_live_pending(
+            session, customer_ref=customer_ref, request_fingerprint=request_fingerprint
+        )
+        if existing is not None:
+            return existing
+    return None
+
+
+async def _select_live_pending(
+    session: AsyncSession, *, customer_ref: str, request_fingerprint: str
+) -> ChallengeRecord | None:
+    """The pending row for this customer and fingerprint, if it is still inside
+    its deadline by the database clock, else ``None``."""
+    stmt = (
         select(ChallengeRecord)
         .where(
             ChallengeRecord.customer_ref == customer_ref,
             ChallengeRecord.request_fingerprint == request_fingerprint,
             ChallengeRecord.status == "pending",
+            ChallengeRecord.expires_at > func.statement_timestamp(),
         )
         .execution_options(populate_existing=True)
     )
-    return (await session.scalars(existing)).one_or_none()
+    return (await session.scalars(stmt)).one_or_none()

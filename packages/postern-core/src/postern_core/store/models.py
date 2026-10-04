@@ -1021,9 +1021,11 @@ class ChallengeRecord(Base):
             name="ck_challenges_status",
         ),
         # One pending challenge per customer and request fingerprint. Partial,
-        # so a row leaves the index when it leaves `pending`. The predicate is
-        # pinned by tests/test_store_producer.py, because `alembic check` does
-        # not compare it.
+        # so a row leaves the index when it leaves `pending`. `alembic check`
+        # does not compare the predicate. The migration's predicate is pinned
+        # by pg_indexes against the database built from migrations; the three
+        # spellings (this one, challenges._PENDING_PREDICATE and the
+        # migration's) are pinned equal by tests/test_store_producer.py.
         Index(
             "ix_challenges_pending_fingerprint",
             "customer_ref",

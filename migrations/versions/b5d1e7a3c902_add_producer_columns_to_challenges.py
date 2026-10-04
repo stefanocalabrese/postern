@@ -23,6 +23,12 @@ _INDEX = "ix_challenges_pending_fingerprint"
 # for its own vocabulary: a migration records what the schema became on one
 # date, and an imported value that later changed would rewrite that record.
 _PENDING = "status = 'pending'"
+# Same value and same reason as f1860c110112: `CREATE INDEX` takes a SHARE lock
+# that blocks every INSERT and UPDATE on `challenges`, and `ADD COLUMN` takes
+# ACCESS EXCLUSIVE, so a migration that cannot get its lock gives up after 3
+# seconds instead of parking the write path behind it. `SET LOCAL` reverts at
+# COMMIT and changes nothing for other revisions.
+_LOCK_TIMEOUT = "3s"
 
 
 def upgrade() -> None:
@@ -54,6 +60,7 @@ def upgrade() -> None:
     clause, so tests/test_store_producer.py reads `pg_indexes.indexdef` and
     pins the predicate itself.
     """
+    op.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
     op.add_column(_TABLE, sa.Column("client_id", sa.String(length=128), nullable=True))
     op.add_column(_TABLE, sa.Column("session_jti", sa.String(length=128), nullable=True))
     op.add_column(_TABLE, sa.Column("request_fingerprint", sa.String(length=64), nullable=True))
@@ -75,6 +82,7 @@ def downgrade() -> None:
     `payments.create_payment` with "the payment could not be recorded", which
     is the fail-closed direction: no challenge is created.
     """
+    op.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
     op.drop_index(_INDEX, table_name=_TABLE)
     op.drop_column(_TABLE, "request_fingerprint")
     op.drop_column(_TABLE, "session_jti")

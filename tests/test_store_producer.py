@@ -10,7 +10,10 @@ and deletes its own rows by the `chal_pfp_` prefix.
 
 import asyncio
 import hashlib
+import importlib.util
 from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import cast
 
 import pytest
 import pytest_asyncio
@@ -18,7 +21,7 @@ from postern_core.payments import CREATE_PAYMENT_TOOL, PAYMENT_TIER, request_fin
 from postern_core.store import challenges
 from postern_core.store.engine import Database
 from postern_core.store.models import ChallengeRecord
-from sqlalchemy import func, select, text
+from sqlalchemy import Table, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 CUSTOMER = "cust_7f3a"
@@ -139,9 +142,11 @@ def test_the_fingerprint_changes_with_the_customer_and_the_tool() -> None:
 
 
 async def test_the_unique_index_covers_pending_rows_only(database: Database) -> None:
-    """Pinned here because `alembic check` compares this index's name,
-    uniqueness and columns and not its WHERE clause, so a model and a
-    migration that disagree on the predicate would pass the drift gate."""
+    """Pins the migration's predicate, as the database built from migrations
+    reports it. `alembic check` compares this index's name, uniqueness and
+    columns and not its WHERE clause, so without this a migration with the
+    wrong predicate would pass the drift gate. The model's and the store's
+    spellings are pinned equal to the migration's by the pure test below."""
     async with database.sessionmaker() as s:
         indexdef = (
             await s.execute(
@@ -156,6 +161,29 @@ async def test_the_unique_index_covers_pending_rows_only(database: Database) -> 
     )
     assert "(customer_ref, request_fingerprint)" in indexdef
     assert indexdef.endswith("WHERE ((status)::text = 'pending'::text)")
+
+
+def test_the_model_the_store_and_the_migration_spell_the_predicate_alike() -> None:
+    """No database: three copies of one string must stay one string."""
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "migrations"
+        / "versions"
+        / "b5d1e7a3c902_add_producer_columns_to_challenges.py"
+    )
+    spec = importlib.util.spec_from_file_location("b5d1e7a3c902_for_test", path)
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    index = next(
+        i
+        for i in cast(Table, ChallengeRecord.__table__).indexes
+        if i.name == "ix_challenges_pending_fingerprint"
+    )
+    model_where = str(index.dialect_options["postgresql"]["where"])
+    assert (
+        model_where == challenges._PENDING_PREDICATE == migration._PENDING == "status = 'pending'"
+    )
 
 
 # -- The insert ------------------------------------------------------------------
@@ -257,6 +285,128 @@ async def test_expiry_touches_only_this_customers_past_deadline_rows(
     assert expired == []
     assert await _status(database, f"{PREFIX}live") == "pending"
     assert await _status(database, f"{PREFIX}other") == "pending"
+
+
+async def test_expiry_is_scoped_by_fingerprint(database: Database, clean: None) -> None:
+    other_fp = request_fingerprint(
+        customer_ref=CUSTOMER, tool_name=CREATE_PAYMENT_TOOL, payload={**PAYLOAD, "amount": "1.00"}
+    )
+    assert other_fp != _fingerprint()
+    async with database.sessionmaker() as s:
+        await _create(s, f"{PREFIX}samefp")
+        await s.commit()
+    async with database.sessionmaker() as s:
+        await s.execute(
+            text(
+                "UPDATE challenges SET expires_at = now() - interval '1 second', "
+                "request_fingerprint = :fp WHERE challenge_id = :c"
+            ),
+            {"c": f"{PREFIX}samefp", "fp": other_fp},
+        )
+        await s.commit()
+    async with database.sessionmaker() as s:
+        expired = await challenges.expire_stale_pending(
+            s, customer_ref=CUSTOMER, request_fingerprint=_fingerprint()
+        )
+        await s.commit()
+    assert expired == []
+    assert await _status(database, f"{PREFIX}samefp") == "pending"
+
+
+@pytest.mark.parametrize("status", ["executed", "approved"])
+async def test_expiry_leaves_a_past_deadline_row_that_is_not_pending(
+    database: Database, clean: None, status: str
+) -> None:
+    async with database.sessionmaker() as s:
+        await _create(s, f"{PREFIX}{status}")
+        await s.commit()
+    async with database.sessionmaker() as s:
+        await s.execute(
+            text(
+                "UPDATE challenges SET status = :st, expires_at = now() - interval '1 second' "
+                "WHERE challenge_id = :c"
+            ),
+            {"c": f"{PREFIX}{status}", "st": status},
+        )
+        await s.commit()
+    async with database.sessionmaker() as s:
+        expired = await challenges.expire_stale_pending(
+            s, customer_ref=CUSTOMER, request_fingerprint=_fingerprint()
+        )
+        await s.commit()
+    assert expired == []
+    assert await _status(database, f"{PREFIX}{status}") == status
+
+
+async def test_a_pending_row_past_its_deadline_is_not_returned_by_the_fallback_select(
+    database: Database, clean: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The narrow race: the stale row is still pending when the INSERT collides
+    with it. With the expire step disabled, the row stays pending past its
+    deadline, and the fallback SELECT must refuse it on both passes."""
+
+    async def no_expiry(*args: object, **kwargs: object) -> list[str]:
+        return []
+
+    async with database.sessionmaker() as s:
+        await _create(s, f"{PREFIX}late")
+        await s.commit()
+    async with database.sessionmaker() as s:
+        await s.execute(
+            text(
+                "UPDATE challenges SET expires_at = now() - interval '1 second' "
+                "WHERE challenge_id = :c"
+            ),
+            {"c": f"{PREFIX}late"},
+        )
+        await s.commit()
+    monkeypatch.setattr(challenges, "expire_stale_pending", no_expiry)
+    async with database.sessionmaker() as s:
+        result = await _create(s, f"{PREFIX}late_again")
+        await s.rollback()
+    assert result is None
+
+
+async def test_the_sequence_runs_twice_when_the_first_select_finds_nothing(
+    database: Database, clean: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with database.sessionmaker() as s:
+        await _create(s, f"{PREFIX}racy")
+        await s.commit()
+    real = challenges._select_live_pending
+    calls = 0
+
+    async def first_misses(*args: object, **kwargs: object) -> ChallengeRecord | None:
+        nonlocal calls
+        calls += 1
+        return None if calls == 1 else await real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(challenges, "_select_live_pending", first_misses)
+    async with database.sessionmaker() as s:
+        result = await _create(s, f"{PREFIX}racy_again")
+        await s.commit()
+    assert calls == 2
+    assert result is not None and result.challenge_id == f"{PREFIX}racy"
+
+
+async def test_the_sequence_gives_up_after_two_passes(
+    database: Database, clean: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with database.sessionmaker() as s:
+        await _create(s, f"{PREFIX}never")
+        await s.commit()
+    calls = 0
+
+    async def always_misses(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(challenges, "_select_live_pending", always_misses)
+    async with database.sessionmaker() as s:
+        result = await _create(s, f"{PREFIX}never_again")
+        await s.rollback()
+    assert result is None
+    assert calls == 2
 
 
 async def test_an_approved_row_does_not_block_a_new_proposal(

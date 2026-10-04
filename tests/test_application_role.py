@@ -26,11 +26,13 @@ statement either service sends:
   granting consent belongs to a flow this repository has not built -- so that
   table takes SELECT and its sequence takes nothing.
 - `packages/postern-core/src/postern_core/store/challenges.py` inserts
-  (``create_challenge``), reads (``get_challenge``, ``list_customer_challenges``)
-  and transitions (``update_challenge_status``, which is an ``UPDATE ...
-  RETURNING``). So ``challenges`` takes SELECT, INSERT and UPDATE, and its
-  sequence takes USAGE. It takes no DELETE: there is no delete helper and no
-  caller that wants one, and an expired challenge is transitioned rather than
+  (``create_challenge``; ``create_pending_challenge_once``, an ``INSERT ... ON
+  CONFLICT ... RETURNING``), reads (``get_challenge``,
+  ``list_customer_challenges``) and transitions (``update_challenge_status``
+  and ``expire_stale_pending``, each an ``UPDATE ... RETURNING``). So
+  ``challenges`` takes SELECT, INSERT and UPDATE, and its sequence takes USAGE.
+  It takes no DELETE: there is no delete helper and no caller that wants one,
+  and an expired challenge is transitioned rather than
   removed.
 
 ``alembic_version`` takes NOTHING, which contradicts a reasonable guess and is
