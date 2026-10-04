@@ -24,7 +24,8 @@ Usage::
 from datetime import timedelta
 from typing import Any, Literal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from postern_core.domain.verification import VerificationTier
@@ -43,6 +44,22 @@ from postern_core.store.models import ChallengeRecord
 # expired" is not a state and a signature that can express it invites someone
 # to pass it.
 ExpiryPredicate = Literal["ignore", "unexpired", "expired"]
+
+
+#: How long a challenge stays approvable, by tier: 30 seconds, 3 minutes and 5
+#: minutes. One table for `create_challenge` and
+#: `create_pending_challenge_once`, so the two cannot stamp different deadlines
+#: for one tier.
+TIER_TTL_SECONDS: dict[VerificationTier, int] = {
+    VerificationTier.SESSION_ONLY: 30,
+    VerificationTier.APP_APPROVAL: 180,
+    VerificationTier.APP_IDENTITY_VERIFICATION: 300,
+}
+
+#: The predicate of `ix_challenges_pending_fingerprint`, spelled as the index
+#: spells it. ON CONFLICT infers a partial index only from a WHERE clause that
+#: implies its predicate, and a bound parameter in its place does not.
+_PENDING_PREDICATE = "status = 'pending'"
 
 
 class ChallengeNotFoundError(Exception):
@@ -82,16 +99,11 @@ async def create_challenge(
         process's).
     """
     # Compute the TTL from the tier.
-    ttl_seconds = {
-        VerificationTier.SESSION_ONLY: 30,
-        VerificationTier.APP_APPROVAL: 180,
-        VerificationTier.APP_IDENTITY_VERIFICATION: 300,
-    }
     if isinstance(tier, int):
         tier_int = tier
     else:
         tier_int = int(tier)
-    ttl = ttl_seconds.get(VerificationTier(tier_int), 180)  # default to tier-1 TTL.
+    ttl = TIER_TTL_SECONDS.get(VerificationTier(tier_int), 180)  # default to tier-1 TTL.
 
     # Both timestamps are SQL expressions, evaluated by the database, so
     # ``expires_at`` is stamped on the clock that ``update_challenge_status``
@@ -375,3 +387,101 @@ async def list_customer_challenges(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def expire_stale_pending(
+    session: AsyncSession,
+    *,
+    customer_ref: str,
+    request_fingerprint: str,
+) -> list[str]:
+    """Move this customer's pending rows with this fingerprint to ``expired``
+    once the database clock has passed their deadline, and name them.
+
+    The payments producer runs this in the same transaction as, and just
+    before, `create_pending_challenge_once`. Without it a row past its
+    deadline that nobody has marked would still occupy the partial unique
+    index, and the insert would hand the caller a challenge that can no longer
+    be approved. ``now()`` is the transaction's timestamp, the clock every
+    other expiry predicate in this module uses.
+    """
+    stmt = (
+        update(ChallengeRecord)
+        .where(
+            ChallengeRecord.customer_ref == customer_ref,
+            ChallengeRecord.request_fingerprint == request_fingerprint,
+            ChallengeRecord.status == "pending",
+            ChallengeRecord.expires_at <= func.now(),
+        )
+        .values(status="expired")
+        .returning(ChallengeRecord.challenge_id)
+        .execution_options(synchronize_session=False)
+    )
+    return list((await session.scalars(stmt)).all())
+
+
+async def create_pending_challenge_once(
+    session: AsyncSession,
+    *,
+    challenge_id: str,
+    customer_ref: str,
+    tool_name: str,
+    payload: dict[str, Any],
+    tier: VerificationTier,
+    request_fingerprint: str,
+    client_id: str | None,
+    session_jti: str | None,
+) -> ChallengeRecord | None:
+    """Insert a pending challenge, or return the one already pending for this
+    customer and fingerprint.
+
+    One INSERT ... ON CONFLICT DO NOTHING against
+    ``ix_challenges_pending_fingerprint``, then, when it inserted nothing, one
+    SELECT of the pending row it collided with. PostgreSQL decides the
+    collision under the index, so two concurrent callers produce one row: the
+    second INSERT waits for the first transaction, and once that commits it
+    inserts nothing and its SELECT, on a fresh READ COMMITTED snapshot, finds
+    the first caller's row.
+
+    Returns ``None`` in one case only: the row it collided with left
+    ``pending`` between the two statements. The caller reports a failure and
+    a retry makes a new challenge, which is correct for a row that has been
+    approved or expired.
+
+    Both timestamps are stamped by the database, as in `create_challenge`.
+    """
+    ttl = TIER_TTL_SECONDS[tier]
+    insert_stmt = (
+        pg_insert(ChallengeRecord)
+        .values(
+            challenge_id=challenge_id,
+            customer_ref=customer_ref,
+            tool_name=tool_name,
+            payload=payload,
+            tier=int(tier),
+            status="pending",
+            created_at=func.statement_timestamp(),
+            expires_at=func.statement_timestamp() + timedelta(seconds=ttl),
+            request_fingerprint=request_fingerprint,
+            client_id=client_id,
+            session_jti=session_jti,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["customer_ref", "request_fingerprint"],
+            index_where=text(_PENDING_PREDICATE),
+        )
+        .returning(ChallengeRecord)
+    )
+    inserted = (await session.scalars(insert_stmt)).one_or_none()
+    if inserted is not None:
+        return inserted
+    existing = (
+        select(ChallengeRecord)
+        .where(
+            ChallengeRecord.customer_ref == customer_ref,
+            ChallengeRecord.request_fingerprint == request_fingerprint,
+            ChallengeRecord.status == "pending",
+        )
+        .execution_options(populate_existing=True)
+    )
+    return (await session.scalars(existing)).one_or_none()

@@ -19,6 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
     column,
     false,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -966,6 +967,17 @@ class ChallengeRecord(Base):
     ``signature``
         Device-bound key signature over the payload, provided by the mobile
         app at approval time.
+
+    ``client_id`` / ``session_jti``
+        The OAuth client and the session token's ``jti`` that proposed the
+        challenge, read from the verified token by the payments producer. NULL
+        when the token carries neither, and on rows other callers create. A
+        record for later revocation matching, never a gate.
+
+    ``request_fingerprint``
+        SHA-256 hex of the customer, the tool and the canonical payload.
+        Unique per customer among pending rows; NULL on rows other callers
+        create.
     """
 
     __tablename__ = "challenges"
@@ -982,6 +994,11 @@ class ChallengeRecord(Base):
     confirming_device: Mapped[str | None] = mapped_column(String(128), nullable=True)
     verification_result: Mapped[str | None] = mapped_column(Text, nullable=True)
     signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The payments producer's three columns (migration b5d1e7a3c902). NULL on
+    # every row another caller creates.
+    client_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    session_jti: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         # Closed vocabulary for tier: 0=session, 1=app approval,
@@ -1002,5 +1019,16 @@ class ChallengeRecord(Base):
                 )
             ),
             name="ck_challenges_status",
+        ),
+        # One pending challenge per customer and request fingerprint. Partial,
+        # so a row leaves the index when it leaves `pending`. The predicate is
+        # pinned by tests/test_store_producer.py, because `alembic check` does
+        # not compare it.
+        Index(
+            "ix_challenges_pending_fingerprint",
+            "customer_ref",
+            "request_fingerprint",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
         ),
     )
