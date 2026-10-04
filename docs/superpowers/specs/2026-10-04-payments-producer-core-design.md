@@ -158,7 +158,7 @@ Flag off (default): the registered tools, `tools/list`, `start_session` output a
 Flag on:
 
 - The two tools are registered. A client sees them only if its customer has a `payments` consent row; nothing in the repository writes one.
-- `start_session` still reports `payments` as `granted=False` and `write_enabled=[]`. Its `_CONFIRMATION_NOTE` ("It cannot move money or change anything") is replaced by a note that payment tools propose a payment the customer must approve in their banking app and cannot move money themselves.
+- `start_session` still reports `payments` as `granted=False` and `write_enabled=[]`. Its `_CONFIRMATION_NOTE` ("It cannot move money or change anything") is replaced by a note that says, in substance: "If payment tools are listed for this customer, they only propose a payment. A proposal moves no money: the customer approves each one in their banking app, never in this conversation, and nothing here can approve or execute it." The note is static: whether the tools are listed depends on the customer's `payments` consent, which `start_session` does not report (the hard-coded `granted=False` stays and is a known limit until a consent flow exists). The note promises neither that the tools are available nor that a prompt reaches the phone.
 
 ## 11. Security properties
 

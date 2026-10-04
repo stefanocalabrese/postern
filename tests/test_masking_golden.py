@@ -16,6 +16,7 @@ quietly green forever.
 
 import json
 import re
+import uuid
 from typing import Any
 
 import httpx2
@@ -27,7 +28,9 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import RSAKeyPair
 from postern_core.facade.client import BackendClient, StubTokenMinter
 from postern_core.payments import CREATE_PAYMENT_TOOL, PAYMENT_STATUS_TOOL
+from postern_core.store import challenges as store
 from postern_core.store.engine import Database
+from sqlalchemy import text
 
 from services.api.server import build_server
 from services.api.settings import Settings
@@ -357,8 +360,9 @@ async def test_every_producer_tool_has_a_masking_case() -> None:
 async def test_no_producer_output_contains_a_pan_or_iban(
     pg_url: str, producer_key_pair: RSAKeyPair, database: Database, audit_server: FastMCP
 ) -> None:
-    """Both tools, end to end: a payee name carrying an IBAN from the backend
-    and a reference carrying a PAN and a grouped IBAN from the agent."""
+    """Every tool in `PRODUCER_CASES`, end to end: a payee name carrying an IBAN
+    from the backend and a reference carrying a PAN and a grouped IBAN from the
+    agent. The create case runs first and its id fills the other cases."""
     await delete_produced_challenges(database)
     await revoke_all_consents(database)
     await grant(database, OWNER, "payments")
@@ -374,10 +378,14 @@ async def test_no_producer_output_contains_a_pan_or_iban(
         body = json.loads(created.text)["result"]
         assert body["isError"] is False, created.text
         challenge_id = body["structuredContent"]["challenge_id"]
-        status = await call_tool(
-            pg_url, producer_key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
-        )
-        for name, response in ((CREATE_PAYMENT_TOOL, created), (PAYMENT_STATUS_TOOL, status)):
+        responses = {CREATE_PAYMENT_TOOL: created}
+        for name, arguments in PRODUCER_CASES.items():
+            if name == CREATE_PAYMENT_TOOL:
+                continue
+            filled = {**arguments, "challenge_id": challenge_id}
+            responses[name] = await call_tool(pg_url, producer_key_pair, token, name, filled)
+        assert set(responses) == set(PRODUCER_CASES)
+        for name, response in responses.items():
             # The challenge id is a server-generated uuid4 hex string, not
             # customer data. Thirty-two random hex characters match these
             # deliberately loose patterns a few percent of the time (twelve
@@ -389,4 +397,49 @@ async def test_no_producer_output_contains_a_pan_or_iban(
             assert not PAN_RE.search(rendered), f"{name} leaked a PAN: {rendered[:400]}"
     finally:
         await delete_produced_challenges(database)
+        await revoke_all_consents(database)
+
+
+async def test_a_status_read_of_a_row_another_caller_wrote_is_scrubbed(
+    pg_url: str, producer_key_pair: RSAKeyPair, database: Database, audit_server: FastMCP
+) -> None:
+    """`get_payment_status` scrubs again what it shows, because the row may not
+    have come from `create_payment`: a raw PAN in `payee_name` and a grouped
+    IBAN in `reference`, written through the store, must not reach the client."""
+    await delete_produced_challenges(database)
+    await revoke_all_consents(database)
+    await grant(database, OWNER, "payments")
+    token = token_for(producer_key_pair, OWNER)
+    challenge_id = uuid.uuid4().hex
+    try:
+        async with database.sessionmaker() as session:
+            await store.create_challenge(
+                session,
+                challenge_id=challenge_id,
+                customer_ref=OWNER,
+                tool_name=CREATE_PAYMENT_TOOL,
+                payload={
+                    "amount": "10.00",
+                    "currency": "EUR",
+                    "payee_name": f"Payee {fx.FULL_PAN}",
+                    "reference": f"Ref {fx.GROUPED_IBAN}",
+                },
+                tier=1,
+            )
+            await session.commit()
+        response = await call_tool(
+            pg_url, producer_key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
+        )
+        assert json.loads(response.text)["result"]["isError"] is False, response.text
+        rendered = response.text.replace(challenge_id, "<challenge_id>")
+        assert fx.FULL_PAN not in rendered
+        assert fx.GROUPED_IBAN not in rendered
+        assert not IBAN_RE.search(rendered), f"status leaked an IBAN: {rendered[:400]}"
+        assert not PAN_RE.search(rendered), f"status leaked a PAN: {rendered[:400]}"
+    finally:
+        async with database.sessionmaker() as session:
+            await session.execute(
+                text("DELETE FROM challenges WHERE challenge_id = :c"), {"c": challenge_id}
+            )
+            await session.commit()
         await revoke_all_consents(database)

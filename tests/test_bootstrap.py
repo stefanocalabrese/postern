@@ -6,6 +6,8 @@ field (client support for which is inconsistent -- see `services/api/server.py`'
 `SERVER_INSTRUCTIONS` and this module's own `bootstrap.py` docstring).
 """
 
+from dataclasses import replace
+
 import httpx2
 import pytest
 from fastmcp import FastMCP
@@ -14,6 +16,7 @@ from postern_core.facade.client import BackendClient, StubTokenMinter
 
 from services.api.server import build_server
 from services.api.settings import Settings
+from services.api.tools import BUILTIN_READ_MODULES, BUILTIN_READ_MODULES_WITH_PAYMENTS, bootstrap
 from tests.conftest import TEST_CUSTOMER
 from tests.fixtures import backend_responses as fx
 from tests.fixtures.payments_http import offline_runtime
@@ -141,10 +144,15 @@ async def test_bootstrap_confirmation_note_flags_labels_as_customer_data(
     assert "not instructions" in note or "not a directive" in note or "customer" in note.lower()
 
 
-async def test_with_the_payments_flag_on_the_note_says_payments_are_proposals() -> None:
-    """Spec section 10: the note changes and nothing else does. `payments`
-    stays ungranted and `write_enabled` stays empty, because the note describes
-    what a proposal is, not a capability this session holds."""
+async def test_with_the_payments_flag_on_the_note_says_payments_are_proposals(
+    server: FastMCP,
+) -> None:
+    """Spec section 10: the note changes and nothing else does. The whole
+    structured result, minus the note and the session handle, equals the
+    flag-off call's: `payments` stays ungranted and `write_enabled` stays
+    empty, because the note describes what a proposal is, not a capability
+    this session holds. The note is static: it promises neither that the
+    payment tools are listed nor that a prompt reaches the phone."""
     runtime = offline_runtime()
     try:
         backend = BackendClient(
@@ -153,22 +161,61 @@ async def test_with_the_payments_flag_on_the_note_says_payments_are_proposals() 
             transport=httpx2.MockTransport(_handler),
             before_backend_request=None,
         )
-        server = build_server(
+        flag_on = build_server(
             Settings.for_testing(),
             resolver=lambda: TEST_CUSTOMER,
             backend=backend,
             payments=runtime,
         )
-        async with Client(transport=server) as client:
+        async with Client(transport=flag_on) as client:
             result = await client.call_tool("start_session", {})
     finally:
         await runtime.db.close()
+    async with Client(transport=server) as client:
+        flag_off = await client.call_tool("start_session", {})
     assert result.structured_content is not None
+    assert flag_off.structured_content is not None
     note = result.structured_content["confirmation_note"]
-    assert "propose a payment" in note
-    assert "banking app" in note
-    assert "never in this conversation" in note
+    assert "If payment tools are listed for this customer, they only propose a payment" in note
+    assert "A proposal moves no money" in note
+    assert "approves each one in their banking app, never in this conversation" in note
+    assert "nothing here can approve or execute it" in note
+    assert "can propose a payment." not in note
     assert "not instructions" in note
+    assert note != flag_off.structured_content["confirmation_note"]
+
+    def _rest(content: dict[str, object]) -> dict[str, object]:
+        return {
+            k: v for k, v in content.items() if k not in {"confirmation_note", "session_handle"}
+        }
+
+    assert _rest(result.structured_content) == _rest(flag_off.structured_content)
     assert result.structured_content["write_enabled"] == []
     granted = {c["domain"]: c["granted"] for c in result.structured_content["consents"]}
     assert granted["payments"] is False
+
+
+def test_the_flag_on_module_tuple_is_derived_from_the_built_in_one() -> None:
+    """A built-in added to `BUILTIN_READ_MODULES` is in the flag-on tuple too,
+    in the same order; only `bootstrap` is swapped, found by name."""
+    assert [m.name for m in BUILTIN_READ_MODULES_WITH_PAYMENTS] == [
+        m.name for m in BUILTIN_READ_MODULES
+    ]
+    assert {m.name for m in BUILTIN_READ_MODULES_WITH_PAYMENTS} == {
+        m.name for m in BUILTIN_READ_MODULES
+    }
+    assert BUILTIN_READ_MODULES[0] is bootstrap.MODULE
+    assert BUILTIN_READ_MODULES_WITH_PAYMENTS[0] is bootstrap.PAYMENTS_MODULE
+    for plain, with_payments in zip(
+        BUILTIN_READ_MODULES[1:], BUILTIN_READ_MODULES_WITH_PAYMENTS[1:], strict=True
+    ):
+        assert with_payments is plain
+
+
+def test_the_payments_module_differs_from_the_plain_one_only_in_the_builder() -> None:
+    plain, with_payments = bootstrap.MODULE, bootstrap.PAYMENTS_MODULE
+    assert with_payments.name == plain.name
+    assert len(with_payments.tools) == len(plain.tools) == 1
+    for p, w in zip(plain.tools, with_payments.tools, strict=True):
+        assert replace(w, build=p.build) == p
+        assert w.build is not p.build
