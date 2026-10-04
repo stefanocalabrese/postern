@@ -104,5 +104,42 @@
       "method": "POST",
       "tier": 1
     }
+  ],
+  "producer_tools": [
+    {
+      "module": "(producer)",
+      "name": "payments.create_payment",
+      "consent_domain": "payments",
+      "read_only_hint": false,
+      "destructive_hint": false,
+      "idempotent_hint": true,
+      "open_world_hint": false,
+      "parameters": [
+        "amount",
+        "from_account_ref",
+        "payee_ref",
+        "reference"
+      ],
+      "required": [
+        "amount",
+        "from_account_ref",
+        "payee_ref"
+      ]
+    },
+    {
+      "module": "(producer)",
+      "name": "payments.get_payment_status",
+      "consent_domain": "payments",
+      "read_only_hint": false,
+      "destructive_hint": false,
+      "idempotent_hint": true,
+      "open_world_hint": false,
+      "parameters": [
+        "challenge_id"
+      ],
+      "required": [
+        "challenge_id"
+      ]
+    }
   ]
 }

@@ -37,3 +37,13 @@ BUILTIN_READ_MODULES: tuple[ReadModule, ...] = (
     accounts.MODULE,
     transactions.MODULE,
 )
+
+#: The same three, with `start_session` reporting the payments note. Chosen by
+#: `services/api/server.py`'s `build_server` when the payments producer is on.
+#: The declarations are equal field for field to `BUILTIN_READ_MODULES`, so
+#: `tool-surface.json`'s read section cannot tell the two tuples apart.
+BUILTIN_READ_MODULES_WITH_PAYMENTS: tuple[ReadModule, ...] = (
+    bootstrap.PAYMENTS_MODULE,
+    accounts.MODULE,
+    transactions.MODULE,
+)

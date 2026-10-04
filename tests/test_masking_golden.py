@@ -24,12 +24,24 @@ from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.client.client import CallToolResult  # not re-exported by fastmcp.client.__init__
 from fastmcp.exceptions import ToolError
+from fastmcp.server.auth.providers.jwt import RSAKeyPair
 from postern_core.facade.client import BackendClient, StubTokenMinter
+from postern_core.payments import CREATE_PAYMENT_TOOL, PAYMENT_STATUS_TOOL
+from postern_core.store.engine import Database
 
 from services.api.server import build_server
 from services.api.settings import Settings
 from tests.conftest import TEST_CUSTOMER
 from tests.fixtures import backend_responses as fx
+from tests.fixtures.payments_http import (
+    OWNER,
+    call_tool,
+    delete_produced_challenges,
+    grant,
+    offline_runtime,
+    revoke_all_consents,
+    token_for,
+)
 
 # Deliberately not `postern_core.domain.masking._PAN_RE` / `_IBAN_RE`. Those
 # are private, fullmatch-oriented patterns for validating a single
@@ -298,3 +310,83 @@ async def test_self_check_harness_catches_a_leak_in_an_error_message() -> None:
     leaky = _leaky_error_server()
     with pytest.raises(AssertionError, match="leaked an IBAN"):
         await _assert_no_tool_output_leaks_a_pan_or_iban(leaky, {"leaky_error": {}})
+
+
+# --- The payments producer (flag on), over HTTP ---------------------------------
+
+PRODUCER_CASES: dict[str, dict[str, Any]] = {
+    CREATE_PAYMENT_TOOL: {
+        "from_account_ref": "acc_7f3a",
+        "payee_ref": fx.PAYEE["payee_ref"],
+        "amount": "340.50",
+        "reference": f"Invoice {fx.FULL_PAN} {fx.GROUPED_IBAN}",
+    },
+    PAYMENT_STATUS_TOOL: {},
+}
+"""Producer tool name -> arguments. The status case takes the id the create
+case returns, so its arguments are filled in at run time."""
+
+
+@pytest.fixture(scope="module")
+def producer_key_pair() -> RSAKeyPair:
+    return RSAKeyPair.generate()
+
+
+async def test_every_producer_tool_has_a_masking_case() -> None:
+    runtime = offline_runtime()
+    try:
+        backend = BackendClient(
+            "https://backend.test",
+            StubTokenMinter(),
+            transport=httpx2.MockTransport(_handler),
+            before_backend_request=None,
+        )
+        server = build_server(
+            Settings.for_testing(),
+            resolver=lambda: TEST_CUSTOMER,
+            backend=backend,
+            payments=runtime,
+        )
+        registered = {tool.name for tool in await server.local_provider.list_tools()}
+    finally:
+        await runtime.db.close()
+    missing = registered - set(CASES) - set(PRODUCER_CASES)
+    assert not missing, f"tools with no golden masking case: {sorted(missing)}"
+
+
+async def test_no_producer_output_contains_a_pan_or_iban(
+    pg_url: str, producer_key_pair: RSAKeyPair, database: Database, audit_server: FastMCP
+) -> None:
+    """Both tools, end to end: a payee name carrying an IBAN from the backend
+    and a reference carrying a PAN and a grouped IBAN from the agent."""
+    await delete_produced_challenges(database)
+    await revoke_all_consents(database)
+    await grant(database, OWNER, "payments")
+    token = token_for(producer_key_pair, OWNER)
+    try:
+        created = await call_tool(
+            pg_url,
+            producer_key_pair,
+            token,
+            CREATE_PAYMENT_TOOL,
+            PRODUCER_CASES[CREATE_PAYMENT_TOOL],
+        )
+        body = json.loads(created.text)["result"]
+        assert body["isError"] is False, created.text
+        challenge_id = body["structuredContent"]["challenge_id"]
+        status = await call_tool(
+            pg_url, producer_key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
+        )
+        for name, response in ((CREATE_PAYMENT_TOOL, created), (PAYMENT_STATUS_TOOL, status)):
+            # The challenge id is a server-generated uuid4 hex string, not
+            # customer data. Thirty-two random hex characters match these
+            # deliberately loose patterns a few percent of the time (twelve
+            # decimal digits in a row, or two letters then two digits at its
+            # start), so it is removed before the scan: leaving it in would
+            # make this gate flaky rather than strict.
+            rendered = response.text.replace(challenge_id, "<challenge_id>")
+            assert not IBAN_RE.search(rendered), f"{name} leaked an IBAN: {rendered[:400]}"
+            assert not PAN_RE.search(rendered), f"{name} leaked a PAN: {rendered[:400]}"
+    finally:
+        await delete_produced_challenges(database)
+        await revoke_all_consents(database)

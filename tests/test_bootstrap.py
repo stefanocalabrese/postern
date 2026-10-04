@@ -16,6 +16,7 @@ from services.api.server import build_server
 from services.api.settings import Settings
 from tests.conftest import TEST_CUSTOMER
 from tests.fixtures import backend_responses as fx
+from tests.fixtures.payments_http import offline_runtime
 
 
 def _handler(request: httpx2.Request) -> httpx2.Response:
@@ -138,3 +139,36 @@ async def test_bootstrap_confirmation_note_flags_labels_as_customer_data(
     assert result.structured_content is not None
     note = result.structured_content["confirmation_note"]
     assert "not instructions" in note or "not a directive" in note or "customer" in note.lower()
+
+
+async def test_with_the_payments_flag_on_the_note_says_payments_are_proposals() -> None:
+    """Spec section 10: the note changes and nothing else does. `payments`
+    stays ungranted and `write_enabled` stays empty, because the note describes
+    what a proposal is, not a capability this session holds."""
+    runtime = offline_runtime()
+    try:
+        backend = BackendClient(
+            "https://backend.test",
+            StubTokenMinter(),
+            transport=httpx2.MockTransport(_handler),
+            before_backend_request=None,
+        )
+        server = build_server(
+            Settings.for_testing(),
+            resolver=lambda: TEST_CUSTOMER,
+            backend=backend,
+            payments=runtime,
+        )
+        async with Client(transport=server) as client:
+            result = await client.call_tool("start_session", {})
+    finally:
+        await runtime.db.close()
+    assert result.structured_content is not None
+    note = result.structured_content["confirmation_note"]
+    assert "propose a payment" in note
+    assert "banking app" in note
+    assert "never in this conversation" in note
+    assert "not instructions" in note
+    assert result.structured_content["write_enabled"] == []
+    granted = {c["domain"]: c["granted"] for c in result.structured_content["consents"]}
+    assert granted["payments"] is False

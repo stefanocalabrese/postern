@@ -38,17 +38,30 @@ import httpx2
 from fastmcp import FastMCP
 from fastmcp.tools import FunctionTool
 from postern_core.facade.client import BackendClient, StubTokenMinter
+from postern_core.identity import TokenClaims
 from postern_core.modules.read import ReadModule, ReadTool, load_read_modules
+from postern_core.payments import PRODUCER_TOOL_NAMES
+from postern_core.store.engine import Database
 
 from services.api.server import build_server
 from services.api.settings import Settings
 from services.api.tools import BUILTIN_READ_MODULES
+from services.api.tools.payments import CONSENT_DOMAIN, PaymentsRuntime
 from services.confirm.execute import build_write_operations
 from tests.conftest import TEST_CUSTOMER
 
 #: The checked-in golden file, at the repository root where a reviewer trips
 #: over it rather than in a tools directory where they would not.
 SURFACE_PATH = Path(__file__).resolve().parents[1] / "tool-surface.json"
+
+
+#: Where a flag-on server's consent check would read. Nothing connects to it:
+#: listing through `local_provider` evaluates no check.
+_UNREACHED_DATABASE_URL = "postgresql+asyncpg://postern:postern@127.0.0.1:9/postern"
+
+
+def _no_claims() -> TokenClaims:
+    return TokenClaims(client_id=None, jti=None)
 
 
 def _server() -> FastMCP:
@@ -143,6 +156,63 @@ async def read_surface() -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: (row["module"], row["name"]))
 
 
+async def producer_surface() -> list[dict[str, Any]]:
+    """The tools POSTERN_PAYMENTS_ENABLED adds, read off a flag-on server.
+
+    `local_provider.list_tools` rather than `list_tools`: the producer's tools
+    are always consent-gated, and with no request there is no token, so the
+    server's own listing would filter both out and record an empty section.
+
+    Raises:
+        AssertionError: if the flag adds anything but the producer's two tools,
+            or takes a read tool away. Either would be a flag-on surface no
+            reviewer was shown.
+    """
+    db = Database(_UNREACHED_DATABASE_URL, null_pool=True)
+    try:
+        backend = BackendClient(
+            "https://backend.test",
+            StubTokenMinter(),
+            transport=httpx2.MockTransport(lambda request: httpx2.Response(404, json={})),
+            before_backend_request=None,
+        )
+        server = build_server(
+            Settings.for_testing(),
+            resolver=lambda: TEST_CUSTOMER,
+            backend=backend,
+            payments=PaymentsRuntime(db=db, claims=_no_claims),
+        )
+        registered = {tool.name: tool for tool in await server.local_provider.list_tools()}
+    finally:
+        await db.close()
+    read_names = set(declared_read_tools())
+    added = sorted(set(registered) - read_names)
+    assert added == sorted(PRODUCER_TOOL_NAMES), (
+        f"the payments flag added {added}; it must add exactly {sorted(PRODUCER_TOOL_NAMES)}"
+    )
+    removed = sorted(read_names - set(registered))
+    assert not removed, f"the payments flag removed read tools: {removed}"
+    rows: list[dict[str, Any]] = []
+    for name in added:
+        tool = registered[name]
+        assert isinstance(tool, FunctionTool), f"{name} is not a FunctionTool"
+        annotations = tool.annotations
+        assert annotations is not None, f"{name} carries no annotations"
+        rows.append(
+            {
+                "module": "(producer)",
+                "name": name,
+                "consent_domain": CONSENT_DOMAIN,
+                "read_only_hint": annotations.read_only_hint,
+                "destructive_hint": annotations.destructive_hint,
+                "idempotent_hint": annotations.idempotent_hint,
+                "open_world_hint": annotations.open_world_hint,
+                **_parameters(tool),
+            }
+        )
+    return rows
+
+
 def write_surface() -> list[dict[str, Any]]:
     """Every write operation this repository routes, built-in and installed."""
     rows = [
@@ -168,7 +238,13 @@ def _module_of(tool_name: str) -> str:
 
 
 async def surface() -> dict[str, Any]:
-    return {"read_tools": await read_surface(), "write_operations": write_surface()}
+    """The first two sections are the flag-off server and never change with
+    the flag; the third is what POSTERN_PAYMENTS_ENABLED adds."""
+    return {
+        "read_tools": await read_surface(),
+        "write_operations": write_surface(),
+        "producer_tools": await producer_surface(),
+    }
 
 
 async def surface_json() -> str:

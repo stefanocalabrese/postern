@@ -67,7 +67,7 @@ from pydantic import ValidationError
 from services.api.consent import consent_for
 from services.api.session_verifier import SessionTokenVerifier
 from services.api.settings import Settings
-from services.api.tools import BUILTIN_READ_MODULES
+from services.api.tools import BUILTIN_READ_MODULES, BUILTIN_READ_MODULES_WITH_PAYMENTS
 from services.api.tools import payments as payments_tools
 from services.api.tools.payments import PaymentsRuntime
 
@@ -155,6 +155,8 @@ def _annotations(tool: ReadTool) -> ToolAnnotations:
 
 def _read_modules(
     explicit: Sequence[ReadModule] | None,
+    *,
+    payments_enabled: bool = False,
 ) -> tuple[ReadModule, ...]:
     """The built-ins plus whatever is installed, or an explicit test set.
 
@@ -165,9 +167,8 @@ def _read_modules(
     tool here -- FastMCP's registry is a dict keyed on the name, and the second
     registration wins with no warning.
     """
-    modules = (
-        tuple(explicit) if explicit is not None else BUILTIN_READ_MODULES + load_read_modules()
-    )
+    builtins = BUILTIN_READ_MODULES_WITH_PAYMENTS if payments_enabled else BUILTIN_READ_MODULES
+    modules = tuple(explicit) if explicit is not None else builtins + load_read_modules()
     refuse_duplicate_tool_names(modules)
     return modules
 
@@ -283,7 +284,7 @@ def build_server(
         # objects. A closure per tool would still hit the request-scoped cache,
         # but that measurement would stop describing this code.
         checks: dict[str, Callable[[AuthContext], Awaitable[bool]]] = {}
-        modules = _read_modules(read_modules)
+        modules = _read_modules(read_modules, payments_enabled=payments is not None)
         if payments is not None:
             _refuse_producer_name_collisions(modules)
         for module in modules:
