@@ -58,9 +58,17 @@ def test_an_unknown_audience_is_refused(minter: ReadTokenMinter) -> None:
     """Fail closed: an audience with no mapped read scope must not silently
     mint a token with an empty or guessed scope."""
     with pytest.raises(KeyError):
-        minter(CUST, "payments.svc")
+        minter(CUST, "ledger.svc")
 
 
-def test_the_payments_audience_is_not_mintable(minter: ReadTokenMinter) -> None:
-    with pytest.raises(KeyError):
-        minter(CUST, "payments.svc")
+def test_the_payments_audience_mints_the_read_scope_only(
+    minter: ReadTokenMinter, source: GeneratedKeySource
+) -> None:
+    """Decision 0022. `payments:execute` is minted by `services/confirm` alone,
+    with the write key."""
+    token = minter(CUST, "payments.svc")
+    keyset = KeySet.import_key_set(source.public_jwks())
+    claims = jwt.decode(token, keyset, algorithms=["RS256"]).claims
+    assert claims["aud"] == "payments.svc"
+    assert claims["scope"] == "payments:read"
+    assert READ_SCOPES["payments.svc"] != "payments:execute"

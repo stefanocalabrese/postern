@@ -206,9 +206,9 @@ def test_a_minter_that_cannot_mint_at_all_fails_with_its_own_exception() -> None
     minter = _read_minter(GeneratedKeySource(kid="read-1"))
 
     def mint() -> str:
-        return minter(PROBE, "payments.svc")
+        return minter(PROBE, "ledger.svc")
 
-    with pytest.raises(KeyError, match="payments.svc"):
+    with pytest.raises(KeyError, match="ledger.svc"):
         refuse_unverifiable_minter(
             mint, built=minter, key_source=GeneratedKeySource(kid="read-1"), role="READ"
         )

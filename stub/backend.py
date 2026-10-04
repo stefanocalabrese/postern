@@ -11,7 +11,7 @@ a route exists. If the server ever forwards one, the golden test and a
 manual Inspector session both show it -- this stub is what puts a raw value
 in front of that check outside the test suite too.
 
-All four domain routes scope their answer to the subject of the internal
+All five domain routes scope their answer to the subject of the internal
 token they receive (handoff §7.1's layer 2, `MCP server -> backend`) and
 refuse a request that carries none. That is not ZT-2 itself: the domain
 services that must enforce on `sub` belong to another team and are not in
@@ -99,6 +99,14 @@ TRANSACTIONS = {
 
 CARDS = {"cards": [{"id": "crd_1", "label": "Debit", "pan": FULL_PAN, "status": "active"}]}
 
+# The payee lookup the payments producer makes (decision 0022). `PAYEE` is
+# byte-identical to `tests/fixtures/backend_responses.py`; `SECOND_PAYEE`
+# belongs to the other customer and exists only here, so a cross-customer
+# test has a real payee to be refused.
+PAYEE = {"payee_ref": "pay_nw01", "name": f"Northwind Energy {COUNTERPARTY_IBAN}"}
+SECOND_PAYEE = {"payee_ref": "pay_ll02", "name": "Landlord Holdings"}
+PAYEES = {PAYEE["payee_ref"]: PAYEE, SECOND_PAYEE["payee_ref"]: SECOND_PAYEE}
+
 # Fixture id -> owning customer. `cust_7f3a` and `cust_9b21` are the same two
 # customers `tests/test_consent_enforcement.py` seeds consent for, so one
 # customer ref means the same person in both files.
@@ -120,6 +128,8 @@ OWNERS = {
     "acc_7f3a": "cust_7f3a",
     "acc_9b21": "cust_9b21",
     "crd_1": "cust_7f3a",
+    "pay_nw01": "cust_7f3a",
+    "pay_ll02": "cust_9b21",
 }
 
 # Keyed by account id: a balance is reachable only through the account it
@@ -138,6 +148,10 @@ _STUB_MINTER_PREFIX = "stub.read."
 # One constant body for every 404 from `balance()`, so "belongs to someone
 # else" and "does not exist" are the same bytes as well as the same status.
 _NO_SUCH_ACCOUNT = {"detail": "no such account"}
+
+# The same rule for `payee()`: a foreign payee and an invented one are the
+# same bytes.
+_NO_SUCH_PAYEE = {"detail": "no such payee"}
 
 
 def _unauthorized() -> JSONResponse:
@@ -276,6 +290,16 @@ async def cards(request: Request) -> JSONResponse:
     return JSONResponse({"cards": rows})
 
 
+async def payee(request: Request) -> JSONResponse:
+    subject = _subject(request)
+    if subject is None:
+        return _unauthorized()
+    payee_ref = request.path_params["payee_ref"]
+    if OWNERS.get(payee_ref) != subject or payee_ref not in PAYEES:
+        return JSONResponse(_NO_SUCH_PAYEE, status_code=404)
+    return JSONResponse(PAYEES[payee_ref])
+
+
 # --- Local dev-only identity-provider stand-in (Task 13 finding) -----------
 #
 # Not "the operator's domain services" -- this module's own docstring and
@@ -297,7 +321,7 @@ async def cards(request: Request) -> JSONResponse:
 # this key set in that stack is `confirm`, as its app-assertion issuer
 # (`POSTERN_APP_ASSERTION_JWKS_URI`), standing in for the banking app.
 #
-# Neither route carries the subject check the four domain routes above now
+# Neither route carries the subject check the five domain routes above now
 # carry, and that is not an omission: both belong to hop 1. A JWKS is a
 # public document by construction, fetched by `JWTVerifier` before the `api`
 # service holds any token at all, so gating it means no request is ever
@@ -345,6 +369,7 @@ app = Starlette(
         Route("/accounts/{account_id}/balance", balance),
         Route("/transactions", transactions),
         Route("/cards", cards),
+        Route("/payees/{payee_ref}", payee),
         Route("/.well-known/jwks.json", jwks),
         Route("/mint-token", mint_token),
     ]

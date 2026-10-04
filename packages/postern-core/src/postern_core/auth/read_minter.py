@@ -1,10 +1,13 @@
 """Adapts the internal minter to the TokenMinter protocol BackendClient calls.
 
-Read audiences only. `payments.svc` is deliberately absent: asking this minter
-for a write audience raises rather than minting a token with a guessed scope.
-That is a second, independent barrier to the key split. Even holding the right
-key, a write token from here would carry the wrong scope, and Istio matches on
-claims as well as on the signature.
+Read scopes only. Every audience below maps to a `:read` scope, and an
+audience with no entry raises rather than minting a token with a guessed
+scope. `payments.svc` has had an entry since decision 0022, for one payee
+lookup, and it maps to `payments:read`: `payments:execute` is minted by
+`services/confirm` alone, with the write key. That is a second, independent
+barrier to the key split. Even holding the right key, a token from here would
+carry the wrong scope for a write endpoint, and Istio matches on claims as
+well as on the signature.
 
 ZT-1 — Continuous authorization: every mint consults the revocation decision
 for this call before issuing a token. A revoked session dies at mint, not at
@@ -56,6 +59,10 @@ READ_SCOPES = {
     "accounts.svc": "accounts:read",
     "transactions.svc": "transactions:read",
     "cards.svc": "cards:read",
+    # Decision 0022: one read, GET /payees/{ref}, for the payments producer's
+    # payee lookup. `payments:read`, never `payments:execute`, which only
+    # `services/confirm` mints, with the write key.
+    "payments.svc": "payments:read",
 }
 
 

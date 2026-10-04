@@ -101,9 +101,29 @@ def test_a_matching_kid_does_not_rescue_a_token_signed_with_the_read_key(
         istio_write_endpoint(token, write_jwks)
 
 
-def test_the_api_cannot_even_ask_for_a_write_audience(api_minter: ReadTokenMinter) -> None:
+def test_the_payments_read_audience_carries_no_write_scope_and_is_refused(
+    write_jwks: KeySetSerialization,
+) -> None:
+    """Decision 0022 maps ``payments.svc`` to ``payments:read`` on this minter.
+    The token names the payments service and still fails at the write endpoint
+    twice over: the wrong key, and a scope that is not ``payments:execute``."""
+    source = GeneratedKeySource(kid="read-1")
+    minter = ReadTokenMinter(
+        InternalTokenMinter(issuer="https://mcp-read.internal", key_source=source),
+        revocation_decision=unchecked_revocation,
+    )
+    token = minter(CUST, "payments.svc")
+    claims = jwt.decode(
+        token, KeySet.import_key_set(source.public_jwks()), algorithms=["RS256"]
+    ).claims
+    assert claims["scope"] == "payments:read"
+    with pytest.raises(InvalidKeyIdError):
+        istio_write_endpoint(token, write_jwks)
+
+
+def test_the_api_cannot_even_ask_for_an_unmapped_audience(api_minter: ReadTokenMinter) -> None:
     with pytest.raises(KeyError):
-        api_minter(CUST, "payments.svc")
+        api_minter(CUST, "ledger.svc")
 
 
 def test_the_write_minter_is_accepted_by_the_write_endpoint(

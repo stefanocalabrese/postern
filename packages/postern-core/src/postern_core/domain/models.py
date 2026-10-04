@@ -79,3 +79,16 @@ class SessionInfo(_Strict):
     only. No tool accepts it: the server recognises the session from the
     access token on every call, never from an argument. Empty when the
     server carries no risk middleware."""
+
+
+class Payee(_Strict):
+    """A saved payee as `payments.create_payment` shows it (decision 0022).
+
+    A reference and a display name, and no account number: handoff §6.5 omits
+    counterparty account numbers entirely. `display_name` is `FreeText`, so a
+    PAN- or IBAN-shaped run inside a name is redacted before anything stores
+    or returns it.
+    """
+
+    payee_ref: Ref
+    display_name: FreeText

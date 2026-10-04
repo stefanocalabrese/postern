@@ -162,8 +162,10 @@ whoever receives it, which for these tokens is your gateway and your domain
 services. If you want replay detection, that is where to build it. See
 `dev-docs/decisions/0014-jti-cache-detects-randomness-not-replay.md`.
 
-`READ_SCOPES` maps audiences to OAuth scopes. The `payments.svc` audience is
-**deliberately absent**, read tokens cannot reach write endpoints.
+`READ_SCOPES` maps audiences to OAuth scopes, all of them read scopes. The
+`payments.svc` audience maps to `payments:read` for one call, the payee lookup the
+payments producer makes (decision 0022), and **never** to `payments:execute`: read
+tokens cannot reach write endpoints. An audience with no entry raises `KeyError`.
 
 ### JWKS Endpoint
 

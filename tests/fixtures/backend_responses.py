@@ -74,3 +74,8 @@ TRANSACTIONS = {
 }
 
 CARDS = {"cards": [{"id": "crd_1", "label": "Debit", "pan": FULL_PAN, "status": "active"}]}
+
+# A saved payee, as `GET /payees/{ref}` answers it. The name carries an IBAN on
+# purpose, as `LEAKY_DESCRIPTION` carries a PAN: a payee name is backend free
+# text, and the producer must show it masked.
+PAYEE = {"payee_ref": "pay_nw01", "name": f"Northwind Energy {COUNTERPARTY_IBAN}"}

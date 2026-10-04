@@ -13,7 +13,7 @@ from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.tools import FunctionTool
 from postern_core.domain.masking import MaskedIban, MaskedPan
-from postern_core.facade import accounts, cards, transactions
+from postern_core.facade import accounts, cards, payments, transactions
 from postern_core.facade.client import BackendClient, StubTokenMinter
 
 from services.api.server import build_server
@@ -55,7 +55,7 @@ async def test_every_registered_tool_is_annotated_read_only(server: FastMCP) -> 
 
 
 def test_the_facade_exposes_no_write_helpers() -> None:
-    for module in (accounts, transactions, cards):
+    for module in (accounts, transactions, cards, payments):
         for name, _obj in inspect.getmembers(module, inspect.iscoroutinefunction):
             assert not name.startswith(("create_", "update_", "delete_", "post_")), (
                 f"{module.__name__}.{name}"
@@ -86,3 +86,9 @@ async def test_no_tool_parameter_accepts_a_masked_type(server: FastMCP) -> None:
                 continue
             assert hint != MaskedPan, f"{tool.name}.{param_name} accepts MaskedPan"
             assert hint != MaskedIban, f"{tool.name}.{param_name} accepts MaskedIban"
+
+
+def test_the_payments_facade_is_one_read() -> None:
+    """Decision 0022: one function and no write helper."""
+    names = [name for name, _ in inspect.getmembers(payments, inspect.iscoroutinefunction)]
+    assert names == ["get_payee"]

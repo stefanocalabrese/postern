@@ -670,15 +670,20 @@ def test_the_backend_client_mints_a_real_read_token_signed_by_the_stashed_key() 
     assert not token.startswith("stub.read.")
 
 
-def test_the_api_process_cannot_mint_a_payments_token() -> None:
-    """The key split is what stops this process signing a write token; this
-    is the second barrier, in claims rather than in key material. `KeyError`
-    from an unmapped audience beats a token minted with a guessed scope,
-    because Istio matches on the scope claim as well as on the signature.
+def test_the_api_process_mints_payments_read_and_never_execute() -> None:
+    """The key split is what stops this process signing a write token; the
+    scope claim is the second barrier, because Istio matches on it as well as
+    on the signature. Decision 0022 gave this minter one payments audience,
+    for a payee lookup, and it carries `payments:read`. An audience with no
+    entry still raises rather than minting a guessed scope.
     """
     app = create_app(Settings.for_testing())
+    token = _mint(app, "payments.svc")
+    keyset = KeySet.import_key_set(app.state.postern_read_key_source.public_jwks())
+    claims = jose_jwt.decode(token, keyset, algorithms=["RS256"]).claims
+    assert claims["scope"] == "payments:read"
     with pytest.raises(KeyError):
-        _mint(app, "payments.svc")
+        _mint(app, "ledger.svc")
 
 
 def test_create_app_stashes_the_read_key_source_under_the_configured_kid() -> None:

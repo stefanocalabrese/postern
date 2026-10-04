@@ -38,7 +38,13 @@ from stub import backend as stub
 OWNER = "Bearer stub.read.cust_7f3a"
 OTHER = "Bearer stub.read.cust_9b21"
 
-DOMAIN_ROUTES = ("/accounts", "/accounts/acc_7f3a/balance", "/transactions", "/cards")
+DOMAIN_ROUTES = (
+    "/accounts",
+    "/accounts/acc_7f3a/balance",
+    "/transactions",
+    "/cards",
+    "/payees/pay_nw01",
+)
 
 # Every value a caller must not obtain without naming a subject that owns it.
 FIXTURE_VALUES = (
@@ -50,6 +56,7 @@ FIXTURE_VALUES = (
     "crd_1",
     "txn_1",
     "1200.50",
+    "pay_nw01",
 )
 
 
@@ -324,3 +331,39 @@ def test_every_fixture_row_has_an_owner() -> None:
     assert {row["id"] for row in stub.CARDS["cards"]} <= owned
     assert {row["account_id"] for row in stub.TRANSACTIONS["transactions"]} <= owned
     assert set(stub.BALANCES) <= owned
+
+
+# --- The payee lookup (decision 0022) ----------------------------------------
+
+
+async def test_a_foreign_payee_is_404_and_the_body_holds_no_name() -> None:
+    response = await get("/payees/pay_nw01", authorization=OTHER)
+    assert response.status_code == 404
+    assert_absent(response, "Northwind", "pay_nw01", stub.COUNTERPARTY_IBAN)
+
+
+async def test_a_foreign_payee_is_indistinguishable_from_one_that_does_not_exist() -> None:
+    foreign = await get("/payees/pay_nw01", authorization=OTHER)
+    invented = await get("/payees/pay_none", authorization=OTHER)
+    assert foreign.status_code == 404
+    assert (foreign.status_code, foreign.text) == (invented.status_code, invented.text)
+
+
+async def test_the_owning_customer_reads_its_own_payee() -> None:
+    response = await get("/payees/pay_nw01", authorization=OWNER)
+    assert response.status_code == 200
+    assert response.json() == stub.PAYEE
+
+
+async def test_the_second_customer_reads_its_own_payee_and_not_the_first() -> None:
+    own = await get("/payees/pay_ll02", authorization=OTHER)
+    assert own.status_code == 200
+    assert own.json() == stub.SECOND_PAYEE
+    foreign = await get("/payees/pay_ll02", authorization=OWNER)
+    assert foreign.status_code == 404
+    assert_absent(foreign, "Landlord")
+
+
+def test_every_payee_has_an_owner_and_names_itself() -> None:
+    assert set(stub.PAYEES) <= set(stub.OWNERS)
+    assert all(row["payee_ref"] == ref for ref, row in stub.PAYEES.items())

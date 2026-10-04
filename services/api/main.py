@@ -15,8 +15,10 @@ site below:
 Plan 3 Task 2 built the real minter here, replacing `StubTokenMinter` and
 its fake bearer token no backend accepts. This process now holds one
 `ReadTokenMinter` over an `InternalTokenMinter` carrying a READ key, and no
-write key and no write scope: `READ_SCOPES` has no `payments.svc` entry, so
-a write audience raises `KeyError` instead of minting.
+write key and no write scope: every `READ_SCOPES` entry is a `:read` scope,
+`payments.svc` included since decision 0022 (`payments:read`, never
+`payments:execute`), and an audience with no entry raises `KeyError` instead
+of minting.
 
 `_refuse_stub_minter_in_production` and the `allow_stub_token_minter` flag
 that disarmed it are deleted with this commit. That guard read a settings

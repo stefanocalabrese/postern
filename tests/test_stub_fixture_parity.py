@@ -71,6 +71,7 @@ def test_the_fixtures_publish_the_names_compared_below() -> None:
         "BALANCE",
         "TRANSACTIONS",
         "CARDS",
+        "PAYEE",
     }
 
 
