@@ -262,6 +262,9 @@ def build_server(
     if auth_override is not None:
         auth = auth_override
 
+    if payments is not None and backend is None:
+        raise ValueError("payments requires a backend")
+
     server = FastMCP(
         name="postern",
         instructions=SERVER_INSTRUCTIONS,

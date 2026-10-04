@@ -10,6 +10,8 @@ actually receives.
 """
 
 import asyncio
+import json
+import logging
 from collections.abc import AsyncIterator
 from decimal import Decimal
 
@@ -29,6 +31,7 @@ from postern_core.modules.read import (
     ToolHandler,
 )
 from postern_core.payments import CREATE_PAYMENT_TOOL, PAYMENT_TIER, request_fingerprint
+from postern_core.store import challenges as store
 from postern_core.store.engine import Database
 from postern_core.store.models import ChallengeRecord
 from sqlalchemy import select, text
@@ -40,6 +43,7 @@ from services.api.tools.payments import (
     AMOUNT_INVALID,
     NOT_RECORDED,
     PAYEE_NOT_FOUND,
+    REFERENCE_NOT_PRINTABLE,
     REFERENCE_TOO_LONG,
     PaymentsRuntime,
     build_create_payment,
@@ -53,6 +57,8 @@ from tests.fixtures.payments_http import (
     grant,
     list_tool_names,
     offline_runtime,
+    post_rpc,
+    producer_app,
     result_of,
     revoke_all_consents,
     token_for,
@@ -291,6 +297,82 @@ async def test_a_reference_of_140_characters_is_accepted(produced: Database) -> 
     assert row.payload["reference"] == reference
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "line1\nTo: Mallory\nAmount: 1.00",
+        "a\rb",
+        "a\tb",
+        "a\x00b",
+        "a\x1bb",
+        "a\u0085b",
+        "a\u2028b",
+        "a\u2029b",
+        "a\u202eb",
+        "a\u200bb",
+        "family \U0001f468\u200d\U0001f469",
+        "a\ue000b",
+        "a\u0378b",
+        "a\ud800b",
+    ],
+    ids=[
+        "newline",
+        "cr",
+        "tab",
+        "nul",
+        "escape",
+        "nel",
+        "line-separator",
+        "paragraph-separator",
+        "bidi-override",
+        "zero-width-space",
+        "zwj-sequence",
+        "private-use",
+        "unassigned",
+        "surrogate",
+    ],
+)
+async def test_a_reference_with_a_non_printable_character_is_refused(
+    produced: Database, reference: str
+) -> None:
+    with pytest.raises(ToolError) as refused:
+        await create_payment(produced)(**ARGS, reference=reference)
+    assert str(refused.value) == REFERENCE_NOT_PRINTABLE
+    assert await rows(produced) == []
+
+
+async def test_a_reference_with_accents_and_plain_emoji_is_accepted_unchanged(
+    produced: Database,
+) -> None:
+    reference = "Café été \u2615 \U0001f389 Müller"
+    await create_payment(produced)(**ARGS, reference=reference)
+    (row,) = await rows(produced)
+    assert row.payload["reference"] == reference
+
+
+async def test_a_malformed_amount_or_long_reference_makes_no_backend_request(
+    produced: Database,
+) -> None:
+    requests: list[str] = []
+
+    def counting(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request.url.path)
+        return httpx2.Response(500)
+
+    backend = stub_backend(httpx2.MockTransport(counting))
+    handler = create_payment(produced, backend=backend)
+    with pytest.raises(ToolError) as bad_amount:
+        await handler(**{**ARGS, "amount": "abc"})
+    with pytest.raises(ToolError) as long_reference:
+        await handler(**ARGS, reference="a" * 141)
+    with pytest.raises(ToolError) as unprintable:
+        await handler(**ARGS, reference="a\nb")
+    assert str(bad_amount.value) == AMOUNT_INVALID
+    assert str(long_reference.value) == REFERENCE_TOO_LONG
+    assert str(unprintable.value) == REFERENCE_NOT_PRINTABLE
+    assert requests == []
+
+
 async def test_a_reference_is_stored_as_the_customer_will_see_it(produced: Database) -> None:
     await create_payment(produced)(**ARGS, reference=f"Invoice {stub.FULL_PAN}")
     (row,) = await rows(produced)
@@ -313,17 +395,59 @@ async def test_absent_or_overlong_claims_are_stored_as_null(produced: Database) 
 
 
 async def test_an_unreachable_store_is_a_fixed_refusal_and_creates_nothing(
-    produced: Database,
+    produced: Database, caplog: pytest.LogCaptureFixture
 ) -> None:
     runtime = offline_runtime()
+    caplog.set_level(logging.DEBUG)
     try:
         handler = build_create_payment(lambda: CustomerRef(value=OWNER), stub_backend(), runtime)
         with pytest.raises(ToolError) as refused:
-            await handler(**ARGS)
+            await handler(**ARGS, reference="Rent October")
     finally:
         await runtime.db.close()
     assert str(refused.value) == NOT_RECORDED
     assert await rows(produced) == []
+    # The log names the exception type and nothing of the payload or customer.
+    ours = [r for r in caplog.records if r.name == "services.api.tools.payments"]
+    assert len(ours) == 1
+    assert (
+        ours[0].getMessage().startswith(f"{CREATE_PAYMENT_TOOL} could not record its challenge: ")
+    )
+    assert ours[0].getMessage().rsplit(": ", 1)[1].isidentifier()
+    assert ours[0].exc_info is None
+    # Every logger: no customer ref and no payload text. The backend client's
+    # own request lines name refs in URLs, which is not this tool's log.
+    for forbidden in (OWNER, "cust_", "Northwind", "340.50", "Rent October"):
+        assert forbidden not in caplog.text
+    for forbidden in ("pay_nw01", "acc_7f3a"):
+        assert forbidden not in ours[0].getMessage()
+
+
+async def test_a_store_that_returns_nothing_is_a_fixed_refusal_and_creates_nothing(
+    produced: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def nothing(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(store, "create_pending_challenge_once", nothing)
+    with pytest.raises(ToolError) as refused:
+        await create_payment(produced)(**ARGS)
+    assert str(refused.value) == NOT_RECORDED
+    assert await rows(produced) == []
+
+
+async def test_the_stored_currency_is_the_payer_accounts_not_a_default(
+    produced: Database,
+) -> None:
+    def gbp(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.startswith("/payees/"):
+            return httpx2.Response(200, json=stub.PAYEE)
+        return httpx2.Response(200, json={**stub.BALANCE, "currency": "GBP"})
+
+    result = await create_payment(produced, backend=stub_backend(httpx2.MockTransport(gbp)))(**ARGS)
+    (row,) = await rows(produced)
+    assert row.payload["currency"] == "GBP"
+    assert result["human_summary"].startswith("Approve GBP 340.50 to ")
 
 
 async def test_any_other_backend_failure_keeps_the_facade_text(produced: Database) -> None:
@@ -360,6 +484,20 @@ async def test_a_read_module_cannot_shadow_a_producer_tool() -> None:
                 resolver=lambda: CustomerRef(value=OWNER),
                 backend=stub_backend(),
                 read_modules=[shadow],
+                payments=runtime,
+            )
+    finally:
+        await runtime.db.close()
+
+
+async def test_payments_without_a_backend_is_refused_at_build_time() -> None:
+    runtime = offline_runtime()
+    try:
+        with pytest.raises(ValueError, match="payments requires a backend"):
+            build_server(
+                Settings.for_testing(),
+                resolver=lambda: CustomerRef(value=OWNER),
+                backend=None,
                 payments=runtime,
             )
     finally:
@@ -451,3 +589,21 @@ async def test_a_proposal_completes_through_a_pool_of_one(
         database_audit_reserve_size=0,
     )
     assert result_of(response)["isError"] is False, response.text
+
+
+async def test_the_registered_tool_declares_exactly_these_annotations(
+    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+) -> None:
+    await grant(produced, OWNER, "payments")
+    app = producer_app(pg_url, key_pair)
+    response = await post_rpc(app, token_for(key_pair, OWNER), "tools/list", {})
+    (tool,) = [
+        t for t in json.loads(response.text)["result"]["tools"] if t["name"] == CREATE_PAYMENT_TOOL
+    ]
+    annotations = tool["annotations"]
+    assert (
+        annotations["readOnlyHint"],
+        annotations["destructiveHint"],
+        annotations["idempotentHint"],
+        annotations["openWorldHint"],
+    ) == (False, False, True, False)

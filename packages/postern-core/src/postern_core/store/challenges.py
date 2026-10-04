@@ -404,8 +404,10 @@ async def expire_stale_pending(
     before, `create_pending_challenge_once`. Without it a row past its
     deadline that nobody has marked would still occupy the partial unique
     index, and the insert would hand the caller a challenge that can no longer
-    be approved. ``now()`` is the transaction's timestamp, the clock every
-    other expiry predicate in this module uses.
+    be approved. The deadline is compared to ``statement_timestamp()``, the
+    clock `_select_live_pending` uses, so a row is never both unexpired here
+    and stale there; ``now()`` would be the transaction's start, earlier than
+    both.
     """
     stmt = (
         update(ChallengeRecord)
@@ -413,7 +415,7 @@ async def expire_stale_pending(
             ChallengeRecord.customer_ref == customer_ref,
             ChallengeRecord.request_fingerprint == request_fingerprint,
             ChallengeRecord.status == "pending",
-            ChallengeRecord.expires_at <= func.now(),
+            ChallengeRecord.expires_at <= func.statement_timestamp(),
         )
         .values(status="expired")
         .returning(ChallengeRecord.challenge_id)

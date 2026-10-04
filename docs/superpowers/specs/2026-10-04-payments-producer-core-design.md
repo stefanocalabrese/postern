@@ -86,20 +86,21 @@ Arguments, all agent-supplied text and none a user or customer identifier:
 | `from_account_ref` | `Ref` | the payer account |
 | `payee_ref` | `Ref` | a saved payee. `Ref` enforces a three-letter prefix and nothing else |
 | `amount` | `str` | `^[0-9]{1,15}(\.[0-9]{1,4})?$`, greater than zero |
-| `reference` | `str \| None` | at most 140 characters; checked before scrubbing |
+| `reference` | `str \| None` | printable characters only, at most 140 characters; both checked before scrubbing |
 
-Flow:
+Flow. The cheap checks on the arguments run first, so a malformed amount or reference costs no backend read; the order of refusals is therefore amount, reference, payer account, payee.
 
-1. `resolver()` gives the customer from the token. A missing token fails closed.
-2. Payer account. Read the balance through the existing accounts facade (`get_balance`), because `Account` carries no currency; the currency comes from `Balance.amount.currency`. A `BackendError` with status 404 becomes `ToolError("account not found")`, identical for a foreign and an invented ref (the stub returns one constant 404 body for both).
-3. Payee. `facade.payments.get_payee`; a 404 becomes `ToolError("payee not found")`.
-4. Amount. Parse as `Decimal`, require greater than zero, build `Money(amount=..., currency=<account currency>)` so `domain/money.py` enforces at most 4 decimals and finiteness. Canonical string: at least 2 and at most 4 decimal places, no exponent, so `340.5` and `340.50` give one fingerprint.
-5. Reference. Reject over 140 characters with a fixed message, then pass through `FreeText`. `FreeText` has no length limit and silently redacts PAN- and IBAN-shaped runs and masks long alphanumeric runs, so the stored text may differ from the input; the stored text is what the user later sees.
-6. Payload, all values strings, built only from server-resolved data:
+1. Amount. Match `^[0-9]{1,15}(\.[0-9]{1,4})?$`, require greater than zero, and build the canonical string: at least 2 and at most 4 decimal places, no exponent, so `340.5` and `340.50` give one fingerprint.
+2. Reference. Refuse any character whose `unicodedata.category` starts with `C` (Cc, Cf, Cs, Co, Cn) or is `Zl` or `Zp` (U+2028, U+2029), with the fixed message `reference may contain only printable characters`. The reference is the only agent-controlled text in the approval display the phone shows, so a newline or an escape sequence could fake a line the customer reads as the server's. Plain emoji are category So and are accepted; a zero-width joiner (U+200D) is Cf and is refused, so an emoji ZWJ sequence is refused as a whole. Then reject over 140 characters with a fixed message, then pass through `FreeText`. `FreeText` strips bidi and zero-width characters but not `\n`, `\r` or `\t`, has no length limit, and silently redacts PAN- and IBAN-shaped runs and masks long alphanumeric runs, so the stored text may differ from the input; the stored text is what the user later sees.
+3. `resolver()` gives the customer from the token. A missing token fails closed.
+4. Payer account. Read the balance through the existing accounts facade (`get_balance`), because `Account` carries no currency; the currency comes from `Balance.amount.currency`. A `BackendError` with status 404 becomes `ToolError("account not found")`, identical for a foreign and an invented ref (the stub returns one constant 404 body for both).
+5. Payee. `facade.payments.get_payee`; a 404 becomes `ToolError("payee not found")`.
+6. Currency. Build `Money(amount=..., currency=<account currency>)` so `domain/money.py` enforces finiteness and a three-letter currency; a failure is reported as the amount refusal.
+7. Payload, all values strings, built only from server-resolved data:
    `{"from_account_ref", "payee_ref", "payee_name", "amount", "currency", "reference"}` (`reference` omitted when absent). Floats are never present, because `canonical_approval_message` raises `UncanonicalChallengeError` on them.
-7. Fingerprint (section 5).
-8. In one transaction: `expire_stale_pending` for this customer and fingerprint, then `create_pending_challenge_once`. That is an `INSERT ... ON CONFLICT (customer_ref, request_fingerprint) WHERE status = 'pending' DO NOTHING RETURNING`; on no row it selects the existing pending row. The challenge id is `uuid4().hex` (32 characters, fits `String(36)`), tier is `PAYMENT_TIER`, `client_id` and `session_jti` come from the claims provider. Commit.
-9. Return `{challenge_id, status: "pending", expires_at, human_summary}` where `human_summary` is "Approve {currency} {amount} to {payee_name} in your banking app." The summary is relayed by the model and is not the authoritative display; the authoritative display is rendered from the stored row.
+8. Fingerprint (section 5).
+9. In one transaction, `create_pending_challenge_once`, which expires this customer's stale pending rows with this fingerprint inside each of its (at most two) passes, using `statement_timestamp()` as `_select_live_pending` does. The insert is an `INSERT ... ON CONFLICT (customer_ref, request_fingerprint) WHERE status = 'pending' DO NOTHING RETURNING`; on no row it selects the existing pending row. The challenge id is `uuid4().hex` (32 characters, fits `String(36)`), tier is `PAYMENT_TIER`, `client_id` and `session_jti` come from the claims provider. Commit.
+10. Return `{challenge_id, status: "pending", expires_at, human_summary}` where `human_summary` is "Approve {currency} {amount} to {payee_name} in your banking app." The summary is relayed by the model and is not the authoritative display; the authoritative display is rendered from the stored row.
 
 A repeat inside the pending window returns the same `challenge_id` and `expires_at`. Once the row is approved, executed or expired, an identical request creates a new challenge; the user still approves each one, and this consequence is intended.
 
@@ -123,9 +124,9 @@ An approved row whose backend call failed (the callback answers 207) stays `appr
 `ReadContext` carries exactly `resolver` and `backend`, pinned by `tests/test_module_seam.py::test_a_read_context_carries_only_the_resolver_and_the_backend`, and `build_server` receives `db` only when real customer auth is configured. The producer therefore does not go through `ReadContext`:
 
 - `CustomerResolver` stays the only source of the customer.
-- `TokenClaimsProvider` (section 4) supplies `client_id` and `jti`. The production implementation calls `fastmcp.server.dependencies.get_access_token()` exactly as `RevocationMiddleware._claims` does: `client_id` from `token.client_id`, `jti` from `token.claims`, both `None` when absent.
+- `TokenClaimsProvider` (section 4) supplies `client_id` and `jti`. The production implementation calls `fastmcp.server.dependencies.get_access_token()` exactly as `RevocationMiddleware._claims` does: `client_id` from `token.client_id`, `jti` from `token.claims`. `client_id` is the value the verifier derives (the `client_id` claim, else `azp`, else `sub`), the same one `RevocationMiddleware` keys on, which is why it is stored; it is NULL only when the token is absent or the value exceeds 128 characters. `jti` is NULL when absent or over 128 characters.
 - Under the in-process `Client(transport=server)` there is no token, so tests pass a provider such as `lambda: TokenClaims(client_id="claude-code", jti="j-1")`. Tests with a real token use `create_app(..., auth_override=<JWTVerifier>)`, as `tests/test_zt7_revocation_reachable.py` does.
-- When a claim is absent the column is NULL and the tool does not fail; it is a record for later revocation matching, not a gate.
+- When a value is absent or too long the column is NULL and the tool does not fail; it is a record for later revocation matching, not a gate.
 
 ## 8. Audit
 
@@ -133,13 +134,14 @@ The api audit middleware wraps every registered tool. The account and payee read
 
 ## 9. Errors
 
-Tool errors in this stack are `isError` results inside an HTTP 200. Messages are fixed strings raised as `ToolError`; no `ValidationError` text reaches the client (`errors(include_input=False)` wherever one is rendered).
+Tool errors in this stack are `isError` results inside an HTTP 200. Messages are fixed strings raised as `ToolError`; no `ValidationError` text from this tool's own checks reaches the client (`errors(include_input=False)` wherever one is rendered). One exception: for a malformed `Ref` argument, FastMCP returns its own argument-validation text, which echoes the caller's own input and is logged at WARNING. That holds for every `Ref`-taking read tool as well, it never carries another customer's data, and the audit row stores it scrubbed.
 
 | Failure | Client sees | Fails closed |
 |---|---|---|
 | Unknown or foreign payer account | `account not found` | yes |
 | Unknown or foreign payee | `payee not found` | yes |
 | Amount not a positive decimal with at most 4 places | `amount must be a positive decimal with at most 4 decimal places` | yes |
+| Reference with a control, format, surrogate, private-use or unassigned character, or U+2028 or U+2029 | `reference may contain only printable characters` | yes |
 | Reference over 140 characters | `reference is limited to 140 characters` | yes |
 | Challenge unknown, foreign, or not a payment | `challenge not found` | yes |
 | Database error on insert, select or update | `the payment could not be recorded` | yes, nothing created |

@@ -29,6 +29,7 @@ let out as one.
 
 import logging
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -64,6 +65,7 @@ ACCOUNT_NOT_FOUND = "account not found"
 PAYEE_NOT_FOUND = "payee not found"
 AMOUNT_INVALID = "amount must be a positive decimal with at most 4 decimal places"
 REFERENCE_TOO_LONG = "reference is limited to 140 characters"
+REFERENCE_NOT_PRINTABLE = "reference may contain only printable characters"
 CHALLENGE_NOT_FOUND = "challenge not found"
 NOT_RECORDED = "the payment could not be recorded"
 
@@ -118,35 +120,53 @@ def canonical_amount(value: Decimal) -> str:
     return format(normalized, "f")
 
 
-def _amount(raw: str, currency: str) -> str:
-    """The canonical amount, or the fixed refusal.
-
-    `Money` is built for its own checks (finite, at most four decimals, a
-    three-letter currency) and then dropped: the payload holds strings only,
-    because `canonical_approval_message` refuses a float.
-    """
+def _amount(raw: str) -> str:
+    """The canonical amount, or the fixed refusal. Needs no backend read."""
     if not _AMOUNT.fullmatch(raw):
         raise ToolError(AMOUNT_INVALID)
     value = Decimal(raw)
     if value <= 0:
         raise ToolError(AMOUNT_INVALID)
-    canonical = canonical_amount(value)
+    return canonical_amount(value)
+
+
+def _check_money(canonical: str, currency: str) -> None:
+    """`Money` is built for its own checks (finite, at most four decimals, a
+    three-letter currency) and then dropped: the payload holds strings only,
+    because `canonical_approval_message` refuses a float.
+    """
     try:
         Money(amount=Decimal(canonical), currency=currency)
     except ValidationError:
         raise ToolError(AMOUNT_INVALID) from None
-    return canonical
+
+
+def _is_unprintable(char: str) -> bool:
+    """A control, format, surrogate, private-use or unassigned character, or a
+    line or paragraph separator (U+2028, U+2029).
+
+    Plain emoji are category So and pass. A zero-width joiner (U+200D) is Cf
+    and is refused, so an emoji ZWJ sequence is refused as a whole: a joiner is
+    also what hides text between two visible characters.
+    """
+    category = unicodedata.category(char)
+    return category.startswith("C") or category in ("Zl", "Zp")
 
 
 def _reference(raw: str | None) -> str | None:
-    """`raw` scrubbed by `FreeText`, after the length check on what was sent.
+    """`raw` scrubbed by `FreeText`, after the printable and length checks on
+    what was sent.
 
-    The stored text can differ from the input, because `FreeText` redacts PAN-
-    and IBAN-shaped runs and masks long alphanumeric runs. The stored text is
-    what the customer is later shown.
+    The reference is the only agent-controlled text in the approval display, so
+    a newline or an escape sequence must not reach it: it could fake a line
+    the customer reads as the server's. The stored text can differ from the
+    input, because `FreeText` redacts PAN- and IBAN-shaped runs and masks long
+    alphanumeric runs. The stored text is what the customer is later shown.
     """
     if raw is None:
         return None
+    if any(_is_unprintable(char) for char in raw):
+        raise ToolError(REFERENCE_NOT_PRINTABLE)
     if len(raw) > MAX_REFERENCE_LENGTH:
         raise ToolError(REFERENCE_TOO_LONG)
     return _FREE_TEXT.validate_python(raw)
@@ -175,6 +195,10 @@ def build_create_payment(
         the payer account's currency. `reference` is optional, at most 140
         characters. Relay `human_summary`, then check `payments.get_payment_status`.
         """
+        # Cheap checks first: a malformed amount or reference costs no backend
+        # read. Only the currency check needs the balance.
+        canonical = _amount(amount)
+        stored_reference = _reference(reference)
         customer = resolver()
         try:
             balance = await accounts_facade.get_balance(backend, customer, from_account_ref)
@@ -189,8 +213,7 @@ def build_create_payment(
                 raise ToolError(PAYEE_NOT_FOUND) from None
             raise
         currency = balance.amount.currency
-        canonical = _amount(amount, currency)
-        stored_reference = _reference(reference)
+        _check_money(canonical, currency)
         payload: dict[str, str] = {
             "from_account_ref": from_account_ref,
             "payee_ref": payee.payee_ref,
@@ -206,9 +229,6 @@ def build_create_payment(
         claims = runtime.claims()
         try:
             async with runtime.db.sessionmaker() as session:
-                await store.expire_stale_pending(
-                    session, customer_ref=customer.value, request_fingerprint=fingerprint
-                )
                 record = await store.create_pending_challenge_once(
                     session,
                     challenge_id=uuid.uuid4().hex,

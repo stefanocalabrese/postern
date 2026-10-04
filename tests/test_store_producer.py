@@ -465,3 +465,30 @@ async def test_the_producer_statements_run_as_the_application_role(
         await s.commit()
     assert first is not None and again is not None
     assert again.challenge_id == first.challenge_id
+
+
+async def test_expiry_uses_the_statement_clock_not_the_transaction_start(
+    database: Database, clean: None
+) -> None:
+    """A deadline that falls after the transaction began and before the
+    statement ran is past by `statement_timestamp()`, which is the clock
+    `_select_live_pending` reads. Judged by `now()` the row was neither expired
+    nor returned."""
+    async with database.sessionmaker() as s:
+        await _create(s, f"{PREFIX}between")
+        await s.commit()
+    async with database.sessionmaker() as s:
+        await s.execute(text("SELECT 1"))  # the transaction starts here
+        await s.execute(text("SELECT pg_sleep(0.05)"))
+        await s.execute(
+            text(
+                "UPDATE challenges SET expires_at = transaction_timestamp() + interval '10 ms' "
+                "WHERE challenge_id = :c"
+            ),
+            {"c": f"{PREFIX}between"},
+        )
+        expired = await challenges.expire_stale_pending(
+            s, customer_ref=CUSTOMER, request_fingerprint=_fingerprint()
+        )
+        await s.rollback()
+    assert expired == [f"{PREFIX}between"]
