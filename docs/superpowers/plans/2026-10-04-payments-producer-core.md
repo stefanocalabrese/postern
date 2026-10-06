@@ -10,6 +10,39 @@
 
 ---
 
+## Execution record
+
+Executed on 4 October 2026, subagent-driven. All ten tasks landed on `main` in 18 commits (`git log --oneline 6872316..2a5790f | wc -l` prints 18), the last being 2a5790f. The step checkboxes below were deliberately not ticked and are not a completion record: read the tree, as `CLAUDE.md` says of the earlier plans.
+
+Each task got an independent review. Tasks 3, 4, 6, 7, 8 and 9 each got a fixup commit as a result. Mapping from commit subjects, task to commits (feature commit, then fixup):
+
+| Task | Commits |
+|---|---|
+| 1 | 74379de feat(core): one shared declaration of the payment tier and tool names |
+| 2 | 2a18ff4 feat(api): read POSTERN_PAYMENTS_ENABLED, off by default |
+| 3 | 0bf46e2 feat(store): idempotent pending challenges keyed on a request fingerprint; fixup fab3c7f test(store): pin the index predicate, the pending guard and the fingerprint scope |
+| 4 | 97729f9 feat(core): a payments:read audience and the payee lookup; fixup 83fbdd1 fix(read-side): check the payee answered is the payee asked for |
+| 5 | 8508d8f feat(api): read client_id and jti from the verified token |
+| 6 | 319acb1 feat(api): payments.create_payment behind POSTERN_PAYMENTS_ENABLED; fixup 97b0291 fix(api): refuse control characters in the payment reference |
+| 7 | 1f3767e feat(api): payments.get_payment_status; fixup 5e77b5a fix(api): refuse an unreadable payment row with a fixed message |
+| 8 | 40feeab feat(api): flag-on surface, its allowlist and its masking cases; fixup 9a91aca fix(api): say only what the flag-on start_session note can promise, derive the flag-on module tuples |
+| 9 | ea0d4bd test(api): producer audit rows, the signed payload and the approval path; fixup 0a3db29 test(api): pin the producer's audit rows, the signed payload and the approval path against the services that enforce them |
+| 10 | 279d553 docs: the payments producer flag, and decision 0022 accepted; f4a43aa docs: correct the statements the payments producer made false; 2a5790f docs: record the tally measured on the final tree |
+
+The Task 9 fixup is matched by subject only (0a3db29 sits after the Task 10 documentation commits in the log), so that one pairing is inferred, not read from a diff.
+
+### Errata
+
+The task bodies below are left as written. Where they disagree with this list, this list and the final tree win.
+
+- **Task 2** did not say to add `POSTERN_PAYMENTS_ENABLED` to the `not_numeric` set in `tests/test_settings_bounds.py`. It was added during execution.
+- **Task 6, Task 7 and Task 9: quoted import blocks.** The import blocks quoted in Tasks 7 and 9 no longer matched HEAD after Task 6's review fixup, so they were merged by hand. Task 7 added `PAYMENT_STATUS_TOOL`, `CHALLENGE_NOT_FOUND`, `build_get_payment_status`, `OTHER`, `uuid`, and kept `logging`, `REFERENCE_NOT_PRINTABLE`, `post_rpc`, `producer_app` and the `store` alias. Task 9 merged `JWTVerifier`, the `approval_signature` imports, `REFUSAL_DOMAIN_NOT_CONSENTED`, `AuditEntry`, `AsyncSession`, `Starlette`, and the confirm and `device_keys` imports into the existing block.
+- **Task 8: `_server` helper.** The helper `_server(**kwargs: object)` in `tests/test_tool_surface_golden.py` failed mypy with 5 `arg-type` errors. It became `_server(payments: PaymentsRuntime | None = None)`.
+- **Task 8: self-check test.** The plan missed that the existing test `test_a_module_added_to_the_surface_makes_the_gate_fail` also needs `services.api.server.BUILTIN_READ_MODULES_WITH_PAYMENTS` patched.
+- **Tasks 6, 7, 8 and 9: text superseded by the review fixups.** The control-character refusal for references, `CHALLENGE_UNREADABLE` for unreadable stored rows, the status-specific fixed messages, the reworded flag-on `start_session` note and the derived flag-on module tuples replace what those task bodies say. The final code and spec sections 9 and 10 are authoritative.
+
+---
+
 ## Before you start: rules that apply to every task
 
 1. **Work in a worktree, never on `main`.** Do not push. Commit once per task, with exactly the `git add` list given.
