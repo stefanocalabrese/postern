@@ -68,8 +68,8 @@ ISSUER = "https://app.test.invalid"
 AUDIENCE = "postern-confirm"
 OWNER = "cust_sig1"
 STRANGER = "cust_sig2"
-TOOL = "payments.create_payment"
-PAYLOAD: dict[str, Any] = {"amount": "EUR 340.00", "payee": "Acme Ltd"}
+TOOL = "standing_orders.cancel"
+PAYLOAD: dict[str, Any] = {"order_id": "so_340", "amount": "EUR 340.00", "payee": "Acme Ltd"}
 
 #: Every challenge this module inserts carries it, so teardown deletes by
 #: prefix without touching another module's rows.

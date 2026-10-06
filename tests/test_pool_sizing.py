@@ -282,8 +282,8 @@ async def insert_pending(db: Database, challenge_id: str) -> None:
             session,
             challenge_id=challenge_id,
             customer_ref=CUSTOMER,
-            tool_name="payments.create_payment",
-            payload={"amount": "EUR 340.00"},
+            tool_name="standing_orders.cancel",
+            payload={"order_id": "so_340"},
             tier=VerificationTier.APP_APPROVAL,
         )
         await session.commit()

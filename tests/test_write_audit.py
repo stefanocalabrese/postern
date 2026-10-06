@@ -72,7 +72,7 @@ ISSUER = "https://app.test.invalid"
 AUDIENCE = "postern-confirm"
 OWNER = "cust_7f3a"
 STRANGER = "cust_9e21"
-TOOL = "payments.create_payment"
+TOOL = "standing_orders.cancel"
 
 #: The owner's one enrolled phone. STRANGER enrols nothing, deliberately: the
 #: cross-customer tests below must be refused by the OWNERSHIP check, which
@@ -296,7 +296,7 @@ async def seed(
                 challenge_id=challenge_id,
                 customer_ref=customer_ref,
                 tool_name=tool_name,
-                payload={"amount": "EUR 340.00", "payee": "Acme Ltd"},
+                payload={"order_id": "so_340", "amount": "EUR 340.00", "payee": "Acme Ltd"},
                 tier=1,
                 status=status,
                 created_at=now,

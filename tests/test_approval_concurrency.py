@@ -159,8 +159,8 @@ async def challenge(db: Database) -> AsyncGenerator[str, None]:
             session,
             challenge_id=challenge_id,
             customer_ref="cust_7f3a",
-            tool_name="payments.create_payment",
-            payload={"amount": "EUR 340.00", "payee_ref": "payee_7"},
+            tool_name="standing_orders.cancel",
+            payload={"order_id": "so_7", "reason": "no longer needed"},
             tier=VerificationTier.APP_APPROVAL,
         )
         await session.commit()

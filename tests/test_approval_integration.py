@@ -275,7 +275,7 @@ async def post(
 async def _insert_pending_challenge(
     session: Any,
     challenge_id: str = "chal_int_001",
-    tool_name: str = "payments.create_payment",
+    tool_name: str = "standing_orders.cancel",
     payload: dict[str, Any] | None = None,
     customer_ref: str = "cust_7f3a",
 ) -> None:
@@ -291,7 +291,7 @@ async def _insert_pending_challenge(
         challenge_id=challenge_id,
         customer_ref=customer_ref,
         tool_name=tool_name,
-        payload=payload or {"amount": "EUR 340.00"},
+        payload=payload or {"order_id": "so_340"},
         tier=VerificationTier.APP_APPROVAL,
     )
     await session.commit()
@@ -374,8 +374,8 @@ async def test_expired_challenge_returns_410(
         session,
         challenge_id="chal_int_expired",
         customer_ref="cust_7f3a",
-        tool_name="payments.create_payment",
-        payload={"amount": "EUR 10.00"},
+        tool_name="standing_orders.cancel",
+        payload={"order_id": "so_10"},
         tier=VerificationTier.APP_APPROVAL,
     )
 

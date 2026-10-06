@@ -321,14 +321,14 @@ def _make_state(
 def _pending_record(
     challenge_id: str = "chal_abc123",
     customer_ref: str = "cust_7f3a",
-    tool_name: str = "payments.create_payment",
+    tool_name: str = "standing_orders.cancel",
     payload: dict[str, Any] | None = None,
 ) -> ChallengeRecord:
     return ChallengeRecord(
         challenge_id=challenge_id,
         customer_ref=customer_ref,
         tool_name=tool_name,
-        payload=payload or {},
+        payload=payload or {"order_id": "so_1"},
         tier=VerificationTier.APP_APPROVAL.value,
         status="pending",
         created_at=datetime.now(UTC),

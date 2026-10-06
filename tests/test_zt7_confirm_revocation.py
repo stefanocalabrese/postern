@@ -80,7 +80,7 @@ OTHER = "cust_zt7w2"
 CLIENT = "vendor-claude"
 OTHER_CLIENT = "vendor-perplexity"
 
-TOOL = "payments.create_payment"
+TOOL = "standing_orders.cancel"
 
 #: Every challenge this module inserts carries it, so teardown can delete by
 #: prefix without touching another module's rows.
@@ -327,7 +327,7 @@ async def seed(db: Database, challenge_id: str, *, customer_ref: str = OWNER) ->
                 challenge_id=challenge_id,
                 customer_ref=customer_ref,
                 tool_name=TOOL,
-                payload={"amount": "EUR 340.00", "payee": "Acme Ltd"},
+                payload={"order_id": "so_340", "amount": "EUR 340.00", "payee": "Acme Ltd"},
                 tier=1,
                 status="pending",
                 created_at=now,
