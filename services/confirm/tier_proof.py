@@ -231,10 +231,10 @@ def tier_refusal(challenge_id: str, refusal: TierRefusal) -> tuple[JSONResponse,
     flag on, each refusal has already cost a customer a verification.
     """
     if refusal.failed_claim is None:
-        logger.warning("challenge approve: %s refused, %s", challenge_id, refusal.detail)
+        logger.warning("challenge approve: %r refused, %s", challenge_id, refusal.detail)
     else:
         logger.warning(
-            "challenge approve: %s refused, the assertion's %s claim does not prove "
+            "challenge approve: %r refused, the assertion's %s claim does not prove "
             "app identity verification for this challenge",
             challenge_id,
             refusal.failed_claim,

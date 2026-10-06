@@ -167,6 +167,24 @@ def test_an_unset_value_refuses_every_tier_2_row() -> None:
         pytest.param(
             claims(challenge_id="t2_unit_0002"), "challenge_id", False, id="challenge-id-other"
         ),
+        pytest.param(
+            claims(challenge_id=CHALLENGE[:-1]), "challenge_id", False, id="challenge-id-prefix"
+        ),
+        pytest.param(
+            claims(challenge_id=CHALLENGE + "0"), "challenge_id", False, id="challenge-id-extended"
+        ),
+        pytest.param(
+            claims(challenge_id=CHALLENGE + "\n"),
+            "challenge_id",
+            False,
+            id="challenge-id-trailing-newline",
+        ),
+        pytest.param(
+            claims(challenge_id=CHALLENGE.upper()),
+            "challenge_id",
+            False,
+            id="challenge-id-other-case",
+        ),
         pytest.param(without("jti"), "jti", False, id="jti-missing"),
         pytest.param(claims(jti=7), "jti", False, id="jti-number"),
         pytest.param(claims(jti=""), "jti", False, id="jti-empty"),
@@ -177,7 +195,12 @@ def test_an_unset_value_refuses_every_tier_2_row() -> None:
         pytest.param(claims(jti="jti-é"), "jti", False, id="jti-non-ascii"),
         pytest.param(without("auth_time"), "auth_time", True, id="auth-time-missing"),
         pytest.param(claims(auth_time=True), "auth_time", True, id="auth-time-bool"),
-        pytest.param(claims(auth_time="1790000000"), "auth_time", True, id="auth-time-string"),
+        pytest.param(
+            claims(auth_time=str(CREATED.timestamp() + 5)),
+            "auth_time",
+            True,
+            id="auth-time-in-range-numeric-string",
+        ),
         pytest.param(claims(auth_time=math.nan), "auth_time", True, id="auth-time-nan"),
         pytest.param(claims(auth_time=math.inf), "auth_time", True, id="auth-time-inf"),
         pytest.param(claims(auth_time=-math.inf), "auth_time", True, id="auth-time-minus-inf"),
@@ -214,6 +237,14 @@ def test_the_auth_time_bounds_are_inclusive(auth_time: float) -> None:
 def test_a_jti_of_exactly_128_characters_passes() -> None:
     jti = "j" * 128
     assert check(record(), claims(jti=jti)) == TierVerdict(None, jti)
+
+
+def test_an_infinite_auth_time_is_refused_even_when_the_bounds_would_admit_it() -> None:
+    """With ``now`` infinite the upper bound is infinite, so ``inf <= inf``
+    holds and only the finiteness check refuses."""
+    verdict = check(record(), claims(auth_time=math.inf), now=math.inf)
+    assert verdict.refusal == required("auth_time")
+    assert verdict.assertion_jti == JTI
 
 
 def test_a_bool_auth_time_is_refused_where_the_integer_1_would_pass() -> None:
@@ -294,6 +325,16 @@ def test_a_claim_refusal_is_a_fixed_403_and_logs_the_claim_name(
     assert logged.levelno == logging.WARNING
     assert CHALLENGE in logged.getMessage()
     assert "jti claim" in logged.getMessage()
+
+
+@pytest.mark.parametrize("refusal", [required("jti"), MISMATCH], ids=["claim", "row"])
+def test_a_newline_in_the_challenge_id_cannot_forge_a_log_line(
+    caplog: pytest.LogCaptureFixture, refusal: TierRefusal
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="services.confirm.tier_proof"):
+        tier_refusal("abc\nWARNING forged line", refusal)
+    (logged,) = caplog.records
+    assert "\n" not in logged.getMessage()
 
 
 def test_a_row_refusal_logs_its_detail(caplog: pytest.LogCaptureFixture) -> None:
