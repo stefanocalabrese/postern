@@ -155,7 +155,7 @@ from postern_core.domain.masking import redaction_budget, scrub_text, scrub_tree
 from postern_core.identity import CustomerRef
 from postern_core.net import client_ip
 from postern_core.store import audit
-from postern_core.store.audit import TRUNCATED, bound_arguments, clamp
+from postern_core.store.audit import ARGUMENTS_TRUNCATED_KEY, TRUNCATED, bound_arguments, clamp
 from postern_core.store.engine import Database
 from postern_core.store.models import (
     ABSENCE_SUBJECT_NOT_A_CUSTOMER_REF,
@@ -534,6 +534,24 @@ class ApprovalAudit:
         """
         self._tool_name = scrub_text(tool_name)
 
+    def note_assertion_jti(self, jti: str) -> None:
+        """Record the tier-2 assertion's ``jti`` in this request's ``arguments``.
+
+        Called by ``services/confirm/callback.py`` once the ``jti`` has passed
+        its check on a tier-2 row, whether the approval then succeeds or is
+        refused (spec docs/superpowers/specs/2026-10-06-tier2-approval-enforcement-design.md,
+        section 8). Both rows written after it carry the value. The
+        ``challenges`` row stores the same ``jti`` as ``verification_result``
+        on success, but ``postern_app`` holds ``UPDATE`` on that table, so this
+        append-only copy is the one of record.
+
+        Scrubbed outside the request's ``redaction_budget`` scope, for the
+        reason `resolve` gives: the value is at most 128 printable ASCII
+        characters by the time it gets here, so the fresh allowance it gets
+        cannot be spent to any degree that matters.
+        """
+        self._arguments = _with_assertion_jti(self._arguments, scrub_text(jti))
+
     async def record(self) -> None:
         """Commit this request's entry row, at most once.
 
@@ -848,6 +866,36 @@ def _arguments(challenge_id: str, body: dict[str, Any]) -> dict[str, Any]:
             "verification_result": scrub_tree(body.get("verification_result")),
         }
     )
+
+
+#: The three server-chosen keys `_arguments` lists first, in its order.
+_SERVER_CHOSEN_KEYS = ("route", "challenge_id", "signature_present")
+
+#: Where `ApprovalAudit.note_assertion_jti` records a tier-2 assertion's ``jti``.
+ASSERTION_JTI_ARGUMENT = "assertion_jti"
+
+
+def _with_assertion_jti(arguments: dict[str, Any], jti: str) -> dict[str, Any]:
+    """``arguments`` with ``jti`` added right after the server-chosen keys.
+
+    THE POSITION IS THE FIRST-FIT RULE `_arguments` documents: the ``jti`` is
+    validated and short, so it goes ahead of the two caller-supplied fields a
+    capped tree drops, and an attack that fills those cannot take it with
+    them.
+
+    Bounded again with `bound_arguments` when the tree was not yet capped, so
+    adding the value cannot carry a tree past ``MAX_ARGUMENTS_BYTES``
+    unmarked. A tree already carrying the truncation marker is not re-capped:
+    its marker describes the body as it arrived, and re-capping would replace
+    that with a description of the capped tree. The overshoot is the ``jti``
+    entry alone, about 150 bytes at most.
+    """
+    head = {key: value for key, value in arguments.items() if key in _SERVER_CHOSEN_KEYS}
+    tail = {key: value for key, value in arguments.items() if key not in _SERVER_CHOSEN_KEYS}
+    merged = {**head, ASSERTION_JTI_ARGUMENT: jti, **tail}
+    if ARGUMENTS_TRUNCATED_KEY in arguments:
+        return merged
+    return bound_arguments(merged)
 
 
 # ---------------------------------------------------------------------------

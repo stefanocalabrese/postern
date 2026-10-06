@@ -419,17 +419,24 @@ def verified_claims(request: Request) -> dict[str, Any]:
     The companion to ``verified_subject`` above, split out rather than folded
     into it because the two have different failure contracts.
     ``verified_subject`` returns ``None`` so a handler can fail closed on it;
-    this one returns an EMPTY DICT, because no claim it carries is ever an
-    authorization input. Its one reader is
-    ``services/confirm/audit.py::_client_id``, which asks for ``client_id``
-    then ``azp`` to record WHICH client called, and a missing claim there is a
-    NULL column, not a refusal.
+    this one returns an EMPTY DICT, and both of its readers are safe with one.
 
-    Returning ``{}`` rather than ``None`` therefore keeps that reader from
-    having to decide what an absent assertion means: on this service it cannot
-    happen except in the same handler-without-middleware case
-    ``verified_subject`` already fails closed on, and that branch returns 401
-    before anything asks for claims.
+    ``services/confirm/audit.py::_client_id`` asks for ``client_id`` then
+    ``azp`` to record WHICH client called, and a missing claim there is a NULL
+    column, not a refusal.
+
+    The approval callback's tier check (decision record 0023) is the other
+    reader, and for it FOUR CLAIMS ARE AUTHORIZATION INPUTS on a tier-2 row:
+    ``idv``, ``challenge_id``, ``jti`` and ``auth_time``. Each is tested with
+    ``isinstance`` before it is compared, so a claim that is absent, and an
+    empty dict as a whole, is a refusal there and never a pass. No other claim
+    decides anything; ``sub`` reaches handlers through ``verified_subject``.
+
+    Returning ``{}`` rather than ``None`` therefore keeps neither reader
+    deciding what an absent assertion means: on this service it cannot happen
+    except in the same handler-without-middleware case ``verified_subject``
+    already fails closed on, and that branch returns 401 before anything asks
+    for claims.
     """
     assertion = request.scope.get("state", {}).get(ASSERTION_STATE_KEY)
     if not isinstance(assertion, AppAssertion):

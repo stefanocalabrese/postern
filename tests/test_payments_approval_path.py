@@ -151,6 +151,8 @@ async def test_a_call_refused_by_consent_writes_one_row(
 DEVICE_PRIVATE, DEVICE_PUBLIC = device_key("producer-phone")
 CONFIRM_ISSUER = "https://app.test.invalid"
 CONFIRM_AUDIENCE = "postern-confirm"
+#: The `idv` value this confirm app requires of a tier-2 approval (decision 0023).
+IDV_VALUE = "postern-test-idv"
 
 
 async def test_the_stored_payload_signs_and_verifies_as_an_approval_message(
@@ -216,6 +218,7 @@ def confirm_app(pg_url: str, key_pair: RSAKeyPair) -> Starlette:
         database_url=pg_url,
         allow_non_uri_audience=True,
         allow_process_local_sessions=True,
+        idv_value=IDV_VALUE,
     )
     verifier = JWTVerifier(
         public_key=key_pair.public_key, issuer=CONFIRM_ISSUER, audience=CONFIRM_AUDIENCE
@@ -237,8 +240,9 @@ async def test_a_produced_challenge_is_approved_and_executes_the_stored_payload(
     """The whole path this slice opens: proposed through the api, approved
     through the real callback with a device signature over the stored row,
     and executed against a mock backend that receives exactly the stored
-    payload. Tier 2 is not enforced at approval yet (spec section 2), which is
-    why a signature alone suffices here."""
+    payload. The row is tier 2, so the assertion carries the four claims
+    decision record 0023 requires, and the row stores the assertion's jti as
+    its verification_result."""
     await grant(produced, OWNER, "payments")
     created = result_of(
         await call_tool(
@@ -265,13 +269,22 @@ async def test_a_produced_challenge_is_approved_and_executes_the_stored_payload(
 
     monkeypatch.setattr(BackendWriteClient, "__init__", patched)
 
-    # Confirm does not read the tier yet; this pins the stored value for when
-    # enforcement lands.
+    # The tier the callback enforces below.
     assert row.tier == PAYMENT_TIER
 
     app = confirm_app(pg_url, key_pair)
+    jti = "producer-approval-0001"
     assertion = key_pair.create_token(
-        subject=OWNER, issuer=CONFIRM_ISSUER, audience=CONFIRM_AUDIENCE, expires_in_seconds=60
+        subject=OWNER,
+        issuer=CONFIRM_ISSUER,
+        audience=CONFIRM_AUDIENCE,
+        expires_in_seconds=60,
+        additional_claims={
+            "idv": IDV_VALUE,
+            "challenge_id": challenge_id,
+            "jti": jti,
+            "auth_time": row.created_at.timestamp(),
+        },
     )
     headers = {"Authorization": f"Bearer {assertion}"}
     approve = f"/challenges/{challenge_id}/approve"
@@ -327,3 +340,7 @@ async def test_a_produced_challenge_is_approved_and_executes_the_stored_payload(
         assert len(sent) == 1
     status = await payment_status(produced)(challenge_id=challenge_id)
     assert status["status"] == "executed"
+    async with produced.sessionmaker() as s:
+        final = await store.get_challenge(s, challenge_id)
+    assert final is not None
+    assert final.verification_result == jti

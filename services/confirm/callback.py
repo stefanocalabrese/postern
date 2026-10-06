@@ -133,8 +133,14 @@ from services.confirm.audit import (
 )
 from services.confirm.auth import unauthenticated_response, verified_claims, verified_subject
 from services.confirm.device_signature import signature_refusal
-from services.confirm.execute import BackendWriteClient, BackendWriteError, resolve_endpoint
+from services.confirm.execute import (
+    WRITE_OPERATIONS,
+    BackendWriteClient,
+    BackendWriteError,
+    resolve_endpoint,
+)
 from services.confirm.revocation import customer_revoked, log_refusal, revoked_response
+from services.confirm.tier_proof import check_tier, tier_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -536,6 +542,35 @@ async def _approve(
         if refusal is not None:
             return refusal
 
+        # --- 2c. Does the assertion prove what the row's tier requires? ---
+        #
+        # AFTER the signature and BEFORE the claim, for the two reasons the
+        # signature check gives for its own position: a caller who cannot
+        # sign learns nothing here about the row's tier, and a refusal leaves
+        # the row exactly `pending`, since nothing in this session has
+        # written yet. `services/confirm/tier_proof.py` holds the rule
+        # (decision record 0023). The tier is read off the stored row and
+        # checked against the tier its operation DECLARES, because the row is
+        # writable by `postern_app` and the declaration is not.
+        verdict = check_tier(
+            record=challenge_record,
+            challenge_id=challenge_id,
+            claims=verified_claims(request),
+            expected_idv=request.app.state.settings.idv_value,
+            now=time.time(),
+            operations=WRITE_OPERATIONS,
+        )
+        if verdict.assertion_jti is not None:
+            audit.note_assertion_jti(verdict.assertion_jti)
+        if verdict.refusal is not None:
+            return tier_refusal(challenge_id, verdict.refusal)
+        # Tier 2 stores the assertion's `jti`, never the body's string: what
+        # lands on the row is then the identifier of an assertion that carried
+        # the configured `idv` and this challenge's id. Tier 1 is unchanged.
+        stored_verification_result = (
+            verification_result if verdict.assertion_jti is None else verdict.assertion_jti
+        )
+
         # --- 3. Claim the challenge: pending -> approved, in one statement ---
         #
         # There is no ``if status != "pending"`` and no ``if now >=
@@ -554,7 +589,7 @@ async def _approve(
                 expected_status="pending",
                 expiry="unexpired",
                 confirming_device=body.get("confirming_device"),
-                verification_result=verification_result,
+                verification_result=stored_verification_result,
                 # Verified by step 2b before this line could be reached, so
                 # what lands on the row is evidence: an Ed25519 signature by
                 # an enrolled device over this row's own contents.
