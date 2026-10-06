@@ -552,6 +552,12 @@ async def _approve(
         # (decision record 0023). The tier is read off the stored row and
         # checked against the tier its operation DECLARES, because the row is
         # writable by `postern_app` and the declaration is not.
+        #
+        # This also runs before the row's status and deadline are looked at,
+        # so an expired or already-terminal tier-2 row presented with bad
+        # claims gets this 403 and is not retired by the request; with good
+        # claims it falls through to the claim and gets 410 `expired` (with
+        # the expiry transition) or 409 `already_terminal`.
         verdict = check_tier(
             record=challenge_record,
             challenge_id=challenge_id,

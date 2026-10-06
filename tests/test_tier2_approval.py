@@ -27,6 +27,7 @@ from postern_core.store.models import AuditEntry, ChallengeRecord
 from sqlalchemy import select, text
 from starlette.applications import Starlette
 
+from services.confirm import callback
 from services.confirm.execute import BackendWriteClient
 from services.confirm.main import create_confirm_app
 from services.confirm.revocation import REVOKED_ERROR
@@ -179,11 +180,14 @@ async def approve(
     headers: dict[str, str],
     *,
     signer: Any = DEVICE_PRIVATE,
+    as_a_server_would: bool = False,
     **extra: Any,
 ) -> httpx2.Response:
+    """POST the approval; ``as_a_server_would`` answers an unhandled raise with a 500."""
     body = {"signature": sign_row(signer, record), **extra}
     async with httpx2.AsyncClient(
-        transport=httpx2.ASGITransport(app=app), base_url="http://t"
+        transport=httpx2.ASGITransport(app=app, raise_app_exceptions=not as_a_server_would),
+        base_url="http://t",
     ) as client:
         return await client.post(
             f"/challenges/{record.challenge_id}/approve", json=body, headers=headers
@@ -500,6 +504,7 @@ async def test_a_revoked_customer_is_refused_as_revoked_even_with_valid_claims(
     assert response.json()["error"] == REVOKED_ERROR
     (row,) = await audit_rows(db, record.challenge_id)
     assert row.detail == "revoked"
+    assert (await stored(db, record.challenge_id)).status == "pending"
     assert sent == []
 
 
@@ -530,3 +535,193 @@ async def test_a_valid_and_an_invalid_approval_race_and_only_the_valid_one_execu
     assert invalid.json()["error"] == "verification_required"
     assert len(sent) == 1
     assert (await stored(db, record.challenge_id)).status == "executed"
+
+
+async def test_two_valid_approvals_race_to_one_execution_and_each_row_carries_its_own_jti(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await seed(db)
+    first, second = await asyncio.gather(
+        approve(app, record, bearer(key_pair, tier2_claims(record, jti="jti-A"))),
+        approve(app, record, bearer(key_pair, tier2_claims(record, jti="jti-B"))),
+    )
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    assert len(sent) == 1
+    row = await stored(db, record.challenge_id)
+    assert row.status == "executed"
+    winner = row.verification_result
+    assert winner in {"jti-A", "jti-B"}
+    loser = ({"jti-A", "jti-B"} - {winner}).pop()
+    entries = await audit_rows(db, record.challenge_id)
+    by_outcome = {e.outcome: e.arguments["assertion_jti"] for e in entries}
+    assert by_outcome["reaching"] == by_outcome["returned"] == winner
+    assert by_outcome["raised"] == loser
+
+
+# -- The jti is recorded as the backend issued it ------------------------------------
+
+#: Three values `scrub_text` rewrites: a PAN, a `uuid4().hex`-shaped id the
+#: masker catches (12.9% of hex ids are masked; this one is an md5 digest found
+#: by search), and an IBAN. The audit row must carry each as issued, or it
+#: cannot be joined to the app backend's issuance log.
+SCRUBBABLE_JTIS = [
+    pytest.param("4111111111111111", id="pan-shaped"),
+    pytest.param("f2aee81c67e9e6a3e0feadc451f05d9f", id="hex-id-the-scrubber-masks"),
+    pytest.param("GB82WEST12345698765432", id="iban-shaped"),
+]
+
+
+@pytest.mark.parametrize("jti", SCRUBBABLE_JTIS)
+async def test_the_audit_rows_carry_the_jti_unscrubbed_on_success(
+    jti: str,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+) -> None:
+    record = await seed(db)
+    response = await approve(app, record, bearer(key_pair, tier2_claims(record, jti=jti)))
+    assert response.status_code == 200, response.text
+    row = await stored(db, record.challenge_id)
+    entries = await audit_rows(db, record.challenge_id)
+    assert [e.outcome for e in entries] == ["reaching", "returned"]
+    assert row.verification_result == jti
+    assert all(e.arguments["assertion_jti"] == jti for e in entries)
+
+
+@pytest.mark.parametrize("jti", SCRUBBABLE_JTIS)
+async def test_the_audit_row_carries_the_jti_unscrubbed_on_a_refusal_after_it_passed(
+    jti: str,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+) -> None:
+    record = await seed(db)
+    claims = tier2_claims(record, jti=jti, auth_time=time.time() + 3600)
+    response = await approve(app, record, bearer(key_pair, claims))
+    assert response.status_code == 403, response.text
+    (entry,) = await audit_rows(db, record.challenge_id)
+    assert entry.detail == "verification_required"
+    assert entry.arguments["assertion_jti"] == jti
+    row = await stored(db, record.challenge_id)
+    assert (row.status, row.verification_result) == ("pending", None)
+
+
+# -- Expired and terminal rows: the tier check answers first -------------------------
+
+
+async def expired_row(db: Database) -> ChallengeRecord:
+    """A pending tier-2 row whose deadline has passed, as `stored` reads it.
+
+    The device signature covers ``expires_at``, so the caller signs the
+    returned row, not the seeded one.
+    """
+    record = await seed(db)
+    async with db.sessionmaker() as s:
+        await s.execute(
+            text(
+                "UPDATE challenges SET expires_at = created_at - INTERVAL '1 hour' "
+                "WHERE challenge_id = :c"
+            ),
+            {"c": record.challenge_id},
+        )
+        await s.commit()
+    return await stored(db, record.challenge_id)
+
+
+async def test_an_expired_row_with_bad_claims_is_refused_as_verification_and_not_retired(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await expired_row(db)
+    response = await approve(app, record, bearer(key_pair, _drop("idv")(record)))
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "verification_required"
+    assert (await stored(db, record.challenge_id)).status == "pending"
+    assert sent == []
+
+
+async def test_an_expired_row_with_good_claims_is_410_and_retired(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await expired_row(db)
+    response = await approve(app, record, bearer(key_pair, tier2_claims(record)))
+    assert response.status_code == 410, response.text
+    assert response.json()["error"] == "expired"
+    row = await stored(db, record.challenge_id)
+    assert (row.status, row.verification_result) == ("expired", None)
+    assert sent == []
+
+
+async def test_an_executed_row_with_bad_claims_is_403_and_with_good_claims_is_409(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await seed(db)
+    done = await approve(app, record, bearer(key_pair, tier2_claims(record)))
+    assert done.status_code == 200, done.text
+    bad = await approve(app, record, bearer(key_pair, _drop("idv")(record)))
+    assert bad.status_code == 403, bad.text
+    assert bad.json()["error"] == "verification_required"
+    good = await approve(app, record, bearer(key_pair, tier2_claims(record)))
+    assert good.status_code == 409, good.text
+    assert good.json()["error"] == "already_terminal"
+    assert len(sent) == 1
+    assert (await stored(db, record.challenge_id)).status == "executed"
+
+
+# -- auth_time: a bool is not the number 1 --------------------------------------------
+
+
+async def test_auth_time_one_is_accepted_and_true_is_refused_when_one_is_in_range(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    """`True == 1`, so a bool the check let through would pass at the HTTP level
+    only if 1 were inside the window: the rows are created at the epoch here."""
+    first = await seed(db)
+    second = await seed(db)
+    async with db.sessionmaker() as s:
+        await s.execute(
+            text(
+                "UPDATE challenges SET created_at = to_timestamp(0) WHERE challenge_id IN (:a, :b)"
+            ),
+            {"a": first.challenge_id, "b": second.challenge_id},
+        )
+        await s.commit()
+    refused = await stored(db, first.challenge_id)
+    accepted = await stored(db, second.challenge_id)
+    assert refused.created_at.timestamp() == 0
+    bad = await approve(app, refused, bearer(key_pair, tier2_claims(refused, auth_time=True)))
+    assert bad.status_code == 403, bad.text
+    assert (await stored(db, refused.challenge_id)).status == "pending"
+    good = await approve(app, accepted, bearer(key_pair, tier2_claims(accepted, auth_time=1)))
+    assert good.status_code == 200, good.text
+    assert len(sent) == 1
+
+
+# -- An exception in the check is not an update failure -------------------------------
+
+
+async def test_an_exception_in_the_tier_check_is_a_bare_500_and_leaves_the_row_pending(
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check sits outside the `try` that wraps the claim, whose handler puts
+    `str(exc)` in the response: an exception here must not reach the caller as text."""
+
+    def explode(**_: Any) -> Any:
+        raise ValueError("SENTINEL")
+
+    monkeypatch.setattr(callback, "check_tier", explode)
+    record = await seed(db)
+    response = await approve(
+        app, record, bearer(key_pair, tier2_claims(record)), as_a_server_would=True
+    )
+    assert response.status_code == 500, response.text
+    assert "SENTINEL" not in response.text
+    (entry,) = await audit_rows(db, record.challenge_id)
+    assert (entry.outcome, entry.detail) == ("raised", "ValueError")
+    assert (await stored(db, record.challenge_id)).status == "pending"
+    assert sent == []

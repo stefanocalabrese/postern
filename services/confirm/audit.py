@@ -545,12 +545,21 @@ class ApprovalAudit:
         on success, but ``postern_app`` holds ``UPDATE`` on that table, so this
         append-only copy is the one of record.
 
-        Scrubbed outside the request's ``redaction_budget`` scope, for the
-        reason `resolve` gives: the value is at most 128 printable ASCII
-        characters by the time it gets here, so the fresh allowance it gets
-        cannot be spent to any degree that matters.
+        RECORDED UNSCRUBBED, and that is deliberate. It is the one value in
+        ``arguments`` that is not scrubbed, because its job is to be joined to
+        the app backend's issuance log, and `scrub_text` masked 12.9% of
+        ``uuid4().hex`` values (``e7635d46842b4480a042740614703510`` became
+        ``e7635d46842b4480a•••• 3510``; an IBAN-shaped ``jti`` became
+        ``GB•• •••• 5432``), which breaks that join for one assertion in
+        eight. What reaches here has already passed `check_tier`: a ``str`` of
+        1 to 128 characters, every one in 0x21..0x7E, from an assertion the
+        app backend signed and this process verified, and the same string is
+        stored raw as ``challenges.verification_result``. It is not free text a
+        customer or a backend typed, so there is no PAN for the scrub to find
+        that the backend did not put there. Only the size cap applies,
+        through `_with_assertion_jti`.
         """
-        self._arguments = _with_assertion_jti(self._arguments, scrub_text(jti))
+        self._arguments = _with_assertion_jti(self._arguments, jti)
 
     async def record(self) -> None:
         """Commit this request's entry row, at most once.
