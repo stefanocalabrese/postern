@@ -931,6 +931,57 @@ async def test_over_http_an_unreadable_stored_payload_is_the_fixed_text(
         assert [block["text"] for block in result["content"]] == [CHALLENGE_UNREADABLE]
 
 
+async def test_over_http_an_approval_that_races_the_expiry_update_is_reported_approved(
+    pg_url: str,
+    key_pair: RSAKeyPair,
+    produced: Database,
+    audit_server: FastMCP,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The row is pending and past its deadline when the handler reads it. An
+    approval commits between that read and the handler's conditional expiry
+    UPDATE, so the UPDATE matches nothing, and the handler's own session still
+    holds the `pending` copy it loaded. The answer must be the committed
+    `approved`, which only the re-read with `refresh=True` produces.
+
+    The interleaving is forced, not timed: `update_challenge_status` is wrapped
+    so that its first call from the status handler commits the approval through
+    a separate session before running the real UPDATE."""
+    await grant(produced, OWNER, "payments")
+    token = token_for(key_pair, OWNER)
+    challenge_id = await insert_row(
+        produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
+    )
+    real_update = store.update_challenge_status
+    raced: list[str] = []
+
+    async def approve_first(session: AsyncSession, cid: str, **kwargs: Any) -> Any:
+        if kwargs.get("status") == "expired" and not raced:
+            raced.append(cid)
+            async with produced.sessionmaker() as other:
+                # Plain SQL: the row is past its deadline, which the store's
+                # own transition would refuse, and this test needs it committed.
+                await other.execute(
+                    text(
+                        "UPDATE challenges SET status = 'approved' "
+                        "WHERE challenge_id = :c AND status = 'pending'"
+                    ),
+                    {"c": cid},
+                )
+                await other.commit()
+        return await real_update(session, cid, **kwargs)
+
+    monkeypatch.setattr(store, "update_challenge_status", approve_first)
+    response = await call_tool(
+        pg_url, key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
+    )
+    assert raced == [challenge_id]
+    result = result_of(response)
+    assert result.get("isError") is not True, response.text
+    assert result["structuredContent"]["status"] == "approved", response.text
+    assert await status_of(produced, challenge_id) == "approved"
+
+
 async def test_status_on_an_unreachable_store_is_a_fixed_refusal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
