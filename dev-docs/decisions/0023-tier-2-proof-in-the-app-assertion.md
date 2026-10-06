@@ -4,7 +4,7 @@ Date: 6 October 2026
 
 ## Status
 
-Proposed, 6 October 2026: awaiting capo's review of the spec
+Accepted, 6 October 2026: capo approved the spec
 (`docs/superpowers/specs/2026-10-06-tier2-approval-enforcement-design.md`).
 The four choices below were taken by capo on 6 October 2026.
 
@@ -38,10 +38,12 @@ Alternatives considered:
 
 ## Decision
 
-For a challenge row of tier 2, `services/confirm` requires three claims in the
-verified banking-app assertion: `acr`, a string equal to the configured
-`POSTERN_CONFIRM_IDV_ACR`; `challenge_id`, a string equal to the challenge in the
-request path; and `jti`, a string of 1 to 128 printable ASCII characters. The
+For a challenge row of tier 2, `services/confirm` requires four claims in the
+verified banking-app assertion: `idv`, a string equal to the configured
+`POSTERN_CONFIRM_IDV_VALUE`; `challenge_id`, a string equal to the challenge in the
+request path; `jti`, a string of 1 to 128 printable ASCII characters; and `auth_time`, a number
+no earlier than 30 seconds before the challenge was created and no later than 30
+seconds from now. The
 check runs after the device-signature check and before the claiming update, so a
 refusal is a 403 and leaves the row `pending`. For tier 2 the stored
 `verification_result` is the assertion's `jti`, not the caller's string, and the
@@ -49,7 +51,7 @@ refusal is a 403 and leaves the row `pending`. For tier 2 the stored
 A tier-0 row is refused for writes. A row whose tier is below its operation's
 declared tier is refused (`tier_mismatch`), because `postern_app` can write the
 `challenges` table and the declared tier is static configuration in confirm. An
-unset `POSTERN_CONFIRM_IDV_ACR` refuses every tier-2 approval and does not stop
+unset `POSTERN_CONFIRM_IDV_VALUE` refuses every tier-2 approval and does not stop
 confirm from starting. The write token to the payments backend is unchanged.
 
 What is lost, and accepted: the trust anchor is the operator's app backend saying
@@ -58,24 +60,24 @@ can check the match, or whether the assertion was minted after it. A compromised
 app backend, or a stolen assertion-signing key, can mint the claims for any
 challenge. The control stops an approval that carries no claim of verification,
 and the reuse of one assertion across challenges, and nothing beyond that. Whether
-one verification backs assertions for several challenges, or whether `acr` is
+one verification backs assertions for several challenges, or whether `idv` is
 copied from a login session, is decided by the app backend and cannot be detected
 here; the spec lists what the backend must do.
 
 ## Consequences
 
 - The banking app's backend must mint, for a tier-2 approval, an assertion carrying
-  the three claims after the verification for that challenge completed. This is
+  the four claims after the verification for that challenge completed. This is
   written into `docs/integration/mobile-app-pairing-contract.md` and is a
   dependency on the app backend team that this repository does not discharge.
 - `verified_claims`' docstring ("no claim it carries is ever an authorization
-  input") is no longer true for `acr`, `challenge_id` and `jti` on tier-2
+  input") is no longer true for `idv`, `challenge_id`, `jti` and `auth_time` on tier-2
   approvals, and is rewritten.
-- Three audit details are added (`verification_required`,
-  `verification_not_configured`, `tier_unsupported`). `audit_log.detail` is
-  unconstrained text, so there is no migration.
+- Four audit details are added (`verification_required`,
+  `verification_not_configured`, `tier_mismatch`, `tier_unsupported`).
+  `audit_log.detail` is unconstrained text, so there is no migration.
 - A signed attestation from the identity-verification service remains the
-  stronger design. Moving to it replaces where the three claims are read from and
+  stronger design. Moving to it replaces where the four claims are read from and
   nothing else in this decision.
 - The payments flag stays off in production. Delivery to the phone and a
   consent-grant flow are still missing, and the Art. 9 basis, the DPIA and the
