@@ -257,7 +257,9 @@ async def update_challenge_status(
         expiry: What the transition asserts about ``expires_at``. See
             ``ExpiryPredicate``.
         confirming_device: Device identifier from the mobile app.
-        verification_result: Tier-2 verification reference (selfie match).
+        verification_result: For a tier-1 approval, the approval body's value;
+            for tier 2, the ``jti`` of the banking-app assertion that proved
+            app identity verification (decision record 0023).
         signature: Device-bound key signature over the payload.
 
     Returns:

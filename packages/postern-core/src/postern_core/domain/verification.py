@@ -122,6 +122,9 @@ class Challenge:
         expires_at: When this challenge expires and can no longer be approved.
         confirming_device: Device identifier once the user approves (None until then).
         verification_result: Opaque reference to the tier-2 verification result.
+            The approval callback does not use this dataclass; on a stored
+            tier-2 row the value is the ``jti`` of the banking-app assertion
+            that proved app identity verification (decision record 0023).
             Never stores the captured image — only the result and an audit
             reference (handoff §7.4: "never store the captured image").
         signature: Device-bound key signature over the payload, provided by

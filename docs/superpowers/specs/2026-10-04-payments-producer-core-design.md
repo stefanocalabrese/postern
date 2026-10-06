@@ -13,7 +13,7 @@ Each of these is left out on purpose, with its blocker.
 | Not in this slice | Why | Blocked by |
 |---|---|---|
 | Delivery of the challenge to the phone, and an endpoint the app can read it from | No push sender, no device registry, no read route exists; only `POST /challenges/{id}/approve` does | Handoff §10.4, another team |
-| Tier-2 enforcement at approval | `services/confirm/callback.py` never reads `row.tier`, and stores `verification_result` unvalidated, so a tier-2 payment can be approved on a device signature alone | A separate slice in `services/confirm` |
+| Tier-2 enforcement at approval | `services/confirm/callback.py` never reads `row.tier`, and stores `verification_result` unvalidated, so a tier-2 payment can be approved on a device signature alone | A separate slice in `services/confirm`, done on 6 October 2026: `docs/superpowers/specs/2026-10-06-tier2-approval-enforcement-design.md` |
 | Consent-grant flow | Nothing writes `consents` rows (`sql/02-grants.sql` says so), so no client can be granted `payments` | A separate flow |
 | New-payee entry | The IBAN is typed in the app, so the signed stored row cannot bind it (handoff §6.5, §10.18) | App team, §10.18 |
 | Approval consulting `client_id` / `session_jti` | The columns are added so it can; making it do so is a separate change | A follow-up in `services/confirm` |
@@ -29,7 +29,7 @@ Four decisions were taken by capo, each from the options shown below.
 |---|---|---|
 | Registration | Built into the api composition; the tools are not a `ReadModule`. The A3 control gains an explicit allowlist for the flag-on surface | A new producer module kind with its own entry-point group and a database-carrying context: new public surface, new import-linter contracts and image wiring, before a second user exists. Renaming the tools to avoid "pay": departs from the names in CLAUDE.md and the handoff, and the test would hide the capability instead of guarding it |
 | Payee lookup | A new read audience `payments.svc` with scope `payments:read`, distinct from `payments:execute`, and a decision record. `GET /payees/{ref}`, scoped by the token `sub` | No lookup in this slice: any well-formed `payee_ref` is accepted, the challenge has no payee name, and the first validation happens after the user approves (a 207) |
-| Tier and gating | Tier 2, from one shared declaration. Tools registered only when `POSTERN_PAYMENTS_ENABLED=1`; the flag stays off in production until tier-2 enforcement lands | Tier 1 for now: contradicts `tool-surface.json` and the handoff row, and changes what existing pending rows mean later. Tier 2 always on: leaves a pay-named write tool visible to every client with an untested gap behind it |
+| Tier and gating | Tier 2, from one shared declaration. Tools registered only when `POSTERN_PAYMENTS_ENABLED=1`; the flag stays off in production until tier-2 enforcement lands (it landed on 6 October 2026, `docs/superpowers/specs/2026-10-06-tier2-approval-enforcement-design.md`) | Tier 1 for now: contradicts `tool-surface.json` and the handoff row, and changes what existing pending rows mean later. Tier 2 always on: leaves a pay-named write tool visible to every client with an untested gap behind it |
 | Idempotency | Fingerprint of customer, tool and canonical payload, plus a partial unique index on pending rows | A required client `idempotency_key` argument: asks an adversarially influenced model to manage a key. Both together: a second contract before any client needs it |
 
 ## 4. Architecture
@@ -200,7 +200,7 @@ The consent-evaluation counts in `tests/test_consent_check_failure_mode.py` assu
 
 The flag stays off in production until all three hold:
 
-1. The approval path enforces the row's tier, including `verification_result` for tier 2.
+1. The approval path enforces the row's tier, including `verification_result` for tier 2. Done on 6 October 2026 (`docs/superpowers/specs/2026-10-06-tier2-approval-enforcement-design.md`, decision record 0023).
 2. A delivery path to the phone exists (handoff §10.4).
 3. A consent-grant flow exists, so `payments` can be granted.
 
@@ -212,7 +212,7 @@ An RCE in the api with the flag on can insert arbitrary pending rows for any cus
 |---|---|
 | `GET /payees/{ref}` contract and response shape (`payee_ref`, `name`) | Backend teams |
 | `POST /payments` accepting `payee_name`, and the stored payload as its body (`resolve_endpoint` forwards it unchanged) | Backend teams |
-| Tier-2 enforcement at approval | `services/confirm` |
+| Tier-2 enforcement at approval | `services/confirm`; done on 6 October 2026 (`docs/superpowers/specs/2026-10-06-tier2-approval-enforcement-design.md`) |
 | Delivery to the phone, and what the app displays | Another team (§10.4); the app team |
 | Consent-grant flow | Not assigned |
 | Payments gateway enforces `payments:read` (read issuer) only on `GET /payees/*`, and requires `payments:execute` from the write issuer on write paths | Backend and platform teams |

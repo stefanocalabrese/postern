@@ -99,8 +99,10 @@ class _MinterProtocol(Protocol):
 # module needs only the triple, and `WriteOperation.as_registry_entry` is what
 # narrows it. The tier reaches ``tool-surface.json``, so raising or lowering one
 # is a reviewable diff. `payments.create_payment` stores `PAYMENT_TIER` on each
-# row it creates, when `POSTERN_PAYMENTS_ENABLED` is on; nothing in
-# `services/confirm` reads the tier.
+# row it creates, when `POSTERN_PAYMENTS_ENABLED` is on. The approval callback
+# reads the declared tier from `WRITE_OPERATIONS` below: a row stored under
+# it is refused (`tier_mismatch`), and a tier-2 row needs the proof decision
+# record 0023 describes (`services/confirm/tier_proof.py`).
 
 #: The write operations this repository ships without a distribution of its own.
 #:

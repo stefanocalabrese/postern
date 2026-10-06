@@ -301,7 +301,7 @@ Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not
 
 ## 10. Out of this contract
 
-`POST /challenges/{challenge_id}/approve` is the payment approval callback. It is separate from pairing, requires an Ed25519 signature from an enrolled device on top of the assertion, and is reachable in production only with `POSTERN_PAYMENTS_ENABLED` on, which the api leaves off by default, and nothing yet delivers the challenge to a phone. It will get its own contract.
+`POST /challenges/{challenge_id}/approve` is the payment approval callback. It is separate from pairing, requires an Ed25519 signature from an enrolled device on top of the assertion, and is reachable in production only with `POSTERN_PAYMENTS_ENABLED` on, which the api leaves off by default, and nothing yet delivers the challenge to a phone. Its request body and the delivery of the challenge to the phone will get their own contract; section 12 states what the assertion must carry to approve a tier-2 challenge.
 
 ## 11. What the server leaves unspecified
 
@@ -310,3 +310,26 @@ Refusal `detail` values on `/scan`: `invalid_subject`, `revoked`, `user_code_not
 - Whether the operator requires app identity verification for pairing at all. The server does not know either way.
 - The copy of every user-facing message. The suggestions above are suggestions.
 - The confirm service's base URL. The app must be configured with it; nothing in the link or the server tells the app where to send `/scan`.
+
+## 12. Tier-2 challenge approval: what the assertion carries
+
+Decision record `dev-docs/decisions/0023-tier-2-proof-in-the-app-assertion.md`. A payment challenge is tier 2, and `POST /challenges/{challenge_id}/approve` approves a tier-2 challenge only when the assertion authenticating that request carries, beyond section 3's claims:
+
+| Claim | Requirement |
+|---|---|
+| `idv` | A string equal, exactly, to the value the operator configures in `POSTERN_CONFIRM_IDV_VALUE`. No case folding or trimming. |
+| `challenge_id` | A string equal to the challenge in the request path. |
+| `jti` | A string of 1 to 128 printable ASCII characters (0x21 to 0x7E). Stored as the challenge's `verification_result` and recorded in `audit_log`. |
+| `auth_time` | A JSON number, seconds since the epoch, no earlier than 30 seconds before the challenge was created and no later than 30 seconds after the server's clock. |
+
+Anything else is refused with 403 `verification_required` and a fixed description that names no claim; the challenge stays `pending`, so the app can retry with a corrected assertion until the challenge expires (300 seconds after it was created). With `POSTERN_CONFIRM_IDV_VALUE` unset every tier-2 approval gets the same 403. A tier-1 challenge needs none of the four.
+
+**What the operator's app backend must do.** Confirm checks that the claims are present and consistent. It cannot check that they are true, so the backend owns all of this:
+
+- Set `idv` only from its own record of an identity verification that completed for this `challenge_id` and this `sub`; never from a value the app supplies, and never from the login session.
+- Mint at most one tier-2 assertion per verification.
+- Use a `jti` unique per issuer, 1 to 128 printable ASCII characters.
+- Use an `idv` value that appears in no other claim and that it emits for nothing else.
+- Set `auth_time` to the time the verification for this challenge completed. Confirm refuses a value earlier than 30 seconds before the challenge was created or later than 30 seconds from now, and cannot check that the value is true.
+
+Nothing in this repository verifies that the match happened, that `auth_time` is true, that the `jti` is unique, or the order of events; the operator's backend owns all of them. The lower bound is measured against the database's clock and the upper bound against confirm's, while the backend sets `auth_time` from its own, so keep all three within a few seconds. How the app asks its backend for a tier-2 assertion, and what that backend accepts as input, is not established here and is not part of this contract.

@@ -960,7 +960,9 @@ class ChallengeRecord(Base):
         Device identifier once the user approves (NULL until then).
 
     ``verification_result``
-        Opaque reference to tier-2 verification result (selfie match).
+        On a tier-2 row, the ``jti`` of the banking-app assertion that proved
+        app identity verification for this challenge (decision record 0023);
+        on a tier-1 row, whatever the approval body carried.
         Never stores the captured image — only the result and an audit
         reference (handoff §7.4).
 

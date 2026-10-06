@@ -341,6 +341,8 @@ Handles verification challenge approvals for write operations (payments, card wr
 - a. Verifies the app assertion; the customer is its `sub` (401 if absent/invalid)
 - b. Looks up challenge by ID
 - c. Rejects with 404 unless `challenge.customer_ref` equals that `sub`
+- c2. After the device signature verifies (below), checks the row's tier and
+  refuses with 403, the row left `pending` (see "Tier enforcement" below)
 - d. Validates state (must be "pending" + not expired)
 - e. Marks challenge as "approved" in Postgres
 - f. Executes backend write endpoint server-side (POST to payments.svc)
@@ -370,6 +372,40 @@ issue from an attack. An unreachable device-key store is not treated as "no
 device enrolled" — it raises, and the request fails with 500, challenge
 untouched. `create_confirm_app` refuses to start without a device-key store
 configured, the same way it refuses without the app-assertion verifier.
+
+**Tier enforcement** (since 2026-10-06, decision record 0023). After the signature
+verifies and before the row is claimed, the callback reads the row's tier, and
+the tier its operation declares in `services/confirm/execute.py`:
+
+| Case | `error` | `detail` in `audit_log` |
+|---|---|---|
+| Row tier below the operation's declared tier | `tier_mismatch` | `tier_mismatch` |
+| Tier 0 (an operation confirm does not declare) | `tier_unsupported` | `tier_unsupported` |
+| Tier 2, `POSTERN_CONFIRM_IDV_VALUE` unset | `verification_required` | `verification_not_configured` |
+| Tier 2, a claim missing or wrong | `verification_required` | `verification_required` |
+
+A tier-2 approval needs four claims in the banking-app assertion: `idv` equal to
+`POSTERN_CONFIRM_IDV_VALUE`, `challenge_id` equal to the challenge in the path, a
+`jti` of 1 to 128 printable ASCII characters, and a numeric `auth_time` no earlier
+than 30 seconds before the challenge was created and no later than 30 seconds from
+now. The row then stores that `jti` as `verification_result`, and both audit rows
+record it as `assertion_jti` (capped in size, not scrubbed, so it joins to the app
+backend's issuance log). Every refusal is a 403 with a fixed description that
+names no claim; one WARNING log line names the claim that failed, never its value.
+The tier check does not look at the row's status or deadline: a tier-2 row that is
+expired or already terminal, presented with bad claims, gets this 403 and not 410
+or 409, and an expired row is not retired by that request.
+Tier-1 rows are approved as before. What this cannot establish: that the
+verification happened. The app backend that mints the assertion is the trust
+anchor; [the pairing contract](../../integration/mobile-app-pairing-contract.md)
+section 12 lists what it must do.
+
+Clock caveat: the lower bound compares `auth_time`, which the app backend sets from
+its own clock, with the challenge's `created_at`, which Postgres stamped; the upper
+bound compares it with confirm's own clock. No startup check measures skew between
+confirm and Postgres. If confirm's clock lags the database by more than about 30
+seconds, legitimate tier-2 approvals are refused, which is a liveness failure and
+not a safety one. Keep the three clocks within a few seconds with NTP.
 
 What this does **not** establish: that a human looked at the payment, or that
 the phone itself is uncompromised. Both depend on the device's secure element

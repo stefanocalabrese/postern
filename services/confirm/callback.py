@@ -18,7 +18,7 @@ Request format (POST /challenges/{challenge_id}/approve)::
 
     {
         "signature": "<86 base64url chars: Ed25519 over the stored row>",
-        "verification_result": "<tier-2 selfie match reference, if applicable>"
+        "verification_result": "<optional; stored for tier 1, ignored for tier 2>"
     }
 
 Response format::
@@ -154,7 +154,9 @@ async def approve_challenge(request: Request) -> JSONResponse:
     record what it did in ``audit_log``.
 
     This is called by the confirmation service (the operator's banking app)
-    after the user completes identity verification and approves the operation.
+    after the user approves the operation. For a tier-2 challenge the app
+    backend's assertion must also prove that app identity verification
+    completed for this challenge (step 2c, decision record 0023).
 
     Flow:
         0. Verify the app assertion; the customer is its ``sub``.
@@ -166,9 +168,15 @@ async def approve_challenge(request: Request) -> JSONResponse:
            enrolled for that customer, over bytes built from the row read in
            step 1. Before step 3 because step 3 WRITES, and a caller who
            cannot sign must not be able to move anybody's challenge.
+        2c. Check the row's tier: below its operation's declared tier is
+           refused, tier 0 is refused, and tier 2 needs the assertion's
+           ``idv``, ``challenge_id``, ``jti`` and ``auth_time``
+           (``services/confirm/tier_proof.py``). Before step 3 for the
+           reason step 2b gives.
         3. Claim it: one conditional ``UPDATE`` that carries "still pending"
            and "not yet expired" in its ``WHERE`` and records the verified
-           signature + verification_result. Winning it is what authorizes
+           signature + verification_result (the body's for tier 1, the
+           assertion's ``jti`` for tier 2). Winning it is what authorizes
            step 4; zero rows goes to ``_refused_transition_response``.
         4. Execute the backend write endpoint server-side via execute.py,
            then mark the row executed, conditional on ``approved``.
@@ -302,6 +310,11 @@ async def approve_challenge(request: Request) -> JSONResponse:
         # caller supplied no `confirming_device`, no `verification_result` and
         # no signature that reached the handler. `detail` below is what says
         # a body arrived and could not be read, as against none arriving.
+        # A readable body's `verification_result` is recorded (scrubbed, like
+        # the rest of the body) even on a tier-2 row, where `_approve` ignores
+        # it and stores the assertion's `jti` instead;
+        # `ApprovalAudit.note_assertion_jti` adds that `jti`, capped and not
+        # scrubbed.
         body=body if body is not None else {},
     )
 
