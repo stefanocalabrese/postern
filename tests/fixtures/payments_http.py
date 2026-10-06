@@ -14,20 +14,32 @@ inside the tool.
 """
 
 import json
+import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx2
+import pytest
+import pytest_asyncio
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from fastmcp.server.http import StarletteWithLifespan
-from postern_core.identity import TokenClaims
+from postern_core.facade.client import BackendClient, StubTokenMinter
+from postern_core.identity import CustomerRef, TokenClaims, TokenClaimsProvider
+from postern_core.modules.read import ToolHandler
+from postern_core.payments import PAYMENT_TIER
+from postern_core.store import challenges as store
 from postern_core.store.engine import Database
-from postern_core.store.models import ConsentRecord
-from sqlalchemy import delete, text
+from postern_core.store.models import ChallengeRecord, ConsentRecord
+from sqlalchemy import delete, select, text
 
 from services.api.main import create_app
 from services.api.settings import Settings
-from services.api.tools.payments import PaymentsRuntime
+from services.api.tools.payments import (
+    PaymentsRuntime,
+    build_create_payment,
+    build_get_payment_status,
+)
 from stub import backend as stub
 
 ISSUER = "https://postern-test.invalid"
@@ -178,3 +190,119 @@ def offline_runtime() -> PaymentsRuntime:
         db=Database(OFFLINE_DATABASE_URL, null_pool=True, connect_timeout_seconds=0.5),
         claims=no_claims,
     )
+
+
+# -- Shared by the four `tests/test_payments_*.py` files ---------------------------
+#
+# Moved here when the producer's single test file was split by what it
+# exercises. Each test file imports what it uses; `key_pair` and `produced`
+# are fixtures, loaded through `pytest_plugins` in each of the four.
+
+ARGS: dict[str, str] = {"from_account_ref": "acc_7f3a", "payee_ref": "pay_nw01", "amount": "340.50"}
+SUMMARY = "Approve EUR 340.50 to Northwind Energy DE•• •••• 3000 in your banking app."
+
+
+def fixed_claims() -> TokenClaims:
+    return TokenClaims(client_id="claude-code", jti="jti-handler-1")
+
+
+def stub_backend(transport: httpx2.AsyncBaseTransport | None = None) -> BackendClient:
+    return BackendClient(
+        "http://backend-stub",
+        StubTokenMinter(),
+        transport=transport or httpx2.ASGITransport(app=stub.app),
+        before_backend_request=None,
+    )
+
+
+def create_payment(
+    database: Database,
+    *,
+    customer: str = OWNER,
+    backend: BackendClient | None = None,
+    claims: TokenClaimsProvider = fixed_claims,
+) -> ToolHandler:
+    runtime = PaymentsRuntime(db=database, claims=claims)
+    return build_create_payment(
+        lambda: CustomerRef(value=customer), backend or stub_backend(), runtime
+    )
+
+
+async def rows(database: Database) -> list[ChallengeRecord]:
+    async with database.sessionmaker() as s:
+        result = await s.execute(
+            select(ChallengeRecord)
+            .where(ChallengeRecord.request_fingerprint.is_not(None))
+            .order_by(ChallengeRecord.id)
+        )
+        return list(result.scalars().all())
+
+
+@pytest.fixture(scope="module")
+def key_pair() -> RSAKeyPair:
+    return RSAKeyPair.generate()
+
+
+@pytest_asyncio.fixture
+async def produced(database: Database) -> AsyncIterator[Database]:
+    """No produced challenge and no consent row before or after each test."""
+    await delete_produced_challenges(database)
+    await revoke_all_consents(database)
+    yield database
+    await delete_produced_challenges(database)
+    await revoke_all_consents(database)
+
+
+def payment_status(database: Database, *, customer: str = OWNER) -> ToolHandler:
+    return build_get_payment_status(
+        lambda: CustomerRef(value=customer), PaymentsRuntime(db=database, claims=fixed_claims)
+    )
+
+
+async def insert_row(
+    database: Database,
+    *,
+    customer_ref: str,
+    tool_name: str,
+    payload: Any = None,
+    past_deadline: bool = False,
+) -> str:
+    """A pending row the producer did not make through its handler: another
+    customer's, or another tool's, or one with a payload of any shape.
+    Fingerprinted, so the `produced` fixture deletes it. `past_deadline` moves
+    `expires_at` into the past, still `pending`."""
+    challenge_id = uuid.uuid4().hex
+    async with database.sessionmaker() as s:
+        await store.create_pending_challenge_once(
+            s,
+            challenge_id=challenge_id,
+            customer_ref=customer_ref,
+            tool_name=tool_name,
+            payload=(
+                {"amount": "1.00", "currency": "EUR", "payee_name": "Payee"}
+                if payload is None
+                else payload
+            ),
+            tier=PAYMENT_TIER,
+            request_fingerprint=challenge_id * 2,
+            client_id=None,
+            session_jti=None,
+        )
+        if past_deadline:
+            await s.execute(
+                text(
+                    "UPDATE challenges SET expires_at = now() - interval '1 second' "
+                    "WHERE challenge_id = :c"
+                ),
+                {"c": challenge_id},
+            )
+        await s.commit()
+    return challenge_id
+
+
+async def status_of(database: Database, challenge_id: str) -> str:
+    async with database.sessionmaker() as s:
+        result = await s.execute(
+            text("SELECT status FROM challenges WHERE challenge_id = :c"), {"c": challenge_id}
+        )
+        return str(result.scalar_one())

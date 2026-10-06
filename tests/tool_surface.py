@@ -197,7 +197,7 @@ async def producer_surface() -> list[dict[str, Any]]:
                 "name": name,
                 # Declared, not observed: this is the imported constant, not a
                 # value read off the registered tool. The registration's own
-                # consent domain is pinned by tests/test_payments_producer.py.
+                # consent domain is pinned by tests/test_payments_over_http.py.
                 "consent_domain": CONSENT_DOMAIN,
                 "read_only_hint": annotations.read_only_hint,
                 "destructive_hint": annotations.destructive_hint,
