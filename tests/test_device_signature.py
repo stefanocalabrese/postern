@@ -486,11 +486,11 @@ async def test_a_signature_over_an_altered_amount_does_not_approve_the_stored_on
 ) -> None:
     """Verification step 3, the shape that matters most.
 
-    The stored challenge is for EUR 340.00. The phone signs EUR 3.40 -- the
-    amount an injected agent would rather have shown -- against the same
-    challenge id, customer, tool and deadline. The message is built from the
-    ROW, so what the caller signed is not what the server checks, and the
-    approval is refused.
+    The stored challenge's payload carries an amount of EUR 340.00. The phone
+    signs EUR 3.40 -- the amount an injected agent would rather have shown --
+    against the same challenge id, customer, tool and deadline. The message is
+    built from the ROW, so what the caller signed is not what the server
+    checks, and the approval is refused.
     """
     record = await seed(clean, f"{PREFIX}amount")
     assert record.payload["amount"] == "EUR 340.00"
@@ -513,10 +513,11 @@ async def test_a_signature_over_an_altered_amount_does_not_approve_the_stored_on
     assert await status_of(clean, f"{PREFIX}amount") == "pending"
 
 
-async def test_a_signature_over_another_tool_does_not_approve_a_payment(
+async def test_a_signature_over_another_tool_does_not_approve_another_operation(
     app: Starlette, clean: Database, backend: Backend, key_pair: RSAKeyPair
 ) -> None:
-    """A card freeze the customer really did approve must not become a payment."""
+    """A card freeze the customer really did approve must not approve the
+    stored challenge, which is for a different operation."""
     record = await seed(clean, f"{PREFIX}tool")
 
     as_a_card_freeze = sign_fields(
@@ -541,7 +542,7 @@ async def test_the_request_body_cannot_influence_what_is_verified(
 ) -> None:
     """The load-bearing property, asserted directly.
 
-    The body carries a full set of fields naming a cheaper payment, matching
+    The body carries a full set of fields naming a different payload, matching
     the ones the caller signed. None of them is read: the message comes from
     the stored row, so the extra fields change nothing and the refusal stands.
     """

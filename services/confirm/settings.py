@@ -368,7 +368,11 @@ def is_visible_ascii(value: str, *, max_length: int = MAX_VISIBLE_ASCII_LENGTH) 
     description (spec docs/superpowers/specs/2026-10-06-tier2-approval-enforcement-design.md,
     section 4).
     """
-    return 1 <= len(value) <= max_length and all("!" <= char <= "~" for char in value)
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= max_length
+        and all("!" <= char <= "~" for char in value)
+    )
 
 
 def _check_idv_value(value: str | None) -> str | None:

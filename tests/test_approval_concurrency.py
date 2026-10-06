@@ -195,7 +195,7 @@ def backend_calls() -> Generator[list[httpx2.Request], None, None]:
 
     def _handler(request: httpx2.Request) -> httpx2.Response:
         calls.append(request)
-        return httpx2.Response(201, json={"payment_id": "pay_1"})
+        return httpx2.Response(201, json={"id": "x_1"})
 
     original_init = BackendWriteClient.__init__
 

@@ -9,6 +9,7 @@ when built in code.
 
 import dataclasses
 import logging
+from typing import Any
 
 import pytest
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
@@ -77,6 +78,24 @@ def test_the_class_is_1_to_128_characters_from_0x21_to_0x7e() -> None:
     assert not is_visible_ascii("j" * 129)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(["a"], id="list-of-one-character-strings"),
+        pytest.param(("a", "b"), id="tuple-of-one-character-strings"),
+        pytest.param(b"abc", id="bytes"),
+        pytest.param(7, id="int"),
+    ],
+)
+def test_a_value_that_is_not_a_string_is_refused_as_a_value_error(value: Any) -> None:
+    """An iterable of one-character strings is not a string: the class check
+    must say so itself, and the settings path must raise `ValueError`, not the
+    `TypeError` a `len()` or a comparison would."""
+    assert not is_visible_ascii(value)
+    with pytest.raises(ValueError, match=VARIABLE):
+        ConfirmSettings(idv_value=value)
+
+
 def test_unset_in_the_environment_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(VARIABLE, raising=False)
     assert ConfirmSettings.from_env().idv_value is None
@@ -92,7 +111,7 @@ def test_a_value_in_the_environment_is_read_exactly(monkeypatch: pytest.MonkeyPa
     assert ConfirmSettings.from_env().idv_value == "Postern-Dev-IDV"
 
 
-@pytest.mark.parametrize("value", [" ", "idv value", " idv", "idv\tvalue", "idv\x1bvalue"])
+@pytest.mark.parametrize("value", [" ", "idv value", " idv", "idv\tvalue", "idv\x1bvalue", "idv\n"])
 def test_a_value_in_the_environment_is_refused_naming_the_variable(
     value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
