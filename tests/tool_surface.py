@@ -38,7 +38,6 @@ import httpx2
 from fastmcp import FastMCP
 from fastmcp.tools import FunctionTool
 from postern_core.facade.client import BackendClient, StubTokenMinter
-from postern_core.identity import TokenClaims
 from postern_core.modules.read import ReadModule, ReadTool, load_read_modules
 from postern_core.payments import PRODUCER_TOOL_NAMES
 from postern_core.store.engine import Database
@@ -49,19 +48,11 @@ from services.api.tools import BUILTIN_READ_MODULES
 from services.api.tools.payments import CONSENT_DOMAIN, PaymentsRuntime
 from services.confirm.execute import build_write_operations
 from tests.conftest import TEST_CUSTOMER
+from tests.fixtures.payments_http import OFFLINE_DATABASE_URL, no_claims
 
 #: The checked-in golden file, at the repository root where a reviewer trips
 #: over it rather than in a tools directory where they would not.
 SURFACE_PATH = Path(__file__).resolve().parents[1] / "tool-surface.json"
-
-
-#: Where a flag-on server's consent check would read. Nothing connects to it:
-#: listing through `local_provider` evaluates no check.
-_UNREACHED_DATABASE_URL = "postgresql+asyncpg://postern:postern@127.0.0.1:9/postern"
-
-
-def _no_claims() -> TokenClaims:
-    return TokenClaims(client_id=None, jti=None)
 
 
 def _server() -> FastMCP:
@@ -168,7 +159,9 @@ async def producer_surface() -> list[dict[str, Any]]:
             or takes a read tool away. Either would be a flag-on surface no
             reviewer was shown.
     """
-    db = Database(_UNREACHED_DATABASE_URL, null_pool=True)
+    # Where a flag-on server's consent check would read. Nothing connects to
+    # it: listing through `local_provider` evaluates no check.
+    db = Database(OFFLINE_DATABASE_URL, null_pool=True)
     try:
         backend = BackendClient(
             "https://backend.test",
@@ -180,7 +173,7 @@ async def producer_surface() -> list[dict[str, Any]]:
             Settings.for_testing(),
             resolver=lambda: TEST_CUSTOMER,
             backend=backend,
-            payments=PaymentsRuntime(db=db, claims=_no_claims),
+            payments=PaymentsRuntime(db=db, claims=no_claims),
         )
         registered = {tool.name: tool for tool in await server.local_provider.list_tools()}
     finally:
