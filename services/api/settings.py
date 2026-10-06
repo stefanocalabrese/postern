@@ -89,9 +89,9 @@ class Settings:
     # docs/superpowers/specs/2026-10-04-payments-producer-core-design.md). On,
     # `build_server` registers `payments.create_payment` and
     # `payments.get_payment_status`, each behind the `payments` consent check.
-    # It stays off in production until the approval path enforces a
-    # challenge's tier, a delivery path to the phone exists and a `payments`
-    # consent can be granted (spec section 13).
+    # It stays off in production until a delivery path to the phone exists and
+    # a `payments` consent can be granted (spec section 13; tier enforcement
+    # landed 6 October 2026, decision record 0023).
     payments_enabled: bool = False
     cache_ttl_seconds: int = 60
     # ZT-5: how many proxies in front of this process append to

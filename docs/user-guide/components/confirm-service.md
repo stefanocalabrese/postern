@@ -388,8 +388,8 @@ A tier-2 approval needs four claims in the banking-app assertion: `idv` equal to
 `POSTERN_CONFIRM_IDV_VALUE`, `challenge_id` equal to the challenge in the path, a
 `jti` of 1 to 128 printable ASCII characters, and a numeric `auth_time` no earlier
 than 30 seconds before the challenge was created and no later than 30 seconds from
-now. The row then stores that `jti` as `verification_result`, and both audit rows
-record it as `assertion_jti` (capped in size, not scrubbed, so it joins to the app
+now. The row then stores that `jti` as `verification_result`, and every audit row
+written after the check records it as `assertion_jti` (capped in size, not scrubbed, so it joins to the app
 backend's issuance log). Every refusal is a 403 with a fixed description that
 names no claim; one WARNING log line names the claim that failed, never its value.
 The tier check does not look at the row's status or deadline: a tier-2 row that is
@@ -403,7 +403,8 @@ section 12 lists what it must do.
 Clock caveat: the lower bound compares `auth_time`, which the app backend sets from
 its own clock, with the challenge's `created_at`, which Postgres stamped; the upper
 bound compares it with confirm's own clock. No startup check measures skew between
-confirm and Postgres. If confirm's clock lags the database by more than about 30
+confirm and Postgres. If confirm's clock lags the app backend's by more than about
+30 seconds, or the database's clock leads the backend's by more than about 30
 seconds, legitimate tier-2 approvals are refused, which is a liveness failure and
 not a safety one. Keep the three clocks within a few seconds with NTP.
 

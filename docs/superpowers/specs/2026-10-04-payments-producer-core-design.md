@@ -169,7 +169,7 @@ Flag on:
 | A5, cross-customer | The payer account, the payee and the challenge are each scoped by the token's customer; foreign and unknown are one refusal |
 | A10, replay of an approval | Unchanged: the single-use conditional update in `services/confirm` |
 | ZT-4 | Read audience only in the api process. Accepted deviation: the api issues an `UPDATE` on `challenges` (`pending -> expired`) where the plan expects insert-only. The shared `postern_app` role already holds `UPDATE`, and a pending-to-expired transition leaves no information the row did not hold. Recorded in decision 0022 |
-| ZT-5 | Tier is stored on the row; nothing reads it yet (non-goal) |
+| ZT-5 | Tier is stored on the row and read at approval since 6 October 2026 (`services/confirm/tier_proof.py`, decision record 0023). Still not read by the api |
 | ZT-7 | `client_id` and `session_jti` are stored so the approval path can match all three revocation scopes later (non-goal) |
 
 ## 12. Tests

@@ -93,9 +93,10 @@ class _MinterProtocol(Protocol):
 # rather than a rewrite: the six entries are proven unchanged by tests written
 # against the literal.
 #
-# THE TIER IS DECLARED ON THE OPERATION AND NOTHING HERE READS IT. CLAUDE.md is
-# explicit that the verification tier belongs on the tool definition and must
-# never be derived from the HTTP verb, so a `WriteOperation` carries one; this
+# THE TIER IS DECLARED ON THE OPERATION; `resolve_endpoint` NEVER READS IT, THE
+# APPROVAL CALLBACK DOES. CLAUDE.md is explicit that the verification tier
+# belongs on the tool definition and must never be derived from the HTTP verb,
+# so a `WriteOperation` carries one; this
 # module needs only the triple, and `WriteOperation.as_registry_entry` is what
 # narrows it. The tier reaches ``tool-surface.json``, so raising or lowering one
 # is a reviewable diff. `payments.create_payment` stores `PAYMENT_TIER` on each
