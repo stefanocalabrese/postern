@@ -61,7 +61,7 @@ Required tier. `declared = WRITE_OPERATIONS[row.tool_name].tier` when the tool i
 |---|---|
 | 1 | Unchanged. The body's `verification_result` and `confirming_device` are stored as today |
 | 2 | The proof below. The body's `verification_result` is ignored; the stored `verification_result` is the assertion's `jti` |
-| 0 | Refused with 403, `tier_unsupported`, row stays `pending`. Tier 0 is a read tier, no producer creates a tier-0 write row, and the column's CHECK allows 0, so the callback must say what it does with one. A `WriteOperation` that declared tier 0 would become unapprovable; none does (every declared tier is 1 or 2) |
+| 0 | Refused with 403, `tier_unsupported`, row stays `pending`. Tier 0 is a read tier, no producer creates a tier-0 write row, and the column's CHECK allows 0, so the callback must say what it does with one. A `WriteOperation` that declared tier 0 would become unapprovable; none does (every declared tier is 1 or 2). Because the tier-mismatch check runs first, a tier-0 row is refused as `tier_mismatch` whenever its tool is declared, so `tier_unsupported` is reachable only for a tool confirm does not declare |
 
 The proof for tier 2, with `claims = verified_claims(request)` and `expected = settings.idv_value`:
 
@@ -104,7 +104,7 @@ All refuse before the claim, return HTTP 403 with `{"error": code, "error_descri
 | Row tier below the operation's declared tier | `tier_mismatch` | `tier_mismatch` |
 | Tier 0 | `tier_unsupported` | `tier_unsupported` |
 
-The `error_description` never echoes a claim value or the configured `idv` value, and does not say which claim failed. A caller cannot change the signed claims, so there is nothing for it to probe; the fixed text exists so that nothing about the expected value is ever in a response. For the operator, one WARNING log line per refusal names the failed claim (`acr`, `challenge_id` or `jti`) and never a value, following `_lifetime_refusal`'s pattern in `services/confirm/auth.py`. The audit row's `detail` is the coarse value in the table; the audit `arguments` hold the scrubbed body and never the assertion's claims, except the recorded `jti` of section 8.
+The `error_description` never echoes a claim value or the configured `idv` value, and does not say which claim failed. A caller cannot change the signed claims, so there is nothing for it to probe; the fixed text exists so that nothing about the expected value is ever in a response. For the operator, one WARNING log line per refusal names the failed claim (`idv`, `challenge_id`, `jti` or `auth_time`) and never a value, following `_lifetime_refusal`'s pattern in `services/confirm/auth.py`. The audit row's `detail` is the coarse value in the table; the audit `arguments` hold the scrubbed body and never the assertion's claims, except the recorded `jti` of section 8.
 
 `detail` is an unconstrained `Text` column and no test enumerates `DETAIL_*` against `__all__`, so adding four literals to `services/confirm/audit.py` (`DETAIL_VERIFICATION_REQUIRED`, `DETAIL_VERIFICATION_NOT_CONFIGURED`, `DETAIL_TIER_MISMATCH`, `DETAIL_TIER_UNSUPPORTED`, each also in `__all__`) needs no migration.
 
@@ -118,7 +118,7 @@ What this makes true: for a tier-2 row that reached `approved` through confirm, 
 
 ## 9. The contract the operator's app backend must meet
 
-Added to `docs/integration/mobile-app-pairing-contract.md` as a new section, replacing the "will get its own contract" line for the tier-2 part only. To approve a tier-2 challenge, the banking app's assertion for that request must carry `acr` (the value the operator configures in `POSTERN_CONFIRM_IDV_VALUE`), `challenge_id` (the challenge being approved) and a `jti`. The backend must:
+Added to `docs/integration/mobile-app-pairing-contract.md` as a new section, replacing the "will get its own contract" line for the tier-2 part only. To approve a tier-2 challenge, the banking app's assertion for that request must carry `idv` (the value the operator configures in `POSTERN_CONFIRM_IDV_VALUE`), `challenge_id` (the challenge being approved), a `jti` and an `auth_time`. The backend must:
 
 - Set `idv` only from its own record of an identity verification that completed for this `challenge_id` and this `sub`; never from a value the app supplies and never from the login session.
 - Mint at most one tier-2 assertion per verification.
@@ -165,7 +165,7 @@ A new file `tests/test_tier2_approval.py`, plus changes to one existing test, ag
 | Retry | A refusal, then the right claims inside the window: second attempt 200 |
 | Concurrency | Two simultaneous approvals of one tier-2 row, one with valid claims and one with missing claims: exactly one 200 and one 403 `verification_required`, the backend reached once |
 | Mutations the review will run | Skip the tier check; compare `idv` case-insensitively; skip the `challenge_id` comparison (not "compare against the row", which is byte-equivalent and cannot be killed); store the body string for tier 2; accept a missing `jti`; drop the `auth_time` lower bound; drop the upper bound; accept a bool `auth_time`; `< 128` for `<= 128`; move the tier check above the ownership check; move it above the signature check; drop the `tier_mismatch` check |
-| Changed existing test | `tests/test_payments_approval_path.py` approves its tier-2 row with the new claims, its comments that say tier 2 is not enforced are removed, and it asserts the stored `verification_result` equals the `jti`. It is the only test that fails under the new rule |
+| Changed existing test | `tests/test_payments_approval_path.py` approves its tier-2 row with the new claims, its comments that say tier 2 is not enforced are removed, and it asserts the stored `verification_result` equals the `jti`. It is the only test that approves a tier-2 row. The `tier_mismatch` rule also breaks 56 tests in 9 other files that use `payments.create_payment`, stored at tier 1, as a generic approval fixture (measured by applying the rule to the suite: 57 failures in all); the plan moves those fixtures to `standing_orders.cancel`, a tier-1 built-in with the same audience and write scope, and none of those files checks the `/payments` path |
 
 `verified_claims`' docstring says no claim is ever an authorization input; it is rewritten to say which four are, for tier-2 rows: `idv`, `challenge_id`, `jti` and `auth_time`.
 
@@ -181,7 +181,7 @@ A new file `tests/test_tier2_approval.py`, plus changes to one existing test, ag
 | `packages/postern-core/src/postern_core/store/challenges.py` line 260, `store/models.py` lines 962 to 963, `domain/verification.py` lines 124 to 126 | Descriptions of `verification_result` as an opaque selfie-match reference: for tier 2 it is the assertion `jti` |
 | `docs/user-guide/components/confirm-service.md` | A new step between steps c and d of the flow at lines 333 to 340, and the four refusal details |
 | `docs/integration/mobile-app-pairing-contract.md` section 10 line 304 and a new section | Section 9 |
-| `dev-docs/decisions/0023` | Proposed until this spec is approved; aligned with this revision |
+| `dev-docs/decisions/0023` | Accepted 6 October 2026, aligned with this revision |
 
 ## 13. What remains after this slice
 
