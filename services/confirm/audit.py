@@ -204,10 +204,14 @@ __all__ = [
     "DETAIL_SIGNATURE_INVALID",
     "DETAIL_SIGNATURE_MALFORMED",
     "DETAIL_STORED_IDENTITY_MALFORMED",
+    "DETAIL_TIER_MISMATCH",
+    "DETAIL_TIER_UNSUPPORTED",
     "DETAIL_UPDATE_MATCHED_NO_ROW",
     "DETAIL_USER_CODE_BUDGET_EXHAUSTED",
     "DETAIL_USER_CODE_MISMATCH",
     "DETAIL_USER_CODE_NOT_FOUND",
+    "DETAIL_VERIFICATION_NOT_CONFIGURED",
+    "DETAIL_VERIFICATION_REQUIRED",
     "PairingAudit",
     "device_code_handle",
     "pairing_client_ip",
@@ -287,6 +291,27 @@ DETAIL_ALREADY_TERMINAL = "already_terminal"
 DETAIL_EXPIRED = "expired"
 DETAIL_CHALLENGE_VANISHED = "challenge_vanished"
 DETAIL_UPDATE_MATCHED_NO_ROW = "update_matched_no_row"
+#: THE FOUR THE TIER CHECK OWNS (decision record 0023), each decided after the
+#: device signature verified and before the claim, so none of them moves the
+#: challenge. The caller sees two codes for the first two and one each for the
+#: others; the table tells all four apart.
+#:
+#: ``verification_required`` is a tier-2 row whose assertion did not carry the
+#: four claims with acceptable values. Which claim failed is in the WARNING
+#: log line, never here and never in the response.
+DETAIL_VERIFICATION_REQUIRED = "verification_required"
+#: ``verification_not_configured`` is a tier-2 row on a service with no
+#: ``POSTERN_CONFIRM_IDV_VALUE``: an operator's setting, not a caller's
+#: failure, which is why it is not the literal above.
+DETAIL_VERIFICATION_NOT_CONFIGURED = "verification_not_configured"
+#: ``tier_mismatch`` is a row stored below the tier its operation declares.
+#: No path in this repository writes one; ``postern_app`` holds ``UPDATE`` on
+#: ``challenges``, so a row like this is what a compromise of a process
+#: holding that role leaves behind. Alert on it.
+DETAIL_TIER_MISMATCH = "tier_mismatch"
+#: ``tier_unsupported`` is a tier-0 row of an operation confirm does not
+#: declare. Tier 0 is a read tier and nothing approves it.
+DETAIL_TIER_UNSUPPORTED = "tier_unsupported"
 
 # `audit_log.client_id` is `String(512)` (models.py). The value here comes off
 # a verified assertion's claims, so producing an over-length one takes the
