@@ -210,10 +210,12 @@ EVERYWHERE = ("api", "confirm", "migrations")
 #: Every ``POSTERN_*`` variable any shipping module reads.
 #:
 #: Generated from the syntax tree on 2026-09-27 rather than typed, and pinned
-#: against it by `tests/test_settings_bounds.py` on every run. 84 rows since
-#: 2026-10-04: 32 strings (30 settings plus this guard's own two lists), 46
-#: numbers, 6 flags, the sixth being ``POSTERN_PAYMENTS_ENABLED``, which
-#: arrived with the payments producer. The eight ``POSTERN_VAULT_*`` rows below the device-code
+#: against it by `tests/test_settings_bounds.py` on every run. 85 rows since
+#: 2026-10-06: 33 strings (31 settings plus this guard's own two lists), 46
+#: numbers, 6 flags. The sixth flag, ``POSTERN_PAYMENTS_ENABLED``, arrived with
+#: the payments producer on 2026-10-04, and the thirty-first setting string,
+#: ``POSTERN_CONFIRM_IDV_VALUE``, with tier-2 approval enforcement on
+#: 2026-10-06. The eight ``POSTERN_VAULT_*`` rows below the device-code
 #: block arrived on 2026-09-29; ``POSTERN_DEVICE_APP_LINK_URI`` and the seven
 #: QR-page rate limits arrived on 2026-09-30, the day
 #: ``POSTERN_USER_CODE_MAX_ATTEMPTS`` left with the attempt budget it set, and
@@ -242,6 +244,7 @@ INVENTORY: tuple[EnvVar, ...] = (
     EnvVar("POSTERN_CONFIRM_DATABASE_AUDIT_RESERVE_SIZE", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_DATABASE_MAX_OVERFLOW", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_DATABASE_POOL_SIZE", "number", ("confirm",)),
+    EnvVar("POSTERN_CONFIRM_IDV_VALUE", "string", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_MAX_BODY_BYTES", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_PAIRING_ENRICHER_TIMEOUT_SECONDS", "number", ("confirm",)),
     EnvVar("POSTERN_CONFIRM_RATE_LIMIT_APPROVE", "number", ("confirm",)),

@@ -569,6 +569,12 @@ services:
       POSTERN_APP_ASSERTION_ISSUER: "https://postern-local-dev.invalid"
       POSTERN_APP_ASSERTION_AUDIENCE: "postern-confirm"
       POSTERN_DEVICE_KEYS_PATH: /etc/postern/device-keys.json
+      # The value the banking-app assertion's `idv` claim must equal to approve
+      # a tier-2 challenge (decision record 0023). A PLACEHOLDER agreed with
+      # nobody: a deployment sets the value its own app backend emits, and it is
+      # not a standard value. With nobody enrolled above, no approval reaches
+      # this check in this stack anyway.
+      POSTERN_CONFIRM_IDV_VALUE: "postern-local-dev-idv"
       # UNSET UNTIL 29 SEPTEMBER 2026, which meant this service resolved
       # `Database`'s own default, `localhost:5432`, inside its own container.
       # The engine is lazy so it started fine and failed on first use: every

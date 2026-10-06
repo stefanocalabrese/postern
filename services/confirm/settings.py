@@ -350,6 +350,49 @@ def _check_app_link_uri(link: str, page_uri: str) -> str:
     return link
 
 
+#: The longest ``POSTERN_CONFIRM_IDV_VALUE`` this service accepts, and the
+#: longest assertion ``jti`` a tier-2 approval accepts (decision record 0023).
+#: Both are compared or stored exactly as given, so both are held to one
+#: character class, `is_visible_ascii`.
+MAX_VISIBLE_ASCII_LENGTH = 128
+
+
+def is_visible_ascii(value: str, *, max_length: int = MAX_VISIBLE_ASCII_LENGTH) -> bool:
+    """True when ``value`` is 1 to ``max_length`` characters, each 0x21 to 0x7E.
+
+    That excludes every whitespace character, every control character, NUL
+    included, DEL, and everything outside ASCII. NUL is the one with a
+    measured consequence: PostgreSQL refuses it in a ``text`` value, so a NUL
+    in a tier-2 ``jti`` would make the claiming ``UPDATE`` raise, and the 500
+    that follows carries the statement and its bound parameters in its
+    description (spec docs/superpowers/specs/2026-10-06-tier2-approval-enforcement-design.md,
+    section 4).
+    """
+    return 1 <= len(value) <= max_length and all("!" <= char <= "~" for char in value)
+
+
+def _check_idv_value(value: str | None) -> str | None:
+    """Return ``value`` if it is unset or a usable ``POSTERN_CONFIRM_IDV_VALUE``, else raise.
+
+    Called by ``ConfirmSettings.__post_init__`` and by ``from_env``, as
+    `_check_app_link_uri` is, so a value built in code is held to the same
+    rule as one read from the environment. From the environment an empty
+    string is unset (``or None``); built in code, ``""`` is refused here.
+
+    The value is never echoed. It is not a credential, but it is the one
+    string a tier-2 approval must carry, and nothing about it needs to be in a
+    log line to fix a refused setting: the rule below is the whole answer.
+    """
+    if value is None or is_visible_ascii(value):
+        return value
+    raise ValueError(
+        "POSTERN_CONFIRM_IDV_VALUE must be 1 to 128 printable ASCII characters "
+        "(0x21 to 0x7E): no whitespace, no control character, nothing outside ASCII. "
+        "It is compared, exactly, with the idv claim of the banking-app assertion that "
+        "approves a tier-2 challenge. Leave it unset to refuse every tier-2 approval."
+    )
+
+
 #: The path the pairing page is served on, in ``services/confirm/verify_page.py``.
 VERIFY_PAGE_PATH = "/verify"
 
@@ -516,6 +559,17 @@ class ConfirmSettings:
     # is still an outage an operator must meet at startup rather than at the
     # first payment.
     device_keys_path: str | None = None
+    # TIER-2 APPROVAL (decision record 0023). The value the banking-app
+    # assertion's ``idv`` claim must equal, exactly, for a tier-2 challenge to
+    # be approved. It is agreed with the operator's app backend and is not a
+    # standard value; that backend must emit it in no other claim.
+    #
+    # NO DEFAULT, on purpose. Unset, every tier-2 approval is refused with
+    # ``verification_required`` and the service still starts, with one
+    # warning (`warn_if_idv_value_unset`): tier-1 approvals do not need it,
+    # and this process cannot know whether the api runs with
+    # POSTERN_PAYMENTS_ENABLED. `_check_idv_value` holds what a set value must be.
+    idv_value: str | None = None
     # The ceiling `services/confirm/body_limit.py` enforces on every request
     # body this service will read into memory. Measured before it existed:
     # `POST /device_authorization` read 9,999,989 bytes and answered 200 with
@@ -708,6 +762,7 @@ class ConfirmSettings:
         # `from_env` runs the same validators and so passes through here twice.
         _verification_uri(self.device_verification_uri)
         _check_app_link_uri(self.device_app_link_uri, self.device_verification_uri)
+        _check_idv_value(self.idv_value)
 
     @classmethod
     def from_env(cls) -> "ConfirmSettings":
@@ -867,6 +922,7 @@ class ConfirmSettings:
                 )
             ),
             device_keys_path=os.environ.get("POSTERN_DEVICE_KEYS_PATH") or None,
+            idv_value=_check_idv_value(os.environ.get("POSTERN_CONFIRM_IDV_VALUE") or None),
             # A FLOOR OF ONE BYTE, and deliberately NOT the 8,192 the comment
             # on ``max_body_bytes`` derives. That derivation is of the bottom
             # of the USEFUL interval -- below `postern_core/store/audit.py`'s
@@ -1212,4 +1268,19 @@ def check_session_token_settings(settings: ConfirmSettings) -> None:
             f"POSTERN_SESSION_TOKEN_AUDIENCE ({audience!r}) must differ from "
             "POSTERN_APP_ASSERTION_AUDIENCE: a token good enough to reach the MCP server "
             "must not be good enough to approve a payment."
+        )
+
+
+def warn_if_idv_value_unset(settings: ConfirmSettings) -> None:
+    """Log one WARNING when ``idv_value`` is unset, and nothing otherwise.
+
+    CALLED BY ``create_confirm_app``, beside `check_session_token_settings`.
+    A warning and not a refusal, for the reason the field's comment gives:
+    tier-1 approvals work without it, and with it unset every tier-2 approval
+    is refused, which is the safe default (spec section 14).
+    """
+    if settings.idv_value is None:
+        logger.warning(
+            "POSTERN_CONFIRM_IDV_VALUE is not set: every tier-2 challenge approval will be "
+            "refused with verification_required. Tier-1 approvals are unaffected."
         )

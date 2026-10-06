@@ -58,6 +58,11 @@ from one replica is refused at another, and a recall at `/scan` never reaches
 (unless `POSTERN_ALLOW_NON_URI_AUDIENCE` is set) or that equals
 `POSTERN_APP_ASSERTION_AUDIENCE`.
 
+It starts without `POSTERN_CONFIRM_IDV_VALUE` and logs one warning: every tier-2
+challenge approval is then refused with `verification_required`, and tier-1
+approvals are unaffected. A set value that is not 1 to 128 printable ASCII
+characters is refused at startup.
+
 Step 1 **raises `ValueError` and the process does not start** if any of the three
 is unset. Unlike the API service, which may run with `auth=None` for local
 development, this service has no unauthenticated mode: it holds the write

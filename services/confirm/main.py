@@ -112,7 +112,11 @@ from services.confirm.rate_limit import (
     limits_from_settings,
 )
 from services.confirm.session_token import build_session_minter, refuse_shared_key_material
-from services.confirm.settings import ConfirmSettings, check_session_token_settings
+from services.confirm.settings import (
+    ConfirmSettings,
+    check_session_token_settings,
+    warn_if_idv_value_unset,
+)
 from services.confirm.verify_page import verify_page_routes
 
 logger = logging.getLogger(__name__)
@@ -378,6 +382,10 @@ def create_confirm_app(
     # in `ConfirmSettings.__post_init__` so a settings object built by hand is
     # refused exactly where a deployment would be.
     check_session_token_settings(settings)
+    # A warning, not a refusal: without POSTERN_CONFIRM_IDV_VALUE every tier-2
+    # approval is refused and every tier-1 approval still works (decision
+    # record 0023).
+    warn_if_idv_value_unset(settings)
 
     # REDIS PREFLIGHT, once per process, before any key is built and only with
     # POSTERN_REDIS_URL set: clock skew against Redis TIME beyond 2 s, or a
