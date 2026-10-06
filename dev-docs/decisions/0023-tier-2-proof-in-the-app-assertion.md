@@ -39,21 +39,28 @@ Alternatives considered:
 ## Decision
 
 For a challenge row of tier 2, `services/confirm` requires three claims in the
-verified banking-app assertion: `acr` equal to the configured
-`POSTERN_CONFIRM_IDV_ACR`, `challenge_id` equal to the challenge in the request
-path, and a non-empty `jti`. The check runs after the device-signature check and
-before the claiming update, so a refusal is a 403 and leaves the row `pending`.
-For tier 2 the stored `verification_result` is the assertion's `jti`, not the
-caller's string. Tier-1 rows behave as before. A tier-0 row is refused for writes.
-An unset `POSTERN_CONFIRM_IDV_ACR` refuses every tier-2 approval and does not stop
+verified banking-app assertion: `acr`, a string equal to the configured
+`POSTERN_CONFIRM_IDV_ACR`; `challenge_id`, a string equal to the challenge in the
+request path; and `jti`, a string of 1 to 128 printable ASCII characters. The
+check runs after the device-signature check and before the claiming update, so a
+refusal is a 403 and leaves the row `pending`. For tier 2 the stored
+`verification_result` is the assertion's `jti`, not the caller's string, and the
+`jti` is also recorded in the approval's audit row. Tier-1 rows behave as before.
+A tier-0 row is refused for writes. A row whose tier is below its operation's
+declared tier is refused (`tier_mismatch`), because `postern_app` can write the
+`challenges` table and the declared tier is static configuration in confirm. An
+unset `POSTERN_CONFIRM_IDV_ACR` refuses every tier-2 approval and does not stop
 confirm from starting. The write token to the payments backend is unchanged.
 
 What is lost, and accepted: the trust anchor is the operator's app backend saying
 that identity verification happened for this challenge. Nothing in this repository
-can check the match. A compromised app backend, or a stolen assertion-signing key,
-can mint the claims for any challenge. The control stops an approval that carries
-no claim of verification, and the reuse of one verification across challenges, and
-nothing beyond that.
+can check the match, or whether the assertion was minted after it. A compromised
+app backend, or a stolen assertion-signing key, can mint the claims for any
+challenge. The control stops an approval that carries no claim of verification,
+and the reuse of one assertion across challenges, and nothing beyond that. Whether
+one verification backs assertions for several challenges, or whether `acr` is
+copied from a login session, is decided by the app backend and cannot be detected
+here; the spec lists what the backend must do.
 
 ## Consequences
 
