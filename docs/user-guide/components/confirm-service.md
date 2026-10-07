@@ -511,13 +511,18 @@ attempt:
  "message": "the backend accepted the operation but recording it failed; do not retry, it will be reconciled"}
 ```
 
-The row stays `approved`, which a 207 backend refusal also leaves, and the completion
-`audit_log` row is `raised` with `detail` `executed_unrecorded`, paired with the
-`reaching` row. **A caller must never retry a 202.** The repository documents no
-backend dedupe behind the `Idempotency-Key` it sends, so a second approval attempt
-(which would be refused 409 `already_terminal` anyway) or any re-drive risks paying
-twice. What an operator does: find the challenge id in the ERROR log line "the backend
-accepted ... and recording it as executed failed", join the two `audit_log` rows by
+The row is normally still `approved`, which a 207 backend refusal also leaves. It is
+not always: an attempt can have committed and raised on the way back with both
+re-reads failing too (the row is `executed`), or something else can have moved the
+row. The ERROR line therefore says "could not be confirmed as executed; check the
+row" and does not claim the status. The completion `audit_log` row is `raised` with
+`detail` `executed_unrecorded`, paired with the `reaching` row. **A caller must never
+retry a 202.** The repository documents no backend dedupe behind the
+`Idempotency-Key` it sends, so a second approval attempt (which would be refused 409
+`already_terminal` anyway) or any re-drive risks paying twice. What an operator does:
+find the challenge id in the ERROR log line "the backend accepted ... and recording it
+as executed failed or could not be confirmed as executed; check the row", join the two
+`audit_log` rows by
 `call_id` for that challenge, ask the payments backend what it did for the
 `Idempotency-Key` equal to the challenge id, then settle the `challenges` row by hand.
 Nothing reconciles it automatically.
@@ -532,18 +537,46 @@ keep your own record of it (an incident note with the challenge id, the old and 
 status, who and when, and what the backend said). The `audit_log` rows stay as they are:
 `reaching`, then `raised` / `executed_unrecorded`.
 
-**Recording outlives the request.** The `executed` record runs in a background task
-that a cancelled request (client disconnect, graceful shutdown) does not stop. If the
-request is cancelled while it runs, the server logs one ERROR line,
-`the backend accepted <tool> and the request was cancelled while recording it; the
-record continues in the background and may need reconciliation`, with the challenge id,
-and re-raises the cancellation. Grep for that line next to the
-`the backend accepted <tool> and recording it as executed failed` line: the first means
-the record may still land (check the row's status), the second means it did not. If the
-event loop itself is closing (a process stop), the task is cancelled with it and nothing
-can finish it: the row stays `approved` with no response and no line beyond the
-cancellation one, which is a case this repository cannot test beyond cancellation. If the completion audit row also cannot be
-written, the request fails with a bare 500 instead (decision 0006).
+**Recording and shutdown.** After the backend accepts, the `executed` record runs in a
+background task, and the request awaits it through `asyncio.shield`. What that buys
+depends on how the process stops, measured on uvicorn 0.52.4 with a real server
+(`tests/test_executed_recording.py`, the `test_real_uvicorn_*` tests):
+
+- **The shipped command** (the Dockerfile `CMD`, no `--timeout-graceful-shutdown`):
+  uvicorn waits for the in-flight request on SIGTERM, so the record lands and the
+  client gets its 200. The shield is not used.
+- **A client disconnect** does not cancel a non-streaming handler under uvicorn, so it
+  does not cancel the request or the record.
+- **`--timeout-graceful-shutdown N` set, and the request outlasts it:** uvicorn
+  cancels the request and then runs the application's shutdown. The request logs one
+  ERROR line, `the backend accepted <tool> and the request was cancelled while
+  recording it; a background task is still recording it; a further ERROR line follows
+  if that task fails or is cancelled`, and re-raises the cancellation. The service's
+  shutdown then waits for the recording, for at most `SHUTDOWN_RECORD_WAIT_SECONDS`
+  (`services/confirm/callback.py`). That is 25 seconds: three attempts at the default
+  database timeouts come to 27.4 seconds, and the wait is capped under ECS's default
+  `stopTimeout` of 30 seconds, after which the task is killed. Whether your
+  `stopTimeout` is the default is not established here; if it is lower, lower the
+  constant to match, or the cap protects nothing.
+- **What is lost.** A recording still running when that wait ends is cancelled when
+  the event loop closes. A forced exit (a second SIGINT) skips uvicorn's lifespan
+  shutdown, so nothing waits, and the loop closing cancels the recording. SIGKILL,
+  including ECS killing the task at `stopTimeout`, stops everything with no line at
+  all. In the first two the task logs one ERROR line, `recording the executed state
+  was cancelled before it finished; the backend accepted the operation (<tool>); the
+  row is most likely still 'approved', check it; do not retry; reconcile by hand`,
+  with the challenge id. In every one of these the backend has accepted the write and
+  the row is most likely still `approved`.
+
+So there are two ERROR lines to grep for besides the exhaustion line above. The
+request-side line means a task was still recording when the request was cancelled and
+promises nothing: look for the task's own outcome, which is either the row becoming
+`executed` or a second line (the exhaustion line, or `was cancelled before it
+finished`). If neither appears and the row is `approved`, the process was killed
+mid-record. An exception that escapes the recording task is logged by type and answered
+with the same 202 (it was a bare 500 before, for a payment that had gone through). If
+the completion audit row also cannot be written, the request fails with a bare 500
+instead (decision 0006).
 
 Ordering: step 2d runs after the revocation, ownership, signature and tier checks, so
 a caller who fails any of those learns nothing from the 400, and it runs before the

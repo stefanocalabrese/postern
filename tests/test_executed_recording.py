@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -471,6 +472,10 @@ async def test_three_failed_attempts_answer_202_and_leave_one_raised_row(
     assert len(errors) == 1
     message = errors[0].getMessage()
     assert "'chal_rec_005'" in message and TOOL in message
+    # The line claims only what is known: "stays approved" was false when an
+    # attempt committed and both re-reads failed (the row is `executed`).
+    assert "could not be confirmed as executed; check the row" in message
+    assert "stays" not in message
     assert len(callback_records(caplog, logging.WARNING)) == 3
 
     # Nothing the driver might say reaches the response, the logs or the table.
@@ -542,13 +547,14 @@ async def test_a_value_error_while_recording_is_not_reported_as_could_not_be_set
 
 async def drain_background_records() -> None:
     """Wait, bounded, for every detached recording task to finish."""
-    pending = set(callback._BACKGROUND_RECORDS)
+    pending = callback.pending_recordings()
     if pending:
         done, still = await asyncio.wait(pending, timeout=30)
         assert not still, "a recording task did not finish"
 
 
 def cancellation_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The REQUEST-side line: the request was cancelled, a task is still recording."""
     return [
         r
         for r in caplog.records
@@ -556,6 +562,25 @@ def cancellation_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogReco
         and r.levelno == logging.ERROR
         and "was cancelled while recording it" in r.getMessage()
     ]
+
+
+def lost_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The TASK-side line: the recording itself was cancelled before it finished."""
+    return [
+        r
+        for r in caplog.records
+        if r.name == "services.confirm.callback"
+        and r.levelno == logging.ERROR
+        and "was cancelled before it finished" in r.getMessage()
+    ]
+
+
+def assert_request_line_claims_only_what_is_true(line: logging.LogRecord) -> None:
+    text = line.getMessage()
+    assert "a background task is still recording it" in text
+    assert "a further ERROR line follows if that task fails or is cancelled" in text
+    # The old wording promised an outcome nothing guarantees.
+    assert "continues" not in text and "may need reconciliation" not in text
 
 
 async def test_cancellation_during_the_retry_sleep_propagates_and_the_record_completes(
@@ -599,6 +624,8 @@ async def test_cancellation_during_the_retry_sleep_propagates_and_the_record_com
 
     (line,) = cancellation_lines(caplog)
     assert "'chal_rec_008'" in line.getMessage() and TOOL in line.getMessage()
+    assert_request_line_claims_only_what_is_true(line)
+    assert lost_lines(caplog) == [], "the record was not lost; it finishes below"
 
     # The recording is still alive after the request is gone, and finishes.
     assert callback._BACKGROUND_RECORDS
@@ -637,7 +664,8 @@ async def test_cancellation_during_an_attempt_propagates_and_the_record_complete
     task.cancel()
     done, _ = await asyncio.wait({task}, timeout=30)
     assert done and task.cancelled()
-    assert len(cancellation_lines(caplog)) == 1
+    (line,) = cancellation_lines(caplog)
+    assert_request_line_claims_only_what_is_true(line)
 
     release.set()
     await drain_background_records()
@@ -691,7 +719,13 @@ async def test_cancellation_inside_the_recording_task_itself_propagates(
     sleeps: Sleeps,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The task being cancelled (a closing loop) is not retried or swallowed."""
+    """The task being cancelled (a closing loop) is not retried or swallowed.
+
+    It used to log "the record continues in the background" here, which was
+    false: the task is the thing that was cancelled. It now logs ONE line, from
+    the task, saying the record was lost, and no request-side line (the task
+    is already done when the request notices, so nothing is "still recording").
+    """
     await seed(clean, "chal_rec_009")
     caplog.set_level(logging.DEBUG)
 
@@ -705,7 +739,97 @@ async def test_cancellation_inside_the_recording_task_itself_propagates(
     assert updates.executed_calls == 1, "a cancelled attempt must not be retried"
     assert len(backend.calls) == 1
     assert sleeps.delays == []
-    assert len(cancellation_lines(caplog)) == 1
+    (line,) = lost_lines(caplog)
+    text = line.getMessage()
+    assert "'chal_rec_009'" in text and TOOL in text
+    assert "the backend accepted the operation" in text
+    assert "do not retry" in text and "reconcile by hand" in text
+    assert cancellation_lines(caplog) == [], "nothing is still recording: no request-side line"
+    assert "continues" not in caplog.text
+    assert await status_of(clean, "chal_rec_009") == "approved"
+
+
+async def test_an_exception_escaping_the_recording_task_answers_202_not_500(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Whatever escapes `_record_executed`, the backend has accepted: say so.
+
+    Nothing logged an escaping exception and a live request got a bare 500 for
+    a payment that went through, which is the one answer that invites a retry.
+    """
+    await seed(clean, "chal_rec_014")
+    caplog.set_level(logging.DEBUG)
+
+    async def escapes(db: Database, challenge_id: str) -> bool:
+        raise RuntimeError(SENTINEL)
+
+    monkeypatch.setattr(callback, "_record_executed", escapes)
+    resp = await post(app, "chal_rec_014", key_pair)
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"challenge_id": "chal_rec_014", **EXPECTED_202}
+    assert len(backend.calls) == 1
+    (line,) = callback_records(caplog, logging.ERROR)
+    assert "'chal_rec_014'" in line.getMessage() and TOOL in line.getMessage()
+    assert "RuntimeError" in line.getMessage(), "the type is logged, as everywhere else"
+    assert SENTINEL not in caplog.text and SENTINEL not in resp.text
+    _, completion = await audit_rows(clean)
+    assert completion.detail == DETAIL_EXECUTED_UNRECORDED
+
+
+async def test_an_exception_raised_after_the_request_was_cancelled_is_never_reported_unretrieved(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The reviewer's probe: the task fails AFTER nobody is awaiting it.
+
+    asyncio would otherwise log "Task exception was never retrieved" with the
+    exception's text when the task is collected, and a driver error's text is
+    SQL and bound parameters.
+    """
+    import gc
+
+    await seed(clean, "chal_rec_015")
+    caplog.set_level(logging.DEBUG)
+    in_task = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fails_late(db: Database, challenge_id: str, tool_name: str) -> bool:
+        in_task.set()
+        await release.wait()
+        raise RuntimeError(SENTINEL)
+
+    monkeypatch.setattr(callback, "_record_and_report", fails_late)
+    task = asyncio.create_task(post(app, "chal_rec_015", key_pair))
+    await asyncio.wait_for(in_task.wait(), timeout=30)
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=30)
+    assert done and task.cancelled()
+    # The cancelled request's CancelledError carries a traceback through frames
+    # that hold the recording task; dropping the request task is what lets the
+    # recording task be collected at all, and collection is when asyncio reports
+    # an exception nobody retrieved.
+    del task, done
+
+    release.set()
+    await drain_background_records()
+    gc.collect()
+    await asyncio.sleep(0)
+    gc.collect()
+
+    assert not [r for r in caplog.records if r.name == "asyncio"], [
+        r.getMessage() for r in caplog.records if r.name == "asyncio"
+    ]
+    assert SENTINEL not in caplog.text
 
 
 async def test_a_row_that_left_approved_for_something_else_is_not_reported_executed(
@@ -798,3 +922,212 @@ async def test_an_audit_failure_after_the_unrecorded_202_still_fails_the_request
 
     assert resp.status_code == 500
     assert len(backend.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# A real uvicorn server, stopped for real.
+# ---------------------------------------------------------------------------
+#
+# Everything above drives the app through an in-process ASGI transport, where
+# nothing ever stops the process. These tests run `uvicorn.Server.run()` in a
+# thread (its own `asyncio.run`, so a recording left over when the server
+# returns is cancelled exactly as it is in production) and stop it the ways an
+# operator does. What they measured against uvicorn 0.52.4:
+#
+# - the shipped command has no `--timeout-graceful-shutdown`, and then
+#   uvicorn WAITS for the in-flight request, so the recording lands and the
+#   shield is never used;
+# - with `timeout_graceful_shutdown=N` uvicorn cancels the request after N
+#   seconds and THEN runs the lifespan shutdown, which is where this service
+#   waits for a recording that outlived its request;
+# - a forced exit (`force_exit`) skips the lifespan shutdown altogether.
+# A client disconnect never cancels a non-streaming handler under uvicorn, so
+# shutdown is the only way a request is cancelled there.
+
+
+class RealServer:
+    """``uvicorn.Server.run()`` in a thread, on a free loopback port."""
+
+    def __init__(self, app: Starlette, *, graceful: int | None) -> None:
+        import socket
+
+        import uvicorn
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        self.port = probe.getsockname()[1]
+        probe.close()
+        self.server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=self.port,
+                log_config=None,
+                timeout_graceful_shutdown=graceful,
+            )
+        )
+        self.thread = threading.Thread(target=self.server.run, daemon=True)
+
+    async def start(self) -> None:
+        self.thread.start()
+        for _ in range(300):
+            if self.server.started:
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError("uvicorn did not start")
+
+    def stop(self, *, force: bool = False) -> None:
+        self.server.should_exit = True
+        if force:
+            self.server.force_exit = True
+
+    async def joined(self, seconds: float) -> bool:
+        await asyncio.to_thread(self.thread.join, seconds)
+        return not self.thread.is_alive()
+
+
+async def _until(event: threading.Event, seconds: float = 30) -> None:
+    assert await asyncio.to_thread(event.wait, seconds), "the recording never started"
+
+
+def _slow_record(monkeypatch: pytest.MonkeyPatch, seconds: float) -> threading.Event:
+    """Make the recording take ``seconds``, cancellably, then do the real thing."""
+    started = threading.Event()
+    real = callback._record_executed
+
+    async def slow(db: Database, challenge_id: str) -> bool:
+        started.set()
+        await asyncio.sleep(seconds)
+        return await real(db, challenge_id)
+
+    monkeypatch.setattr(callback, "_record_executed", slow)
+    return started
+
+
+async def _real_post(
+    server: RealServer, db: Database, challenge_id: str, key_pair: RSAKeyPair
+) -> httpx2.Response | str:
+    """The status or the failure the client saw, over a real socket."""
+    body = await approval_body(db, challenge_id, DEVICE_PRIVATE)
+    try:
+        async with httpx2.AsyncClient(timeout=30) as c:
+            return await c.post(
+                f"http://127.0.0.1:{server.port}/challenges/{challenge_id}/approve",
+                json=body,
+                headers=bearer(key_pair, OWNER),
+            )
+    except Exception as exc:  # noqa: BLE001
+        return type(exc).__name__
+
+
+async def test_real_uvicorn_default_shutdown_waits_for_the_request_and_the_record_lands(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The shipped command: no graceful-shutdown timeout, so the request finishes."""
+    await seed(clean, "chal_rec_020")
+    caplog.set_level(logging.INFO)
+    started = _slow_record(monkeypatch, 2)
+    server = RealServer(app, graceful=None)
+    await server.start()
+    client = asyncio.create_task(_real_post(server, clean, "chal_rec_020", key_pair))
+    await _until(started)
+    server.stop()
+
+    assert await server.joined(30), "uvicorn did not exit"
+    resp = await asyncio.wait_for(client, 30)
+    assert not isinstance(resp, str), resp
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "executed"
+    assert await status_of(clean, "chal_rec_020") == "executed"
+    assert len(backend.calls) == 1
+    assert cancellation_lines(caplog) == [] and lost_lines(caplog) == []
+
+
+async def test_real_uvicorn_graceful_timeout_cancels_the_request_and_the_lifespan_waits(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The request is cancelled at 1 s; the 3 s record is waited for at shutdown."""
+    await seed(clean, "chal_rec_021")
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(callback, "SHUTDOWN_RECORD_WAIT_SECONDS", 15.0)
+    started = _slow_record(monkeypatch, 3)
+    server = RealServer(app, graceful=1)
+    await server.start()
+    client = asyncio.create_task(_real_post(server, clean, "chal_rec_021", key_pair))
+    await _until(started)
+    server.stop()
+
+    assert await server.joined(30), "uvicorn did not exit"
+    await asyncio.wait_for(client, 30)
+    assert await status_of(clean, "chal_rec_021") == "executed"
+    assert len(backend.calls) == 1
+    (line,) = cancellation_lines(caplog)
+    assert_request_line_claims_only_what_is_true(line)
+    assert lost_lines(caplog) == [], "the record finished, so nothing was lost"
+    assert callback.pending_recordings() == set()
+
+
+async def test_real_uvicorn_a_record_longer_than_the_shutdown_wait_is_lost_and_says_so(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The wait is bounded: the process still exits, and the lost record is named."""
+    await seed(clean, "chal_rec_022")
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(callback, "SHUTDOWN_RECORD_WAIT_SECONDS", 1.0)
+    started = _slow_record(monkeypatch, 60)
+    server = RealServer(app, graceful=1)
+    await server.start()
+    client = asyncio.create_task(_real_post(server, clean, "chal_rec_022", key_pair))
+    await _until(started)
+    server.stop()
+
+    assert await server.joined(30), "uvicorn hung on a recording it could not wait for"
+    await asyncio.wait_for(client, 30)
+    assert await status_of(clean, "chal_rec_022") == "approved"
+    assert len(backend.calls) == 1
+    assert len(cancellation_lines(caplog)) == 1
+    (line,) = lost_lines(caplog)
+    assert "'chal_rec_022'" in line.getMessage() and TOOL in line.getMessage()
+    assert callback.pending_recordings() == set()
+
+
+async def test_real_uvicorn_a_forced_exit_skips_the_lifespan_and_the_lost_record_is_named(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A second SIGINT: uvicorn never runs the lifespan shutdown, so nothing waits."""
+    await seed(clean, "chal_rec_023")
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(callback, "SHUTDOWN_RECORD_WAIT_SECONDS", 15.0)
+    started = _slow_record(monkeypatch, 60)
+    server = RealServer(app, graceful=None)
+    await server.start()
+    client = asyncio.create_task(_real_post(server, clean, "chal_rec_023", key_pair))
+    await _until(started)
+    server.stop(force=True)
+
+    assert await server.joined(30), "uvicorn did not exit on a forced exit"
+    await asyncio.wait_for(client, 30)
+    assert await status_of(clean, "chal_rec_023") == "approved"
+    assert len(backend.calls) == 1
+    (line,) = lost_lines(caplog)
+    assert "'chal_rec_023'" in line.getMessage() and TOOL in line.getMessage()

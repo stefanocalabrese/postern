@@ -229,11 +229,18 @@ async def test_the_status_tool_tells_the_model_not_to_re_propose_an_approved_pay
         t for t in json.loads(response.text)["result"]["tools"] if t["name"] == PAYMENT_STATUS_TOOL
     ]
     description = " ".join(tool["description"].split())
-    assert "does NOT mean the bank refused it" in description
+    # "does NOT mean refused" contradicted "either the bank refused it" in the
+    # same sentence; `approved` is also what a payment reads while execution
+    # is in flight; and the instructions bind an `approved` status only.
+    assert "does NOT necessarily mean the bank refused it" in description
+    assert "does NOT mean the bank refused it" not in description
+    assert "execution is still in flight" in description
     assert (
-        "Do not propose the same payment again unless the customer explicitly asks" in description
+        "For an `approved` status, do not propose the same payment again unless "
+        "the customer asks you directly in this conversation" in description
     )
-    assert "outcome is unconfirmed" in description
+    assert "explicitly asks" not in description
+    assert "tell the customer the outcome is unconfirmed" in description
 
 
 async def test_over_http_an_unreadable_stored_payload_is_the_fixed_text(

@@ -93,6 +93,7 @@ from starlette.middleware import Middleware
 from starlette.routing import Route
 from starlette.types import ASGIApp
 
+from services.confirm import callback
 from services.confirm.auth import AppAssertionMiddleware, AssertionVerifier
 from services.confirm.body_limit import BodySizeLimit
 from services.confirm.callback import callback_routes
@@ -272,13 +273,25 @@ class _ConfirmApp(Starlette):
 
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncIterator[None]:
-    """Startup: warn when confirm and Postgres disagree on the time.
+    """Startup: warn when confirm and Postgres disagree on the time. Shutdown: wait for recordings.
 
-    Never blocks and never raises (`services/confirm/database_clock.py`). Nothing
-    runs at shutdown, which is what it did before this existed.
+    The startup check never blocks and never raises
+    (`services/confirm/database_clock.py`).
+
+    At shutdown, after the app stops serving, wait for any `approved ->
+    executed` recording that outlived its request (`callback.pending_recordings`),
+    for at most `callback.SHUTDOWN_RECORD_WAIT_SECONDS`. uvicorn runs this AFTER
+    it has cancelled the requests that outlasted `--timeout-graceful-shutdown`,
+    and `asyncio.run` cancels whatever is still running once it returns, so
+    without this wait a recording that had started was lost at every such
+    shutdown. A forced exit skips the lifespan shutdown, and so does SIGKILL.
+    The wait is bounded and a cancellation of it is not swallowed.
     """
     await run_database_clock_check(app.state.postern_database)
     yield
+    pending = callback.pending_recordings()
+    if pending:
+        await asyncio.wait(pending, timeout=callback.SHUTDOWN_RECORD_WAIT_SECONDS)
 
 
 def pin_http_client_loggers() -> None:

@@ -143,6 +143,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from postern_core.json_strict import loads_finite
+from postern_core.log_safety import describe_exception
 from postern_core.store.challenges import get_challenge, update_challenge_status
 from postern_core.store.engine import Database
 from starlette.requests import Request
@@ -873,42 +874,91 @@ async def _approve(
 _BACKGROUND_RECORDS: set[asyncio.Task[bool]] = set()
 
 
+def pending_recordings() -> set[asyncio.Task[bool]]:
+    """A snapshot of the recording tasks still running, for the shutdown wait."""
+    return set(_BACKGROUND_RECORDS)
+
+
 def _forget_record(task: asyncio.Task[bool]) -> None:
     _BACKGROUND_RECORDS.discard(task)
     if not task.cancelled():
         # Retrieved so an exception nobody awaited is not reported as "never
-        # retrieved" with its text; `_record_and_report` logs by type.
+        # retrieved" with its text. `_record_and_report` logs what escapes it
+        # (by type, `describe_exception`), so this is the backstop for a
+        # failure in the logging itself, and for the case where nothing awaits
+        # the task any more.
         task.exception()
 
 
-def _log_accepted_unrecorded(challenge_id: str, tool_name: str) -> None:
-    """THE line an operator reconciles from: no exception text, payload or customer."""
+def _log_accepted_unrecorded(challenge_id: str, tool_name: str, why: str | None = None) -> None:
+    """THE line an operator reconciles from: no exception text, payload or customer.
+
+    "Could not be confirmed as executed" and not "the row stays approved": that
+    was false when an attempt committed and raised on the way back and both
+    re-reads raised too (the row is `executed`), or when something else had
+    moved the row (it is `declined`, say). The row is what to check.
+    """
     logger.error(
-        "challenge %r: the backend accepted %s and recording it as executed "
-        "failed; the row stays 'approved', do not retry, reconcile by hand",
+        "challenge %r: the backend accepted %s and recording it as executed failed "
+        "or could not be confirmed as executed; check the row, do not retry, "
+        "reconcile by hand%s",
         challenge_id,
         tool_name,
+        f" ({why})" if why else "",
     )
 
 
 async def _record_and_report(db: Database, challenge_id: str, tool_name: str) -> bool:
-    """Run the recording and log the exhaustion line, in the task that outlives the request."""
-    recorded = await _record_executed(db, challenge_id)
+    """Run the recording and log the exhaustion line, in the task that outlives the request.
+
+    Three ways out besides ``True``. Exhaustion returns ``False``. An
+    exception that escapes ``_record_executed`` (it handles ``Exception`` per
+    attempt, so this is a bug or a failure in the bookkeeping around it) is
+    logged by type and also returns ``False``: the backend has accepted, so a
+    live request must answer the truthful 202, not a 500 that invites a retry.
+    A cancellation (a closing event loop, or a shutdown that gave up waiting)
+    logs the line that says the record was lost and is re-raised.
+    """
+    try:
+        recorded = await _record_executed(db, challenge_id)
+    except asyncio.CancelledError:
+        logger.error(
+            "challenge %r: recording the executed state was cancelled before it finished; "
+            "the backend accepted the operation (%s); the row is most likely still "
+            "'approved', check it; "
+            "do not retry; reconcile by hand",
+            challenge_id,
+            tool_name,
+        )
+        raise
+    except Exception as exc:
+        _log_accepted_unrecorded(challenge_id, tool_name, describe_exception(exc))
+        return False
     if not recorded:
         _log_accepted_unrecorded(challenge_id, tool_name)
     return recorded
 
 
 async def _record_executed_detached(db: Database, challenge_id: str, tool_name: str) -> bool:
-    """Record ``executed`` in a task a cancelled request cannot stop.
+    """Record ``executed`` in a task that a cancelled request does not take down with it.
 
     The record phase can last tens of seconds under database trouble. If the
-    request is cancelled during it (client disconnect, graceful shutdown), the
-    backend has already accepted the write, so the recording goes on in the
-    background and ONE ERROR line says so; the cancellation is then re-raised,
-    never swallowed. The task opens its own sessions and holds nothing that
-    dies with the request. A loop that is closing cancels the task too, and
-    nothing here can finish that recording.
+    REQUEST is cancelled during it, the backend has already accepted the
+    write, so the task goes on and ONE ERROR line says so; the cancellation is
+    then re-raised, never swallowed. The task opens its own sessions and holds
+    nothing that dies with the request.
+
+    WHEN THAT HAPPENS UNDER UVICORN, measured on 0.52.4: a non-streaming
+    handler is not cancelled by a client disconnect, so the only cancellation
+    is shutdown, and only with ``timeout_graceful_shutdown`` set (the shipped
+    command has none, and uvicorn then waits for the request). uvicorn cancels
+    the request and THEN runs the lifespan shutdown, where
+    ``services.confirm.main`` waits, bounded by ``SHUTDOWN_RECORD_WAIT_SECONDS``,
+    for the tasks in ``pending_recordings()``. What survives is therefore a
+    recording that finishes inside that wait. A forced exit skips the lifespan
+    shutdown, SIGKILL skips everything, and a recording still running when the
+    wait ends is cancelled by ``asyncio.run``: each of those logs the task's
+    own line (``_record_and_report``) and leaves the row ``approved``.
     """
     task = asyncio.ensure_future(_record_and_report(db, challenge_id, tool_name))
     _BACKGROUND_RECORDS.add(task)
@@ -916,13 +966,17 @@ async def _record_executed_detached(db: Database, challenge_id: str, tool_name: 
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        logger.error(
-            "challenge %r: the backend accepted %s and the request was cancelled while "
-            "recording it; the record continues in the background and may need "
-            "reconciliation",
-            challenge_id,
-            tool_name,
-        )
+        # `task.done()` means it is the TASK that was cancelled (the shield
+        # re-raises that here), and the task has logged its own line: saying
+        # "a background task is still recording it" would be false.
+        if not task.done():
+            logger.error(
+                "challenge %r: the backend accepted %s and the request was cancelled while "
+                "recording it; a background task is still recording it; a further ERROR "
+                "line follows if that task fails or is cancelled",
+                challenge_id,
+                tool_name,
+            )
         raise
 
 
@@ -1136,6 +1190,26 @@ EXECUTED_UNRECORDED_MESSAGE = (
 #: and the pause before each repeat (so one fewer than the attempts).
 EXECUTED_RECORD_ATTEMPTS = 3
 EXECUTED_RECORD_BACKOFF_SECONDS = (0.1, 0.3)
+
+#: How long the lifespan shutdown waits for a recording that outlived its
+#: request (`services.confirm.main._lifespan`). Derived, then capped.
+#:
+#: One attempt, at the default database timeouts (`ConfirmSettings`: pool 1.0 s,
+#: connect 2.0 s, command 3.0 s; `postern_core.store.engine`): a pool checkout
+#: that waits, a connect, then the UPDATE and the commit, each bounded by the
+#: command timeout, so 1.0 + 2.0 + 2 x 3.0 = 9.0 s. Three attempts and the two
+#: backoffs: 3 x 9.0 + 0.4 = 27.4 s. That is a first-order bound and not a
+#: proof (a recycled connection's pre-ping adds up to three more statements;
+#: an operator may set other timeouts), and it is capped at 25 s anyway: ECS
+#: gives a stopped task `stopTimeout` seconds between SIGTERM and SIGKILL, 30
+#: by default on Fargate, and a wait that runs past it is SIGKILLed with the
+#: record unwritten. Whether this deployment's stopTimeout differs is not
+#: established here: an operator who sets it lower than 30 must lower this to
+#: match, or the cap buys nothing.
+SHUTDOWN_RECORD_WAIT_SECONDS = min(
+    25.0,
+    EXECUTED_RECORD_ATTEMPTS * (1.0 + 2.0 + 2 * 3.0) + sum(EXECUTED_RECORD_BACKOFF_SECONDS),
+)
 
 #: Line and paragraph separators (U+2028, U+2029) are `Zl` and `Zp`, outside `C*`.
 _REFUSED_CATEGORIES_EXTRA = frozenset({"Zl", "Zp"})
