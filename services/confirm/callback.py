@@ -41,6 +41,21 @@ the write and recording ``executed`` failed on every attempt::
 
 A caller must never retry a 202: the money may already have moved.
 
+HTTP 502 is sent when the approval is recorded and the backend call then failed
+with no status (unreachable, timed out, or a reply the HTTP parser refused)::
+
+    {
+        "challenge_id": "...",
+        "status": "approved",
+        "execution": "outcome_unknown",
+        "message": "the backend call failed after the approval was recorded; ..."
+    }
+
+One status for every kind, because the caller cannot tell "never sent" from "sent
+and possibly committed". A caller must never retry a 502 and must not re-propose
+the payment: it may have been made. The row stays ``approved`` and is reconciled
+by hand against the backend by ``Idempotency-Key`` (the challenge id).
+
 HTTP 207 is sent when the approval is recorded and the backend answered
 anything but 200, 201 or 202::
 
@@ -416,10 +431,11 @@ async def approve_challenge(request: Request) -> JSONResponse:
             # `from None` drops that audit exception from the traceback instead
             # of chaining it, since it is the one carrying the audit INSERT.
             #
-            # `_exception_name`, not `type(exc).__name__`: a transport failure
-            # reaches here as `BackendTransportError`, a fixed-text wrapper, and
-            # the evidence has always named what actually failed (`ConnectError`,
-            # `ReadTimeout`), which the wrapper carries as `kind`.
+            # `_exception_name`, not `type(exc).__name__`: a `BackendTransportError`
+            # is a fixed-text wrapper, and the evidence names what actually failed
+            # (`ConnectError`, `ReadTimeout`), which the wrapper carries as `kind`.
+            # `_approve` answers that error with the 502 itself now, so this
+            # branch is a backstop for one raised anywhere else in this handler.
             raised_name = _exception_name(exc)
             logger.error(
                 "challenge approve: %r: the approval raised %s",
@@ -812,6 +828,47 @@ async def _approve(
                 type(exc).__name__,
             )
 
+        except BackendTransportError as exc:
+            # NO STATUS ARRIVED, AFTER THE REQUEST MAY HAVE BEEN SENT. The kinds
+            # are not told apart on purpose: a refused connection (nothing sent)
+            # and a read timeout (sent, possibly committed) look the same from
+            # the app's side of this answer, and the safe reading of both is "the
+            # payment may have been made". Until this arm existed the exception
+            # escaped to `approve_challenge`'s ``except Exception`` and the app
+            # got Starlette's bare text 500.
+            #
+            # The claim stays committed and the row stays `approved`: no status
+            # change, no retry and no second backend call, because nothing in
+            # this repository documents a backend dedupe. Only this class is
+            # mapped, and `Exception` or `BaseException` must not replace it: a
+            # bug is still a 500, and a cancellation must still propagate.
+            #
+            # The completion row is written by the caller of `_approve` as for
+            # the 207, with the ORIGINAL kind as detail. One ERROR line, no
+            # exception text; the id is what an operator reconciles by
+            # (`Idempotency-Key` = challenge id).
+            kind = exc.kind  # a type name, never the exception's text
+            logger.error(
+                "challenge approve: %r: tool=%s kind=%s: the backend call failed after the "
+                "approval was recorded; outcome unknown; reconcile by Idempotency-Key = "
+                "challenge id",
+                challenge_id,
+                updated.tool_name,
+                kind,
+            )
+            return (
+                _json(
+                    502,
+                    {
+                        "challenge_id": challenge_id,
+                        "status": "approved",
+                        "execution": "outcome_unknown",
+                        "message": OUTCOME_UNKNOWN_MESSAGE,
+                    },
+                ),
+                kind,
+            )
+
         except ValueError as exc:
             # Tool not registered or payload missing required fields.
             #
@@ -1185,6 +1242,10 @@ EXECUTION_SETUP_FAILED_DESCRIPTION = "the approved operation could not be set up
 EXECUTED_UNRECORDED_MESSAGE = (
     "the backend accepted the operation but recording it failed; "
     "do not retry, it will be reconciled"
+)
+OUTCOME_UNKNOWN_MESSAGE = (
+    "the backend call failed after the approval was recorded; the payment may or "
+    "may not have been made; do not retry, it will be reconciled"
 )
 
 #: Attempts at recording ``approved -> executed`` after the backend accepted,

@@ -204,11 +204,11 @@ def _mock_backend_transport() -> Generator[None]:
     these tests to write to. Without this fixture, ``BackendWriteClient``
     makes a real outbound call and DNS resolution fails with
     ``httpx2.ConnectError`` before any HTTP response exists; ``callback.py``
-    only catches ``BackendWriteError`` (a non-2xx *response*), not a
-    transport-level connection failure, so that exception propagates
-    unhandled out of the ASGI app instead of producing the 207 these tests
-    expect. Patching ``BackendWriteClient.__init__`` to inject an
-    ``httpx2.MockTransport`` that answers with a non-2xx response reproduces
+    answers a transport-level connection failure with a 502
+    `outcome_unknown`, not the 207 these tests expect (that one is for a
+    non-2xx *response*, ``BackendWriteError``). Patching
+    ``BackendWriteClient.__init__`` to inject an ``httpx2.MockTransport``
+    that answers with a non-2xx response reproduces
     "the backend is unreachable" the way it is handled in production — a
     real response, just a bad one — the same pattern
     ``tests/test_callback.py`` already uses for the same client.

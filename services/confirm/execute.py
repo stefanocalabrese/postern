@@ -483,7 +483,8 @@ class BackendTransportError(RuntimeError):
 
     Not a ``BackendWriteError``: that one means a status was received and the
     write was refused, which the approval answers with a 207. This one means the
-    outcome is unknown, and it propagates as every transport failure did before.
+    outcome is unknown, and the approval callback answers it with a 502
+    `outcome_unknown` (`services/confirm/callback.py`).
     """
 
     def __init__(self, *, kind: str) -> None:

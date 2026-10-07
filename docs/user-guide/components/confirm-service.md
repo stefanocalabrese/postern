@@ -489,10 +489,9 @@ safe to forward. Three mechanisms hold that line:
   HTTP parser refuses) the client raises `BackendTransportError`, whose text is fixed
   and whose `kind` is the original exception's type name (`ConnectError`,
   `ReadTimeout`, `RemoteProtocolError`). The original is not chained, because `h11`
-  and `httpcore2` quote the bytes they refused in their messages. Behaviour is as it
-  was: the exception leaves the handler (a 500 under a server), the row stays
-  `approved`, and the completion `audit_log` row is `raised` with `detail` set to
-  the original type name.
+  and `httpcore2` quote the bytes they refused in their messages. The handler answers
+  it with the 502 `outcome_unknown` response below, the row stays `approved`, and the
+  completion `audit_log` row is `raised` with `detail` set to the original type name.
 - **`httpx2` and `httpcore2` are held at WARNING** by `create_confirm_app` (and by
   `create_app` in the api service), through one function,
   `postern_core.log_safety.pin_http_client_loggers`. They log
@@ -511,11 +510,11 @@ the challenge id: de-duplicate on it.
 **Status-line edge cases.** Each is a measured behaviour of the parser, not a promise
 the backend may lean on:
 
-- A `101 Switching Protocols` answer becomes a transport failure: the exception leaves
-  the handler (500) and the row stays `approved`.
+- A `101 Switching Protocols` answer becomes a transport failure: the answer is the
+  502 `outcome_unknown` and the row stays `approved`.
 - `HTTP/9.9 201 Created` is accepted: the version is not checked, only the status.
 - A `201` whose header block the parser refuses (for example
-  `Transfer-Encoding: gzip, chunked`) is reported as a transport failure (500) with the
+  `Transfer-Encoding: gzip, chunked`) is reported as a transport failure (502) with the
   row left `approved`, even though the backend accepted the write. Reconcile by
   `Idempotency-Key`.
 
@@ -531,7 +530,8 @@ completion `audit_log` row is `raised` with `detail` `TotalTimeout`, and the ope
 reconciles by `Idempotency-Key`. A status taken before the deadline is the answer. An
 outer cancellation (the caller going away) still propagates as a cancellation. Only
 `httpx2.HTTPError` is reported as a transport failure: any other exception raised
-inside the client is a bug in this process and fails loudly through the generic path.
+inside the client is a bug in this process and fails loudly through the generic path
+(a bare 500, not the 502).
 
 **Proxy environment variables are ignored.** Every outbound HTTP client in this
 repository (the write client, the api's read facade, the Vault client and both JWKS
@@ -547,6 +547,37 @@ the numeric status. The row stays `approved` and the completion `audit_log` row 
 `raised` with `detail` `BackendWriteError`. To find out why the backend refused, look
 in the payments backend's own logs, by the `Idempotency-Key`, which equals the
 challenge id.
+
+**The 502 `outcome_unknown` response, when the backend call fails with no status.**
+The approval is recorded, the request may or may not have reached the backend, and no
+status line came back (connection refused, a read timeout, a reply the HTTP parser
+refuses, the 30-second bound). The answer is one status and one fixed body for every
+kind, because the app cannot tell "never sent" from "sent and possibly committed":
+
+```json
+{"challenge_id": "<id>", "status": "approved", "execution": "outcome_unknown",
+ "message": "the backend call failed after the approval was recorded; the payment may or may not have been made; do not retry, it will be reconciled"}
+```
+
+Before this response existed the exception left the handler and the app got Starlette's
+bare text 500, indistinguishable from an internal crash. Now the claim stays committed
+and the row stays `approved` (no status change), the backend is not called again (the
+repository documents no backend dedupe behind the `Idempotency-Key`), and the
+completion `audit_log` row is `raised` with `detail` set to the original kind
+(`ConnectError`, `ReadTimeout`, `RemoteProtocolError`, `TotalTimeout`), paired with the
+`reaching` row. If that completion row cannot be written the request still fails with a
+bare 500 (decision 0006). Only `BackendTransportError` is mapped: any other exception is
+a bug and keeps the bare 500, and a cancellation still propagates. A second approval of
+the row is refused 409 `already_terminal`. **A caller must never retry a 502 or propose
+the payment again.**
+
+What an operator does: find the challenge id in the one ERROR line, "challenge approve:
+'<id>': tool=<tool> kind=<kind>: the backend call failed after the approval was
+recorded; outcome unknown; reconcile by Idempotency-Key = challenge id". It carries no
+exception text. Ask the payments backend what it did for the `Idempotency-Key` equal to
+the challenge id, then settle the `challenges` row by hand with `postern_owner`. The
+settling write leaves no `audit_log` row, so keep an incident note (challenge id, old
+and new status, who, when, what the backend said).
 
 **The 202 `accepted_unrecorded` response.** Not a refusal: the backend accepted the
 write (money may have moved) and recording `approved -> executed` failed on every

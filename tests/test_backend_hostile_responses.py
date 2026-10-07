@@ -14,9 +14,9 @@ What each case settles:
 * the client reads the STATUS LINE and nothing else, so a garbled body behind an
   accepted status is an accepted write and a garbled body behind a refused one
   is a 207;
-* a failure before any status (a bad status line, a bad header block) escapes as
-  ``BackendTransportError``, whose text is fixed, whose ``kind`` is the original
-  exception's type name, and whose chain holds nothing the backend sent;
+* a failure before any status (a bad status line, a bad header block) is a 502
+  `outcome_unknown` with a fixed body; the audit detail is the original
+  exception's type name and nothing the backend sent reaches any of it;
 * nothing is buffered: a 50 MB body that never arrives does not hold the
   approval up;
 * a cancellation is not swallowed.
@@ -89,9 +89,9 @@ BODY = b'{"detail":"BODY-SNTL postgresql://svc:hunter2@10.0.3.4/p"}'
 CHUNKED = b"Transfer-Encoding: chunked\r\n\r\n"
 
 #: What the approval ends as. EXECUTED: 200, row `executed`. REFUSED: 207 with
-#: the numeric status, row `approved`. ESCAPES: no status ever arrived, so the
-#: exception leaves the handler as it did before this change (a 500 under a
-#: server, the row left `approved`), but as `BackendTransportError`.
+#: the numeric status, row `approved`. ESCAPES: no status ever arrived, so
+#: the answer is 502 `outcome_unknown` and the row is left `approved` (the name
+#: predates the 502: the exception no longer escapes the handler).
 EXECUTED, REFUSED, ESCAPES = "executed", "refused", "escapes"
 
 CASES: dict[str, tuple[bytes, str, int | None]] = {
@@ -368,15 +368,21 @@ async def test_hostile_response_over_a_real_socket(
         assert out.challenge_status == "approved"
         assert out.entries[-1].detail == "BackendWriteError"
     else:
-        assert out.status is None
-        exc = out.escaped
-        assert exc is not None
-        assert type(exc).__name__ == "BackendTransportError", type(exc)
-        assert exc.kind == "RemoteProtocolError"  # type: ignore[attr-defined]
-        assert str(exc) == "the backend write endpoint could not be reached or answered improperly"
-        assert exc.__suppress_context__ is True
-        assert exc.__cause__ is None
-        assert exc.__context__ is None
+        # No status ever arrived: 502 `outcome_unknown` with a fixed body. The
+        # exception's own shape (fixed text, no chain) is pinned by
+        # `tests/test_execute.py`; it no longer leaves the handler.
+        assert out.escaped is None
+        assert out.status == 502, out.body
+        sent = json.loads(out.body)
+        assert sent.pop("challenge_id").startswith("chal_h_")
+        assert sent == {
+            "status": "approved",
+            "execution": "outcome_unknown",
+            "message": (
+                "the backend call failed after the approval was recorded; the payment may or "
+                "may not have been made; do not retry, it will be reconciled"
+            ),
+        }
         assert out.challenge_status == "approved"
         # The evidence keeps naming the ORIGINAL type, not the wrapper.
         assert [e.outcome for e in out.entries] == ["reaching", "raised"]
@@ -386,7 +392,7 @@ async def test_hostile_response_over_a_real_socket(
 
 
 #: Status-line edge cases the operator's backend must not rely on. A transport
-#: failure leaves the row `approved` and escapes (500) EVEN IF the backend
+#: failure leaves the row `approved` and answers 502 EVEN IF the backend
 #: accepted the write: reconcile by `Idempotency-Key` (the challenge id).
 STATUS_LINE_EDGES: dict[str, tuple[bytes, str]] = {
     "101_upgrade_is_a_transport_failure": (
@@ -420,8 +426,9 @@ async def test_status_line_edge_cases(
         assert out.escaped is None and out.status == 200, (out.status, out.escaped)
         assert out.challenge_status == "executed"
     else:
-        assert out.status is None
-        assert type(out.escaped).__name__ == "BackendTransportError", repr(out.escaped)
+        assert out.escaped is None
+        assert out.status == 502, out.body
+        assert json.loads(out.body)["execution"] == "outcome_unknown"
         assert out.challenge_status == "approved"
         assert [e.outcome for e in out.entries] == ["reaching", "raised"]
 
@@ -476,7 +483,7 @@ async def test_a_backend_that_dribbles_its_headers_is_cut_off_at_the_total_bound
 
     Measured before the total bound: 1 byte per 2 s kept an approval pending at
     40 s, and the ceiling was days. The row stays `approved`, the audit detail is
-    `TotalTimeout`, and the request fails as any transport failure does.
+    `TotalTimeout`, and the answer is the 502 every transport failure gets.
     """
     from services.confirm import execute as execute_module
 
@@ -490,10 +497,9 @@ async def test_a_backend_that_dribbles_its_headers_is_cut_off_at_the_total_bound
         elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < 6, elapsed
-    assert out.status is None
-    exc = out.escaped
-    assert type(exc).__name__ == "BackendTransportError", type(exc)
-    assert exc.kind == "TotalTimeout"  # type: ignore[union-attr]
+    assert out.escaped is None
+    assert out.status == 502, out.body
+    assert json.loads(out.body)["execution"] == "outcome_unknown"
     assert out.challenge_status == "approved"
     assert [e.outcome for e in out.entries] == ["reaching", "raised"]
     assert out.entries[-1].detail == "TotalTimeout"
