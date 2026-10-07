@@ -239,7 +239,7 @@ value, not an edit to this transcript. Expected row: `outcome = raised`,
 `account_ref = "acc_4111111111114417"` satisfies `Ref`'s pattern
 `^[a-z]{3}_[A-Za-z0-9]{1,32}$`
 (`packages/postern-core/src/postern_core/domain/models.py:16`) while
-containing `stub/backend.py:24`'s `FULL_PAN`.
+containing `stub/backend.py`'s `FULL_PAN`.
 
 ```bash
 curl -sS http://localhost:8080/mcp \
@@ -388,9 +388,9 @@ docker compose exec -T db psql -U postern -d postern -c "SELECT id, arguments FR
 (0 rows)
 ```
 
-Zero rows. `4111111111114417` (`stub/backend.py:24`, `FULL_PAN`) was typed
+Zero rows. `4111111111114417` (`stub/backend.py`'s `FULL_PAN`) was typed
 verbatim into Call 4's `account_ref` and does not occur in any stored
-`arguments` value. `ES9121000418450200051332` (`stub/backend.py:25`,
+`arguments` value. `ES9121000418450200051332` (`stub/backend.py`'s
 `FULL_IBAN`) was not sent in this run's arguments at all and equally does
 not occur. Checked against the JSONB text form in the database, not inferred
 from the HTTP responses.

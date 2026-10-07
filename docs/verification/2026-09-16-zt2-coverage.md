@@ -53,35 +53,34 @@ only for one pytest file, not for the compose stack that record ran against.
 
 Commit `316b51c` ("stub: enforce on the internal token subject", 2026-09-16)
 rewrote all four routes. Each one calls `_subject(request)`
-(`stub/backend.py:160-191`) before touching any fixture, and returns 401
-with no fixture value (`_unauthorized`, `stub/backend.py:113-125`) when
+(`stub/backend.py`'s `_subject`) before touching any fixture, and returns 401
+with no fixture value (`stub/backend.py`'s `_unauthorized`) when
 `_subject` returns `None`. `_subject` reads the `Authorization` header and
 recognizes two shapes for the credential that follows `Bearer `:
 
 - `StubTokenMinter`'s own literal output, `stub.read.<customer>`
-  (`stub/backend.py:106`, matching
+  (`stub/backend.py`'s `_STUB_MINTER_PREFIX`, matching
   `packages/postern-core/src/postern_core/facade/client.py:77`) -- the
   subject is whatever follows the `stub.read.` prefix.
 - A JWT, read for its `sub` claim without verifying the signature
-  (`_jwt_subject`, `stub/backend.py:128-157`) -- deliberate, per that
+  (`stub/backend.py`'s `_jwt_subject`) -- deliberate, per that
   function's own docstring: the stub holds no key for this hop and applies
   no issuer, audience or expiry check, because its one job is subject
   scoping, not acting as an authorization server.
 
-The literal prefix is checked first (`stub/backend.py:189-191`), and the
-code says why (`stub/backend.py:172-177`): `stub.read.cust_7f3a` is itself
+The literal prefix is checked first (`stub/backend.py`'s `_subject`), and the
+code says why (`stub/backend.py`'s `_subject`, in its docstring): `stub.read.cust_7f3a` is itself
 three dot-separated segments, the same shape a JWT has, so a JWT-shaped
 check applied first would claim it and then fail to base64-decode `read` as
-a claims payload. `tests/test_stub_subject_scoping.py:251-257`
-(`test_a_stub_token_is_not_mistaken_for_a_jwt`) pins exactly this ordering.
+a claims payload. `tests/test_stub_subject_scoping.py::test_a_stub_token_is_not_mistaken_for_a_jwt` pins exactly this ordering.
 
 Once a subject is resolved, each route filters the fixture rows through
-`OWNERS`, a fixture-id-to-customer map (`stub/backend.py:90-94`): `accounts`,
+`OWNERS`, a fixture-id-to-customer map (`stub/backend.py`'s `OWNERS`): `accounts`,
 `cards` and `transactions` return only the rows their owner matches;
 `balance` answers 404, not 403, for an account that exists but belongs to
 someone else, on the stated reasoning that a 403 would confirm the account's
 existence to a caller who does not own it, functioning as an enumeration
-oracle (`stub/backend.py:213-221`). That is a narrower response than the
+oracle (`stub/backend.py`'s `balance`). That is a narrower response than the
 zero-trust plan's own acceptance wording for the real services asks for --
 "a token for customer A requesting customer B's account returns 403, not
 200" (`docs/bank-mcp-zero-trust-plan.md:108`) -- but that acceptance
@@ -249,7 +248,7 @@ worth the coverage is not this record's call.
   `test_consent_enforcement.py` onto the stub is worth the coupling
   described above.** Left open; no code was changed to test it either way.
 - [ ] **Whether the stub's 404-not-403 choice on a foreign account
-  (`stub/backend.py:213-221`) is the right answer for the real services'
+  (`stub/backend.py`'s `balance`) is the right answer for the real services'
   ZT-2 acceptance criterion** ("returns 403, not 200",
   `docs/bank-mcp-zero-trust-plan.md:108`). That criterion gates the bank's
   own services in their own CI, not this stub; this record only notes the
