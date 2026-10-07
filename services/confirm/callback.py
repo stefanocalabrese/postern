@@ -108,12 +108,14 @@ that reaches neither this handler nor the table.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
 import unicodedata
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NoReturn
 
 from postern_core.store.challenges import get_challenge, update_challenge_status
 from postern_core.store.engine import Database
@@ -355,7 +357,11 @@ async def approve_challenge(request: Request) -> JSONResponse:
         # the control: this is what the caller PRESENTED. `_approve` verifies
         # it against an enrolled device key before anything is written, and
         # only a verified value ever reaches the `challenges` row.
-        presented_signature: str = body.get("signature", "")
+        # A `signature` of any JSON type but a string is treated as absent,
+        # so it takes the existing `missing_signature` 400 rather than
+        # raising `TypeError` inside the signature decoder.
+        raw_signature = body.get("signature", "")
+        presented_signature: str = raw_signature if isinstance(raw_signature, str) else ""
         verification_result: str | None = body.get("verification_result")
         try:
             response, detail = await _approve(
@@ -369,14 +375,21 @@ async def approve_challenge(request: Request) -> JSONResponse:
                 verification_result=verification_result,
             )
         except Exception as exc:
-            # `raise exc from audit_exc`, never a bare `raise` from inside
-            # this handler: an audit-write failure must not REPLACE the
-            # exception that actually ended the request. Raising while already
-            # handling `exc` would chain implicitly through `__context__` and
-            # put the database's exception where the request's own belongs, so
-            # the operator reading the traceback would learn what the audit
-            # store did and not what the approval did. Same shape, same
-            # reasoning, as `services/api/middleware/audit.py`'s raised branch.
+            # THE LOG LINES CARRY THE TYPE NAME ONLY, never an exception's text
+            # or `exc_info`: a driver error names the statement and its bound
+            # parameters (the customer, the assertion `jti`, the scrubbed
+            # arguments). The audit row's `detail` is the same type name.
+            #
+            # What still escapes is the approval's OWN exception, re-raised
+            # because decision 0006 fails the request and tests pin the class
+            # (`tests/test_audit_reserve.py`). When the audit write failed too,
+            # `from None` drops that audit exception from the traceback instead
+            # of chaining it, since it is the one carrying the audit INSERT.
+            logger.error(
+                "challenge approve: %r: the approval raised %s",
+                challenge_id,
+                type(exc).__name__,
+            )
             try:
                 await audit.raised(type(exc).__name__)
             except Exception as audit_exc:
@@ -384,10 +397,9 @@ async def approve_challenge(request: Request) -> JSONResponse:
                     "audit write failed for challenge %r after the approval raised %s: %s",
                     challenge_id,
                     type(exc).__name__,
-                    audit_exc,
-                    exc_info=audit_exc,
+                    type(audit_exc).__name__,
                 )
-                raise exc from audit_exc
+                raise exc from None
             raise
 
     try:
@@ -398,10 +410,10 @@ async def approve_challenge(request: Request) -> JSONResponse:
     except Exception as audit_exc:
         logger.error(
             "audit write failed for challenge %r after the approval finished with "
-            "status %d; failing the request because the audit row could not be written",
+            "status %d; failing the request because the audit row could not be written: %s",
             challenge_id,
             response.status_code,
-            exc_info=audit_exc,
+            type(audit_exc).__name__,
         )
         raise
     return response
@@ -479,6 +491,16 @@ async def _approve(
         return (
             _error(400, "invalid_request", "signature is required"),
             DETAIL_MISSING_SIGNATURE,
+        )
+
+    # A path id that cannot name a challenge (`String(36)` ids of this
+    # alphabet) is answered as an unknown one without a database round trip:
+    # a NUL in it made the lookup raise and the caller got a 500. The body is
+    # the unknown-id 404's own.
+    if not _CHALLENGE_ID_RE.fullmatch(challenge_id):
+        return (
+            _error(404, "not_found", f"challenge {challenge_id} not found"),
+            DETAIL_CHALLENGE_NOT_FOUND,
         )
 
     # --- 1. Look up the challenge (from DB, not agent input) ---
@@ -592,7 +614,18 @@ async def _approve(
         # NUL or a device past `String(128)` made the driver raise inside the
         # claim and the 500 carried the SQL. A tier-2 row ignores the body's
         # `verification_result` and stores the assertion's `jti`, so that
-        # value is never written and is not validated.
+        # value is not written to the row and is not validated. It IS still
+        # written to `audit_log.arguments` (scrubbed and bounded), which is
+        # why non-finite JSON numbers are refused when the body is parsed.
+        #
+        # THE ORDER THAT FOLLOWS FROM THE POSITION: the owner, the device
+        # signature and the tier check all answer first, so a foreign or
+        # unsigned caller learns nothing from this 400. It also runs BEFORE
+        # the row's status and deadline are looked at, which the claim does:
+        # an expired row with a malformed body gets this 400 and stays
+        # `pending` (with a good body it gets 410 and the expiry
+        # transition), and an `executed` row with a malformed body gets this
+        # 400 and not 409.
         invalid_field = _invalid_body_field(
             body, check_verification_result=verdict.assertion_jti is None
         )
@@ -817,11 +850,22 @@ async def _read_body(request: Request) -> dict[str, Any] | None:
     Without that middleware this function would be reading an unbounded body
     into memory in order to refuse it.
     """
+    # Parsed here rather than by `request.json()`, which accepts the JSON
+    # extensions `NaN`, `Infinity` and `-Infinity`. A float like that reaches
+    # `audit_log.arguments` and PostgreSQL refuses it as a JSONB token, so
+    # the audit write failed and a request, including a cross-customer probe,
+    # ended with no row at all. Refused at parse time they are a malformed
+    # body, which gets its row before any challenge is looked at.
     try:
-        parsed = await request.json()
+        parsed = json.loads(await request.body(), parse_constant=_refuse_constant)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _refuse_constant(name: str) -> NoReturn:
+    """``json.loads``'s ``parse_constant`` hook: a non-finite number is not accepted."""
+    raise ValueError(f"non-finite JSON number {name}")
 
 
 async def _refused_transition_response(
@@ -930,6 +974,12 @@ async def _refused_transition_response(
 APPROVAL_UPDATE_FAILED_DESCRIPTION = "the approval could not be recorded"
 EXECUTION_SETUP_FAILED_DESCRIPTION = "the approved operation could not be set up"
 
+#: Line and paragraph separators (U+2028, U+2029) are `Zl` and `Zp`, outside `C*`.
+_REFUSED_CATEGORIES_EXTRA = frozenset({"Zl", "Zp"})
+
+#: What a challenge id can look like: `challenges.challenge_id` is `String(36)`.
+_CHALLENGE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,36}")
+
 #: `challenges.confirming_device` is `String(128)`.
 CONFIRMING_DEVICE_MAX_LENGTH = 128
 
@@ -945,7 +995,11 @@ def _clean_text(value: object, *, min_length: int = 0, max_length: int | None = 
         return False
     if len(value) < min_length or (max_length is not None and len(value) > max_length):
         return False
-    return not any(unicodedata.category(ch).startswith("C") for ch in value)
+    return not any(
+        unicodedata.category(ch) in _REFUSED_CATEGORIES_EXTRA
+        or unicodedata.category(ch).startswith("C")
+        for ch in value
+    )
 
 
 def _invalid_body_field(body: dict[str, Any], *, check_verification_result: bool) -> str | None:

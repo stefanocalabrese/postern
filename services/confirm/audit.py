@@ -607,9 +607,9 @@ class ApprovalAudit:
                 # whole point, and the caller needs the exception to do it.
                 logger.error(
                     "audit entry write failed for challenge approval of %r; the backend "
-                    "write it precedes will not be made",
+                    "write it precedes will not be made: %s",
                     self._tool_name,
-                    exc_info=audit_exc,
+                    type(audit_exc).__name__,
                 )
                 raise
 

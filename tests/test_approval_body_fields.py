@@ -7,18 +7,23 @@ its bound parameters. These tests drive the real confirm app and Postgres.
 """
 
 import json
+import logging
+import traceback
 from collections.abc import AsyncIterator
 from typing import Any
+from urllib.parse import quote
 
 import httpx2
 import pytest
 import pytest_asyncio
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
 from postern_core.payments import CREATE_PAYMENT_TOOL
+from postern_core.store import audit as audit_store
 from postern_core.store import challenges as store
+from postern_core.store.audit import bound_arguments
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry, ChallengeRecord
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from starlette.applications import Starlette
 
 from services.confirm import callback
@@ -48,6 +53,7 @@ DRIVER_MESSAGE = (
 )
 
 DEVICE_PRIVATE, DEVICE_PUBLIC = device_key("bodyfields-phone")
+OTHER_PRIVATE, _OTHER_PUBLIC = device_key("bodyfields-not-enrolled")
 
 
 @pytest.fixture(scope="module")
@@ -107,12 +113,12 @@ def new_challenge_id() -> str:
     return "bf_" + "".join("abcdefghij"[int(d)] for d in str(n)) + "_xyz"
 
 
-async def seed(db: Database, *, tier: int) -> ChallengeRecord:
+async def seed(db: Database, *, tier: int, customer_ref: str = OWNER) -> ChallengeRecord:
     async with db.sessionmaker() as s:
         record = await store.create_challenge(
             s,
             challenge_id=new_challenge_id(),
-            customer_ref=OWNER,
+            customer_ref=customer_ref,
             tool_name=TIER_1_TOOL if tier == 1 else CREATE_PAYMENT_TOOL,
             payload=dict(TIER_1_PAYLOAD if tier == 1 else TIER_2_PAYLOAD),
             tier=tier,
@@ -147,13 +153,22 @@ async def approve(
     headers: dict[str, str],
     *,
     as_a_server_would: bool = False,
+    signer: Any = DEVICE_PRIVATE,
+    raw_body: bytes | None = None,
     **extra: Any,
 ) -> httpx2.Response:
-    body = {"signature": sign_row(DEVICE_PRIVATE, record), **extra}
+    """POST the approval; ``raw_body`` replaces the JSON built from ``extra``."""
+    body = {"signature": sign_row(signer, record), **extra}
     async with httpx2.AsyncClient(
         transport=httpx2.ASGITransport(app=app, raise_app_exceptions=not as_a_server_would),
         base_url="http://t",
     ) as client:
+        if raw_body is not None:
+            return await client.post(
+                f"/challenges/{record.challenge_id}/approve",
+                content=raw_body,
+                headers={**headers, "Content-Type": "application/json"},
+            )
         return await client.post(
             f"/challenges/{record.challenge_id}/approve", json=body, headers=headers
         )
@@ -298,7 +313,10 @@ async def test_a_database_error_returns_no_exception_text(
     record = await seed(db, tier=1)
     response = await approve(app, record, bearer(key_pair), as_a_server_would=True)
     assert response.status_code == 500, response.text
-    assert response.json()["error"] == "internal_error"
+    assert response.json() == {
+        "error": "internal_error",
+        "error_description": "the approval could not be recorded",
+    }
     assert SENTINEL not in response.text
     assert "SELECT" not in response.text
     assert "parameters" not in response.text
@@ -334,3 +352,341 @@ async def test_an_execution_setup_error_returns_no_exception_text(
     assert sent == []
     (row,) = await audit_rows(db, record.challenge_id)
     assert (row.outcome, row.detail) == ("raised", "ValueError")
+
+
+# -- Non-finite JSON numbers ---------------------------------------------------------
+#
+# `request.json()` accepts NaN, Infinity and -Infinity, PostgreSQL refuses them
+# in JSONB, and the audit write then failed with no row. Refused at parse time
+# they are a malformed body, which is decided BEFORE the challenge is looked
+# at: a foreign challenge with such a body gets a 400 `malformed_body` row, not
+# the 404 a well formed body would get, and the 404's oracle is not touched
+# because the body is refused for every caller alike.
+
+
+def raw_with(record: ChallengeRecord, field: str, constant: str) -> bytes:
+    signature = sign_row(DEVICE_PRIVATE, record)
+    return ('{"signature": "' + signature + '", "' + field + '": ' + constant + "}").encode()
+
+
+NON_FINITE = ["NaN", "Infinity", "-Infinity"]
+FIELDS = ["confirming_device", "verification_result"]
+
+
+@pytest.mark.parametrize("target", ["foreign", "tier-1", "tier-2"])
+@pytest.mark.parametrize("field", FIELDS)
+@pytest.mark.parametrize("constant", NON_FINITE)
+async def test_a_non_finite_number_is_a_malformed_body_with_a_row_and_no_claim(
+    constant: str,
+    field: str,
+    target: str,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+) -> None:
+    if target == "foreign":
+        record = await seed(db, tier=1, customer_ref="cust_someone_else")
+        headers = bearer(key_pair)
+    elif target == "tier-1":
+        record = await seed(db, tier=1)
+        headers = bearer(key_pair)
+    else:
+        record = await seed(db, tier=2)
+        headers = bearer(key_pair, tier2_claims(record))
+    response = await approve(app, record, headers, raw_body=raw_with(record, field, constant))
+    assert response.status_code == 400, response.text
+    assert response.json() == {
+        "error": "invalid_request",
+        "error_description": "body must be a JSON object",
+    }
+    assert (await stored(db, record.challenge_id)).status == "pending"
+    assert sent == []
+    (row,) = await audit_rows(db, record.challenge_id)
+    assert (row.outcome, row.detail) == ("raised", "malformed_body")
+
+
+async def test_the_audit_arguments_survive_a_non_finite_number_that_got_past_the_parser(
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defence in depth: with the parse-time refusal bypassed, the row is still written."""
+    record = await seed(db, tier=1)
+    signature = sign_row(DEVICE_PRIVATE, record)
+
+    async def parsed(request: Any) -> dict[str, Any]:
+        return {"signature": signature, "confirming_device": float("nan")}
+
+    monkeypatch.setattr(callback, "_read_body", parsed)
+    response = await approve(app, record, bearer(key_pair))
+    assert response.status_code == 400, response.text
+    assert (await stored(db, record.challenge_id)).status == "pending"
+    (row,) = await audit_rows(db, record.challenge_id)
+    assert row.detail == "body_field_invalid"
+    assert row.arguments["confirming_device"] == "NaN"
+
+
+@pytest.mark.parametrize("constant", [float("inf"), float("-inf")])
+async def test_a_tier_2_approval_is_not_stranded_by_a_non_finite_unvalidated_field(
+    constant: float,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier-2 body `verification_result` is not validated but is audited."""
+    record = await seed(db, tier=2)
+    signature = sign_row(DEVICE_PRIVATE, record)
+
+    async def parsed(request: Any) -> dict[str, Any]:
+        return {"signature": signature, "verification_result": constant}
+
+    monkeypatch.setattr(callback, "_read_body", parsed)
+    response = await approve(app, record, bearer(key_pair, tier2_claims(record)))
+    assert response.status_code == 200, response.text
+    assert [e.outcome for e in await audit_rows(db, record.challenge_id)] == [
+        "reaching",
+        "returned",
+    ]
+
+
+def test_bound_arguments_replaces_non_finite_floats_and_leaves_finite_ones() -> None:
+    tree = {
+        "a": float("nan"),
+        "b": [float("inf"), {"c": float("-inf")}],
+        "d": 1.5,
+        "e": 3,
+        "f": True,
+    }
+    out = bound_arguments(tree)
+    assert out == {"a": "NaN", "b": ["Infinity", {"c": "-Infinity"}], "d": 1.5, "e": 3, "f": True}
+    json.dumps(out, allow_nan=False)
+
+
+# -- Audit failures log the type only ------------------------------------------------
+
+
+def assert_no_sentinel_anywhere(caplog: pytest.LogCaptureFixture) -> None:
+    for record in caplog.records:
+        rendered = [record.getMessage(), record.exc_text or "", str(record.args)]
+        if record.exc_info is not None:
+            rendered.append("".join(traceback.format_exception(*record.exc_info)))
+        for text_ in rendered:
+            assert "secret_sentinel" not in text_
+
+
+@pytest.mark.parametrize("only_the_completion_row_fails", [False, True])
+async def test_an_audit_write_failure_logs_and_raises_the_type_name_only(
+    only_the_completion_row_fails: bool,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_append = audit_store.append
+
+    async def failing(session: Any, **kw: Any) -> None:
+        if only_the_completion_row_fails and kw["outcome"] == "reaching":
+            await real_append(session, **kw)
+            return
+        raise RuntimeError(DRIVER_MESSAGE)
+
+    monkeypatch.setattr(audit_store, "append", failing)
+    record = await seed(db, tier=1)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError) as caught:
+            await approve(app, record, bearer(key_pair))
+    # What escapes is the original exception (decision 0006 and the class
+    # `tests/test_audit_reserve.py` pins), so its own text is in the
+    # traceback and is not asserted on here. The audit exception is not
+    # chained onto it when the approval itself raised.
+    if not only_the_completion_row_fails:
+        assert caught.value.__cause__ is None
+        assert caught.value.__suppress_context__
+        assert "".join(traceback.format_exception(caught.value)).count("secret_sentinel") == 2
+    assert any("RuntimeError" in r.getMessage() for r in caplog.records if r.levelno >= 40)
+    assert_no_sentinel_anywhere(caplog)
+
+
+# -- The step-2d warning -------------------------------------------------------------
+
+
+async def test_the_body_field_warning_names_the_field_and_not_the_value(
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    record = await seed(db, tier=1)
+    with caplog.at_level(logging.WARNING, logger="services.confirm.callback"):
+        response = await approve(
+            app, record, bearer(key_pair), confirming_device="OFFENDING_VALUE\x00"
+        )
+    assert response.status_code == 400
+    messages = [r.getMessage() for r in caplog.records if r.name == "services.confirm.callback"]
+    assert any("confirming_device" in m for m in messages)
+    assert not any("OFFENDING_VALUE" in m for m in messages)
+
+
+# -- Where step 2d sits --------------------------------------------------------------
+
+
+async def test_the_tier_check_answers_before_the_body_check(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await seed(db, tier=2)
+    response = await approve(app, record, bearer(key_pair), confirming_device="a\x00")
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "verification_required"
+    assert (await stored(db, record.challenge_id)).status == "pending"
+
+
+async def test_the_signature_check_answers_before_the_body_check(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await seed(db, tier=1)
+    response = await approve(
+        app, record, bearer(key_pair), signer=OTHER_PRIVATE, confirming_device="a\x00"
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "invalid_signature"
+    assert (await stored(db, record.challenge_id)).status == "pending"
+
+
+async def test_the_ownership_check_answers_before_the_body_check(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await seed(db, tier=1, customer_ref="cust_someone_else")
+    response = await approve(app, record, bearer(key_pair), confirming_device="a\x00")
+    assert response.status_code == 404, response.text
+    assert response.json() == {
+        "error": "not_found",
+        "error_description": f"challenge {record.challenge_id} not found",
+    }
+    (row,) = await audit_rows(db, record.challenge_id)
+    assert row.detail == "challenge_not_owned"
+
+
+async def test_an_expired_row_with_a_malformed_body_is_a_400_and_stays_pending(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await seed(db, tier=1)
+    async with db.sessionmaker() as s:
+        await s.execute(
+            text(
+                "UPDATE challenges SET expires_at = now() - interval '1 minute' "
+                "WHERE challenge_id = :c"
+            ),
+            {"c": record.challenge_id},
+        )
+        await s.commit()
+    record = await stored(db, record.challenge_id)
+    response = await approve(app, record, bearer(key_pair), confirming_device="a\x00")
+    assert response.status_code == 400, response.text
+    assert (await stored(db, record.challenge_id)).status == "pending"
+    (row,) = await audit_rows(db, record.challenge_id)
+    assert row.detail == "body_field_invalid"
+
+
+async def test_an_executed_row_with_a_malformed_body_is_a_400_not_a_409(
+    app: Starlette, db: Database, key_pair: RSAKeyPair, sent: list[httpx2.Request]
+) -> None:
+    record = await seed(db, tier=1)
+    async with db.sessionmaker() as s:
+        await s.execute(
+            text("UPDATE challenges SET status = 'executed' WHERE challenge_id = :c"),
+            {"c": record.challenge_id},
+        )
+        await s.commit()
+    record = await stored(db, record.challenge_id)
+    response = await approve(app, record, bearer(key_pair), confirming_device="a\x00")
+    assert response.status_code == 400, response.text
+    assert (await stored(db, record.challenge_id)).status == "executed"
+
+
+# -- A signature that is not a string ------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [1, True, ["x"], {"k": "v"}], ids=repr)
+async def test_a_signature_of_the_wrong_json_type_is_a_400_missing_signature(
+    value: Any,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+) -> None:
+    """Treated as absent: the closest existing refusal, `missing_signature`."""
+    record = await seed(db, tier=1)
+    response = await approve(app, record, bearer(key_pair), signature=value)
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "invalid_request"
+    assert (await stored(db, record.challenge_id)).status == "pending"
+    (row,) = await audit_rows(db, record.challenge_id)
+    assert (row.outcome, row.detail) == ("raised", "missing_signature")
+
+
+# -- A path id that cannot name a challenge ------------------------------------------
+
+
+async def audit_count(db: Database) -> int:
+    async with db.sessionmaker() as s:
+        return int((await s.execute(select(func.count()).select_from(AuditEntry))).scalar_one())
+
+
+@pytest.mark.parametrize(
+    "raw_id",
+    ["chal\x00x", "chal x", "c" * 37, "chal.x", "chal x"],
+    ids=["nul", "space", "37-characters", "dot", "line-separator"],
+)
+async def test_a_path_id_outside_the_alphabet_is_the_unknown_id_404_with_a_row(
+    raw_id: str,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+) -> None:
+    before = await audit_count(db)
+    path_id = raw_id if "%" in raw_id else quote(raw_id, safe="")
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://t"
+    ) as client:
+        response = await client.post(
+            f"/challenges/{path_id}/approve", json={"signature": "x"}, headers=bearer(key_pair)
+        )
+    assert response.status_code == 404, response.text
+    body = response.json()
+    assert body["error"] == "not_found"
+    assert body["error_description"].startswith("challenge ")
+    assert body["error_description"].endswith(" not found")
+    assert await audit_count(db) == before + 1
+    async with db.sessionmaker() as s:
+        latest = (
+            await s.execute(select(AuditEntry).order_by(AuditEntry.id.desc()).limit(1))
+        ).scalar_one()
+    assert latest.detail == "challenge_not_found"
+
+
+# -- Line and paragraph separators ---------------------------------------------------
+
+
+@pytest.mark.parametrize("field", FIELDS)
+@pytest.mark.parametrize("separator", [" ", " "], ids=["U+2028", "U+2029"])
+async def test_a_line_or_paragraph_separator_is_refused(
+    separator: str,
+    field: str,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+) -> None:
+    record = await seed(db, tier=1)
+    body_field: dict[str, Any] = {field: f"a{separator}b"}
+    response = await approve(app, record, bearer(key_pair), **body_field)
+    await assert_refused_field(response, field, db, record, sent, None)

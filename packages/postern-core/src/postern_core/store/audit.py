@@ -176,6 +176,7 @@ for the five keys, and about 150 bytes more with `assertion_jti`.
 
 import json
 import logging
+import math
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
@@ -451,7 +452,16 @@ def clip_tree(value: Any) -> Any:
         return {clip_tree(k): clip_tree(v) for k, v in value.items()}
     if isinstance(value, list):
         return [clip_tree(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        # JSONB has no NaN or Infinity and PostgreSQL refuses the token, which
+        # would fail the audit write and, under decision 0006, the call with
+        # no row. Recorded as its JSON spelling in a string. Finite floats are
+        # untouched.
+        return "NaN" if math.isnan(value) else _NON_FINITE_SPELLING[value]
     return value
+
+
+_NON_FINITE_SPELLING = {math.inf: "Infinity", -math.inf: "-Infinity"}
 
 
 def cap_arguments(tree: dict[str, Any]) -> dict[str, Any]:
