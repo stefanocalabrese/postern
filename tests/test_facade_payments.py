@@ -74,4 +74,4 @@ async def test_a_malformed_ref_is_refused_before_any_request(payee_ref: str) -> 
 async def test_a_foreign_or_invented_payee_is_the_same_404(payee_ref: str) -> None:
     with pytest.raises(BackendError) as failed:
         await payments.get_payee(stub_backend(), OWNER, payee_ref)
-    assert (failed.value.status, failed.value.detail) == (404, "no such payee")
+    assert failed.value.status == 404

@@ -18,41 +18,53 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 import httpx2
-from pydantic import TypeAdapter
 
-from postern_core.domain.masking import FreeText
 from postern_core.identity import CustomerRef
-
-# Built once at import time: validating a bare string against `FreeText`
-# doesn't need a wrapping `BaseModel`, just its `AfterValidator`.
-_FREE_TEXT: TypeAdapter[str] = TypeAdapter(FreeText)
-
-
-def _scrub(text: str) -> str:
-    return _FREE_TEXT.validate_python(text)
 
 
 class BackendError(RuntimeError):
-    """A backend call failed. `guidance` is what the agent should be told to do.
+    """The backend answered with an error status. `guidance` is what the agent should be told to do.
 
-    `detail` is always the *scrubbed* backend text (see `_detail` below), and
-    its text does NOT reach the model: `services/api` builds FastMCP with
-    `mask_error_details=True`, so a `BackendError` escaping a tool handler
-    reaches the client as ``Error calling tool 'x'`` and nothing more. The
-    only specific thing a client learns is what a tool chooses to say by
-    catching it: `services/api/tools` maps a 404 to a fixed `ToolError`
-    (``not found`` and the payments tools' own sentences) and lets every other
-    status stay masked. `detail` is still scrubbed because it can reach a log
-    and an audit row, and an operator backend's 4xx/5xx body can carry a PAN,
-    an IBAN, an account number or a customer name; nothing derived from it may
-    reach this exception unscrubbed.
+    CARRIES THE STATUS AND A FIXED SENTENCE, NOTHING FROM THE RESPONSE. `str` is
+    ``backend answered 500``; there is no ``detail`` field, and neither the body
+    nor the URL is read into this exception. The reason is the logger, not the
+    model: `services/api` builds FastMCP with `mask_error_details=True`, so the
+    model only ever reads ``Error calling tool 'x'`` or what a tool chooses to
+    say after catching `status`, but FastMCP's own logger
+    (`fastmcp.server.server`, its own handler, `propagate` False) writes the
+    exception's text to stderr. A scrubber that knows a PAN and an IBAN does
+    not make a body safe: a DSN, a bearer token or a customer name in a 4xx/5xx
+    body went through it untouched. Callers branch on `status` and nothing else
+    (`services/api/tools/not_found.py`, `services/api/tools/payments.py`).
+
+    The write side's `services/confirm/execute.BackendWriteError` is the same
+    rule.
     """
 
-    def __init__(self, status: int, detail: str, guidance: str) -> None:
-        super().__init__(f"{status}: {detail}")
+    def __init__(self, status: int, guidance: str) -> None:
+        super().__init__(f"backend answered {status}")
         self.status = status
-        self.detail = detail
         self.guidance = guidance
+
+
+class BackendUnavailableError(RuntimeError):
+    """No status arrived: the backend was unreachable, timed out or answered improperly.
+
+    `str` is FIXED TEXT. `kind` is the TYPE NAME of the `httpx2` exception that
+    was caught (``ConnectError``, ``ReadTimeout``, ``DecodingError``,
+    ``RemoteProtocolError``) and never its message, because those carry the
+    host and port, and `h11` and `httpcore2` quote the bytes they refused. The
+    original is not chained (``from None``, raised outside the ``except``), so
+    no logger, traceback printer or ``__context__`` walker can reach it.
+
+    Deliberately NOT a `BackendError`: that one means a status was received and
+    callers read `.status` from it; this one has none. Counterpart of
+    `services/confirm/execute.BackendTransportError`.
+    """
+
+    def __init__(self, *, kind: str) -> None:
+        super().__init__("the backend could not be reached or answered improperly")
+        self.kind = kind
 
 
 class TokenMinter(Protocol):
@@ -233,31 +245,26 @@ class BackendClient:
             # `BackendRequestHook` on why a hook that raises must stop the
             # request rather than be logged past.
             await self._before_backend_request()
-        response = await self._client.get(
-            path, params=params, headers={"Authorization": f"Bearer {token}"}
-        )
+        response: httpx2.Response | None = None
+        failure: str | None = None
+        try:
+            response = await self._client.get(
+                path, params=params, headers={"Authorization": f"Bearer {token}"}
+            )
+        except httpx2.HTTPError as exc:
+            # `HTTPError` only: a cancellation (a `BaseException`) and a bug that
+            # is not an `httpx2` failure propagate as what they are. Only the
+            # type name is kept; the message carries host and port.
+            failure = type(exc).__name__
+        if response is None:
+            # RAISED OUTSIDE THE `except`, with `from None`: raising inside it
+            # would set `__context__` to the original exception.
+            raise BackendUnavailableError(kind=failure or "UnknownError") from None
         if response.status_code >= 400:
-            detail = _detail(response)
             raise BackendError(
-                response.status_code, detail, _GUIDANCE.get(response.status_code, _DEFAULT_GUIDANCE)
+                response.status_code, _GUIDANCE.get(response.status_code, _DEFAULT_GUIDANCE)
             )
         return response.json()
 
     async def aclose(self) -> None:
         await self._client.aclose()
-
-
-def _detail(response: httpx2.Response) -> str:
-    """Scrubbed, length-capped summary of a backend error body.
-
-    Scrubbing runs on the full body *before* the 200-character cut: cutting
-    first could split a PAN or IBAN in half, leaving an unmasked digit
-    fragment past the cut instead of a masked value before it.
-    """
-    try:
-        body = response.json()
-    except ValueError:
-        text = response.text
-    else:
-        text = str(body.get("detail", body)) if isinstance(body, dict) else str(body)
-    return _scrub(text)[:200]

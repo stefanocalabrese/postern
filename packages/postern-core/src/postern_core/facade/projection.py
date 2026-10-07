@@ -38,14 +38,11 @@ from postern_core.facade.client import BackendError
 
 def build_model[Model](factory: Callable[[], Model], *, resource: str) -> Model:
     """Call `factory` and turn any `pydantic.ValidationError` it raises into
-    a `BackendError` naming only the failing field(s), never the value.
+    a status-502 `BackendError`, which carries a fixed sentence and neither the
+    value nor the field names (`BackendError` holds a status and nothing else).
+    `resource` names the call site for a reader and is not part of the error.
 
     `factory` is typically `lambda: SomeModel(**fields_read_from_the_backend_payload)`.
-
-    Only `error["loc"]` (the field path, defined by this codebase's own
-    model, never backend data) is read from `exc.errors(include_input=False)`;
-    `include_input=False` is redundant defence in depth given that, kept
-    because it costs nothing and documents the intent at the call site.
 
     `raise ... from None`, not `from exc`: measured, not assumed, to be
     defence in depth rather than the load-bearing fix for this codebase's
@@ -72,10 +69,8 @@ def build_model[Model](factory: Callable[[], Model], *, resource: str) -> Model:
     """
     try:
         return factory()
-    except ValidationError as exc:
-        fields = ", ".join(str(error["loc"][-1]) for error in exc.errors(include_input=False))
+    except ValidationError:
         raise BackendError(
             502,
-            f"backend response for {resource!r} failed validation on field(s): {fields}",
             "The backend returned data in an unexpected shape. Tell the customer and retry later.",
         ) from None

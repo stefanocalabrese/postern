@@ -407,7 +407,7 @@ class RedisCustomerRateLimitStore(CustomerRateLimitStoreBase):
         except Exception as exc:
             raise CustomerRateLimitStoreUnavailable(
                 f"the per-customer rate limit counter could not be reached: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
         if int(count) <= limit.requests:
             return None

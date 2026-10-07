@@ -249,8 +249,14 @@ lookups.
 The `BackendClient` is the HTTP façade to the operator's backend services:
 
 - **Path validation**: rejects absolute URLs, protocol-relative URLs, and `..` segments
-- **Error scrubbing**: passes backend error bodies through `FreeText` redaction before
-  truncating to 200 characters (prevents PAN/IBAN leakage in error responses)
+- **No backend text in exceptions**: an error status raises `BackendError`, which carries the
+  status and the fixed sentence `backend answered <status>` and nothing from the response body
+  or URL; a transport failure (connect, timeout, protocol or decoding error) raises
+  `BackendUnavailableError`, which carries a fixed sentence and the original exception's type
+  name as `kind`, with no chain. FastMCP's own logger writes a failing tool's exception to
+  stderr, so the exception is the only place text can be kept out of it. The same rule holds
+  for `VaultTransitError` (status or `kind` only, no path, key name or Vault body) and for the
+  Redis store wrappers (`from None`, type name only).
 - **Timeout budgets**: four independent timeouts per phase (connect, write, read, pool)
   summing to a worst-case 10.0s per backend request
 

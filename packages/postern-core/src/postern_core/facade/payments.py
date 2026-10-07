@@ -44,7 +44,6 @@ async def get_payee(backend: BackendReader, customer: CustomerRef, payee_ref: Re
     if payee.payee_ref != payee_ref:
         raise BackendError(
             502,
-            "backend answered a different payee",
             "The backend returned data in an unexpected shape. Tell the customer and retry later.",
         )
     return payee

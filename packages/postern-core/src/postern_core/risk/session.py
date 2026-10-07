@@ -336,7 +336,7 @@ class RedisSessionStore(SessionStoreBase):
         except Exception as exc:
             raise SessionStoreUnavailable(
                 f"risk context {key.log_ref} could not be read: {type(exc).__name__}"
-            ) from exc
+            ) from None
         return ctx
 
     async def save(self, key: SessionKey, ctx: RiskContext) -> None:
@@ -345,7 +345,7 @@ class RedisSessionStore(SessionStoreBase):
         except Exception as exc:
             raise SessionStoreUnavailable(
                 f"risk context {key.log_ref} could not be written: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
     async def remove(self, key: SessionKey) -> None:
         try:
@@ -353,7 +353,7 @@ class RedisSessionStore(SessionStoreBase):
         except Exception as exc:
             raise SessionStoreUnavailable(
                 f"risk context {key.log_ref} could not be removed: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
     def _remaining_ttl(self, ctx: RiskContext) -> int:
         """What is left of this context's lifetime, never less than a second.

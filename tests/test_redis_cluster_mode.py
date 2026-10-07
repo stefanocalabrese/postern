@@ -161,10 +161,17 @@ async def refused(call: Awaitable[Any]) -> BaseException:
 
 
 def assert_crossslot_wrapped(exc: BaseException, wrapper: type[Exception]) -> None:
-    """Fail closed: the store's own exception, with the server's answer as its cause."""
+    """Fail closed: the store's own exception, naming the driver's TYPE and nothing else.
+
+    Changed from "with the server's answer as its cause": a chained `ResponseError`
+    prints the server's text (and a connection error prints host, port and ACL user)
+    in whatever logs the exception, so the wrapper is raised `from None`.
+    """
     assert type(exc) is wrapper
-    assert isinstance(exc.__cause__, ResponseError)
-    assert str(exc.__cause__) == CROSSSLOT
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
+    assert "ResponseError" in str(exc)
+    assert CROSSSLOT not in str(exc)
 
 
 def assert_crossslot_raw(exc: BaseException) -> None:

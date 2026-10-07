@@ -129,12 +129,25 @@ class VaultTransitError(RuntimeError):
     different to do with the answer, and the operator reading the message
     already has the status in it.
 
+    THE TEXT IS FIXED, plus at most an HTTP `status` (an int) or a `kind` (the
+    TYPE NAME of the exception that was caught). It never holds a Vault path,
+    a key name, a token path, an address or any text Vault sent: FastMCP's own
+    logger writes a failing tool's exception, and its chain, to stderr, and
+    this one is raised on every backend call's signing step. The operator
+    learns the path, key and address from their own configuration, and what
+    Vault said from Vault's audit device.
+
     NOTHING CONSTRUCTED HERE CARRIES THE VAULT TOKEN. The credential is in
     every request this module sends, so every message built around a failed
     one is a place it can leak;
     `tests/test_vault_transit_key_source.py::TestItFailsClosed::test_no_refusal_ever_carries_the_vault_token`
     drives both endpoints across three statuses and asserts it does not.
     """
+
+    def __init__(self, message: str, *, status: int | None = None, kind: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.kind = kind
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +289,7 @@ class VaultTransitKeySource:
         signing_input = header + b"." + payload
         data = self._post(
             self._sign_path,
+            "sign",
             {
                 "input": base64.b64encode(signing_input).decode("ascii"),
                 # NAMED, never Vault's default. Transit's default for an RSA
@@ -286,13 +300,11 @@ class VaultTransitKeySource:
                 "key_version": material.version,
             },
         )
-        signed_version = data.get("key_version")
-        if signed_version != material.version:
+        if data.get("key_version") != material.version:
             raise VaultTransitError(
-                f"{self._sign_path} signed with key version {signed_version!r} but this "
-                f"process asked for {material.version} and published its public half under "
-                f"kid {kid!r}. A token whose kid names a version that did not sign it is "
-                f"rejected as a bad signature, which reads like forgery."
+                "transit signed with a key version other than the one this process asked for "
+                "and published its public half under. A token whose kid names a version that "
+                "did not sign it is rejected as a bad signature, which reads like forgery."
             )
         return (signing_input + b"." + urlsafe_b64encode(_unwrap(data["signature"]))).decode(
             "ascii"
@@ -317,60 +329,88 @@ class VaultTransitKeySource:
         cached = self._cached
         if cached is not None and self._clock() - cached.read_at < self._ttl:
             return cached
-        data = self._get(self._keys_path)
+        data = self._get(self._keys_path, "key read")
         key_type = data.get("type")
         if not isinstance(key_type, str) or not key_type.startswith("rsa-"):
             raise VaultTransitError(
-                f"transit key {self._key_name!r} is of type {key_type!r}; this source signs "
-                f"RS256 and needs an RSA key. Create it with -type=rsa-2048 or rsa-4096."
+                "the configured transit key is not an RSA key; this source signs RS256 and "
+                "needs one. Create it with -type=rsa-2048 or rsa-4096."
             )
-        version = int(data["latest_version"])
-        keys: list[Key] = [
-            RSAKey.import_key(
-                entry["public_key"],
-                parameters=_parameters(f"{self._kid}.v{number}"),
-            )
-            for number, entry in sorted(data["keys"].items(), key=lambda item: int(item[0]))
-        ]
-        material = _Material(version=version, key_set=KeySet(keys), read_at=self._clock())
+        try:
+            version = int(data["latest_version"])
+            keys: list[Key] = [
+                RSAKey.import_key(
+                    entry["public_key"],
+                    parameters=_parameters(f"{self._kid}.v{number}"),
+                )
+                for number, entry in sorted(data["keys"].items(), key=lambda item: int(item[0]))
+            ]
+            key_set = KeySet(keys)
+        except Exception:
+            # Fixed text, raised below: the parser's own message quotes the
+            # value it refused, and that value is Vault's.
+            key_set = None
+        if key_set is None:
+            raise VaultTransitError(
+                "Vault's description of the transit key could not be read as a set of RSA "
+                "public keys."
+            ) from None
+        material = _Material(version=version, key_set=key_set, read_at=self._clock())
         self._cached = material
         return material
 
     def _headers(self) -> dict[str, str]:
         return {"X-Vault-Token": self._read_token()}
 
-    def _get(self, path: str) -> dict[str, Any]:
-        return self._data(path, lambda: self._client.get(path, headers=self._headers()))
+    def _get(self, path: str, operation: str) -> dict[str, Any]:
+        return self._data(operation, lambda: self._client.get(path, headers=self._headers()))
 
-    def _post(self, path: str, body: dict[str, object]) -> dict[str, Any]:
-        return self._data(path, lambda: self._client.post(path, json=body, headers=self._headers()))
+    def _post(self, path: str, operation: str, body: dict[str, object]) -> dict[str, Any]:
+        return self._data(
+            operation, lambda: self._client.post(path, json=body, headers=self._headers())
+        )
 
-    def _data(self, path: str, call: Callable[[], httpx2.Response]) -> dict[str, Any]:
+    def _data(self, operation: str, call: Callable[[], httpx2.Response]) -> dict[str, Any]:
         """One request, and every way it can fail turned into one exception.
 
         ``httpx2.HTTPError`` is the base of connect errors, timeouts, protocol
         errors and pool timeouts alike, so the one `except` covers the whole
-        transport surface; the status check covers the rest. Neither branch
-        formats a header.
+        transport surface; the status check covers the rest. `operation` is one
+        of two literals ("sign", "key read") naming which call failed, because
+        the path no longer may. Nothing formats a header, a path or a body.
         """
+        response: httpx2.Response | None = None
+        failure: str | None = None
         try:
             response = call()
         except httpx2.HTTPError as exc:
+            failure = type(exc).__name__
+        if response is None:
+            # Raised outside the `except`, `from None`: the original's message
+            # carries the address and the transport's own text.
             raise VaultTransitError(
-                f"Vault is unreachable at {path}: {type(exc).__name__}. No signature means no "
-                f"internal token and no backend call, which is the intended direction: this "
-                f"process fails closed rather than reaching a backend unauthenticated."
-            ) from exc
+                f"Vault is unreachable for the transit {operation} request "
+                f"({failure or 'UnknownError'}). No signature means no internal token and no "
+                f"backend call, which is the intended direction: this process fails closed "
+                f"rather than reaching a backend unauthenticated. Check POSTERN_VAULT_ADDR "
+                f"and the network path to it.",
+                kind=failure or "UnknownError",
+            ) from None
         if response.status_code >= 400:
             raise VaultTransitError(
-                f"{path} answered HTTP {response.status_code}: {_errors(response)}"
+                f"Vault answered HTTP {response.status_code} to the transit {operation} "
+                f"request. Vault's own audit device records why; its answer is not repeated "
+                f"here.",
+                status=response.status_code,
             )
         payload = response.json()
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
             raise VaultTransitError(
-                f"{path} answered HTTP {response.status_code} with no `data` object. That is "
-                f"not a transit endpoint; check POSTERN_VAULT_TRANSIT_MOUNT."
+                f"Vault answered HTTP {response.status_code} to the transit {operation} "
+                f"request with no `data` object. That is not a transit endpoint; check "
+                f"POSTERN_VAULT_TRANSIT_MOUNT.",
+                status=response.status_code,
             )
         return data
 
@@ -388,14 +428,17 @@ def _token_from(path: Path) -> str:
     backend call. A file read is single-digit microseconds against the 1.8ms
     the round trip it precedes costs.
     """
+    failure: str | None = None
     try:
         return path.read_text(encoding="utf-8").strip()
     except OSError as exc:
-        raise VaultTransitError(
-            f"cannot read the Vault token from {path}: {type(exc).__name__}. "
-            f"POSTERN_VAULT_TOKEN_PATH names the file a Vault Agent sink writes; without it "
-            f"this process can mint no token and will reach no backend."
-        ) from exc
+        failure = type(exc).__name__
+    raise VaultTransitError(
+        f"cannot read the Vault token file ({failure}). POSTERN_VAULT_TOKEN_PATH names the "
+        f"file a Vault Agent sink writes; without it this process can mint no token and "
+        f"will reach no backend.",
+        kind=failure,
+    ) from None
 
 
 def _unwrap(signature: object) -> bytes:
@@ -412,24 +455,6 @@ def _unwrap(signature: object) -> bytes:
             f"'vault:v<n>:<base64>', got {type(signature).__name__}."
         )
     return base64.b64decode(signature.split(":", 2)[2])
-
-
-def _errors(response: httpx2.Response) -> str:
-    """Vault's own ``errors`` array, or the body, capped.
-
-    Vault does not echo the token in an error body -- checked against 1.20.4
-    for 403, 400 and 404 -- but the cap is here anyway, for the same reason
-    `postern_core.facade.client`'s `_detail` caps a backend body: an error
-    string that lands in a log should not be able to carry an unbounded
-    response.
-    """
-    try:
-        body = response.json()
-    except ValueError:
-        return response.text[:200]
-    if isinstance(body, dict) and isinstance(body.get("errors"), list):
-        return "; ".join(str(item) for item in body["errors"])[:200]
-    return str(body)[:200]
 
 
 @dataclass(frozen=True, slots=True)

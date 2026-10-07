@@ -431,15 +431,18 @@ class TestItFailsClosed:
         with pytest.raises(VaultTransitError, match="403"):
             source.sign({"sub": CUST.value})
 
-    def test_a_refusal_names_the_path_and_vaults_own_error(
+    def test_a_refusal_names_the_status_and_neither_the_path_nor_vaults_own_error(
         self, vault: FakeVault, source: VaultTransitKeySource
     ) -> None:
+        """Changed from "names the path and Vault's error": FastMCP's own logger
+        writes this exception's text, so it is fixed (status or kind only)."""
         source.public_jwks()
         vault.fail_with = (403, {"errors": ["permission denied"]})
         with pytest.raises(VaultTransitError) as caught:
             source.sign({"sub": CUST.value})
-        assert "transit/sign/postern-read" in str(caught.value)
-        assert "permission denied" in str(caught.value)
+        assert caught.value.status == 403
+        assert "transit/sign/postern-read" not in str(caught.value)
+        assert "permission denied" not in str(caught.value)
 
     def test_no_refusal_ever_carries_the_vault_token(
         self, vault: FakeVault, source: VaultTransitKeySource, clock: Clock
@@ -485,8 +488,9 @@ class TestItFailsClosed:
             token=TOKEN,
             transport=httpx2.MockTransport(vault),
         )
-        with pytest.raises(VaultTransitError, match="ed25519"):
+        with pytest.raises(VaultTransitError, match="not an RSA key") as caught:
             src.public_jwks()
+        assert "ed25519" not in str(caught.value)
         src.close()
 
     def test_a_signature_for_the_wrong_version_is_refused(self, vault: FakeVault) -> None:
@@ -579,7 +583,7 @@ class TestTheVaultCredential:
             token_path=tmp_path / "absent",
             transport=httpx2.MockTransport(lambda r: httpx2.Response(200)),
         )
-        with pytest.raises(VaultTransitError, match="absent"):
+        with pytest.raises(VaultTransitError, match="POSTERN_VAULT_TOKEN_PATH"):
             src.sign({"sub": CUST.value})
         src.close()
 

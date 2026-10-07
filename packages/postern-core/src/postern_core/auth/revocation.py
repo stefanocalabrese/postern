@@ -407,7 +407,7 @@ def _parse_stamp(raw: Any) -> int:
     except (TypeError, ValueError) as exc:
         raise RevocationStoreUnavailable(
             f"revocation timestamp is corrupt: {type(exc).__name__}"
-        ) from exc
+        ) from None
 
 
 def _now_ms() -> int:
@@ -1077,7 +1077,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation list could not be read: {type(exc).__name__}"
-            ) from exc
+            ) from None
         members, stamps = results[: len(checks)], results[len(checks) :]
         if any(bool(result) for result in members):
             return True
@@ -1091,7 +1091,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation entry could not be removed: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
     async def revoke_session(self, *, jti: str) -> None:
         """The SET member and its index entry, in one script; then a bounded prune.
@@ -1113,7 +1113,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation entry could not be written: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
     async def restore_session(self, *, jti: str) -> None:
         """Remove the member AND its index entry.
@@ -1132,7 +1132,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation entry could not be removed: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
     async def prune_sessions(self, *, limit: int = SESSION_PRUNE_BATCH) -> int:
         try:
@@ -1142,7 +1142,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation list could not be pruned: {type(exc).__name__}"
-            ) from exc
+            ) from None
         return int(removed)
 
     async def unindexed_session_count(self) -> int:
@@ -1154,7 +1154,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation list could not be counted: {type(exc).__name__}"
-            ) from exc
+            ) from None
         return max(0, int(members) - int(indexed))
 
     async def revoke_customer_client(self, *, customer_ref: str, client_id: str) -> None:
@@ -1173,7 +1173,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation entry could not be written: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
     async def _get_stamp(self, key: str) -> int | None:
         """One stamp ``GET``; an outage or a corrupt value fails closed."""
@@ -1182,7 +1182,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation timestamp could not be read: {type(exc).__name__}"
-            ) from exc
+            ) from None
         return None if raw is None else _parse_stamp(raw)
 
     async def customer_revoked_at(self, customer_ref: str) -> int | None:
@@ -1208,7 +1208,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation entry could not be written: {type(exc).__name__}"
-            ) from exc
+            ) from None
 
     async def restore_client(self, *, client_id: str) -> None:
         await self._remove(self._clients_key, client_id)
@@ -1221,7 +1221,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation list could not be enumerated: {type(exc).__name__}"
-            ) from exc
+            ) from None
         return RevocationSnapshot(
             sessions=tuple(sorted(str(value) for value in sessions)),
             customer_clients=tuple(sorted(_pair_from_member(str(value)) for value in pairs)),
@@ -1253,7 +1253,7 @@ class RedisRevocationStore(RevocationStoreBase):
         except Exception as exc:
             raise RevocationStoreUnavailable(
                 f"revocation list could not be read: {type(exc).__name__}"
-            ) from exc
+            ) from None
         return any(_pair_from_member(str(value))[0] == customer_ref for value in members)
 
     async def close(self) -> None:

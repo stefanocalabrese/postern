@@ -275,8 +275,8 @@ call N with call N+1's body. That is a correctness argument, not hygiene. It als
 means a 2.0 s timeout costs a 55 ms restart, which is affordable.
 
 **Malformed output.** Host-side pydantic validation through `build_model`, which
-already turns a `ValidationError` into a `BackendError` naming fields and not
-values, for the reason that module's docstring gives about FastMCP's own logger.
+already turns a `ValidationError` into a status-502 `BackendError` carrying no field or
+value, for the reason that module's docstring gives about FastMCP's own logger.
 
 **A valid-looking wrong answer.** Not detectable, and the spec should say so
 plainly rather than gesture at defence in depth. A module that returns the wrong
