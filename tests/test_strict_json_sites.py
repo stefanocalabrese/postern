@@ -14,7 +14,8 @@ body, so it has no site.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import sys
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import replace
 from typing import Any
 
@@ -274,3 +275,127 @@ async def test_the_api_refuses_a_non_finite_number_in_a_body_that_is_not_a_tool_
     assert _parse_error_shape(response) == PARSE_ERROR
     assert backend_paths == []
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# services/api: a body the strict parser cannot read never reaches FastMCP.
+# ---------------------------------------------------------------------------
+
+DIGIT_PAD = "7" * 700
+
+
+@pytest.fixture()
+def small_int_digit_limit() -> Iterator[None]:
+    """640 is the smallest limit Python allows; same as PYTHONINTMAXSTRDIGITS=640."""
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(640)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def _padded_call(meta_x: str) -> str:
+    return (
+        '{"pad":' + DIGIT_PAD + ',"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        '"params":{"name":"accounts.list","arguments":{},"_meta":{"x":' + meta_x + "}}}"
+    )
+
+
+@pytest.mark.usefixtures("small_int_digit_limit")
+@pytest.mark.parametrize("meta_x", ["NaN", "1"])
+async def test_a_body_the_strict_parser_cannot_read_is_not_handed_to_a_second_parser(
+    pg_url: str, meta_x: str
+) -> None:
+    """The reviewer's exploit. The stdlib refuses a 700-digit integer once the
+    limit is 640, so the middleware cannot read the body; FastMCP's own
+    parser (jiter) has a fixed limit of its own, reads it, and accepts `NaN`.
+    Unfixed, the body was passed through: 200, the backend reached, two audit
+    rows. The `1` variant is the same body with nothing non-finite in it: the
+    refusal is of an unparseable body, not of the constant."""
+    response, backend_paths, rows = await _api_post(pg_url, _padded_call(meta_x))
+
+    assert _parse_error_shape(response) == PARSE_ERROR
+    assert response.json()["error"]["message"] == "Parse error"
+    assert backend_paths == []
+    assert rows == []
+
+
+@pytest.mark.usefixtures("small_int_digit_limit")
+async def test_a_normal_body_still_passes_under_the_same_digit_limit(pg_url: str) -> None:
+    response, backend_paths, rows = await _api_post(pg_url, _call("1"))
+
+    assert response.status_code == 200, response.text
+    assert backend_paths == ["/accounts"]
+    assert len(rows) >= 1
+
+
+async def test_a_nesting_depth_the_parser_cannot_read_is_answered_by_the_middleware(
+    pg_url: str,
+) -> None:
+    """200,000 nested arrays: `RecursionError`, refused with the middleware's
+    own fixed message and not FastMCP's detailed one."""
+    deep = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"accounts.list",'
+    deep += '"arguments":{"x":' + "[" * 200_000 + "}}}"
+    response, backend_paths, rows = await _api_post(pg_url, deep)
+
+    assert _parse_error_shape(response) == PARSE_ERROR
+    assert response.json()["error"]["message"] == "Parse error"
+    assert backend_paths == []
+    assert rows == []
+
+
+async def test_an_underflowing_number_is_finite_and_passes(pg_url: str) -> None:
+    """`1e-999` is 0.0, which is finite: not refused by the parser or the api."""
+    response, backend_paths, _ = await _api_post(pg_url, _call("1e-999"))
+
+    assert response.status_code == 200, response.text
+    assert backend_paths == ["/accounts"]
+
+
+# ---------------------------------------------------------------------------
+# services/confirm: nesting past the recursion limit is the same malformed body.
+# ---------------------------------------------------------------------------
+
+DEEP_BODY = "[" * 20_000
+
+
+async def test_device_authorization_answers_a_too_deep_body_as_malformed_json(
+    app: Starlette,
+) -> None:
+    control = await post_raw(app, "/device_authorization", "{not json")
+    before = dict(device_store_of(app)._codes)  # type: ignore[attr-defined]
+
+    resp = await post_raw(app, "/device_authorization", DEEP_BODY)
+
+    assert (resp.status_code, resp.json()) == (control.status_code, control.json())
+    assert dict(device_store_of(app)._codes) == before  # type: ignore[attr-defined]
+
+
+async def test_scan_answers_a_too_deep_body_as_malformed_json(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    code = await new_pairing(app)
+    headers = bearer(key_pair)
+    control = await post_raw(app, "/scan", "{not json", headers)
+
+    resp = await post_raw(app, "/scan", DEEP_BODY, headers)
+
+    assert (resp.status_code, resp.json()) == (control.status_code, control.json())
+    assert (await device_store_of(app).get_device_code(code.device_code)).scanned_by == ""  # type: ignore[union-attr]
+    assert await audit_rows(clean) == []
+
+
+async def test_approve_answers_a_too_deep_body_as_malformed_json(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair
+) -> None:
+    code = await new_pairing(app)
+    await scan_in_store(app, code.user_code, ALICE)
+    headers = bearer(key_pair)
+    control = await post_raw(app, "/approve", "{not json", headers)
+
+    resp = await post_raw(app, "/approve", DEEP_BODY, headers)
+
+    assert (resp.status_code, resp.json()) == (control.status_code, control.json())
+    assert (await device_store_of(app).get_device_code(code.device_code)).approved is False  # type: ignore[union-attr]
+    assert await audit_rows(clean) == []

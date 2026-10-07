@@ -13,7 +13,7 @@ FastMCP exposes no way to set the HTTP status from a tool or hook.
 import json
 from typing import Any
 
-from postern_core.json_strict import NonFiniteJsonError, loads_finite
+from postern_core.json_strict import loads_finite
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 HEADER_MISMATCH = -32020
@@ -58,7 +58,7 @@ class HeaderBodyValidation:
             return
         try:
             problem = self._check(_headers(scope), body)
-        except NonFiniteJsonError:
+        except _Unparseable:
             await _reject_parse_error(send)
             return
         if problem is not None:
@@ -136,76 +136,46 @@ def _single(headers: dict[str, list[str]], name: str) -> tuple[str | None, bool]
     return matches[0], False
 
 
+class _Unparseable(Exception):
+    """The body cannot be read as JSON by the strict parser; `__call__` refuses it."""
+
+
 def _parse(body: bytes) -> dict[str, Any] | None:
-    """The body as a JSON object, or `None` when there is nothing to compare.
+    """The body as a JSON object, `None` when it is JSON but not an object, and
+    `_Unparseable` when the strict parser cannot read it at all.
 
-    `None` is not a verdict. It says this middleware could not derive the two
-    values the spec has it cross-check, so it has no opinion and the body goes
-    downstream unchanged. `test_unparseable_body_is_left_to_the_mcp_layer` and
-    finding 7 of dev-docs/decisions/0002-header-validation.md already pin that
-    for `b"not json"` and for a top-level array.
+    `None` is not a verdict. A top-level array, string or number parsed fine and
+    has no `method` to compare, so the body goes downstream unchanged, as
+    finding 7 of dev-docs/decisions/0002-header-validation.md records.
 
-    `RecursionError` IS NAMED HERE BECAUSE `json.loads` RAISES IT, and it is a
-    `RuntimeError` subclass that `except (ValueError, UnicodeDecodeError)` does
-    not catch. Measured against the real assembled app on 2026-09-24, before
-    this line named it: `b"[" * 200_000` -- 200,000 bytes, under a
-    `max_body_bytes` of 1,048,576, and cheap to send -- left this middleware
-    as an exception, reached Starlette's `ServerErrorMiddleware` (which wraps
-    `user_middleware` and is therefore OUTSIDE this control), and produced
-    `500 Internal Server Error` plus a logged traceback out of a control whose
-    entire job is to refuse cleanly. `services/confirm/callback.py` had the
-    same escape on the write path and `0743101` closed it; this is the read
-    path's half, and `tests/test_confirm_body_limit.py`'s docstring for
-    `30,000 nested arrays` names this function as the one that would still
-    miss it.
+    EVERY BODY THE STRICT PARSER CANNOT READ IS REFUSED HERE, with HTTP 400 and
+    JSON-RPC -32700, and never passed on. Until 2026-10-07 the unreadable ones
+    (not JSON, not UTF-8, nested past the recursion limit) returned `None` and
+    were left to FastMCP on the argument that its parser gives up at the same
+    point. That argument was about a parser in another package, and it was
+    false the moment the two disagreed: with `sys.set_int_max_str_digits(640)`
+    (`PYTHONINTMAXSTRDIGITS=640`) the stdlib refuses a 700-digit integer, while
+    FastMCP's `pydantic_core.from_json` has a limit of its own, reads it, and
+    accepts `NaN`. The body then reached a tool, the backend and the audit log
+    with this control's cross-check skipped. A second parser that can read what
+    this one cannot makes the cross-check, and the refusal of non-finite
+    numbers, decorative; so nothing this parser declines is handed to another.
 
-    IT RETURNS `None` RATHER THAN REJECTING, which is the part that was a
-    decision and not a port. The write path answers 400 for the same body
-    because `services/confirm/callback.py` is the component that would
-    otherwise execute on it. This middleware is not: FastMCP's dispatcher sits
-    behind it and parses the same bytes itself. Measured through the real
-    stack on 2026-09-24, the passed-through body gets `400` with JSON-RPC
-    `-32700` "Parse error" -- the code that exists for precisely this, from
-    the layer that owns JSON-RPC error semantics. Two reasons to leave it
-    there:
+    The refusals this covers, all `_Unparseable`: `json.JSONDecodeError`,
+    `UnicodeDecodeError`, any other `ValueError` (an integer past the digit
+    limit), `NonFiniteJsonError` (`NaN`, `Infinity`, `-Infinity`, `1e999`), and
+    `RecursionError`, which is a `RuntimeError` and not a `ValueError`: 200,000
+    nested arrays, under `max_body_bytes`, left this middleware as an exception
+    until 2026-09-24 and produced a 500 from Starlette's `ServerErrorMiddleware`.
 
-    1. Both parses give up at the same depth, so nothing this function
-       declines can go on to execute. That is measured, not assumed, and the
-       mechanism is why it is stable: on CPython 3.12.13 the `_json` C scanner
-       spends a C-stack budget of its own, not Python frames. Measured here,
-       the ceiling is 9,997 nested arrays and it does not move --
-       `sys.setrecursionlimit(100)` and `sys.setrecursionlimit(20_000)` both
-       leave it at 9,997, and so do 500 and 900 extra Python frames under the
-       call. So this middleware's position in the stack, which is outside the
-       dispatcher, buys the dispatcher no headroom this function did not also
-       have. Through the real assembled app the two thresholds coincide
-       exactly: an `arguments` value nested 9,990 deep is cross-checked here
-       and answered by the tool layer; 9,991 deep is passed through
-       uncross-checked and answered `-32700`.
-    2. Rejecting would need this control to own a code for "too deeply
-       nested". It owns exactly one, `-32020` "Header mismatch", and that
-       would be a false statement about a request whose headers were never
-       compared to anything.
-
-    Reason 1 is load-bearing and it is a fact about a parser in another
-    package, so it is pinned rather than trusted:
-    `test_a_deeply_nested_body_is_refused_by_the_mcp_layer_with_32700` finds
-    the shallowest body this function declines and drives THAT through the
-    real stack, so it fails if a future parser downstream ever accepts what
-    this one rejects.
+    The answer is 400 -32700 "Parse error", the code JSON-RPC defines for it,
+    and not -32020, which this control owns for "Header mismatch" and would
+    misstate about a request whose headers were never compared to anything.
     """
     try:
         payload = loads_finite(body)
-    except NonFiniteJsonError:
-        # NOT `None`. FastMCP's own parser accepts `NaN`, `Infinity` and a
-        # literal like `1e999` (measured 2026-10-07: a `tools/call` carrying
-        # `NaN` in `_meta` reached the tool and wrote its audit row), so
-        # passing such a body through is passing it to a handler. `__call__`
-        # refuses it with the JSON-RPC answer the dispatcher gives a body that
-        # is not JSON.
-        raise
-    except (ValueError, UnicodeDecodeError, RecursionError):
-        return None
+    except (ValueError, RecursionError) as exc:
+        raise _Unparseable from exc
     return payload if isinstance(payload, dict) else None
 
 

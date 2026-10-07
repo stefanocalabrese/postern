@@ -135,11 +135,20 @@ async def test_resources_read_matches_on_uri_not_name() -> None:
     assert _status(sent) == 200
 
 
-async def test_unparseable_body_is_left_to_the_mcp_layer() -> None:
+async def test_unparseable_body_is_refused_with_a_parse_error() -> None:
+    """Refused HERE, not left to FastMCP: a second parser that reads a body this
+    one cannot is a parser difference, and a parser difference is what a
+    request-smuggling shape needs. HTTP 400 with JSON-RPC -32700, id null."""
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen))
     sent = await _call(app, {"Mcp-Method": "tools/call"}, b"not json")
-    assert _status(sent) == 200
+    assert _status(sent) == 400
+    assert _json(sent) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32700, "message": "Parse error"},
+    }
+    assert seen == []
 
 
 async def test_non_post_requests_are_ignored() -> None:
@@ -193,20 +202,21 @@ async def _call_raw(
     return sent
 
 
-async def test_non_utf8_body_does_not_crash_and_is_left_to_the_mcp_layer() -> None:
+async def test_non_utf8_body_does_not_crash_and_is_refused_with_a_parse_error() -> None:
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen))
     body = b"\xff\xfe\x00\x01not-utf8"
     sent = await _call(app, {"Mcp-Method": "tools/call", "Mcp-Name": "accounts.list"}, body)
-    assert _status(sent) == 200
-    assert seen == [body]
+    assert _status(sent) == 400
+    assert _json(sent)["error"]["code"] == -32700
+    assert seen == []
 
 
 async def test_json_array_body_is_not_a_batch_and_does_not_crash() -> None:
     """2026-07-28 sends one message per POST, so a top-level array is not a
     legitimate batch; `_parse` only accepts a dict and returns `None`
-    otherwise, so this is left to the MCP layer, same as any other body this
-    middleware cannot validate. It must not crash on the way there.
+    otherwise, so this is left to the MCP layer, same as any other JSON body
+    this middleware has no `method` to compare in. It must not crash on the way there.
     """
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen))
@@ -494,18 +504,22 @@ async def test_body_split_across_multiple_asgi_messages_is_reassembled_byte_iden
     assert seen == [CALL]
 
 
-async def test_zero_length_body_passes_through_unchanged() -> None:
+async def test_zero_length_body_is_refused_as_a_parse_error() -> None:
+    """An empty body is not JSON; it is refused here like any other, and not
+    left to a second parser."""
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen), strict=False)
     sent = await _call(app, {}, b"")
-    assert _status(sent) == 200
-    assert seen == [b""]
+    assert _status(sent) == 400
+    assert _json(sent)["error"]["code"] == -32700
+    assert seen == []
 
 
-async def test_disconnect_mid_drain_does_not_crash_and_downstream_gets_the_partial_body() -> None:
+async def test_disconnect_mid_drain_does_not_crash_and_the_partial_body_is_refused() -> None:
     """A client can disconnect before sending the rest of the body. The drain
     loop must not raise, and whatever was collected before the disconnect is
-    what gets replayed -- there is nothing else to replay.
+    what is parsed: a truncated JSON document, so it is refused with a parse
+    error and never replayed.
     """
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen))
@@ -535,7 +549,9 @@ async def test_disconnect_mid_drain_does_not_crash_and_downstream_gets_the_parti
         sent.append(message)
 
     await app(scope, receive, send)  # must not raise
-    assert seen == [CALL[:5]]
+    assert seen == []
+    assert _status(sent) == 400
+    assert _json(sent)["error"]["code"] == -32700
 
 
 async def test_body_exceeding_configured_cap_is_rejected_with_413_and_stops_buffering() -> None:
@@ -768,9 +784,13 @@ async def test_the_cap_boundary_is_exact() -> None:
     for size, expected in ((63, 200), (64, 200), (65, 413)):
         seen: list[bytes] = []
         app = HeaderBodyValidation(_downstream(seen), max_body_bytes=64)
-        sent, _ = await _drive(app, {}, _Counted(b"x" * size, 1))
+        # A JSON string of exactly `size` bytes: valid JSON that is not an
+        # object, which passes through; arbitrary bytes would be refused as
+        # unparseable and would hide the cap.
+        body = b'"' + b"x" * (size - 2) + b'"'
+        sent, _ = await _drive(app, {}, _Counted(body, 1))
         assert _status(sent) == expected, f"{size} bytes against a cap of 64"
-        assert seen == ([b"x" * size] if expected == 200 else [])
+        assert seen == ([body] if expected == 200 else [])
 
 
 DEEP = b"[" * 200_000
@@ -789,27 +809,25 @@ async def test_a_deeply_nested_body_does_not_escape_the_middleware() -> None:
     outside this control. `services/confirm/callback.py` had the same escape
     and `0743101` closed it.
 
-    What it produces instead is what `_parse`'s docstring argues for at
-    length: nothing. It is a body this middleware cannot cross-check, so it
-    goes downstream exactly as `b"not json"` and a top-level array already do
-    (finding 7 of dev-docs/decisions/0002-header-validation.md), and the test
-    below pins the part that makes that safe.
+    What it produces instead is a 400 with -32700 from this middleware: a
+    body it cannot parse is refused here and never handed to another parser
+    (see `_parse`'s docstring). The body goes downstream only when it parsed.
     """
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen))
     sent = await _call(app, {"Mcp-Method": "tools/call", "Mcp-Name": "accounts.list"}, DEEP)
-    assert _status(sent) == 200
-    assert seen == [DEEP]
+    assert _status(sent) == 400
+    assert _json(sent)["error"] == {"code": -32700, "message": "Parse error"}
+    assert seen == []
 
 
 async def test_a_deeply_nested_body_behaves_identically_under_strict_headers() -> None:
     """`strict` does not reach this body, in either direction.
 
-    `_check` returns at `payload is None` before either `if self.strict`
-    branch, so an unparseable body is passed through whether or not strict
-    mode is on -- which is true of `b"not json"` today and stays true of a
-    deeply nested one. Recorded because the two fixes in this commit had to be
-    checked against the flag, not because the flag should change: it defaults
+    `_parse` raises before either `if self.strict` branch, so an unparseable
+    body is refused whether or not strict mode is on. Recorded because the
+    fixes had to be checked against the flag, not because the flag should
+    change: it defaults
     to `False` in `services/api/settings.py` and `docker-compose.yml` ships
     `"0"`, so a fix that only held under `strict=True` would not hold in the
     configuration that actually ships.
@@ -817,25 +835,24 @@ async def test_a_deeply_nested_body_behaves_identically_under_strict_headers() -
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen), strict=True)
     sent = await _call(app, {}, DEEP)
-    assert _status(sent) == 200
-    assert seen == [DEEP]
+    assert _status(sent) == 400
+    assert _json(sent)["error"] == {"code": -32700, "message": "Parse error"}
+    assert seen == []
 
 
-async def test_a_deeply_nested_body_is_refused_by_the_mcp_layer_with_32700() -> None:
-    """The fact that makes passing it through safe, pinned rather than
-    trusted.
+async def test_a_deeply_nested_body_is_refused_by_the_middleware_with_32700() -> None:
+    """The refusal is the middleware's own, at the depth where it stops parsing.
 
-    `_parse` returns `None` on the measured fact that the layer below gives up
-    at the same depth it does, so nothing it declines can go on to execute.
-    That is a fact about a parser in another package, so it is checked here
-    against the real stack rather than assumed -- and at the BOUNDARY, since
-    the boundary is the only place a divergence could appear. The depth is
-    searched for rather than written down: on CPython 3.12.13 the `_json` C
-    scanner stops at 9,997 nested arrays, but that is an interpreter constant
-    this test has no business hardcoding.
-
-    If a future parser downstream ever accepts what this one rejects, the body
-    runs with the header/body cross-check silently skipped, and this fails.
+    Until 2026-10-07 `_parse` returned `None` for a body it could not read and
+    this test pinned that the layer below gave up at the same depth. That was a
+    fact about a parser in another package, and it did not survive contact with
+    a second one (see `tests/test_strict_json_sites.py`, the integer-digit
+    limit): now every body this middleware cannot parse strictly is answered
+    here, and what is pinned is that the answer is the middleware's, identified
+    by its fixed message "Parse error" and not FastMCP's detailed one, at the
+    BOUNDARY as well as at the gross case. The depth is searched for rather
+    than written down: on CPython 3.12.13 the `_json` C scanner stops at 9,997
+    nested arrays, an interpreter constant this test has no business hardcoding.
 
     `raise_app_exceptions` is left at its default `True`, so a `RecursionError`
     escaping the middleware again propagates here and fails the test loudly
@@ -844,7 +861,7 @@ async def test_a_deeply_nested_body_is_refused_by_the_mcp_layer_with_32700() -> 
     import httpx2
     from starlette.middleware import Middleware
 
-    from services.api.asgi.header_validation import _parse
+    from services.api.asgi.header_validation import _parse, _Unparseable
     from services.api.server import build_server
     from services.api.settings import Settings
     from tests.conftest import TEST_CUSTOMER
@@ -858,15 +875,19 @@ async def test_a_deeply_nested_body_is_refused_by_the_mcp_layer_with_32700() -> 
             '"io.modelcontextprotocol/clientCapabilities":{}}}}'
         ).encode()
 
-    # The shallowest body `_parse` declines: binary search over a range wide
-    # enough that hitting its top would mean the ceiling moved, which the
-    # assertion below reports rather than silently passing.
+    def declined(body: bytes) -> bool:
+        try:
+            _parse(body)
+        except _Unparseable:
+            return True
+        return False
+
     low, high = 1, 100_000
-    assert _parse(body_at(low)) is not None, "the search must start from a body that parses"
-    assert _parse(body_at(high)) is None, f"_parse still reads {high:,} levels; widen the search"
+    assert not declined(body_at(low)), "the search must start from a body that parses"
+    assert declined(body_at(high)), f"_parse still reads {high:,} levels; widen the search"
     while low < high - 1:
         middle = (low + high) // 2
-        if _parse(body_at(middle)) is None:
+        if declined(body_at(middle)):
             high = middle
         else:
             low = middle
@@ -910,7 +931,7 @@ async def test_a_deeply_nested_body_is_refused_by_the_mcp_layer_with_32700() -> 
 
     for status, payload in answers:
         assert status == 400, payload
-        assert payload["error"]["code"] == -32700, payload
+        assert payload["error"] == {"code": -32700, "message": "Parse error"}, payload
 
 
 async def test_a_chunked_matching_request_is_replayed_in_a_shape_the_dispatcher_reads() -> None:

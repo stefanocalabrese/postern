@@ -488,10 +488,11 @@ async def device_authorization(request: Request) -> JSONResponse:
     if "application/json" in content_type:
         # `loads_finite`, not `request.json()`: `NaN`, `Infinity` and a literal
         # like `1e999` are refused as a body that is not JSON. `ValueError`
-        # covers the decode error, bad UTF-8 and that refusal alike.
+        # covers the decode error, bad UTF-8 and that refusal alike, and
+        # `RecursionError` (a `RuntimeError`) is a body nested past the limit.
         try:
             body = loads_finite(await request.body())
-        except ValueError:
+        except (ValueError, RecursionError):
             return _error(400, "invalid_request", "body must be JSON")
         if not isinstance(body, dict):
             return _error(400, "invalid_request", "body must be a JSON object")
@@ -2082,7 +2083,7 @@ async def _pair(
 
     try:
         body = loads_finite(await request.body())
-    except ValueError:
+    except (ValueError, RecursionError):
         return _Pairing(_error(400, "invalid_request", "body must be JSON"), recorded=False)
     if not isinstance(body, dict):
         return _Pairing(
@@ -2539,7 +2540,7 @@ async def _scan(
 
     try:
         body = loads_finite(await request.body())
-    except ValueError:
+    except (ValueError, RecursionError):
         return _Scanned(_error(400, "invalid_request", "body must be JSON"), recorded=False)
     if not isinstance(body, dict):
         return _Scanned(

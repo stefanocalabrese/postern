@@ -18,8 +18,9 @@ only that class has to be widened, which is what the three device-grant
 handlers were.
 
 Duplicate keys, nesting depth and size are NOT handled here. Depth raises
-``RecursionError`` exactly as ``json.loads`` does and callers that name it keep
-naming it; size is the body-limit middlewares' job.
+``RecursionError`` exactly as ``json.loads`` does; it is a ``RuntimeError``, not
+a ``ValueError``, so a caller must catch it by name, and every call site in
+``services/`` does; size is the body-limit middlewares' job.
 """
 
 from __future__ import annotations

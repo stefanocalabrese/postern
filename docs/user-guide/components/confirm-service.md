@@ -135,7 +135,8 @@ A JSON body on `/device_authorization`, `/scan`, `/approve` or the challenge
 callback is read with `postern_core.json_strict.loads_finite`, so `NaN`,
 `Infinity`, `-Infinity` and an overflowing literal such as `1e999` are refused
 exactly as a body that is not JSON is (400 `invalid_request`, "body must be JSON",
-on the three device-grant routes). `/token` reads a form and has no JSON body.
+on the three device-grant routes; the callback's `malformed_body` 400). So does a body nested past
+the recursion limit. `/token` reads a form and has no JSON body.
 
 ### Flow
 
