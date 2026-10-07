@@ -33,10 +33,14 @@ import httpx2
 import pytest
 from postern_core.domain.masking import SCRUB_MAX_DEPTH, TOO_DEEP, scrub_text, scrub_tree
 from postern_core.identity import CustomerRef
+from postern_core.json_strict import loads_finite_utf8
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry
 from sqlalchemy import select
+from starlette.types import Message, Receive, Scope, Send
 
+from services.api.asgi import header_validation
+from services.api.asgi.header_validation import HeaderBodyValidation, _storable
 from services.api.main import create_app
 from services.api.settings import Settings
 from tests.fixtures import backend_responses as fx
@@ -167,12 +171,34 @@ async def test_a_string_the_audit_row_cannot_hold_is_refused_as_a_parse_error(
 async def test_a_valid_surrogate_pair_and_ordinary_unicode_are_not_refused(pg_url: str) -> None:
     """A pair is ONE code point once decoded (U+1F600), not two surrogates."""
     response, backend_paths, rows = await _post(
-        pg_url, _call(LEGACY, meta_members='"x":"\\ud83d\\ude00 caf\\u00e9"'), LEGACY
+        pg_url,
+        # U+D7FF and U+E000 are the code points either side of the surrogate
+        # block and are ordinary text: a range widened by one at either end
+        # would refuse them.
+        _call(LEGACY, meta_members='"x":"\\ud83d\\ude00 caf\\u00e9 \\ud7ff \\ue000"'),
+        LEGACY,
     )
 
     assert response.status_code == 200, response.text
     assert backend_paths == ["/accounts"]
     assert len(rows) >= 1
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+async def test_a_top_level_array_is_walked_too(pg_url: str, protocol: dict[str, str]) -> None:
+    """A batch is refused downstream anyway, which is why a walk that skipped a
+    top-level list would go unnoticed; the refusal is pinned here so it cannot
+    start to matter. Same answer as the object form, on both protocols."""
+    plain = await _post(pg_url, "[" + _call(protocol) + "]", protocol)
+    assert plain[0].status_code != 400 or _shape(plain[0]) != PARSE_ERROR
+
+    response, backend_paths, rows = await _post(
+        pg_url, "[" + _call(protocol, id_='"\\u0000"') + "]", protocol
+    )
+
+    assert _shape(response) == PARSE_ERROR, response.text
+    assert backend_paths == []
+    assert rows == []
 
 
 def _nested(depth: int) -> str:
@@ -262,3 +288,88 @@ def test_scrub_tree_does_not_raise_on_any_depth(depth: int) -> None:
     for _ in range(depth):
         tree = [tree]
     assert TOO_DEEP in repr(scrub_tree({"a": tree}))
+
+
+# ---------------------------------------------------------------------------
+# The walk itself, and the REAL node cap.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (chr(0xD7FF), True),
+        (chr(0xE000), True),
+        (chr(0xD800), False),
+        (chr(0xDFFF), False),
+        ("\x00", False),
+    ],
+)
+def test_the_walk_accepts_the_code_points_either_side_of_the_surrogate_block(
+    text: str, expected: bool
+) -> None:
+    """As a value, as a key, and nested in a list inside a dict."""
+    assert _storable(text) is expected
+    assert _storable({"k": text}) is expected
+    assert _storable({text: 1}) is expected
+    assert _storable({"a": [1, [{"b": [text]}]]}) is expected
+    assert _storable([text]) is expected
+
+
+def test_the_node_cap_is_one_million() -> None:
+    assert header_validation.MAX_WALK_NODES == 1_000_000
+
+
+async def _run(raw: bytes, max_body_bytes: int | None) -> tuple[int, list[bytes]]:
+    """Drive the middleware with `raw`; return the status and what went downstream."""
+    seen: list[bytes] = []
+    statuses: list[int] = []
+
+    async def downstream(scope: Scope, receive: Receive, send: Send) -> None:
+        message = await receive()
+        seen.append(message.get("body", b""))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": raw, "more_body": False}
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+
+    scope: Scope = {"type": "http", "method": "POST", "headers": []}
+    await HeaderBodyValidation(downstream, max_body_bytes=max_body_bytes)(scope, receive, send)
+    return statuses[0], seen
+
+
+def _numbers(count: int) -> bytes:
+    """A top-level array of `count` numbers: `count + 1` nodes, 2 bytes each."""
+    return ("[" + ",".join(["0"] * count) + "]").encode()
+
+
+@pytest.mark.parametrize(
+    ("count", "status"), [(999_998, 200), (999_999, 200), (1_000_000, 400), (1_000_001, 400)]
+)
+async def test_the_real_node_cap_refuses_exactly_past_one_million_nodes(
+    count: int, status: int
+) -> None:
+    """Not monkeypatched: 999,999 numbers plus the array is 1,000,000 nodes and
+    passes, one more is refused. A cap of 10**9 passes all four."""
+    raw = _numbers(count)
+    got, seen = await _run(raw, max_body_bytes=4 * 1024 * 1024)
+
+    assert got == status
+    assert (seen == [raw]) is (status == 200)
+    if status == 400:
+        assert loads_finite_utf8(raw)  # it parsed: the refusal is the cap, not the parser
+
+
+async def test_the_cap_never_fires_at_the_default_body_limit() -> None:
+    """The largest all-numbers body 1 MiB holds is about 524,000 nodes."""
+    limit = 1_048_576
+    count = (limit - 1) // 2
+    raw = _numbers(count)
+    assert len(raw) <= limit
+    got, seen = await _run(raw, max_body_bytes=limit)
+    assert got == 200 and seen == [raw]

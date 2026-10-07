@@ -113,6 +113,15 @@ Enforces MCP Streamable HTTP spec compliance:
   iterative. Nesting depth is not refused: an `arguments` tree nested past 100 containers is
   recorded in the audit row with the string `"[nested too deeply]"` in place of everything
   below that depth, and the call is audited like any other
+- Why a body that parsed is still answered `-32700` "Parse error": the audit row written before
+  the backend is reached cannot hold the value, so the call is refused before any side effect
+  rather than run with no record. `-32600` would describe it more exactly; `-32700` stays
+  because it is the code clients already see. One behaviour changed with it: a U+0000 inside an
+  argument VALUE used to be stripped on its way to the audit row and the call succeeded; it is
+  refused now, like the same character anywhere else in the body
+- The 1,000,000-node cap does not scale with `POSTERN_MAX_BODY_BYTES`. At the 1 MiB default a
+  body holds about 524,000 nodes at most, so the cap never fires. From about 1.9 MiB up (or with
+  no limit set) a valid body of more than 1,000,000 numbers is refused as a parse error
 - This applies to EVERY POST path on the api, whatever it routes to, and it runs before
   authentication: a POST whose body is not JSON gets 400 / `-32700` instead of the 405, 404 or
   401 the route would give, as the 413 and `-32020` refusals already do. A future form-encoded

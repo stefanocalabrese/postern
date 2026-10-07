@@ -11,10 +11,10 @@ FastMCP exposes no way to set the HTTP status from a tool or hook.
 """
 
 import json
-import re
 from typing import Any
 
 from postern_core.json_strict import loads_finite_utf8
+from postern_core.unstorable import contains_unstorable_character
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 HEADER_MISMATCH = -32020
@@ -185,6 +185,25 @@ def _parse(body: bytes) -> dict[str, Any] | None:
     The answer is 400 -32700 "Parse error", the code JSON-RPC defines for it,
     and not -32020, which this control owns for "Header mismatch" and would
     misstate about a request whose headers were never compared to anything.
+
+    -32700 IS ANSWERED FOR A BODY THAT DID PARSE (the U+0000 / surrogate and
+    node-cap refusals), and -32600 "Invalid Request" would describe that more
+    exactly. It stays -32700 because the code is an observed contract and
+    changing it would change what clients already see, not because the text
+    is accurate. WHY it is a refusal at all: the audit ENTRY row is written
+    before the backend is reached and cannot hold the value (PostgreSQL
+    refuses U+0000, UTF-8 cannot encode a surrogate), so the call is refused
+    before any side effect rather than run with no record.
+
+    DOCUMENTED BEHAVIOUR CHANGE: a U+0000 inside an argument VALUE used to be
+    stripped by `scrub_text` on its way to the audit row and the call
+    succeeded. It is refused now, like the same character anywhere else in the
+    body, because the walk cannot tell an argument value from a JSON-RPC `id`.
+
+    `_reject` calls this a second time on the -32020 path, so a body that is
+    refused for a header mismatch is parsed and walked twice (about 40 ms per
+    MiB). Left as it is: the path is a refusal, and one parse threaded
+    through `_check` would change three signatures for it.
     """
     try:
         payload = loads_finite_utf8(body)
@@ -193,9 +212,6 @@ def _parse(body: bytes) -> dict[str, Any] | None:
     if not _storable(payload):
         raise _Unparseable
     return payload if isinstance(payload, dict) else None
-
-
-_UNSTORABLE_CHARACTER = re.compile("[\x00\ud800-\udfff]")
 
 
 def _storable(payload: object) -> bool:
@@ -214,8 +230,14 @@ def _storable(payload: object) -> bool:
 
     ITERATIVE ON PURPOSE: the stdlib parser reads about 9,997 levels, and a
     recursive walk raises `RecursionError` on exactly the bodies this exists
-    for. The node cap is the walk's own bound; at one million nodes it is far
-    above anything `max_body_bytes` lets in and refuses what is above it.
+    for. The node cap is the walk's own bound. A node costs at least two bytes
+    (`0,`), so at the 1 MiB default of `max_body_bytes` a body holds about
+    524,000 nodes and the cap never fires. IT DOES NOT SCALE WITH
+    `max_body_bytes`: that setting is operator-chosen, and from about 1.9 MiB
+    up (or with no limit set) a VALID body of more than 1,000,000 numbers is
+    refused as a parse error. The constant is not derived from the setting
+    because the walk's CPU bound is the point of it; raise `MAX_WALK_NODES` in
+    step if a deployment sets the body limit past 1.9 MiB.
     Depth is not refused here, `scrub_tree` bounds it for the audit row.
     """
     stack: list[object] = [payload]
@@ -226,12 +248,12 @@ def _storable(payload: object) -> bool:
         if visited > MAX_WALK_NODES:
             return False
         if isinstance(node, str):
-            if _UNSTORABLE_CHARACTER.search(node):
+            if contains_unstorable_character(node):
                 return False
         elif isinstance(node, dict):
             for key, value in node.items():
                 visited += 1
-                if _UNSTORABLE_CHARACTER.search(key):
+                if contains_unstorable_character(key):
                     return False
                 stack.append(value)
         elif isinstance(node, list):

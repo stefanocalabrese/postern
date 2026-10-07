@@ -140,6 +140,7 @@ from postern_core.risk.pairing_network import (
 )
 from postern_core.risk.types import signal_to_json
 from postern_core.store.engine import Database
+from postern_core.unstorable import contains_unstorable_character
 from pydantic import ValidationError
 from redis.exceptions import RedisError
 from starlette.requests import Request
@@ -533,6 +534,20 @@ async def device_authorization(request: Request) -> JSONResponse:
             "invalid_scope",
             f"scopes exceeds {settings.max_scopes_length} characters",
         )
+
+    # U+0000 AND LONE SURROGATES, REFUSED. Both strings are stored and `client_id`
+    # is minted into the session token and written to an `audit_log` row at
+    # `/approve`; PostgreSQL refuses NUL and UTF-8 cannot encode a surrogate
+    # (`postern_core.unstorable`). Until 2026-10-07 `{"client_id": "\ud800"}` was
+    # a 200 with a device code, and `POST /token` after the approval answered
+    # 500 with the audit write failing. After the length checks so the scan is
+    # bounded; the description names the field and never echoes the value.
+    if contains_unstorable_character(client_id):
+        return _error(
+            400, "invalid_request", "client_id contains a character that cannot be stored"
+        )
+    if contains_unstorable_character(scopes):
+        return _error(400, "invalid_request", "scopes contains a character that cannot be stored")
 
     store: DeviceCodeStoreBase = request.app.state.device_code_store
 
@@ -1728,6 +1743,11 @@ async def _lookup_by_user_code(store: DeviceCodeStoreBase, presented: str) -> De
     """The live pairing a presented ``user_code`` names, or ``None``."""
     normalized = _normalize_user_code(presented)
     if len(normalized) != _USER_CODE_LENGTH:
+        return None
+    # A lone surrogate cannot be a Redis key (`UnicodeEncodeError` on the way
+    # out: a 500 on the Redis backend, measured 2026-10-07) and no stored code
+    # holds one, so it is a lookup miss like any other wrong code.
+    if contains_unstorable_character(normalized):
         return None
     return await store.get_by_user_code(normalized)
 

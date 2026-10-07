@@ -445,6 +445,14 @@ def clip_tree(value: Any) -> Any:
     Non-`str`, non-`dict`, non-`list` values pass through untouched, exactly
     as they do through `scrub_tree`: an `int`, a `float`, a `bool`, `None`.
     An oversized one of those is the tree bound's job, not this one's.
+
+    WARNING: RECURSIVE AND UNBOUNDED IN DEPTH. It raises `RecursionError` on
+    its own input at about 9,000 levels. It is safe only because every caller
+    scrubs first and `scrub_tree` cuts depth at `SCRUB_MAX_DEPTH` (100): the
+    tree it sees is never deeper than 101. Do not call it on a tree that did
+    not go through `scrub_tree`.
+    `tests/test_unstorable_confirm_input.py::test_every_caller_of_clip_tree_is_a_known_one_that_scrubs_first`
+    lists the call sites, so a new one fails there until it is reviewed.
     """
     if isinstance(value, str):
         return clamp(value, MAX_ARGUMENT_VALUE)
