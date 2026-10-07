@@ -166,6 +166,7 @@ from services.confirm.auth import unauthenticated_response, verified_claims, ver
 from services.confirm.device_signature import signature_refusal
 from services.confirm.execute import (
     WRITE_OPERATIONS,
+    BackendTransportError,
     BackendWriteClient,
     BackendWriteError,
     resolve_endpoint,
@@ -413,18 +414,24 @@ async def approve_challenge(request: Request) -> JSONResponse:
             # (`tests/test_audit_reserve.py`). When the audit write failed too,
             # `from None` drops that audit exception from the traceback instead
             # of chaining it, since it is the one carrying the audit INSERT.
+            #
+            # `_exception_name`, not `type(exc).__name__`: a transport failure
+            # reaches here as `BackendTransportError`, a fixed-text wrapper, and
+            # the evidence has always named what actually failed (`ConnectError`,
+            # `ReadTimeout`), which the wrapper carries as `kind`.
+            raised_name = _exception_name(exc)
             logger.error(
                 "challenge approve: %r: the approval raised %s",
                 challenge_id,
-                type(exc).__name__,
+                raised_name,
             )
             try:
-                await audit.raised(type(exc).__name__)
+                await audit.raised(raised_name)
             except Exception as audit_exc:
                 logger.error(
                     "audit write failed for challenge %r after the approval raised %s: %s",
                     challenge_id,
-                    type(exc).__name__,
+                    raised_name,
                     type(audit_exc).__name__,
                 )
                 raise exc from None
@@ -445,6 +452,13 @@ async def approve_challenge(request: Request) -> JSONResponse:
         )
         raise
     return response
+
+
+def _exception_name(exc: Exception) -> str:
+    """The type name to record for ``exc``: the wrapped failure's, for a transport error."""
+    if isinstance(exc, BackendTransportError):
+        return exc.kind
+    return type(exc).__name__
 
 
 async def _approve(

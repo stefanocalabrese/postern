@@ -12,6 +12,7 @@ Backend mocking is at the transport layer with ``httpx2.MockTransport``, per
 cannot mock ``httpx2``.
 """
 
+import asyncio
 from collections.abc import Callable
 
 import httpx2
@@ -19,6 +20,7 @@ import pytest
 
 from services.confirm.execute import (
     TOOL_REGISTRY,
+    BackendTransportError,
     BackendWriteClient,
     BackendWriteError,
     resolve_endpoint,
@@ -160,7 +162,7 @@ def _transport(handler: Callable[[httpx2.Request], httpx2.Response]) -> httpx2.M
 
 
 async def test_execute_success_200() -> None:
-    """A 200 response is returned as-is."""
+    """A 200 is accepted; the status code is what comes back, not the response."""
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(200, json={"id": "pay_123"})
@@ -171,19 +173,19 @@ async def test_execute_success_200() -> None:
         transport=_transport(handler),
         before_backend_request=None,
     )
-    response = await client.execute(
+    status = await client.execute(
         customer_ref="cust_7f3a",
         audience="payments.svc",
         path="/payments",
         body={"amount": "EUR 340.00"},
         challenge_id="chal_abc",
     )
-    assert response.status_code == 200
+    assert status == 200
     await client.aclose()
 
 
 async def test_execute_success_201() -> None:
-    """A 201 response is returned as-is."""
+    """A 201 is accepted."""
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(201, json={"id": "pay_456"})
@@ -194,19 +196,19 @@ async def test_execute_success_201() -> None:
         transport=_transport(handler),
         before_backend_request=None,
     )
-    response = await client.execute(
+    status = await client.execute(
         customer_ref="cust_7f3a",
         audience="payments.svc",
         path="/payments",
         body={},
         challenge_id="chal_abc",
     )
-    assert response.status_code == 201
+    assert status == 201
     await client.aclose()
 
 
 async def test_execute_success_202() -> None:
-    """A 202 accepted response is returned as-is."""
+    """A 202 is accepted."""
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(202, json={"status": "accepted"})
@@ -217,14 +219,14 @@ async def test_execute_success_202() -> None:
         transport=_transport(handler),
         before_backend_request=None,
     )
-    response = await client.execute(
+    status = await client.execute(
         customer_ref="cust_7f3a",
         audience="payments.svc",
         path="/payments",
         body={},
         challenge_id="chal_abc",
     )
-    assert response.status_code == 202
+    assert status == 202
     await client.aclose()
 
 
@@ -445,7 +447,7 @@ async def test_distinct_challenges_carry_distinct_idempotency_keys() -> None:
 
 
 # ---------------------------------------------------------------------------
-# BackendWriteClient — response scrubbing (PAN/IBAN).
+# BackendWriteClient — nothing from the response travels.
 # ---------------------------------------------------------------------------
 
 
@@ -502,6 +504,70 @@ async def test_backend_write_error_carries_nothing_the_backend_said(
     for needle in (_TEST_PAN, _TEST_IBAN, _HOSTILE_DSN, "hunter2", _HOSTILE_JWT, _HOSTILE_SENTINEL):
         assert needle not in carried
     assert exc.status == response.status_code
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        httpx2.ConnectError("refused SNTL-connect"),
+        httpx2.ReadTimeout("timed out SNTL-timeout"),
+        httpx2.RemoteProtocolError("illegal status line: bytearray(b'SNTL-status')"),
+        httpx2.DecodingError("corrupt SNTL-gzip"),
+    ],
+    ids=["ConnectError", "ReadTimeout", "RemoteProtocolError", "DecodingError"],
+)
+async def test_a_transport_failure_is_a_fixed_text_error_naming_the_type_only(
+    raised: httpx2.HTTPError,
+) -> None:
+    """``BackendTransportError``: fixed ``str``, original type as ``kind``, no chain."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise raised
+
+    client = BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
+    with pytest.raises(BackendTransportError) as excinfo:
+        await client.execute(
+            customer_ref="cust_7f3a",
+            audience="payments.svc",
+            path="/payments",
+            body={},
+            challenge_id="chal_abc",
+        )
+    exc = excinfo.value
+    assert exc.kind == type(raised).__name__
+    assert str(exc) == "the backend write endpoint could not be reached or answered improperly"
+    assert "SNTL" not in f"{exc!s} {exc!r} {exc.args!r} {vars(exc)!r}"
+    assert exc.__suppress_context__ is True
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert not isinstance(exc, (BackendWriteError, ValueError))
+    await client.aclose()
+
+
+async def test_a_cancellation_inside_the_request_is_not_wrapped() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise asyncio.CancelledError
+
+    client = BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await client.execute(
+            customer_ref="cust_7f3a",
+            audience="payments.svc",
+            path="/payments",
+            body={},
+            challenge_id="chal_abc",
+        )
     await client.aclose()
 
 

@@ -280,6 +280,21 @@ async def _lifespan(app: Starlette) -> AsyncIterator[None]:
     yield
 
 
+def pin_http_client_loggers() -> None:
+    """Hold ``httpx2`` and ``httpcore2`` at WARNING, whatever the root logger says.
+
+    The backend write endpoint's response is text this service must not log.
+    ``httpx2`` writes ``HTTP Request: POST <url> "HTTP/1.1 500 <reason phrase>"``
+    at INFO, and ``httpcore2`` writes every response header at DEBUG, so a
+    deployment that lowers the root logger to debug a problem would start logging
+    the backend's reason phrase and headers. Dormant at the default root level
+    (WARNING), live the moment an operator lowers it. Neither logger emits
+    anything at WARNING or above on the paths this service uses.
+    """
+    for name in ("httpx2", "httpcore2"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def create_confirm_app(
     settings: ConfirmSettings | None = None,
     *,
@@ -336,6 +351,7 @@ def create_confirm_app(
             ``load_network_enricher``: more than one, one that will not
             import, or one whose ``lookup`` is not async.
     """
+    pin_http_client_loggers()
     # FIRST, AND AHEAD OF THE AUTHENTICATION GUARD, which is a deliberate
     # exception to the ordering the next comment states. That order exists so
     # an operator missing both authentication and Redis hears about

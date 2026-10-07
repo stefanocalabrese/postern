@@ -455,13 +455,36 @@ approval is recorded and the write was not accepted (3xx, 4xx, 5xx and 204 all c
 ```
 
 `backend_status` is the integer from the backend's HTTP status line. The `message` is
-a fixed text, and no text derived from the backend's response body appears in the
-response, in the audit rows or in any log line: a backend body can carry a connection
-string or a token, and scrubbing PAN and IBAN shapes out of it never made it safe to
-forward. The one log line per refusal is a WARNING naming the challenge id, the
-operation and the numeric status. The row stays `approved` and the completion
-`audit_log` row is `raised` with `detail` `BackendWriteError`; what the backend said is
-in the backend's own logs, found by the `Idempotency-Key`, which equals the challenge id.
+a fixed text, and no text the backend sent appears in the response, in an audit row, in
+an application log line or in an exception message: a backend response can carry a
+connection string or a token, and scrubbing PAN and IBAN shapes out of it never made it
+safe to forward. Three mechanisms hold that line:
+
+- **Only the status line is read.** The request is sent as a stream and the client
+  takes `status_code` and nothing else: not the body, not the headers, not the reason
+  phrase. Leaving the block closes the connection with the body unread, so a body of
+  any size, a corrupt gzip body or a short `Content-Length` changes nothing. An
+  accepted status (200, 201, 202) with a garbled body is an accepted write and goes
+  on to the `executed` record; a refused status with a garbled body is this 207.
+- **Transport and protocol failures are reported by exception type only.** When no
+  status arrives (connection refused, a timeout, a status line or header block the
+  HTTP parser refuses) the client raises `BackendTransportError`, whose text is fixed
+  and whose `kind` is the original exception's type name (`ConnectError`,
+  `ReadTimeout`, `RemoteProtocolError`). The original is not chained, because `h11`
+  and `httpcore2` quote the bytes they refused in their messages. Behaviour is as it
+  was: the exception leaves the handler (a 500 under a server), the row stays
+  `approved`, and the completion `audit_log` row is `raised` with `detail` set to
+  the original type name.
+- **`httpx2` and `httpcore2` are held at WARNING** by `create_confirm_app`. They log
+  `HTTP Request: POST <url> "HTTP/1.1 500 <reason phrase>"` at INFO and every
+  response header at DEBUG, which would start logging the backend's text the moment an
+  operator lowers the root logger.
+
+The one log line per refusal is a WARNING naming the challenge id, the operation and
+the numeric status. The row stays `approved` and the completion `audit_log` row is
+`raised` with `detail` `BackendWriteError`. To find out why the backend refused, look
+in the payments backend's own logs, by the `Idempotency-Key`, which equals the
+challenge id.
 
 **The 202 `accepted_unrecorded` response.** Not a refusal: the backend accepted the
 write (money may have moved) and recording `approved -> executed` failed on every

@@ -65,6 +65,21 @@ class _MinterProtocol(Protocol):
 # scrubber that knows two shapes does not make a body safe: a DSN or a bearer
 # token in it went through untouched. `BackendWriteError` now carries the
 # numeric status and nothing else, and the body is never read.
+#
+# "NEVER READ" IS A PROPERTY OF HOW THE REQUEST IS SENT, not of what is done with
+# the response afterwards. `AsyncClient.post()` buffers and decodes the whole body
+# before it returns, for every status, so a corrupt gzip body behind an accepted
+# 200 raised `DecodingError` out of an accepted write, a short `Content-Length`
+# behind a 201 raised `RemoteProtocolError`, and a body of any size was held in
+# memory (the 10 second timeout bounds each read, not the total). `execute` uses
+# `stream()` and leaves the block as soon as the status line is in hand, which
+# closes the connection with the body unread.
+#
+# THE SECOND LEAK WAS IN THE EXCEPTIONS. `h11` and `httpcore2` quote the bytes
+# they refuse (`illegal status line: bytearray(b'...')`, and a line of the BODY in
+# `illegal chunk header`), and the chain `h11 -> httpcore2 -> httpx2` carried them
+# to whatever logs an unhandled exception. `BackendTransportError` replaces that
+# chain with fixed text and the original exception's type name.
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +272,7 @@ class BackendWriteClient:
         #
         # `None` stays legal because this package has callers with genuinely
         # nothing to record: `tests/test_execute.py` exercises path
-        # resolution, minting and response scrubbing with no store behind
+        # resolution, minting and status handling with no store behind
         # them. What is NOT enforced anywhere is that
         # `services/confirm/callback.py` passes a real one;
         # `tests/test_write_audit.py` fails if it stops.
@@ -280,7 +295,7 @@ class BackendWriteClient:
         path: str,
         body: dict[str, Any],
         challenge_id: str,
-    ) -> httpx2.Response:
+    ) -> int:
         """Execute a backend write endpoint.
 
         Args:
@@ -292,7 +307,17 @@ class BackendWriteClient:
                 claim and as the ``Idempotency-Key`` header.
 
         Returns:
-            The backend response. Raises BackendWriteError on non-2xx.
+            The accepted status code (200, 201 or 202) and nothing else: the
+            response is not handed back, because reading any part of it is how
+            backend text got into the logs.
+
+        Raises:
+            BackendWriteError: the backend answered with any other status. It
+                carries that status and nothing else.
+            BackendTransportError: no status arrived, or the exchange failed
+                before one could be taken (unreachable, timed out, or a reply
+                the HTTP parser refused). It carries the original exception's
+                TYPE NAME as ``kind`` and no text from it.
         """
         # Mint an internal JWT with challenge_id in claims (§7.2).
         token = self._minter.mint(
@@ -347,23 +372,45 @@ class BackendWriteClient:
         # `challenge_id` in the audit row are the same string, so the two
         # sides of one payment can be joined by eye. The value is opaque, not
         # a secret shared with anyone but the operator's own backend.
-        response = await self._client.post(
-            path,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Idempotency-Key": challenge_id,
-            },
-        )
+        #
+        # `stream()`, and ONLY `response.status_code` is taken inside the block.
+        # Never `aread()`, `.text`, `.content`, `.json()`, `.headers`,
+        # `.reason_phrase` or `.extensions`: each is backend-controlled text (a
+        # DSN, a token, a stack trace), and scrubbing it for PAN and IBAN shapes
+        # never made it safe to forward. Leaving the block closes the connection
+        # without reading the body, so an accepted status with a garbled body is
+        # an accepted write.
+        status: int | None = None
+        failure: str | None = None
+        try:
+            async with self._client.stream(
+                "POST",
+                path,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Idempotency-Key": challenge_id,
+                },
+            ) as response:
+                status = response.status_code
+        except httpx2.HTTPError as exc:
+            # `HTTPError` only, so a cancellation (a `BaseException`) propagates.
+            # If the status was already taken, a failure while closing the unread
+            # body changes nothing: the status is the answer.
+            if status is None:
+                failure = type(exc).__name__
 
-        if response.status_code not in (200, 201, 202):
-            # The status line only. The response BODY is never read here: a
-            # backend body is attacker- or bug-controlled text (a DSN, a
-            # token, a stack trace) and scrubbing it for PAN and IBAN shapes
-            # never made it safe to forward.
-            raise BackendWriteError(status=response.status_code)
+        if status is None:
+            # RAISED OUTSIDE THE `except`, with `from None`: raising inside it
+            # would set `__context__` to the original exception, whose message
+            # is backend text.
+            raise BackendTransportError(kind=failure or "UnknownError") from None
 
-        return response
+        if status not in (200, 201, 202):
+            # The number only, raised outside the stream block.
+            raise BackendWriteError(status=status)
+
+        return status
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -382,3 +429,24 @@ class BackendWriteError(RuntimeError):
     def __init__(self, *, status: int) -> None:
         super().__init__(f"backend write endpoint answered {status}")
         self.status = status
+
+
+class BackendTransportError(RuntimeError):
+    """The backend write endpoint could not be reached or answered improperly.
+
+    No status arrived: the connection failed, timed out, or the reply was one
+    the HTTP parser refused. ``str`` is FIXED TEXT. ``kind`` is the TYPE NAME of
+    the exception that was caught (``ConnectError``, ``ReadTimeout``,
+    ``RemoteProtocolError``) and never its message, because ``h11`` and
+    ``httpcore2`` quote the bytes they refused. The original exception is not
+    chained (``from None``, raised outside the ``except``), so no traceback
+    printer, logger or ``__context__`` walker can reach it.
+
+    Not a ``BackendWriteError``: that one means a status was received and the
+    write was refused, which the approval answers with a 207. This one means the
+    outcome is unknown, and it propagates as every transport failure did before.
+    """
+
+    def __init__(self, *, kind: str) -> None:
+        super().__init__("the backend write endpoint could not be reached or answered improperly")
+        self.kind = kind

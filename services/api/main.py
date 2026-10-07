@@ -50,6 +50,7 @@ is a validated token's subject to check it for, since consent has nowhere to
 read a customer from otherwise.
 """
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -271,6 +272,11 @@ def create_app(
     # `postern_core/env_inventory.py` carries the three populations, why only
     # the third refuses, and why the escape hatch cannot be the hole.
     enforce_known_environment(service="api")
+    # `httpx2` logs `HTTP Request: GET <url> "HTTP/1.1 200 <reason phrase>"` at INFO
+    # and `httpcore2` logs every response header at DEBUG: the operator's backend's
+    # text. Dormant at the default root level, live once an operator lowers it.
+    for _http_logger in ("httpx2", "httpcore2"):
+        logging.getLogger(_http_logger).setLevel(logging.WARNING)
     settings = settings or Settings.from_env()
 
     # REDIS PREFLIGHT, once per process, BEFORE any key, Vault probe, backend client or

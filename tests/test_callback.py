@@ -51,6 +51,7 @@ from starlette.requests import Request
 from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
 from services.confirm.callback import approve_challenge
 from services.confirm.execute import BackendWriteClient
+from services.confirm.main import pin_http_client_loggers
 from services.confirm.settings import ConfirmSettings
 from tests.fixtures.device_keys import device_key, enrolled_store, sign_row
 
@@ -904,10 +905,27 @@ async def test_207_body_shape_is_the_same_for_any_kind_of_backend_body(
 async def test_nothing_the_backend_said_reaches_the_207_or_any_log_record(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A PAN, an IBAN, a DSN, a JWT and a sentinel in the backend body: none escapes."""
+    """A PAN, IBAN, DSN, JWT and sentinel in the body, reason phrase or a header: none escapes.
+
+    The reason phrase and the headers are what ``httpx2`` logs at INFO and
+    ``httpcore2`` at DEBUG, so the loggers are pinned the way
+    ``create_confirm_app`` pins them (this test builds no app).
+    """
+    pin_http_client_loggers()
     caplog.set_level(logging.DEBUG)
 
-    resp = await _post_with_backend(httpx2.Response(500, json={"detail": _HOSTILE_TEXT}))
+    resp = await _post_with_backend(
+        httpx2.Response(
+            500,
+            json={"detail": _HOSTILE_TEXT},
+            headers={
+                "Location": f"https://evil.test/{_HOSTILE_TEXT}",
+                "WWW-Authenticate": f"Bearer realm={_HOSTILE_TEXT}",
+                "X-Debug": _HOSTILE_TEXT,
+            },
+            extensions={"reason_phrase": _HOSTILE_TEXT.encode()},
+        )
+    )
 
     assert resp.status_code == 207
     body = _resp_body(resp).decode()
