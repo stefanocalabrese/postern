@@ -20,7 +20,7 @@ from fastmcp.server.auth.providers.jwt import RSAKeyPair
 from postern_core.facade.client import BackendError
 
 from services.api.tools import not_found
-from services.api.tools.not_found import NOT_FOUND, not_found_is_a_fixed_refusal
+from services.api.tools.not_found import NOT_FOUND, not_found_is_a_fixed_refusal, note_forbidden
 from tests.test_audit_reserve import token_for
 from tests.test_not_found_mapping import (  # noqa: F401  (fixtures)
     CUSTOMER,
@@ -35,6 +35,8 @@ from tests.test_not_found_mapping import (  # noqa: F401  (fixtures)
 LOGGER = "services.api.tools.not_found"
 MARKER = "backend answered 403 on a caller-chosen ref"
 BODY_SENTINEL = "zzsentinel_backend_body_8841"
+TOOL = "accounts.get_balance"
+OTHER_TOOL = "transactions.list"
 
 
 class _Clock:
@@ -50,12 +52,12 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     """A clock the test owns, and a rate-limit state that starts empty."""
     fake = _Clock()
     monkeypatch.setattr(not_found, "_clock", fake)
-    monkeypatch.setattr(not_found, "_last_warned_at", None)
+    monkeypatch.setattr(not_found, "_last_warned_at", {})
     return fake
 
 
-async def _refuse(status: int) -> None:
-    async with not_found_is_a_fixed_refusal():
+async def _refuse(status: int, tool: str = TOOL) -> None:
+    async with not_found_is_a_fixed_refusal(tool):
         raise BackendError(status, "guidance")
 
 
@@ -73,7 +75,7 @@ async def test_a_403_logs_one_warning(caplog: pytest.LogCaptureFixture) -> None:
     text = records[0].getMessage()
     assert MARKER in text
     assert "audience and scope" in text
-    assert records[0].args in ((), None)
+    assert f"tool={TOOL}" in text
     assert records[0].exc_info is None
 
 
@@ -155,3 +157,38 @@ async def test_a_403_through_the_real_app_is_the_same_bytes_as_a_404_and_logs_no
     for forbidden in (FOREIGN_REF, UNKNOWN_REF, BODY_SENTINEL, CUSTOMER, "account_ref"):
         assert forbidden not in records[0].getMessage()
     assert BODY_SENTINEL not in everything
+
+
+async def test_the_window_is_per_tool_name(caplog: pytest.LogCaptureFixture, clock: _Clock) -> None:
+    """A rejected audience on one tool is not hidden by another tool's warning."""
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ToolError):
+        await _refuse(403, TOOL)
+    with pytest.raises(ToolError):
+        await _refuse(403, OTHER_TOOL)
+    texts = [r.getMessage() for r in _warnings(caplog)]
+    assert len(texts) == 2
+    assert f"tool={TOOL}" in texts[0]
+    assert f"tool={OTHER_TOOL}" in texts[1]
+
+    with pytest.raises(ToolError):
+        await _refuse(403, TOOL)
+    with pytest.raises(ToolError):
+        await _refuse(403, OTHER_TOOL)
+    assert len(_warnings(caplog)) == 2, "each tool is inside its own window"
+
+    clock.now += 60.1
+    with pytest.raises(ToolError):
+        await _refuse(403, OTHER_TOOL)
+    assert len(_warnings(caplog)) == 3, "only the tool whose window passed logs"
+
+
+def test_the_window_table_stays_bounded_for_any_number_of_tool_names(
+    caplog: pytest.LogCaptureFixture, clock: _Clock
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    for index in range(100):
+        clock.now += 0.001
+        note_forbidden(f"fake.tool_{index}")
+    assert len(not_found._last_warned_at) <= 64
+    assert len(_warnings(caplog)) == 100, "a full table still warns, it only forgets"

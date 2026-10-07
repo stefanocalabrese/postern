@@ -21,7 +21,9 @@ With no verified token the check refuses, so a server without customer auth
 lists these tools to nobody.
 
 A BACKEND 403 IS A 404 HERE, as in `not_found.py`: a foreign payer account or
-payee must read exactly as an unknown one, whatever the backend answers.
+payee must read exactly as an unknown one, whatever the backend answers. A
+403, and only a 403, also leaves the one rate-limited warning of
+`not_found.note_forbidden` (tool name, no ref).
 
 EVERY REFUSAL IS A FIXED STRING raised as `ToolError`, which FastMCP 4.0.3
 renders as an `isError` result whose one text block is exactly that string.
@@ -61,7 +63,7 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from services.api.consent import consent_for
-from services.api.tools.not_found import NOT_FOUND_STATUSES
+from services.api.tools.not_found import NOT_FOUND_STATUSES, note_forbidden
 
 logger = logging.getLogger(__name__)
 
@@ -231,12 +233,16 @@ def build_create_payment(
             balance = await accounts_facade.get_balance(backend, customer, from_account_ref)
         except BackendError as exc:
             if exc.status in NOT_FOUND_STATUSES:
+                if exc.status == 403:
+                    note_forbidden(CREATE_PAYMENT_TOOL)
                 raise ToolError(ACCOUNT_NOT_FOUND) from None
             raise
         try:
             payee = await payments_facade.get_payee(backend, customer, payee_ref)
         except BackendError as exc:
             if exc.status in NOT_FOUND_STATUSES:
+                if exc.status == 403:
+                    note_forbidden(CREATE_PAYMENT_TOOL)
                 raise ToolError(PAYEE_NOT_FOUND) from None
             raise
         currency = balance.amount.currency

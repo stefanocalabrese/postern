@@ -54,7 +54,7 @@ def _build_transactions_list(context: ReadContext) -> ToolHandler:
         `true`, narrow `days` (or ask the customer to narrow the period)
         rather than presenting `items` as the whole history for the window.
         """
-        async with not_found_is_a_fixed_refusal():
+        async with not_found_is_a_fixed_refusal("transactions.list"):
             result = await facade.list_transactions(
                 context.backend, context.resolver(), account_ref, days
             )

@@ -59,7 +59,7 @@ def _build_accounts_get_balance(context: ReadContext) -> ToolHandler:
         `account_ref` comes from `accounts.list`. Report the amount and currency
         exactly as returned; do not convert or round.
         """
-        async with not_found_is_a_fixed_refusal():
+        async with not_found_is_a_fixed_refusal("accounts.get_balance"):
             result = await facade.get_balance(context.backend, context.resolver(), account_ref)
         ctx = get_current_session()
         if ctx is not None:

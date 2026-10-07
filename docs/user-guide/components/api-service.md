@@ -143,10 +143,15 @@ Postgres-backed consent check:
 | `cards.list` | cards.svc | Yes | Lists customer cards |
 
 A backend 404 or 403 on a read tool's caller-chosen `account_ref` reaches the model as the
-fixed sentence `not found` (`services/api/tools/not_found.py`). A 403 also writes one warning
-to the `services.api.tools.not_found` logger, `backend answered 403 on a caller-chosen ref;
-reported to the model as not found. A 403 on every call means the api's token is rejected:
-check the minter's audience and scope.`, at most once per 60 seconds per process, with no
+fixed sentence `not found` (`services/api/tools/not_found.py`); `payments.create_payment` maps
+the same two statuses on its payer account and payee to `account not found` and `payee not
+found`. A 403 on any of these also writes one warning to the `services.api.tools.not_found`
+logger, `backend answered 403 on a caller-chosen ref (tool=accounts.get_balance); reported to
+the model as not found. A 403 on every call means the api's token is rejected: check the
+minter's audience and scope.` The `tool=` value is a fixed tool name (`accounts.get_balance`,
+`transactions.list` or `payments.create_payment`), so the line says which backend audience
+rejects the token. There is one 60-second window per tool name per process, so a rejected
+payments audience is not hidden by a read tool's warning in the same minute. The line has no
 ref, argument or backend body in it. Grep the api's logs for `backend answered 403`: a 404
 writes nothing, and the audit row of a 403 is identical to a 404's, so that line is the
 only trace. The backend contract is still to answer 404 for a foreign ref. A line on every
