@@ -847,7 +847,7 @@ async def _approve(
             # the 207, with the ORIGINAL kind as detail. One ERROR line, no
             # exception text; the id is what an operator reconciles by
             # (`Idempotency-Key` = challenge id).
-            kind = exc.kind  # a type name, never the exception's text
+            kind = _exception_name(exc)  # a type name, never the exception's text
             logger.error(
                 "challenge approve: %r: tool=%s kind=%s: the backend call failed after the "
                 "approval was recorded; outcome unknown; reconcile by Idempotency-Key = "
