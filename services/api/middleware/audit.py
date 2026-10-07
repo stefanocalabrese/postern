@@ -841,7 +841,11 @@ INTERNAL_ERROR_TEXT = "internal error"
 #: * `RiskActionError`: `Session blocked by N risk signal(s): <codes>`, codes are
 #:   this repository's constants.
 #: * `RevocationStoreUnavailable`, `SessionStoreUnavailable`: every raise site
-#:   writes `<what> could not be <verb>: <TypeName>` and nothing else.
+#:   writes `<what> could not be <verb>: <TypeName>`. For `SessionStoreUnavailable`
+#:   `<what>` is `risk context <key.log_ref>`, the first 12 hex characters of a
+#:   SHA-256 over the customer and client (`risk/session.py`): a non-reversing
+#:   handle for the session, not the customer's reference, and the one
+#:   identifier-derived value in an otherwise fixed sentence.
 #: * A bare `PermissionError("<fixed sentence>")` (see `_fixed_permission_error`):
 #:   `token_customer_resolver` refusing a caller it cannot name.
 _CLIENT_FACING: tuple[type[BaseException], ...] = (
@@ -859,16 +863,14 @@ _CLIENT_FACING: tuple[type[BaseException], ...] = (
 def _fixed_permission_error(exc: BaseException) -> bool:
     """A `PermissionError` this repository built from one sentence.
 
-    Not every `PermissionError`: the operating system raises one with an errno
-    and a path in its text. `OSError` leaves `errno` None only when it was
-    constructed by hand with a single argument.
+    Not every `PermissionError`, and not a subclass of one: the exact type, with
+    ONE string argument. The operating system raises one with an errno, a
+    strerror and a path (three arguments), so the single-argument test is what
+    keeps an OS-built error out; an `exc.errno is None` check beside it would be
+    redundant (`OSError(1 arg)` has no errno, and an OS-built one never has one
+    argument), so there is none.
     """
-    return (
-        type(exc) is PermissionError
-        and exc.errno is None
-        and len(exc.args) == 1
-        and isinstance(exc.args[0], str)
-    )
+    return type(exc) is PermissionError and len(exc.args) == 1 and isinstance(exc.args[0], str)
 
 
 def _client_safe(exc: BaseException) -> MCPError | None:

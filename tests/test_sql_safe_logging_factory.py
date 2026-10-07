@@ -277,6 +277,57 @@ def test_a_huge_container_argument_is_scanned_only_up_to_the_cap(
     assert _first_arg(beyond)[-1] is driver_error
 
 
+class _CountingDict(dict[Any, Any]):
+    """A mapping whose `values()` and `items()` stream ``total`` items and count each.
+
+    One real entry keeps it truthy (`LogRecord` unwraps a sole mapping argument
+    only when it is); everything the scrub iterates is the lazy stream, so the
+    count is how many items it looked at, and no 1,000,000-entry dict is built.
+    """
+
+    iterated = 0
+
+    def __init__(self, total: int, planted: dict[int, Any]) -> None:
+        super().__init__({"real": 0})
+        self.total = total
+        self.planted = planted
+
+    def _stream(self) -> Iterator[tuple[int, Any]]:
+        for index in range(self.total):
+            type(self).iterated += 1
+            yield index, self.planted.get(index, 0)
+
+    def values(self) -> Any:
+        return (item for _, item in self._stream())
+
+    def items(self) -> Any:
+        return self._stream()
+
+
+@pytest.mark.usefixtures("installed")
+def test_a_huge_sole_mapping_argument_is_scanned_only_up_to_the_cap(
+    driver_error: Exception,
+) -> None:
+    """The pre-check iterated EVERY value of a sole dict (41 ms a record at 1M)."""
+    _CountingDict.iterated = 0
+    record = _record(_CountingDict(1_000_000, {}))
+    assert _CountingDict.iterated <= 2 * log_safety._MAX_ITEMS
+
+    # An exception at the last scanned index is still found and replaced.
+    inside = _CountingDict(1_000_000, {log_safety._MAX_ITEMS - 1: driver_error})
+    args: Any = _record(inside).args
+    assert "sqlalchemy.exc." in args[log_safety._MAX_ITEMS - 1]
+    assert record.args is not None
+
+
+@pytest.mark.usefixtures("installed")
+def test_a_sole_mapping_holding_a_huge_list_is_scanned_only_up_to_the_cap() -> None:
+    items = _CountingList([0] * 1_000_000)
+    _CountingList.iterated = 0
+    _record({"k": items})
+    assert _CountingList.iterated <= log_safety._MAX_ITEMS
+
+
 @pytest.mark.usefixtures("installed")
 def test_the_depth_the_scrub_reaches_is_one_container_and_no_more(
     driver_error: Exception,

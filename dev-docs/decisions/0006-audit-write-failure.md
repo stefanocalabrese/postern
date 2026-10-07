@@ -441,7 +441,8 @@ THREE LAYERS, each pinned by its own test (`tests/test_api_driver_error_client_t
 1. `FastMCP(mask_error_details=True)`. Read in fastmcp 4.0.3 (`server.py`, `call_tool`): a `FastMCPError`
    (so `ToolError`) is re-raised unchanged, which is why the tools' own fixed refusals still reach the client;
    any other exception becomes `ToolError("Error calling tool 'x'")` with no detail, except that an HTTP-429-shaped
-   or timeout-shaped exception gets one of two fixed texts. It does NOT cover the completion-row failure: that
+   or timeout-shaped exception gets one of two fixed texts (`Rate limited by upstream API, please retry later`,
+   `Upstream request timed out, please retry`; nothing from the backend's body in either). It does NOT cover the completion-row failure: that
    exception leaves `AuditMiddleware` after the tool returned, and reaches the client as a JSON-RPC
    `error.message` that masking never sees (measured: with masking on and the middleware guard off, the sentinel
    was in the reply).
@@ -450,10 +451,17 @@ THREE LAYERS, each pinned by its own test (`tests/test_api_driver_error_client_t
    `RiskActionError`, `RevocationStoreUnavailable`, `SessionStoreUnavailable`, and a `PermissionError` built from
    one sentence with no errno) is replaced by a JSON-RPC error `-32603 internal error`. That covers a driver error
    anywhere in the chain, and an unlisted class whose text nobody read (measured: a store raising a Redis
-   `ConnectionError` with a `redis://user:password@host` URL put the password in the reply). The call still fails,
-   at the protocol level as an unhandled exception from here always did. Each allowlisted class is tested to still
-   reach the client unchanged. A backend 404 on a caller-chosen account ref is mapped by the two tools that take
-   one to the fixed `not found`, because masking had made a typo and an outage read the same.
+   `ConnectionError` with a `redis://user:password@host` URL put the password in the reply). The call still fails.
+   The shape of that failure moved twice, and it did not "always" reach the client as a JSON-RPC error: before 287d216
+   a driver error below the middleware carried its text to the client, from 287d216 it was an `isError` `ToolError`
+   with fixed text, and since 7eac0c9 it is a protocol-level JSON-RPC `-32603` error with fixed text. The MCP
+   2026-07-28 tools page (fetched 7 October 2026) files server errors under protocol errors and says clients MAY
+   provide protocol errors to language models, where tool execution errors SHOULD be provided. The cost is that a
+   client may never show the model that the call failed. That is deliberate: a model that is told its tool call
+   failed will retry or narrate, and what it narrates goes into an AI vendor's chat history. Each allowlisted class is tested to still
+   reach the client unchanged. A backend 404 or 403 on a caller-chosen account ref is mapped by the two tools that take
+   one to the fixed `not found` (both, so that a backend which answers 403 for a foreign ref does not make it read
+   differently from an unknown one), because masking had made a typo and an outage read the same.
 3. `postern_core.log_safety.install_sql_safe_logging()`, called by `create_app` and `create_confirm_app`, wraps the
    process-wide log record factory so that a record created through `Logger._log`, on any logger, is sanitised
    when created (frames, each exception's type and SQLSTATE, a withheld marker) when its `exc_info`, an

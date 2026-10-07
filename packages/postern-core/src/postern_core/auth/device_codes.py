@@ -1236,7 +1236,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
                         logger.warning(
                             "refusing to claim device code %s: its stored value will not "
                             "deserialize",
-                            device_code,
+                            _device_code_handle(device_code),
                         )
                         return False
                     if code.exchanged_at is not None:
@@ -1257,7 +1257,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
         logger.warning(
             "refusing to claim device code %s: %d attempts were each beaten by another "
             "writer on the same key",
-            device_code,
+            _device_code_handle(device_code),
             _CLAIM_ATTEMPTS,
         )
         return False
@@ -1292,7 +1292,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
                         logger.warning(
                             "refusing a scan of device code %s: its stored value will not "
                             "deserialize",
-                            device_code,
+                            _device_code_handle(device_code),
                         )
                         return ScanClaim.GONE
                     claim = _scan_verdict(code, customer_ref)
@@ -1342,7 +1342,7 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
                         logger.warning(
                             "refusing to approve device code %s: its stored value will not "
                             "deserialize",
-                            device_code,
+                            _device_code_handle(device_code),
                         )
                         return False
                     if not _may_approve(code, customer_ref):

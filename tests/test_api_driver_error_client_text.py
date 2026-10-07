@@ -35,7 +35,13 @@ from typing import Any
 
 import httpx2
 import pytest
-from fastmcp.exceptions import NotFoundError, ToolError
+from fastmcp.exceptions import (
+    AuthorizationError,
+    DisabledError,
+    NotFoundError,
+    ToolError,
+    ValidationError,
+)
 from fastmcp.server.auth.providers.jwt import RSAKeyPair
 from fastmcp.server.middleware import Middleware
 from mcp.shared.exceptions import MCPError
@@ -464,6 +470,14 @@ class _Unknown(Exception):
     """A class nobody listed."""
 
 
+class _SubclassedPermissionError(PermissionError):
+    """A subclass of the one `PermissionError` the allowlist keeps.
+
+    An `isinstance` test would let this through; the allowlist is an exact-type
+    test on purpose, because a subclass is a class nobody read the text of.
+    """
+
+
 _ALLOWLISTED = {
     "RevokedError": (
         RevokedError("access has been revoked; tools/call was refused"),
@@ -479,6 +493,12 @@ _ALLOWLISTED = {
         "risk context abc could not be read: TimeoutError",
     ),
     "NotFoundError": (NotFoundError("anything"), "Unknown tool: 'accounts.list'"),
+    "DisabledError": (DisabledError("tool is disabled"), "Unknown tool: 'accounts.list'"),
+    "ValidationError": (
+        ValidationError("arguments did not validate"),
+        "arguments did not validate",
+    ),
+    "AuthorizationError": (AuthorizationError("not authorised for this tool"), "not authorised"),
     "ToolError": (ToolError("a deliberate refusal"), "a deliberate refusal"),
     "MCPError": (MCPError(-32000, "a deliberate protocol error"), "a deliberate protocol error"),
     "resolver PermissionError": (
@@ -509,8 +529,15 @@ async def test_each_allowlisted_exception_still_reaches_the_client_unchanged(
         ConnectionError("redis://postern_api:zzsentinel_pw_7788@redis:6379"),
         RuntimeError("zzsentinel_pw_7788"),
         PermissionError(13, "Permission denied", "/etc/zzsentinel_pw_7788"),
+        _SubclassedPermissionError("zzsentinel_pw_7788"),
     ],
-    ids=["unknown class", "ConnectionError", "RuntimeError", "OS PermissionError"],
+    ids=[
+        "unknown class",
+        "ConnectionError",
+        "RuntimeError",
+        "OS PermissionError",
+        "subclass of the allowlisted PermissionError",
+    ],
 )
 async def test_an_exception_of_an_unlisted_class_is_masked(
     stack: tuple[Any, str], exc: BaseException
