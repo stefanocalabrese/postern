@@ -87,20 +87,22 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import DisabledError, FastMCPError, NotFoundError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
-from mcp.types import CallToolRequestParams
+from mcp.shared.exceptions import MCPError
+from mcp.types import INTERNAL_ERROR, CallToolRequestParams
+from postern_core.auth.revocation import RevocationStoreUnavailable, RevokedError
 from postern_core.domain.masking import redaction_budget, scrub_tree
 from postern_core.identity import CustomerRef
 from postern_core.log_safety import (
-    chain_holds_driver_error,
     describe_exception,
     exc_info_for_log,
 )
-from postern_core.risk.session import get_current_session
+from postern_core.risk.session import SessionStoreUnavailable, get_current_session
+from postern_core.risk.types import RiskActionError
 from postern_core.store import audit
 from postern_core.store.audit import (
     ARGUMENTS_TRUNCATED_KEY,
@@ -821,25 +823,74 @@ async def record_data_touch() -> None:
 INTERNAL_ERROR_TEXT = "internal error"
 
 
-def _client_safe(exc: BaseException) -> ToolError | None:
-    """A fixed-text `ToolError` to raise in place of ``exc``, or None to keep it.
+#: The exceptions whose text is known to be fixed and is meant for the client, so
+#: that a deliberate refusal still reads as one. Everything NOT in this list that
+#: leaves `on_call_tool` is replaced by `INTERNAL_ERROR_TEXT`, because an
+#: unlisted class is one whose text nobody here has read: measured, a store
+#: method that raised `redis.ConnectionError("...redis://postern_api:<pw>@redis")`
+#: put that text, password included, in the JSON-RPC reply.
+#:
+#: * `FastMCPError` (`ToolError`, `ValidationError`, `AuthorizationError`),
+#:   `NotFoundError` and `DisabledError`: FastMCP's own, with fixed sentences
+#:   (`Unknown tool: 'x'` is what a consent denial must look like); a
+#:   `ToolError` is masked by `mask_error_details=True`, and the tools here
+#:   raise fixed strings only.
+#: * `MCPError`: a deliberate JSON-RPC error with its own code.
+#: * `RevokedError`: `access has been revoked; <what> was refused`
+#:   (`RevocationMiddleware`, the one refusal that must reach a revoked caller).
+#: * `RiskActionError`: `Session blocked by N risk signal(s): <codes>`, codes are
+#:   this repository's constants.
+#: * `RevocationStoreUnavailable`, `SessionStoreUnavailable`: every raise site
+#:   writes `<what> could not be <verb>: <TypeName>` and nothing else.
+#: * A bare `PermissionError("<fixed sentence>")` (see `_fixed_permission_error`):
+#:   `token_customer_resolver` refusing a caller it cannot name.
+_CLIENT_FACING: tuple[type[BaseException], ...] = (
+    FastMCPError,
+    NotFoundError,
+    DisabledError,
+    MCPError,
+    RevokedError,
+    RiskActionError,
+    RevocationStoreUnavailable,
+    SessionStoreUnavailable,
+)
 
-    Replaces an exception whose chain (`__cause__`, `__context__`, exception
-    groups) holds a SQL driver error, so the call still FAILS CLOSED and the
-    client reads `INTERNAL_ERROR_TEXT` instead of the driver's text.
 
-    A `ToolError` is exempt, because by the time one reaches here its text is
-    safe by construction: this server is built with `mask_error_details=True`,
-    so FastMCP turns every other exception a tool raised into
-    ``Error calling tool 'x'`` with no detail, and this repository's tools
-    raise only fixed strings. The exemption is what makes a deliberate
-    refusal (`CHALLENGE_NOT_FOUND` and the like) reach the client unchanged.
+def _fixed_permission_error(exc: BaseException) -> bool:
+    """A `PermissionError` this repository built from one sentence.
+
+    Not every `PermissionError`: the operating system raises one with an errno
+    and a path in its text. `OSError` leaves `errno` None only when it was
+    constructed by hand with a single argument.
     """
-    if isinstance(exc, ToolError):
+    return (
+        type(exc) is PermissionError
+        and exc.errno is None
+        and len(exc.args) == 1
+        and isinstance(exc.args[0], str)
+    )
+
+
+def _client_safe(exc: BaseException) -> MCPError | None:
+    """A fixed-text `MCPError` to raise in place of ``exc``, or None to keep it.
+
+    Keeps `_CLIENT_FACING` and replaces every other exception, so the call still
+    FAILS CLOSED and the client reads `INTERNAL_ERROR_TEXT` in a JSON-RPC error
+    (code -32603): the same protocol-level shape an unhandled exception from here
+    always had (`tests/test_audit_middleware.py` pins it), with a fixed text. That covers an
+    exception whose chain (`__cause__`, `__context__`, exception groups) holds a
+    SQL driver error, whose message names the bound value or the failing row,
+    and an exception of a class nobody has read the text of.
+
+    A `ToolError` is in the kept list because by the time one reaches here its
+    text is safe by construction: this server is built with
+    `mask_error_details=True`, so FastMCP turns every other exception a tool
+    raised into ``Error calling tool 'x'`` with no detail, and this
+    repository's tools raise only fixed strings.
+    """
+    if isinstance(exc, _CLIENT_FACING) or _fixed_permission_error(exc):
         return None
-    if chain_holds_driver_error(exc):
-        return ToolError(INTERNAL_ERROR_TEXT)
-    return None
+    return MCPError(INTERNAL_ERROR, INTERNAL_ERROR_TEXT)
 
 
 class AuditMiddleware(Middleware):

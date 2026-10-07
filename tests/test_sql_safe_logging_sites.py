@@ -18,7 +18,6 @@ import asyncio
 import gc
 import io
 import logging
-import re
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -138,36 +137,41 @@ async def test_a_failed_withdrawal_logs_the_driver_error_by_type_only(
 
 
 # ---------------------------------------------------------------------------
-# The scan: no raw exception in a log call's exc_info or arguments.
+# I5b: a device code is a bearer credential and never reaches a log.
 # ---------------------------------------------------------------------------
 
-_SCANNED = [*sorted((ROOT / "services").rglob("*.py")), *sorted((ROOT / "packages").rglob("*.py"))]
-
-_RAW_EXC_INFO = re.compile(r"exc_info=(?!True\b|False\b|None\b|exc_info_for_log\()")
-_RAW_ARGUMENT = re.compile(r"^\s+(?:audit_exc|revoke_exc),$", re.MULTILINE)
+DEVICE_CODE_SENTINEL = "zzdevcode_sentinel_6620_abcdefghijklmnopq"
 
 
-def _source(path: Path) -> str:
-    return path.read_text()
+async def test_a_device_code_that_fails_to_deserialise_is_logged_by_handle_only(
+    every_log: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from postern_core.auth.device_codes import RedisDeviceCodeStore
+
+    from services.confirm.audit import device_code_handle
+
+    class Redis:
+        async def get(self, key: str) -> str:
+            return "{ not json"
+
+    store = object.__new__(RedisDeviceCodeStore)
+    store._redis = Redis()
+    monkeypatch.setattr(RedisDeviceCodeStore, "_key", lambda self, value: f"k:{value}")
+
+    assert await store.get_device_code(DEVICE_CODE_SENTINEL) is None
+
+    captured = every_log.getvalue()
+    assert DEVICE_CODE_SENTINEL not in captured, captured
+    assert "Failed to deserialize device code" in captured
+    assert device_code_handle(DEVICE_CODE_SENTINEL) in captured
 
 
-def test_no_log_call_passes_a_raw_exception_as_exc_info() -> None:
-    offenders = [
-        f"{path.relative_to(ROOT)}: {match.group(0)}"
-        for path in _SCANNED
-        if "site-packages" not in str(path)
-        for match in _RAW_EXC_INFO.finditer(_source(path))
-    ]
-    # `log_safety.py` documents the keyword in prose; nothing else may name it raw.
-    offenders = [o for o in offenders if "log_safety.py" not in o]
-    assert not offenders, offenders
+def test_the_core_handle_is_the_audit_rows_handle() -> None:
+    from postern_core.auth.device_codes import _device_code_handle
 
+    from services.confirm.audit import device_code_handle
 
-def test_no_log_call_passes_a_bare_audit_or_revoke_exception_as_an_argument() -> None:
-    offenders = [
-        str(path.relative_to(ROOT)) for path in _SCANNED if _RAW_ARGUMENT.search(_source(path))
-    ]
-    assert not offenders, offenders
+    assert _device_code_handle(DEVICE_CODE_SENTINEL) == device_code_handle(DEVICE_CODE_SENTINEL)
 
 
 # ---------------------------------------------------------------------------

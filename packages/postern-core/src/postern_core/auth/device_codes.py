@@ -67,6 +67,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import enum
+import hashlib
 import heapq
 import json as _json
 import os
@@ -919,6 +920,16 @@ _DELETE_IF_OWNED = (
 )
 
 
+def _device_code_handle(device_code: str) -> str:
+    """The non-reversing handle the audit rows carry in place of a device code.
+
+    The same digest as `services.confirm.audit.device_code_handle` (SHA-256,
+    first 16 hex characters), which this package cannot import;
+    `tests/test_sql_safe_logging_sites.py` pins that the two agree.
+    """
+    return hashlib.sha256(device_code.encode("utf-8")).hexdigest()[:16]
+
+
 class RedisDeviceCodeStore(DeviceCodeStoreBase):
     """Redis-backed device code store.
 
@@ -1154,8 +1165,14 @@ class RedisDeviceCodeStore(DeviceCodeStoreBase):
             return None
         try:
             return DeviceCode.from_json(data)
-        except (KeyError, ValueError, TypeError) as exc:  # pragma: no cover
-            logger.warning("Failed to deserialize device code %s: %s", device_code, exc)
+        except (KeyError, ValueError, TypeError) as exc:
+            # The HANDLE, never the code: `device_code` is the whole authority to
+            # exchange at `POST /token` and a log outlives the 900-second code.
+            logger.warning(
+                "Failed to deserialize device code %s: %s",
+                _device_code_handle(device_code),
+                type(exc).__name__,
+            )
             return None
 
     async def get_by_display_handle(self, display_handle: str) -> DeviceCode | None:

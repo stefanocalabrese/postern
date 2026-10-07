@@ -232,6 +232,68 @@ def test_a_non_sql_exception_is_untouched_byte_for_byte() -> None:
     assert "outer detail" in with_factory and "inner detail" in with_factory
 
 
+class _CountingList(list[Any]):
+    """A list that counts how many items anything iterates out of it."""
+
+    iterated = 0
+
+    def __iter__(self) -> Iterator[Any]:
+        for item in super().__iter__():
+            type(self).iterated += 1
+            yield item
+
+
+def _record(arg: Any) -> logging.LogRecord:
+    return logging.getLogRecordFactory()("n", logging.ERROR, __file__, 1, "m %s", (arg,), None)
+
+
+def _first_arg(arg: Any) -> Any:
+    """The first record argument, after the factory ran, untyped for indexing."""
+    args: Any = _record(arg).args
+    return args[0]
+
+
+@pytest.mark.usefixtures("installed")
+def test_a_huge_container_argument_is_scanned_only_up_to_the_cap(
+    driver_error: Exception,
+) -> None:
+    """1,000,000 items cost 60 ms per record before the cap. Counted, not timed."""
+    items = _CountingList([0] * 1_000_000)
+    _CountingList.iterated = 0
+    record = _record(items)
+    assert _CountingList.iterated <= log_safety._MAX_ITEMS
+    assert record.args == (items,)
+
+    # An exception inside the first `_MAX_ITEMS` items is replaced...
+    inside = _CountingList([0] * 999 + [driver_error] + [0] * 5000)
+    replaced = _first_arg(inside)
+    assert all(not isinstance(item, BaseException) for item in replaced)
+    assert "sqlalchemy.exc." in replaced[999]
+    assert len(replaced) == len(inside)
+
+    # ...and one past it is NOT: the documented residual, pinned so it is not
+    # mistaken for coverage.
+    beyond = _CountingList([0] * log_safety._MAX_ITEMS + [driver_error])
+    assert _first_arg(beyond)[-1] is driver_error
+
+
+@pytest.mark.usefixtures("installed")
+def test_the_depth_the_scrub_reaches_is_one_container_and_no_more(
+    driver_error: Exception,
+) -> None:
+    """Pins `_scrub_value`'s documented reach. `[[e]]` and a set are NOT covered."""
+    assert isinstance(_first_arg(driver_error), str)
+    for one_container in ([driver_error], (driver_error,)):
+        scrubbed = _first_arg(one_container)
+        assert driver_error not in scrubbed
+    # A lone mapping argument becomes `record.args` itself (logging's own rule).
+    mapping_record = _record({"k": driver_error})
+    assert isinstance(mapping_record.args, dict)
+    assert isinstance(mapping_record.args["k"], str)
+    assert _first_arg([[driver_error]])[0][0] is driver_error
+    assert _first_arg({driver_error}) == {driver_error}
+
+
 @pytest.mark.usefixtures("installed")
 def test_a_plain_record_is_not_modified() -> None:
     factory = logging.getLogRecordFactory()

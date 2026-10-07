@@ -35,12 +35,17 @@ def _scrub(text: str) -> str:
 class BackendError(RuntimeError):
     """A backend call failed. `guidance` is what the agent should be told to do.
 
-    `detail` is always the *scrubbed* backend text (see `_detail` below): a
-    `BackendError` raised inside a tool handler propagates to FastMCP and
-    from there into the model's context, which lands in a vendor chat history
-    that cannot be recalled. An operator backend's 4xx/5xx body can carry a
-    PAN, an IBAN, an account number or a customer name; nothing derived from
-    it may reach this exception unscrubbed.
+    `detail` is always the *scrubbed* backend text (see `_detail` below), and
+    its text does NOT reach the model: `services/api` builds FastMCP with
+    `mask_error_details=True`, so a `BackendError` escaping a tool handler
+    reaches the client as ``Error calling tool 'x'`` and nothing more. The
+    only specific thing a client learns is what a tool chooses to say by
+    catching it: `services/api/tools` maps a 404 to a fixed `ToolError`
+    (``not found`` and the payments tools' own sentences) and lets every other
+    status stay masked. `detail` is still scrubbed because it can reach a log
+    and an audit row, and an operator backend's 4xx/5xx body can carry a PAN,
+    an IBAN, an account number or a customer name; nothing derived from it may
+    reach this exception unscrubbed.
     """
 
     def __init__(self, status: int, detail: str, guidance: str) -> None:

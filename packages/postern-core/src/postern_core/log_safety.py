@@ -21,16 +21,29 @@ the measured exposure was wider than those two, and a logger's filter does not
 see a record that another logger's own handler (``propagate = False``) writes.
 
 So the net is a PROCESS-WIDE LOG RECORD FACTORY. `install_sql_safe_logging`
-wraps ``logging.getLogRecordFactory()``, and every record on every logger and
-handler is sanitised when it is created:
+wraps ``logging.getLogRecordFactory()``, and a record created through
+``Logger._log``, on any logger and handler, is sanitised when it is created, in
+the shapes below and no others:
 
 * an ``exc_info`` whose exception chain holds a driver error is replaced by the
   traceback FRAMES of the outermost exception (file, line and source line, so a
   failure is still locatable) plus one line per exception in the chain: its
   dotted type, a qualifier (below) and a literal saying what was withheld;
 * an exception in ``record.args`` (or ``record.msg``) whose chain holds a driver
-  error is replaced by `describe_exception`'s text;
+  error is replaced by `describe_exception`'s text, and so is one inside ONE
+  tuple, list or mapping that is itself an argument (`_scrub_value`; at most
+  `_MAX_ITEMS` items per container are scanned);
+* the ``repr`` of a driver error that asyncio embeds in the MESSAGE of ``Task
+  exception was never retrieved``;
 * everything else is left alone, byte for byte.
+
+NOT COVERED, each measured to leak: an exception nested two containers deep
+(``[[e]]``), in a set, in a dataclass or other wrapper object, or past the
+`_MAX_ITEMS`th item; a non-chained wrapper whose own text embeds the driver's;
+``str(e)`` or an f-string built at the call site (the rule for a developer is
+to log `describe_exception(e)` instead; `tests/test_log_call_scan.py` enforces
+it); ``extra=`` rendered by a custom formatter; ``logging.makeLogRecord``, which
+bypasses the factory; ``warnings.warn``.
 
 The chain walk follows ``__cause__``, ``__context__`` and the ``.exceptions`` of
 any ``BaseExceptionGroup`` (an ``asyncio.TaskGroup`` or anyio task group wraps
@@ -68,6 +81,7 @@ import logging
 import re
 import traceback
 from collections.abc import Mapping
+from itertools import islice
 from types import TracebackType
 from typing import Any, Final
 
@@ -276,11 +290,23 @@ def _type_names_only(exc: BaseException) -> str:
         return _LAST_RESORT
 
 
+#: How many items of one container `_scrub_value` looks at. A 1,000,000-element
+#: list passed as a log argument cost 60 ms per record before this cap, on every
+#: record, with no limit. An exception beyond the first `_MAX_ITEMS` items of a
+#: container is NOT scanned: that is the residual, and it is documented rather
+#: than closed because nothing in this repository logs a container that size.
+_MAX_ITEMS: Final[int] = 1000
+
+
 def _scrub_value(value: Any, depth: int = 0) -> Any:
     """``value`` with a driver-error exception replaced by its description.
 
-    Looks into a tuple, list or mapping one level down, since a record's
-    arguments are often passed that way. Returns the same object when nothing
+    Called on a record's ``args`` (depth 0). What it reaches: an exception that
+    is an argument (depth 1), and an exception inside ONE tuple, list or mapping
+    that is itself an argument (depth 2). A container inside that container
+    (depth 2 holding another) is not entered, so ``[[e]]`` is not covered; nor
+    are sets, dataclasses or other wrapper objects. At most `_MAX_ITEMS` items
+    of any one container are scanned. Returns the same object when nothing
     changed.
     """
     if isinstance(value, BaseException):
@@ -288,15 +314,23 @@ def _scrub_value(value: Any, depth: int = 0) -> Any:
     if depth >= 2:
         return value
     if isinstance(value, tuple | list):
-        scrubbed = [_scrub_value(item, depth + 1) for item in value]
-        if all(a is b for a, b in zip(scrubbed, value, strict=True)):
+        head = list(islice(value, _MAX_ITEMS))
+        scrubbed = [_scrub_value(item, depth + 1) for item in head]
+        if all(a is b for a, b in zip(scrubbed, head, strict=True)):
             return value
-        return type(value)(scrubbed) if isinstance(value, list) else tuple(scrubbed)
+        rebuilt = [*scrubbed, *islice(value, _MAX_ITEMS, None)]
+        return rebuilt if isinstance(value, list) else tuple(rebuilt)
     if isinstance(value, Mapping):
-        changed = {key: _scrub_value(item, depth + 1) for key, item in value.items()}
-        if all(changed[key] is value[key] for key in changed):
+        replaced: dict[Any, Any] = {}
+        for key, item in islice(value.items(), _MAX_ITEMS):
+            scrubbed_item = _scrub_value(item, depth + 1)
+            if scrubbed_item is not item:
+                replaced[key] = scrubbed_item
+        if not replaced:
             return value
-        return changed
+        merged = dict(value)
+        merged.update(replaced)
+        return merged
     return value
 
 

@@ -32,6 +32,8 @@ from postern_core.modules.read import ReadContext, ReadModule, ReadTool, ToolHan
 from postern_core.risk.session import get_current_session
 from pydantic import Field
 
+from services.api.tools.not_found import not_found_is_a_fixed_refusal
+
 
 def _build_transactions_list(context: ReadContext) -> ToolHandler:
     async def transactions_list(
@@ -52,9 +54,10 @@ def _build_transactions_list(context: ReadContext) -> ToolHandler:
         `true`, narrow `days` (or ask the customer to narrow the period)
         rather than presenting `items` as the whole history for the window.
         """
-        result = await facade.list_transactions(
-            context.backend, context.resolver(), account_ref, days
-        )
+        async with not_found_is_a_fixed_refusal():
+            result = await facade.list_transactions(
+                context.backend, context.resolver(), account_ref, days
+            )
         ctx = get_current_session()
         if ctx is not None:
             ctx.record_records(len(result.items))

@@ -35,9 +35,15 @@ from typing import Any
 
 import httpx2
 import pytest
+from fastmcp.exceptions import NotFoundError, ToolError
 from fastmcp.server.auth.providers.jwt import RSAKeyPair
+from fastmcp.server.middleware import Middleware
+from mcp.shared.exceptions import MCPError
 from postern_core import log_safety
+from postern_core.auth.revocation import RevocationStoreUnavailable, RevokedError
 from postern_core.identity import CustomerRef
+from postern_core.risk.session import SessionStoreUnavailable
+from postern_core.risk.types import RiskActionError
 from postern_core.store import audit as store_audit
 from postern_core.store import consents
 from postern_core.store.engine import Database
@@ -397,3 +403,122 @@ async def test_the_consent_site_does_not_rely_on_the_record_factory(
     _assert_log_clean(buffer.getvalue())
     assert "consent" in buffer.getvalue()
     _assert_client_clean(response)
+
+
+# ---------------------------------------------------------------------------
+# An exception raised BELOW the audit middleware (another FastMCP middleware),
+# which is the only way to reach the two `raise outgoing from None` points on
+# the raised branch: a tool-body failure is already a `ToolError` by then.
+# ---------------------------------------------------------------------------
+
+
+class _RaisesBelow(Middleware):
+    """An inner middleware that raises what it is given, or a real driver error."""
+
+    def __init__(self, raiser: Callable[[], Any]) -> None:
+        self.raiser = raiser
+
+    async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+        await self.raiser()
+        return await call_next(context)
+
+
+def _driver_raiser(app: Any, statement: Callable[..., Any]) -> Callable[[], Any]:
+    database: Database = app_database(app)
+
+    async def raise_driver_error() -> None:
+        async with database.sessionmaker() as session:
+            await statement(session)
+
+    return raise_driver_error
+
+
+def _raising(exc: BaseException) -> Callable[[], Any]:
+    async def raise_it() -> None:
+        raise exc
+
+    return raise_it
+
+
+@pytest.mark.parametrize("statement", [_bound_value_error, _failing_row_error])
+@pytest.mark.parametrize("audit_also_fails", [False, True])
+async def test_a_driver_error_raised_below_the_audit_middleware_is_the_fixed_text(
+    stack: tuple[Any, str],
+    monkeypatch: pytest.MonkeyPatch,
+    statement: Callable[..., Any],
+    audit_also_fails: bool,
+) -> None:
+    """(a) the `raised` row writes fine, (b) the `raised` row's write ALSO fails."""
+    app, token = stack
+    app.state.postern_server.add_middleware(_RaisesBelow(_driver_raiser(app, statement)))
+    if audit_also_fails:
+        _install(monkeypatch, app, fail_outcomes={"raised"}, statement=_failing_row_error)
+
+    response = await _tools_call(app, token, ENTRY_TOOL, {})
+
+    _assert_client_clean(response)
+    assert _client_text(response) == INTERNAL_ERROR_TEXT
+
+
+class _Unknown(Exception):
+    """A class nobody listed."""
+
+
+_ALLOWLISTED = {
+    "RevokedError": (
+        RevokedError("access has been revoked; tools/call was refused"),
+        "access has been revoked",
+    ),
+    "RiskActionError": (RiskActionError([]), "Session blocked by 0 risk signal(s)"),
+    "RevocationStoreUnavailable": (
+        RevocationStoreUnavailable("revocation list could not be read: TimeoutError"),
+        "revocation list could not be read: TimeoutError",
+    ),
+    "SessionStoreUnavailable": (
+        SessionStoreUnavailable("risk context abc could not be read: TimeoutError"),
+        "risk context abc could not be read: TimeoutError",
+    ),
+    "NotFoundError": (NotFoundError("anything"), "Unknown tool: 'accounts.list'"),
+    "ToolError": (ToolError("a deliberate refusal"), "a deliberate refusal"),
+    "MCPError": (MCPError(-32000, "a deliberate protocol error"), "a deliberate protocol error"),
+    "resolver PermissionError": (
+        PermissionError("request carries no validated access token"),
+        "request carries no validated access token",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_ALLOWLISTED))
+async def test_each_allowlisted_exception_still_reaches_the_client_unchanged(
+    stack: tuple[Any, str], name: str
+) -> None:
+    app, token = stack
+    exc, expected = _ALLOWLISTED[name]
+    app.state.postern_server.add_middleware(_RaisesBelow(_raising(exc)))
+
+    response = await _tools_call(app, token, ENTRY_TOOL, {})
+
+    assert expected in response.text, response.text
+    assert INTERNAL_ERROR_TEXT not in response.text
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _Unknown("redis://postern_api:zzsentinel_pw_7788@redis:6379"),
+        ConnectionError("redis://postern_api:zzsentinel_pw_7788@redis:6379"),
+        RuntimeError("zzsentinel_pw_7788"),
+        PermissionError(13, "Permission denied", "/etc/zzsentinel_pw_7788"),
+    ],
+    ids=["unknown class", "ConnectionError", "RuntimeError", "OS PermissionError"],
+)
+async def test_an_exception_of_an_unlisted_class_is_masked(
+    stack: tuple[Any, str], exc: BaseException
+) -> None:
+    app, token = stack
+    app.state.postern_server.add_middleware(_RaisesBelow(_raising(exc)))
+
+    response = await _tools_call(app, token, ENTRY_TOOL, {})
+
+    assert "zzsentinel_pw_7788" not in response.text, response.text
+    assert _client_text(response) == INTERNAL_ERROR_TEXT

@@ -31,6 +31,8 @@ from postern_core.facade import accounts as facade
 from postern_core.modules.read import ReadContext, ReadModule, ReadTool, ToolHandler
 from postern_core.risk.session import get_current_session
 
+from services.api.tools.not_found import not_found_is_a_fixed_refusal
+
 
 def _build_accounts_list(context: ReadContext) -> ToolHandler:
     async def accounts_list() -> list[Account]:
@@ -57,7 +59,8 @@ def _build_accounts_get_balance(context: ReadContext) -> ToolHandler:
         `account_ref` comes from `accounts.list`. Report the amount and currency
         exactly as returned; do not convert or round.
         """
-        result = await facade.get_balance(context.backend, context.resolver(), account_ref)
+        async with not_found_is_a_fixed_refusal():
+            result = await facade.get_balance(context.backend, context.resolver(), account_ref)
         ctx = get_current_session()
         if ctx is not None:
             ctx.record_records(1)

@@ -605,13 +605,14 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
             # reached this line. Remembering the failure is what makes the
             # request-wide claim true, so the line now makes it.
             #
-            # The traceback can carry the SQL and its bound parameters, so
-            # this line can put a `cust_`-prefixed customer reference in the
-            # log. That value is already written to `audit_log.customer_ref`
-            # in the clear on every call this customer makes, and `_customer`
-            # admits nothing that `CustomerRef` rejects, so the PAN-, IBAN-
-            # and DNI-shaped subjects `postern_core.identity`'s `_OPAQUE`
-            # warns about never reach this line.
+            # THE LINE CARRIES NO STATEMENT, NO BOUND PARAMETER AND NO DRIVER
+            # MESSAGE. It logs `describe_exception(cause)` (the exception's
+            # type and, for a driver error, its SQLSTATE or `client-side`), and
+            # passes `exc_info` only when the cause is NOT a driver error
+            # (`exc_info_for_log`), so a customer reference bound in the lookup
+            # never reaches the log through this line. Before 2026-10-07 the
+            # traceback was attached and could carry the SQL and its
+            # parameters.
             if failure.probed:
                 cause = failure.__cause__
                 if failure.reason == REFUSAL_CONSENT_STORE_UNAVAILABLE:

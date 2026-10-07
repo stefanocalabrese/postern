@@ -445,12 +445,24 @@ THREE LAYERS, each pinned by its own test (`tests/test_api_driver_error_client_t
    exception leaves `AuditMiddleware` after the tool returned, and reaches the client as a JSON-RPC
    `error.message` that masking never sees (measured: with masking on and the middleware guard off, the sentinel
    was in the reply).
-2. `AuditMiddleware._client_safe`: an exception that leaves the middleware with a SQL driver error anywhere in its
-   chain (cause, context, exception groups) is replaced by `ToolError("internal error")`. The call still fails. A
-   `ToolError` is exempt, because with (1) its text is safe by construction.
+2. `AuditMiddleware._client_safe`: every exception that leaves `on_call_tool` and is NOT on an explicit allowlist
+   (`FastMCPError` including `ToolError`, `NotFoundError`, `DisabledError`, `MCPError`, `RevokedError`,
+   `RiskActionError`, `RevocationStoreUnavailable`, `SessionStoreUnavailable`, and a `PermissionError` built from
+   one sentence with no errno) is replaced by a JSON-RPC error `-32603 internal error`. That covers a driver error
+   anywhere in the chain, and an unlisted class whose text nobody read (measured: a store raising a Redis
+   `ConnectionError` with a `redis://user:password@host` URL put the password in the reply). The call still fails,
+   at the protocol level as an unhandled exception from here always did. Each allowlisted class is tested to still
+   reach the client unchanged. A backend 404 on a caller-chosen account ref is mapped by the two tools that take
+   one to the fixed `not found`, because masking had made a typo and an outage read the same.
 3. `postern_core.log_safety.install_sql_safe_logging()`, called by `create_app` and `create_confirm_app`, wraps the
-   process-wide log record factory so that every record on every logger is sanitised when created (frames, each
-   exception's type and SQLSTATE, a withheld marker). The first design was a filter on `uvicorn.error` and
+   process-wide log record factory so that a record created through `Logger._log`, on any logger, is sanitised
+   when created (frames, each exception's type and SQLSTATE, a withheld marker) when its `exc_info`, an
+   argument or its message is an exception, or is inside ONE tuple, list or mapping that is itself an argument
+   (`_scrub_value`: depth one container, at most 1,000 items per container), whose chain (cause, context,
+   exception groups) holds a driver error, and asyncio's embedded `repr` of an unretrieved task exception.
+   NOT covered, measured: `[[e]]`, sets, dataclasses and other wrapper objects, anything past the 1,000th
+   item, a non-chained wrapper whose own text embeds the driver's, `str(e)` or an f-string built at the call
+   site, `extra={...}` rendered by a custom formatter, `logging.makeLogRecord`, and `warnings.warn`. The first design was a filter on `uvicorn.error` and
    `uvicorn`; it missed `fastmcp.server.server` (its own handler, `propagate = False`), the MCP dispatcher, and
    every `exc_info=` and `%s` of an exception in the application's own loggers, so it was replaced, not kept
    alongside: a filter that cannot see a record adds nothing the factory does not. The application's own log calls
