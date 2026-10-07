@@ -55,6 +55,15 @@ Production starts the process with: `uvicorn services.api.main:app`.
 8. **Server builder**, FastMCP server with middleware chain
 9. **JWKS route**, appended to router at `/.well-known/jwks.json`
 
+### Uncaught driver errors in the log
+
+A SQL driver error that escapes a handler is logged by uvicorn as `Exception in
+ASGI application`. Both database engines hide bound parameters, and `create_app`
+installs `postern_core.log_safety.SqlSafeExceptionFilter` on `uvicorn.error` and
+`uvicorn`: the log keeps the traceback frames, each exception's type and its
+SQLSTATE, and withholds the driver's message, the SQL and the parameters. The
+driver's message text is in Postgres' own log.
+
 ## ASGI Middleware Chain
 
 Middleware is installed inside `server.http_app()`. Starlette wraps the list in reverse,

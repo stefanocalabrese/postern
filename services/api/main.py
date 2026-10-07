@@ -72,6 +72,7 @@ from postern_core.config import bool_from_env, enforce_redis_requirement
 from postern_core.env_inventory import enforce_known_environment
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef, CustomerResolver
+from postern_core.log_safety import install_sql_safe_logging
 from postern_core.store.engine import Database
 from starlette.middleware import Middleware
 
@@ -277,6 +278,10 @@ def create_app(
     # text. Dormant at the default root level, live once an operator lowers it.
     for _http_logger in ("httpx2", "httpcore2"):
         logging.getLogger(_http_logger).setLevel(logging.WARNING)
+    # An uncaught SQL driver error is logged by uvicorn with its statement,
+    # bound parameters and the driver's own message; this withholds all three
+    # from the log and keeps frames, types and the SQLSTATE. Idempotent.
+    install_sql_safe_logging()
     settings = settings or Settings.from_env()
 
     # REDIS PREFLIGHT, once per process, BEFORE any key, Vault probe, backend client or

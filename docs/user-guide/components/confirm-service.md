@@ -75,6 +75,17 @@ customer token good enough to read a balance would be good enough to approve a
 payment. Neither process can detect the collision, so it is an operator
 requirement.
 
+### Uncaught driver errors in the log
+
+The approval callback re-raises its own exception after writing its audit row
+(decision 0006), so a driver error can reach uvicorn's `Exception in ASGI
+application` line. Both database engines hide bound parameters, and
+`create_confirm_app` installs `postern_core.log_safety.SqlSafeExceptionFilter`
+on `uvicorn.error` and `uvicorn`: for such an error the log keeps the traceback
+frames, each exception's type and its SQLSTATE, and withholds the driver's
+message, the SQL and the parameters. To read the message, look up the SQLSTATE
+and the time in Postgres' own log.
+
 ### Startup clock check
 
 In its lifespan confirm runs one `SELECT statement_timestamp()` through its own

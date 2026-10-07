@@ -417,3 +417,44 @@ never states: whether the RECORD survives when Postgres is unreachable, as
 against whether the request fails. It does not, and record 0016 is where that
 is argued and accepted rather than left for someone to discover and try to fix
 with a spool.
+
+---
+
+## Amendment, 7 October 2026: the re-raise stays, and the log it produces is sanitised
+
+Nothing in this record's decision changes. The approval callback still writes
+its `raised` audit row and then re-raises the approval's own exception, and
+`tests/test_audit_reserve.py` still pins the escaping class (`TimeoutError`,
+`ConnectionRefusedError`). The request still fails with 500.
+
+What changed is the line that escape produces. Measured through a real uvicorn
+server, an uncaught SQL driver error was logged as `Exception in ASGI
+application` with SQLAlchemy's `[SQL: ...]` and `[parameters: (...)]`, and with
+the asyncpg message under it, which names the offending value (for a unique
+violation, the `Key (a, b)=(x, y)` detail). `hide_parameters=True` on both
+`Database` engines removes the `[parameters: ...]` line and does not touch the
+driver's own message, which `tests/test_sql_safe_logging.py` measures: a value
+cast to an integer is named in asyncpg's message with parameters hidden.
+
+So `postern_core.log_safety.SqlSafeExceptionFilter` rewrites the rendering of
+any record on `uvicorn.error` or `uvicorn` whose exception chain holds a
+SQLAlchemy `StatementError` or an asyncpg exception: traceback frames, one line
+per exception with its type and SQLSTATE, and a literal saying the message, SQL
+and parameters were withheld. `tests/test_sql_safe_logging_uvicorn.py` drives it
+through a real uvicorn server, the confirm approval callback and an api route,
+with the filter off (the sentinel is in the log) and on (it is nowhere).
+
+WHERE IT IS INSTALLED, stated for the shipped image. `create_confirm_app` and
+`create_app` both call `install_sql_safe_logging()`. The Dockerfile's `CMD` for
+the `api` and `confirm` targets is `uvicorn services.<name>.main:app` with no
+`--log-config`. uvicorn applies its logging config in `Config.__init__` and
+imports the application afterwards, in `Config.load()`, so on the shipped
+command the filter is installed after uvicorn's config and is not removed by it.
+An operator who replaces uvicorn's logging after the app exists (a `dictConfig`
+run from their own wrapper module, after importing the app) can drop it and must
+call `install_sql_safe_logging()` again after that. An operator who serves the
+app under a different server (a gunicorn worker class with its own loggers) is
+not covered, because the filter attaches to uvicorn's two loggers only.
+
+What an operator loses: the driver's message text in the application log. The
+SQLSTATE and the time identify the statement in Postgres' own log.

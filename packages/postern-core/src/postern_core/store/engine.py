@@ -230,6 +230,13 @@ class Database:
         the numbers above; one that is silently dropping every packet
         including a fresh connection's is bounded by the kernel, not by this.
         """
+        # `hide_parameters=True` on BOTH engines: a failed statement's exception
+        # text then ends `[SQL parameters hidden due to hide_parameters=True]`
+        # instead of `[parameters: (...)]`, which carried customer refs, assertion
+        # `jti` values and signatures into whatever logged the exception. The
+        # driver's own message is a second carrier, which
+        # `postern_core.log_safety` withholds from uncaught-error logs.
+        #
         # All three of these are QueuePool arguments. `create_async_engine`
         # consumes one only if the pool class in use accepts it, and rejects
         # the whole call otherwise: measured against SQLAlchemy 2.0.52,
@@ -257,6 +264,7 @@ class Database:
         # this constructor a single call.
         self.engine: AsyncEngine = create_async_engine(
             url,
+            hide_parameters=True,
             pool_pre_ping=True,
             poolclass=NullPool if null_pool else None,
             connect_args={
@@ -293,6 +301,7 @@ class Database:
             if null_pool or audit_reserve_size <= 0
             else create_async_engine(
                 url,
+                hide_parameters=True,
                 pool_pre_ping=True,
                 pool_timeout=pool_timeout_seconds,
                 pool_size=audit_reserve_size,

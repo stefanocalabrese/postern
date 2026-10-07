@@ -84,6 +84,7 @@ from postern_core.auth.refresh_sessions import create_refresh_session_store
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement, redis_url_from_env
 from postern_core.env_inventory import enforce_known_environment
+from postern_core.log_safety import install_sql_safe_logging
 from postern_core.modules.enrichers import load_network_enricher
 from postern_core.risk.pairing_network import NetworkEnricher
 from postern_core.store.engine import Database
@@ -352,6 +353,10 @@ def create_confirm_app(
             import, or one whose ``lookup`` is not async.
     """
     pin_http_client_loggers()
+    # An uncaught SQL driver error is logged by uvicorn with its statement,
+    # bound parameters and the driver's own message; this withholds all three
+    # from the log and keeps frames, types and the SQLSTATE. Idempotent.
+    install_sql_safe_logging()
     # FIRST, AND AHEAD OF THE AUTHENTICATION GUARD, which is a deliberate
     # exception to the ordering the next comment states. That order exists so
     # an operator missing both authentication and Redis hears about
