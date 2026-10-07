@@ -82,10 +82,13 @@ from tests.test_write_audit import (
 # `tests/test_audit_arguments_cap.py` arrived at the hard way and whose two
 # lessons both apply here unchanged.
 #
-# WRAPPED at RFC 2045's 76-character line width rather than one unbroken run:
-# an unbroken alphanumeric run longer than `masking`'s `_IBAN_SCAN_MAX_TOKEN`
-# (128) is already bare-masked to `••••` by the scrub, so a naive fixture
-# arrives at this bound as four characters and tests nothing at all.
+# WRAPPED every 76 characters rather than one unbroken run: an unbroken
+# alphanumeric run longer than `masking`'s `_IBAN_SCAN_MAX_TOKEN` (128) is
+# already bare-masked to `••••` by the scrub, so a naive fixture arrives at
+# this bound as four characters and tests nothing at all. The separator only
+# has to break long tokens, and it must NOT be a control character: the
+# approval callback refuses a `verification_result` containing one, so a
+# newline here would turn the 409 and 200 cases into 400s.
 #
 # INCOMPRESSIBLE, from a seeded PRNG rather than one line repeated: TOAST
 # compresses a JSONB value before storing it and `pg_column_size` reports the
@@ -94,7 +97,7 @@ from tests.test_write_audit import (
 # is bytes on disk.
 _RNG = random.Random(20260924)  # noqa: S311 -- a test fixture's bytes, not a key
 _B64 = base64.b64encode(_RNG.randbytes(786_000)).decode()
-ONE_MIB = "\n".join(_B64[i : i + 76] for i in range(0, len(_B64), 76))
+ONE_MIB = " ".join(_B64[i : i + 76] for i in range(0, len(_B64), 76))
 assert 1_000_000 < len(ONE_MIB) <= 1_100_000, len(ONE_MIB)
 
 # Far above any bound this column should ever carry, and far below the 979,108

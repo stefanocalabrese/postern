@@ -184,6 +184,7 @@ __all__ = [
     "DETAIL_ALREADY_APPROVED",
     "DETAIL_ALREADY_SCANNED",
     "DETAIL_ALREADY_TERMINAL",
+    "DETAIL_BODY_FIELD_INVALID",
     "DETAIL_CHALLENGE_NOT_FOUND",
     "DETAIL_CHALLENGE_NOT_OWNED",
     "DETAIL_CHALLENGE_VANISHED",
@@ -312,6 +313,11 @@ DETAIL_TIER_MISMATCH = "tier_mismatch"
 #: ``tier_unsupported`` is a tier-0 row of an operation confirm does not
 #: declare. Tier 0 is a read tier and nothing approves it.
 DETAIL_TIER_UNSUPPORTED = "tier_unsupported"
+#: ``body_field_invalid`` is an approval whose ``confirming_device`` or
+#: ``verification_result`` is not a well formed string (wrong type, a control
+#: character, or a device outside 1 to 128 characters). Refused before the
+#: claim, so the row stays ``pending``; the response names the field only.
+DETAIL_BODY_FIELD_INVALID = "body_field_invalid"
 
 # `audit_log.client_id` is `String(512)` (models.py). The value here comes off
 # a verified assertion's claims, so producing an over-length one takes the

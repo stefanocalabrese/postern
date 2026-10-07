@@ -110,6 +110,7 @@ from __future__ import annotations
 
 import logging
 import time
+import unicodedata
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -121,6 +122,7 @@ from starlette.responses import JSONResponse
 
 from services.confirm.audit import (
     DETAIL_ALREADY_TERMINAL,
+    DETAIL_BODY_FIELD_INVALID,
     DETAIL_CHALLENGE_NOT_FOUND,
     DETAIL_CHALLENGE_NOT_OWNED,
     DETAIL_CHALLENGE_VANISHED,
@@ -583,6 +585,32 @@ async def _approve(
             audit.note_assertion_jti(verdict.assertion_jti)
         if verdict.refusal is not None:
             return tier_refusal(challenge_id, verdict.refusal)
+        # --- 2d. Are the body fields the claim will write well formed? ---
+        #
+        # AFTER the tier check and BEFORE the claim, so a refusal leaves the
+        # row `pending`. Neither field reached a check before: a wrong type, a
+        # NUL or a device past `String(128)` made the driver raise inside the
+        # claim and the 500 carried the SQL. A tier-2 row ignores the body's
+        # `verification_result` and stores the assertion's `jti`, so that
+        # value is never written and is not validated.
+        invalid_field = _invalid_body_field(
+            body, check_verification_result=verdict.assertion_jti is None
+        )
+        if invalid_field is not None:
+            logger.warning(
+                "challenge approve: %s refused, body field %s is malformed",
+                challenge_id,
+                invalid_field,
+            )
+            return (
+                _error(
+                    400,
+                    "invalid_request",
+                    f"{invalid_field} is not a well formed value",
+                ),
+                DETAIL_BODY_FIELD_INVALID,
+            )
+
         # Tier 2 stores the assertion's `jti`, never the body's string: what
         # lands on the row is then the identifier of an assertion that carried
         # the configured `idv` and this challenge's id. Tier 1 is unchanged.
@@ -615,12 +643,17 @@ async def _approve(
                 signature=presented_signature,
             )
         except Exception as exc:
-            # `type(exc).__name__` and never `str(exc)` on the audit row, even
-            # though the RESPONSE interpolates the message: a store exception
-            # can embed the offending value, and this table is a long-lived
-            # one. The response's own disclosure predates this change.
+            # `type(exc).__name__` and never `str(exc)`, on the audit row, in
+            # the log and in the response: a driver exception carries the SQL
+            # and its bound parameters, and the response used to interpolate
+            # it, which handed a caller the statement and the values it sent.
+            logger.error(
+                "challenge approve: %s: the claiming update raised %s",
+                challenge_id,
+                type(exc).__name__,
+            )
             return (
-                _error(500, "internal_error", f"approval update failed: {exc}"),
+                _error(500, "internal_error", APPROVAL_UPDATE_FAILED_DESCRIPTION),
                 type(exc).__name__,
             )
 
@@ -747,7 +780,7 @@ async def _approve(
             # challenge is stranded in `approved` with no execution behind it
             # and no backend to reconcile against.
             return (
-                _error(500, "internal_error", f"execution setup failed: {exc}"),
+                _error(500, "internal_error", EXECUTION_SETUP_FAILED_DESCRIPTION),
                 type(exc).__name__,
             )
 
@@ -890,6 +923,46 @@ async def _refused_transition_response(
         _error(500, "internal_error", "approval update matched no row"),
         DETAIL_UPDATE_MATCHED_NO_ROW,
     )
+
+
+#: Fixed response texts. No exception's message reaches a caller: a driver
+#: error carries the statement and its bound parameters.
+APPROVAL_UPDATE_FAILED_DESCRIPTION = "the approval could not be recorded"
+EXECUTION_SETUP_FAILED_DESCRIPTION = "the approved operation could not be set up"
+
+#: `challenges.confirming_device` is `String(128)`.
+CONFIRMING_DEVICE_MAX_LENGTH = 128
+
+
+def _clean_text(value: object, *, min_length: int = 0, max_length: int | None = None) -> bool:
+    """True for a ``str`` within bounds with no control character in it.
+
+    Unicode category ``C*`` covers NUL, the C0 and C1 controls, format
+    characters, surrogates and private use: nothing a device name or a
+    verification note needs, and NUL is one PostgreSQL text cannot hold.
+    """
+    if not isinstance(value, str):
+        return False
+    if len(value) < min_length or (max_length is not None and len(value) > max_length):
+        return False
+    return not any(unicodedata.category(ch).startswith("C") for ch in value)
+
+
+def _invalid_body_field(body: dict[str, Any], *, check_verification_result: bool) -> str | None:
+    """The name of the first malformed body field the claim would write, or ``None``.
+
+    Names the field only; the value is never echoed. An absent or ``null``
+    field is valid.
+    """
+    device = body.get("confirming_device")
+    if device is not None and not _clean_text(
+        device, min_length=1, max_length=CONFIRMING_DEVICE_MAX_LENGTH
+    ):
+        return "confirming_device"
+    result = body.get("verification_result")
+    if check_verification_result and result is not None and not _clean_text(result):
+        return "verification_result"
+    return None
 
 
 def _error(status: int, code: str, description: str) -> JSONResponse:
