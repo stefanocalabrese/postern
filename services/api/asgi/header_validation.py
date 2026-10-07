@@ -11,13 +11,16 @@ FastMCP exposes no way to set the HTTP status from a tool or hook.
 """
 
 import json
+import re
 from typing import Any
 
-from postern_core.json_strict import loads_finite
+from postern_core.json_strict import loads_finite_utf8
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 HEADER_MISMATCH = -32020
 PARSE_ERROR = -32700
+
+MAX_WALK_NODES = 1_000_000
 
 _NAME_FROM_PARAM = {"tools/call": "name", "prompts/get": "name", "resources/read": "uri"}
 
@@ -168,15 +171,72 @@ def _parse(body: bytes) -> dict[str, Any] | None:
     nested arrays, under `max_body_bytes`, left this middleware as an exception
     until 2026-09-24 and produced a 500 from Starlette's `ServerErrorMiddleware`.
 
+    THE BODY IS READ AS STRICT UTF-8 WITHOUT A BYTE-ORDER MARK
+    (`loads_finite_utf8`). `json.loads(bytes)` is more lenient than its name
+    suggests: it sniffs UTF-16 and UTF-32, accepts a UTF-8 BOM, and decodes raw
+    CESU-8 surrogate bytes with `surrogatepass`. Until 2026-10-07 this
+    docstring said non-UTF-8 bodies were refused; those were not. RFC 8259
+    section 8.1 requires UTF-8 and says implementations MUST NOT add a BOM and
+    MAY ignore one, so refusing a BOM is allowed and is what happens.
+
+    A body that parses is then walked once by `_storable`: a string with U+0000
+    or a surrogate, anywhere, is refused the same way (see there).
+
     The answer is 400 -32700 "Parse error", the code JSON-RPC defines for it,
     and not -32020, which this control owns for "Header mismatch" and would
     misstate about a request whose headers were never compared to anything.
     """
     try:
-        payload = loads_finite(body)
+        payload = loads_finite_utf8(body)
     except (ValueError, RecursionError) as exc:
         raise _Unparseable from exc
+    if not _storable(payload):
+        raise _Unparseable
     return payload if isinstance(payload, dict) else None
+
+
+_UNSTORABLE_CHARACTER = re.compile("[\x00\ud800-\udfff]")
+
+
+def _storable(payload: object) -> bool:
+    """False when any string in the parsed body, a key or a value at any depth,
+    holds U+0000 or a surrogate code point, or the body has more than
+    `MAX_WALK_NODES` nodes.
+
+    WHY: the audit ENTRY row is written before the backend is reached and a
+    failed insert fails the call closed with no row. PostgreSQL refuses U+0000
+    in text and JSONB (`CharacterNotInRepertoireError`) and UTF-8 cannot encode
+    a surrogate (`UnicodeEncodeError`), and both are reachable as a JSON
+    escape (`"\\u0000"`, `"\\ud800"`) in a JSON-RPC `id`, which nothing scrubs.
+    Refused here the call is a parse error answered before auth, like every
+    other body this middleware cannot take; it never becomes a call that ends
+    as a 200 with no record.
+
+    ITERATIVE ON PURPOSE: the stdlib parser reads about 9,997 levels, and a
+    recursive walk raises `RecursionError` on exactly the bodies this exists
+    for. The node cap is the walk's own bound; at one million nodes it is far
+    above anything `max_body_bytes` lets in and refuses what is above it.
+    Depth is not refused here, `scrub_tree` bounds it for the audit row.
+    """
+    stack: list[object] = [payload]
+    visited = 0
+    while stack:
+        node = stack.pop()
+        visited += 1
+        if visited > MAX_WALK_NODES:
+            return False
+        if isinstance(node, str):
+            if _UNSTORABLE_CHARACTER.search(node):
+                return False
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                visited += 1
+                if _UNSTORABLE_CHARACTER.search(key):
+                    return False
+                stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return True
 
 
 class _BodyTooLarge(Exception):

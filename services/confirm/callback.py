@@ -142,7 +142,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from postern_core.json_strict import loads_finite
+from postern_core.json_strict import loads_finite_utf8
 from postern_core.log_safety import describe_exception
 from postern_core.store.challenges import get_challenge, update_challenge_status
 from postern_core.store.engine import Database
@@ -1060,7 +1060,8 @@ async def _read_body(request: Request) -> dict[str, Any] | None:
     Without that middleware this function would be reading an unbounded body
     into memory in order to refuse it.
     """
-    # Parsed with `loads_finite` rather than `request.json()`, which accepts
+    # Parsed with `loads_finite_utf8` (strict UTF-8, no BOM, so UTF-16 and
+    # UTF-32 bodies are malformed too) rather than `request.json()`, which accepts
     # the JSON extensions `NaN`, `Infinity` and `-Infinity` (and a literal like
     # `1e999` decodes to infinity). A float like that reaches
     # `audit_log.arguments` and PostgreSQL refuses it as a JSONB token, so
@@ -1070,7 +1071,7 @@ async def _read_body(request: Request) -> dict[str, Any] | None:
     # any challenge is looked at. Every other JSON body this service reads
     # goes through the same function.
     try:
-        parsed = loads_finite(await request.body())
+        parsed = loads_finite_utf8(await request.body())
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) else None

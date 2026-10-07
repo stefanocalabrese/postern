@@ -3153,6 +3153,10 @@ def scrub_text(value: str) -> str:
     return _redact_free_text(value.replace("\x00", ""))
 
 
+SCRUB_MAX_DEPTH = 100
+TOO_DEEP = "[nested too deeply]"
+
+
 def scrub_tree(value: Any) -> Any:
     """`scrub_text` applied through a dict/list tree, INCLUDING dict keys.
 
@@ -3175,11 +3179,26 @@ def scrub_tree(value: Any) -> Any:
     an `int`, a `bool`, `None`. Nothing in those shapes can carry a PAN that
     `_PAN_IN_TEXT_RE` would match, and coercing them to text to find out would
     change what the caller stores.
+
+    DEPTH IS BOUNDED AT `SCRUB_MAX_DEPTH` (100) CONTAINERS, the root being the
+    first. A dict or list nested deeper is replaced, whole, by the string
+    `TOO_DEEP`, so the audit row records that something was cut and where.
+    Unbounded, the recursion raised `RecursionError` on `arguments` nested
+    1,000 to 9,997 levels deep (the stdlib parser reads about 9,997), which
+    failed the audit write and ended the call with no row. Everything at or
+    above the bound is returned exactly as before; a legitimate argument tree
+    is a handful of levels deep.
     """
+    return _scrub_at(value, 1)
+
+
+def _scrub_at(value: Any, depth: int) -> Any:
     if isinstance(value, str):
         return scrub_text(value)
+    if isinstance(value, (dict, list)) and depth > SCRUB_MAX_DEPTH:
+        return TOO_DEEP
     if isinstance(value, dict):
-        return {scrub_tree(k): scrub_tree(v) for k, v in value.items()}
+        return {_scrub_at(k, depth + 1): _scrub_at(v, depth + 1) for k, v in value.items()}
     if isinstance(value, list):
-        return [scrub_tree(v) for v in value]
+        return [_scrub_at(v, depth + 1) for v in value]
     return value

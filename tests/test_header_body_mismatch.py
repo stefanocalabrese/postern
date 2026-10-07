@@ -1,6 +1,7 @@
 import json
 from typing import Any
 
+import pytest
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from services.api.asgi.header_validation import HeaderBodyValidation
@@ -202,14 +203,60 @@ async def _call_raw(
     return sent
 
 
-async def test_non_utf8_body_does_not_crash_and_is_refused_with_a_parse_error() -> None:
+@pytest.mark.parametrize("body", [b'{"a":"\xff"}', b"\x80"])
+async def test_non_utf8_body_does_not_crash_and_is_refused_with_a_parse_error(
+    body: bytes,
+) -> None:
+    """Bytes with no encoding at all, so a real `UnicodeDecodeError` is what is
+    caught. (This test used `\\xff\\xfe...`, a UTF-16-LE byte-order mark: the
+    stdlib sniffed UTF-16, raised `JSONDecodeError`, and the `UnicodeDecodeError`
+    branch was never exercised.)"""
+    with pytest.raises(UnicodeDecodeError):
+        body.decode("utf-8")
     seen: list[bytes] = []
     app = HeaderBodyValidation(_downstream(seen))
-    body = b"\xff\xfe\x00\x01not-utf8"
     sent = await _call(app, {"Mcp-Method": "tools/call", "Mcp-Name": "accounts.list"}, body)
     assert _status(sent) == 400
-    assert _json(sent)["error"]["code"] == -32700
+    assert _json(sent)["error"] == {"code": -32700, "message": "Parse error"}
     assert seen == []
+
+
+_TOOLS_CALL = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"accounts.list"}}'
+_NOT_UTF8_ENCODINGS = {
+    "utf-16-le-bom": b"\xff\xfe" + _TOOLS_CALL.encode("utf-16-le"),
+    "utf-16-be-bom": b"\xfe\xff" + _TOOLS_CALL.encode("utf-16-be"),
+    "utf-16-le-no-bom": _TOOLS_CALL.encode("utf-16-le"),
+    "utf-32-le-bom": b"\xff\xfe\x00\x00" + _TOOLS_CALL.encode("utf-32-le"),
+    "utf-32-be-no-bom": _TOOLS_CALL.encode("utf-32-be"),
+    "utf-8-bom": b"\xef\xbb\xbf" + _TOOLS_CALL.encode(),
+    "cesu-8-surrogate": b'{"jsonrpc":"2.0","id":"\xed\xa0\x80","method":"tools/list"}',
+}
+
+
+@pytest.mark.parametrize("name", sorted(_NOT_UTF8_ENCODINGS))
+async def test_a_body_in_any_encoding_but_plain_utf8_is_refused_with_a_parse_error(
+    name: str,
+) -> None:
+    """`json.loads(bytes)` sniffs UTF-16 and UTF-32, accepts a UTF-8 BOM and, via
+    `surrogatepass`, raw CESU-8 surrogate bytes. The body is read as strict
+    UTF-8 without a BOM (RFC 8259 section 8.1; a BOM is refused, which the RFC
+    allows), so none of these reaches the tool: same answer as `{not json`."""
+    seen: list[bytes] = []
+    app = HeaderBodyValidation(_downstream(seen))
+    sent = await _call(app, {}, _NOT_UTF8_ENCODINGS[name])
+    assert _status(sent) == 400
+    assert _json(sent)["error"] == {"code": -32700, "message": "Parse error"}
+    assert seen == []
+
+
+async def test_the_same_body_in_plain_utf8_is_not_refused() -> None:
+    """The control for the group above: only the encoding differs."""
+    seen: list[bytes] = []
+    app = HeaderBodyValidation(_downstream(seen))
+    body = _TOOLS_CALL.encode()
+    sent = await _call(app, {"Mcp-Method": "tools/call", "Mcp-Name": "accounts.list"}, body)
+    assert _status(sent) == 200
+    assert seen == [body]
 
 
 async def test_json_array_body_is_not_a_batch_and_does_not_crash() -> None:
@@ -849,7 +896,10 @@ async def test_a_deeply_nested_body_is_refused_by_the_middleware_with_32700() ->
     a second one (see `tests/test_strict_json_sites.py`, the integer-digit
     limit): now every body this middleware cannot parse strictly is answered
     here, and what is pinned is that the answer is the middleware's, identified
-    by its fixed message "Parse error" and not FastMCP's detailed one, at the
+    by its fixed message "Parse error" and not FastMCP's detailed one (which
+    only the LEGACY path emits: the request therefore carries no
+    `MCP-Protocol-Version` header, since the 2026-07-28 path answers with the
+    identical fixed message and could not tell the two apart), at the
     BOUNDARY as well as at the gross case. The depth is searched for rather
     than written down: on CPython 3.12.13 the `_json` C scanner stops at 9,997
     nested arrays, an interpreter constant this test has no business hardcoding.
@@ -923,7 +973,6 @@ async def test_a_deeply_nested_body_is_refused_by_the_middleware_with_32700() ->
                         "Mcp-Name": "accounts.list",
                         "Accept": "application/json, text/event-stream",
                         "Content-Type": "application/json",
-                        "MCP-Protocol-Version": "2026-07-28",
                     },
                     content=content,
                 )

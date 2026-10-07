@@ -94,11 +94,25 @@ Enforces MCP Streamable HTTP spec compliance:
 - Rejects requests where `Mcp-Method` / `Mcp-Name` headers don't match body values
   (HTTP 400 + JSON-RPC `-32020`)
 - Answers any body it cannot parse strictly with HTTP 400 and JSON-RPC `-32700` "Parse error"
-  before FastMCP sees it: not JSON, not UTF-8, nested past the recursion limit, an integer past
-  the interpreter's digit limit, or holding `NaN`, `Infinity`, `-Infinity` or an overflowing
-  literal such as `1e999`. FastMCP's own parsers accept some of these, so a body the middleware
-  cannot read is never handed to a second parser. A JSON value that is not an object (an array)
-  is not refused here and goes downstream
+  before FastMCP sees it: not JSON, not plain UTF-8 (UTF-16, UTF-32, a UTF-8 byte-order mark and
+  raw surrogate bytes are refused too: the body is read as strict UTF-8 without a BOM, which RFC
+  8259 section 8.1 permits), nested past the recursion limit, an integer past the interpreter's
+  digit limit, or holding `NaN`, `Infinity`, `-Infinity` or an overflowing literal such as
+  `1e999`. FastMCP's own parsers accept some of these, so a body the middleware cannot read is
+  never handed to a second parser. A JSON value that is not an object (an array) is not refused
+  here and goes downstream
+- Answers the same 400 / `-32700` for a body that parses but holds, in any key or value at any
+  depth (the JSON-RPC `id`, `arguments` and `_meta` included), a string with U+0000 or a
+  surrogate code point (U+D800 to U+DFFF), or more than 1,000,000 nodes. PostgreSQL refuses
+  U+0000 and UTF-8 cannot encode a surrogate, so such a call used to fail its audit insert and
+  end as an HTTP 200 carrying an error, with no backend call and no audit row. The walk is
+  iterative. Nesting depth is not refused: an `arguments` tree nested past 100 containers is
+  recorded in the audit row with the string `"[nested too deeply]"` in place of everything
+  below that depth, and the call is audited like any other
+- This applies to EVERY POST path on the api, whatever it routes to, and it runs before
+  authentication: a POST whose body is not JSON gets 400 / `-32700` instead of the 405, 404 or
+  401 the route would give, as the 413 and `-32020` refusals already do. A future form-encoded
+  POST route on the api must be exempted explicitly or it will never see its body
 - Bounds request body to `POSTERN_MAX_BODY_BYTES` (default 1 MiB)
 - Prevents request smuggling via header/body mismatch
 

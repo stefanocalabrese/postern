@@ -399,3 +399,77 @@ async def test_approve_answers_a_too_deep_body_as_malformed_json(
     assert (resp.status_code, resp.json()) == (control.status_code, control.json())
     assert (await device_store_of(app).get_device_code(code.device_code)).approved is False  # type: ignore[union-attr]
     assert await audit_rows(clean) == []
+
+
+# ---------------------------------------------------------------------------
+# services/confirm: a body in any encoding but plain UTF-8 is malformed JSON.
+# ---------------------------------------------------------------------------
+
+ENCODINGS = ["utf-16-le-bom", "utf-16-be", "utf-32-le-bom", "utf-8-bom", "cesu-8-surrogate"]
+
+
+def encode_as(name: str, text: str) -> bytes:
+    """`text` in an encoding `json.loads(bytes)` accepts and strict UTF-8 refuses."""
+    return {
+        "utf-16-le-bom": b"\xff\xfe" + text.encode("utf-16-le"),
+        "utf-16-be": text.encode("utf-16-be"),
+        "utf-32-le-bom": b"\xff\xfe\x00\x00" + text.encode("utf-32-le"),
+        "utf-8-bom": b"\xef\xbb\xbf" + text.encode(),
+        "cesu-8-surrogate": text[:-1].encode() + b', "x": "\xed\xa0\x80"}',
+    }[name]
+
+
+async def post_bytes(
+    app: Starlette, path: str, raw: bytes, headers: dict[str, str] | None = None
+) -> httpx2.Response:
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://t"
+    ) as c:
+        return await c.post(path, content=raw, headers={**JSON, **(headers or {})})
+
+
+@pytest.mark.parametrize("name", ENCODINGS)
+async def test_device_authorization_answers_a_non_utf8_body_as_malformed_json(
+    app: Starlette, name: str
+) -> None:
+    control = await post_raw(app, "/device_authorization", "{not json")
+    before = dict(device_store_of(app)._codes)  # type: ignore[attr-defined]
+
+    raw = encode_as(name, f'{{"client_id": "{BROWSER_CLIENT}"}}')
+    resp = await post_bytes(app, "/device_authorization", raw)
+
+    assert (resp.status_code, resp.json()) == (control.status_code, control.json())
+    assert dict(device_store_of(app)._codes) == before  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("name", ENCODINGS)
+async def test_scan_answers_a_non_utf8_body_as_malformed_json(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair, name: str
+) -> None:
+    code = await new_pairing(app)
+    headers = bearer(key_pair)
+    control = await post_raw(app, "/scan", "{not json", headers)
+
+    raw = encode_as(name, f'{{"user_code": "{code.user_code_display}", "qr": "{qr_for(code)}"}}')
+    resp = await post_bytes(app, "/scan", raw, headers)
+
+    assert (resp.status_code, resp.json()) == (control.status_code, control.json())
+    assert (await device_store_of(app).get_device_code(code.device_code)).scanned_by == ""  # type: ignore[union-attr]
+    assert await audit_rows(clean) == []
+
+
+@pytest.mark.parametrize("name", ENCODINGS)
+async def test_approve_answers_a_non_utf8_body_as_malformed_json(
+    app: Starlette, clean: Database, key_pair: RSAKeyPair, name: str
+) -> None:
+    code = await new_pairing(app)
+    await scan_in_store(app, code.user_code, ALICE)
+    headers = bearer(key_pair)
+    control = await post_raw(app, "/approve", "{not json", headers)
+
+    raw = encode_as(name, f'{{"user_code": "{code.user_code_display}"}}')
+    resp = await post_bytes(app, "/approve", raw, headers)
+
+    assert (resp.status_code, resp.json()) == (control.status_code, control.json())
+    assert (await device_store_of(app).get_device_code(code.device_code)).approved is False  # type: ignore[union-attr]
+    assert await audit_rows(clean) == []

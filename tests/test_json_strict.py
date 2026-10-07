@@ -13,7 +13,7 @@ import math
 from typing import Any
 
 import pytest
-from postern_core.json_strict import NonFiniteJsonError, loads_finite
+from postern_core.json_strict import NonFiniteJsonError, loads_finite, loads_finite_utf8
 
 NON_FINITE_LITERALS = ["NaN", "Infinity", "-Infinity", "1e999", "-1e999", "1E999", "1.5e400"]
 
@@ -97,6 +97,48 @@ def test_invalid_json_still_raises_a_decode_error(text: str) -> None:
 def test_bytes_that_are_not_utf8_still_raise_a_value_error() -> None:
     with pytest.raises(UnicodeDecodeError):
         loads_finite(b"\xff\xfe\x00")
+
+
+ENCODED_OBJECT = {
+    "utf-16-le-bom": b"\xff\xfe" + '{"a": 1}'.encode("utf-16-le"),
+    "utf-16-be-bom": b"\xfe\xff" + '{"a": 1}'.encode("utf-16-be"),
+    "utf-16-le": '{"a": 1}'.encode("utf-16-le"),
+    "utf-32-le-bom": b"\xff\xfe\x00\x00" + '{"a": 1}'.encode("utf-32-le"),
+    "utf-32-be": '{"a": 1}'.encode("utf-32-be"),
+    "utf-8-bom": b'\xef\xbb\xbf{"a": 1}',
+    "cesu-8-surrogate": b'{"a": "\xed\xa0\x80"}',
+    "not-utf-8": b'{"a": "\xff"}',
+}
+
+
+def test_the_stdlib_accepts_most_of_these_which_is_why_the_utf8_reader_exists() -> None:
+    """Pins the premise: `loads_finite(bytes)` reads every one of these but the
+    last, so the refusal below is the new reader's and not the stdlib's."""
+    for name, data in ENCODED_OBJECT.items():
+        if name == "not-utf-8":
+            continue
+        loads_finite(data)  # does not raise
+
+
+@pytest.mark.parametrize("name", sorted(ENCODED_OBJECT))
+def test_loads_finite_utf8_refuses_every_encoding_but_plain_utf8(name: str) -> None:
+    with pytest.raises(ValueError):
+        loads_finite_utf8(ENCODED_OBJECT[name])
+
+
+def test_loads_finite_utf8_reads_plain_utf8_including_non_ascii() -> None:
+    assert loads_finite_utf8('{"café": "\U0001f600"}'.encode()) == {"café": "\U0001f600"}
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_loads_finite_utf8_still_refuses_non_finite_numbers(constant: str) -> None:
+    with pytest.raises(NonFiniteJsonError):
+        loads_finite_utf8(f'{{"a": {constant}}}'.encode())
+
+
+def test_loads_finite_utf8_still_raises_recursion_error_past_the_limit() -> None:
+    with pytest.raises(RecursionError):
+        loads_finite_utf8(b"[" * 200_000)
 
 
 def test_nesting_past_the_recursion_limit_still_raises_recursion_error() -> None:

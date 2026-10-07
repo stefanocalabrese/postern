@@ -692,3 +692,44 @@ async def test_a_line_or_paragraph_separator_is_refused(
     body_field: dict[str, Any] = {field: f"a{separator}b"}
     response = await approve(app, record, bearer(key_pair), **body_field)
     await assert_refused_field(response, field, db, record, sent, None)
+
+
+# -- Encodings other than plain UTF-8 -------------------------------------------------
+#
+# `json.loads(bytes)` sniffs UTF-16 and UTF-32 and accepts a UTF-8 BOM and raw
+# CESU-8 surrogate bytes. The callback reads strict UTF-8 without a BOM, so a
+# body in any of them is a malformed body, same answer as `NaN` above.
+
+
+def encoded_bodies(record: ChallengeRecord) -> dict[str, bytes]:
+    text = '{"signature": "' + sign_row(DEVICE_PRIVATE, record) + '"}'
+    return {
+        "utf-16-le-bom": b"\xff\xfe" + text.encode("utf-16-le"),
+        "utf-16-be": text.encode("utf-16-be"),
+        "utf-32-le-bom": b"\xff\xfe\x00\x00" + text.encode("utf-32-le"),
+        "utf-8-bom": b"\xef\xbb\xbf" + text.encode(),
+        "cesu-8-surrogate": text.encode()[:-1] + b', "x": "\xed\xa0\x80"}',
+    }
+
+
+@pytest.mark.parametrize(
+    "name", ["utf-16-le-bom", "utf-16-be", "utf-32-le-bom", "utf-8-bom", "cesu-8-surrogate"]
+)
+async def test_a_body_in_an_encoding_other_than_utf8_is_a_malformed_body(
+    name: str,
+    app: Starlette,
+    db: Database,
+    key_pair: RSAKeyPair,
+    sent: list[httpx2.Request],
+) -> None:
+    record = await seed(db, tier=1)
+    response = await approve(app, record, bearer(key_pair), raw_body=encoded_bodies(record)[name])
+    assert response.status_code == 400, response.text
+    assert response.json() == {
+        "error": "invalid_request",
+        "error_description": "body must be a JSON object",
+    }
+    assert (await stored(db, record.challenge_id)).status == "pending"
+    assert sent == []
+    (row,) = await audit_rows(db, record.challenge_id)
+    assert (row.outcome, row.detail) == ("raised", "malformed_body")

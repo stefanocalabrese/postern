@@ -141,11 +141,13 @@ route on this service is denied by default. Decision record 0021 is why the page
 is served here rather than by `services/api`.
 
 A JSON body on `/device_authorization`, `/scan`, `/approve` or the challenge
-callback is read with `postern_core.json_strict.loads_finite`, so `NaN`,
+callback is read with `postern_core.json_strict.loads_finite_utf8`, so `NaN`,
 `Infinity`, `-Infinity` and an overflowing literal such as `1e999` are refused
 exactly as a body that is not JSON is (400 `invalid_request`, "body must be JSON",
 on the three device-grant routes; the callback's `malformed_body` 400). So does a body nested past
-the recursion limit. `/token` reads a form and has no JSON body.
+the recursion limit, and so does any body that is not strict UTF-8 without a byte-order mark
+(UTF-16, UTF-32, a UTF-8 BOM, raw surrogate bytes), which `json.loads(bytes)` alone would sniff
+and accept. `/token` reads a form and has no JSON body.
 
 ### Flow
 
