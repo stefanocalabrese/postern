@@ -20,6 +20,7 @@ Real confirm app and real Postgres, helpers copied from
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import threading
@@ -66,8 +67,8 @@ EXPECTED_202 = {
     "status": "approved",
     "execution": "accepted_unrecorded",
     "message": (
-        "the backend accepted the operation but recording it failed; "
-        "do not retry, it will be reconciled"
+        "the backend accepted the operation but recording it as executed failed or "
+        "could not be confirmed; do not retry, it will be reconciled"
     ),
 }
 
@@ -1056,10 +1057,13 @@ async def test_real_uvicorn_graceful_timeout_cancels_the_request_and_the_lifespa
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The request is cancelled at 1 s; the 3 s record is waited for at shutdown."""
+    """The request is cancelled at 1 s; the 3 s record is waited for at shutdown.
+
+    The REAL wait constant is used on purpose: with the wait patched in, a wait of
+    zero survives every test that depends on it.
+    """
     await seed(clean, "chal_rec_021")
     caplog.set_level(logging.INFO)
-    monkeypatch.setattr(callback, "SHUTDOWN_RECORD_WAIT_SECONDS", 15.0)
     started = _slow_record(monkeypatch, 3)
     server = RealServer(app, graceful=1)
     await server.start()
@@ -1131,3 +1135,105 @@ async def test_real_uvicorn_a_forced_exit_skips_the_lifespan_and_the_lost_record
     assert len(backend.calls) == 1
     (line,) = lost_lines(caplog)
     assert "'chal_rec_023'" in line.getMessage() and TOOL in line.getMessage()
+
+
+# ---------------------------------------------------------------------------
+# The shutdown wait: its size, its cancellation, and the logging helper.
+# ---------------------------------------------------------------------------
+
+
+def test_the_shutdown_wait_is_derived_from_the_real_engine_timeouts_and_under_30s() -> None:
+    """Pins the derivation, so a wait of zero (or any hand-typed number) is caught."""
+    defaults: dict[str, Any] = {f.name: f.default for f in dataclasses.fields(ConfirmSettings)}
+    one_attempt = (
+        defaults["database_pool_timeout_seconds"]
+        + defaults["database_connect_timeout_seconds"]
+        + 2 * defaults["database_command_timeout_seconds"]
+    )
+    assert one_attempt == 9.0
+    derived = min(
+        25.0,
+        callback.EXECUTED_RECORD_ATTEMPTS * one_attempt
+        + sum(callback.EXECUTED_RECORD_BACKOFF_SECONDS),
+    )
+    assert derived == pytest.approx(25.0)
+    assert callback.SHUTDOWN_RECORD_WAIT_SECONDS == derived
+    assert callback.SHUTDOWN_RECORD_WAIT_SECONDS < 30.0, "ECS stopTimeout default"
+
+
+async def test_a_cancelled_lifespan_shutdown_propagates_and_cancels_the_leftover_recordings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wait never swallows a cancellation, and leaves no recording task running behind it."""
+    from services.confirm import main as confirm_main
+
+    async def no_clock_check(db: object) -> None:
+        return None
+
+    monkeypatch.setattr(confirm_main, "run_database_clock_check", no_clock_check)
+    monkeypatch.setattr(callback, "SHUTDOWN_RECORD_WAIT_SECONDS", 30.0)
+    leftover = asyncio.ensure_future(asyncio.sleep(60))
+    callback._BACKGROUND_RECORDS.add(leftover)  # type: ignore[arg-type]
+    app = Starlette()
+    app.state.postern_database = None
+    ctx = confirm_main._lifespan(app)
+    await ctx.__aenter__()
+    shutdown = asyncio.ensure_future(ctx.__aexit__(None, None, None))
+    try:
+        await asyncio.sleep(0.1)
+        assert not shutdown.done(), "the lifespan did not wait"
+        shutdown.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(shutdown, 5)
+        await asyncio.sleep(0)
+        assert leftover.cancelled()
+    finally:
+        callback._BACKGROUND_RECORDS.discard(leftover)
+        leftover.cancel()
+
+
+class _RaisingLogger:
+    """A logger whose ``error`` raises for any call with more than ``allow_args`` arguments."""
+
+    def __init__(self, allow_args: int | None) -> None:
+        self.allow_args = allow_args
+        self.written: list[tuple[Any, ...]] = []
+
+    def error(self, msg: str, *args: Any) -> None:
+        if self.allow_args is None or len(args) > self.allow_args:
+            raise OSError("log sink is gone")
+        self.written.append((msg, *args))
+
+
+def test_the_unrecorded_log_helper_falls_back_to_the_id_alone_when_the_full_line_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _RaisingLogger(allow_args=1)
+    monkeypatch.setattr(callback, "logger", fake)
+    callback._log_accepted_unrecorded("chal_x", TOOL, "OSError")
+    assert fake.written == [(fake.written[0][0], "chal_x")]
+    assert TOOL not in str(fake.written)
+
+
+def test_the_unrecorded_log_helper_never_raises_even_when_every_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(callback, "logger", _RaisingLogger(allow_args=None))
+    callback._log_accepted_unrecorded("chal_x", TOOL)
+
+
+async def test_a_logger_that_raises_does_not_turn_the_exhaustion_into_an_escaping_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False stays False: the caller must still answer the 202, never a 500."""
+
+    async def exhausted(db: Database, challenge_id: str) -> bool:
+        return False
+
+    async def blew_up(db: Database, challenge_id: str) -> bool:
+        raise RuntimeError(SENTINEL)
+
+    monkeypatch.setattr(callback, "logger", _RaisingLogger(allow_args=None))
+    for rec in (exhausted, blew_up):
+        monkeypatch.setattr(callback, "_record_executed", rec)
+        assert await callback._record_and_report(None, "chal_x", TOOL) is False  # type: ignore[arg-type]

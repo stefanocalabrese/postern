@@ -279,6 +279,10 @@ class _ConfirmApp(Starlette):
         return TokenResponseHeaders(super().build_middleware_stack())
 
 
+#: How long the lifespan waits for a cancelled recording task to write its line and unwind.
+_CANCEL_UNWIND_SECONDS = 2.0
+
+
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncIterator[None]:
     """Startup: warn when confirm and Postgres disagree on the time. Shutdown: wait for recordings.
@@ -288,18 +292,41 @@ async def _lifespan(app: Starlette) -> AsyncIterator[None]:
 
     At shutdown, after the app stops serving, wait for any `approved ->
     executed` recording that outlived its request (`callback.pending_recordings`),
-    for at most `callback.SHUTDOWN_RECORD_WAIT_SECONDS`. uvicorn runs this AFTER
-    it has cancelled the requests that outlasted `--timeout-graceful-shutdown`,
-    and `asyncio.run` cancels whatever is still running once it returns, so
-    without this wait a recording that had started was lost at every such
-    shutdown. A forced exit skips the lifespan shutdown, and so does SIGKILL.
-    The wait is bounded and a cancellation of it is not swallowed.
+    for at most `callback.SHUTDOWN_RECORD_WAIT_SECONDS`, and then CANCEL and
+    await whatever is still running, here, inside the lifespan. Not later:
+    under SIGTERM uvicorn restores the default handler once its shutdown is
+    done and re-raises the signal inside its own coroutine, so the process dies
+    (exit 143) before `asyncio.run` could cancel anything, and a task's own
+    "was cancelled before it finished" line would never be written. Measured on
+    uvicorn 0.52.4 with a real subprocess (`tests/test_shutdown_signals.py`).
+    Cancelling here writes the line under SIGTERM and SIGINT alike.
+
+    uvicorn runs this AFTER it has cancelled the requests that outlasted
+    `--timeout-graceful-shutdown`. Under the shipped command there is no such
+    timeout: uvicorn waits for the request without bound, so this wait is never
+    reached while a request is in flight, and a SIGKILL that lands first leaves
+    no line. A forced exit (a second SIGINT) skips this shutdown, and then
+    `asyncio.run` cancels the task, which writes the line itself. SIGKILL, or the
+    OS killing the process, leaves no line either way.
+    The budget rule is on `callback.SHUTDOWN_RECORD_WAIT_SECONDS`. A cancellation
+    of the lifespan itself is not swallowed: the leftover tasks are cancelled and
+    it is re-raised. The wait for the cancelled tasks to unwind is itself bounded.
     """
     await run_database_clock_check(app.state.postern_database)
     yield
     pending = callback.pending_recordings()
-    if pending:
-        await asyncio.wait(pending, timeout=callback.SHUTDOWN_RECORD_WAIT_SECONDS)
+    if not pending:
+        return
+    try:
+        _, still = await asyncio.wait(pending, timeout=callback.SHUTDOWN_RECORD_WAIT_SECONDS)
+        for task in still:
+            task.cancel()
+        if still:
+            await asyncio.wait(still, timeout=_CANCEL_UNWIND_SECONDS)
+    except asyncio.CancelledError:
+        for task in pending:
+            task.cancel()
+        raise
 
 
 def create_confirm_app(

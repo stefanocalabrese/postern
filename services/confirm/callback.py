@@ -30,13 +30,14 @@ Response format::
     }
 
 The one other success-shaped answer is HTTP 202, sent when the backend accepted
-the write and recording ``executed`` failed on every attempt::
+the write and recording ``executed`` failed on every attempt, or could not be
+confirmed (the row can be ``executed`` after all)::
 
     {
         "challenge_id": "...",
         "status": "approved",
         "execution": "accepted_unrecorded",
-        "message": "the backend accepted the operation but recording it failed; ..."
+        "message": "the backend accepted the operation but recording it as executed failed or ..."
     }
 
 A caller must never retry a 202: the money may already have moved.
@@ -149,6 +150,7 @@ that reaches neither this handler nor the table.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -955,14 +957,22 @@ def _log_accepted_unrecorded(challenge_id: str, tool_name: str, why: str | None 
     re-reads raised too (the row is `executed`), or when something else had
     moved the row (it is `declined`, say). The row is what to check.
     """
-    logger.error(
-        "challenge %r: the backend accepted %s and recording it as executed failed "
-        "or could not be confirmed as executed; check the row, do not retry, "
-        "reconcile by hand%s",
-        challenge_id,
-        tool_name,
-        f" ({why})" if why else "",
-    )
+    try:
+        logger.error(
+            "challenge %r: the backend accepted %s and recording it as executed failed "
+            "or could not be confirmed as executed; check the row, do not retry, "
+            "reconcile by hand%s",
+            challenge_id,
+            tool_name,
+            f" ({why})" if why else "",
+        )
+    except Exception:  # noqa: BLE001
+        # Never raise: the caller is answering a 202 for a payment the backend
+        # accepted, and an escape here would turn it into a 500 that invites a retry.
+        with contextlib.suppress(Exception):
+            logger.error(
+                "challenge %r: the backend accepted the operation; check the row", challenge_id
+            )
 
 
 async def _record_and_report(db: Database, challenge_id: str, tool_name: str) -> bool:
@@ -1008,14 +1018,15 @@ async def _record_executed_detached(db: Database, challenge_id: str, tool_name: 
     WHEN THAT HAPPENS UNDER UVICORN, measured on 0.52.4: a non-streaming
     handler is not cancelled by a client disconnect, so the only cancellation
     is shutdown, and only with ``timeout_graceful_shutdown`` set (the shipped
-    command has none, and uvicorn then waits for the request). uvicorn cancels
-    the request and THEN runs the lifespan shutdown, where
+    command has none, and uvicorn then waits for the request without bound).
+    uvicorn cancels the request and THEN runs the lifespan shutdown, where
     ``services.confirm.main`` waits, bounded by ``SHUTDOWN_RECORD_WAIT_SECONDS``,
-    for the tasks in ``pending_recordings()``. What survives is therefore a
-    recording that finishes inside that wait. A forced exit skips the lifespan
-    shutdown, SIGKILL skips everything, and a recording still running when the
-    wait ends is cancelled by ``asyncio.run``: each of those logs the task's
-    own line (``_record_and_report``) and leaves the row ``approved``.
+    for the tasks in ``pending_recordings()``, and then cancels and awaits any
+    that remain, so this task's own line is written before uvicorn re-raises
+    SIGTERM. What survives is a recording that finishes inside that wait. A
+    forced exit skips the lifespan shutdown and ``asyncio.run`` cancels the task
+    (the same line). A line is written in every case but two: SIGKILL, and the
+    OS killing the process.
     """
     task = asyncio.ensure_future(_record_and_report(db, challenge_id, tool_name))
     _BACKGROUND_RECORDS.add(task)
@@ -1030,7 +1041,8 @@ async def _record_executed_detached(db: Database, challenge_id: str, tool_name: 
             logger.error(
                 "challenge %r: the backend accepted %s and the request was cancelled while "
                 "recording it; a background task is still recording it; a further ERROR "
-                "line follows if that task fails or is cancelled",
+                "line follows if that task fails or is cancelled, unless the process is "
+                "killed first (SIGKILL)",
                 challenge_id,
                 tool_name,
             )
@@ -1240,8 +1252,8 @@ async def _refused_transition_response(
 APPROVAL_UPDATE_FAILED_DESCRIPTION = "the approval could not be recorded"
 EXECUTION_SETUP_FAILED_DESCRIPTION = "the approved operation could not be set up"
 EXECUTED_UNRECORDED_MESSAGE = (
-    "the backend accepted the operation but recording it failed; "
-    "do not retry, it will be reconciled"
+    "the backend accepted the operation but recording it as executed failed or "
+    "could not be confirmed; do not retry, it will be reconciled"
 )
 OUTCOME_UNKNOWN_MESSAGE = (
     "the backend call failed after the approval was recorded; the payment may or "
@@ -1262,12 +1274,18 @@ EXECUTED_RECORD_BACKOFF_SECONDS = (0.1, 0.3)
 #: command timeout, so 1.0 + 2.0 + 2 x 3.0 = 9.0 s. Three attempts and the two
 #: backoffs: 3 x 9.0 + 0.4 = 27.4 s. That is a first-order bound and not a
 #: proof (a recycled connection's pre-ping adds up to three more statements;
-#: an operator may set other timeouts), and it is capped at 25 s anyway: ECS
-#: gives a stopped task `stopTimeout` seconds between SIGTERM and SIGKILL, 30
-#: by default on Fargate, and a wait that runs past it is SIGKILLed with the
-#: record unwritten. Whether this deployment's stopTimeout differs is not
-#: established here: an operator who sets it lower than 30 must lower this to
-#: match, or the cap buys nothing.
+#: an operator may set other timeouts), and it is capped at 25 s anyway.
+#:
+#: BUDGET RULE: `timeout_graceful_shutdown + 0.1 + SHUTDOWN_RECORD_WAIT_SECONDS
+#: < stopTimeout`. ECS gives a stopped task `stopTimeout` seconds between SIGTERM
+#: and SIGKILL, 30 by default on Fargate (whether this deployment's differs is
+#: not established here), and the wait starts only after uvicorn has spent its
+#: graceful phase, so with a graceful timeout above about 4.9 s the default 30 s
+#: ends before the wait does and an operator must lower this constant. Under the
+#: SHIPPED command (no graceful timeout) uvicorn waits for the request without
+#: bound and this wait never runs; SIGKILL at `stopTimeout` ends it with no line.
+#: Setting a graceful timeout cancels approvals still waiting on the backend, and
+#: they answer a bare 500 for a payment the backend accepted.
 SHUTDOWN_RECORD_WAIT_SECONDS = min(
     25.0,
     EXECUTED_RECORD_ATTEMPTS * (1.0 + 2.0 + 2 * 3.0) + sum(EXECUTED_RECORD_BACKOFF_SECONDS),

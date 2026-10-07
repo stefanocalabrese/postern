@@ -589,7 +589,7 @@ attempt:
 
 ```json
 {"challenge_id": "<id>", "status": "approved", "execution": "accepted_unrecorded",
- "message": "the backend accepted the operation but recording it failed; do not retry, it will be reconciled"}
+ "message": "the backend accepted the operation but recording it as executed failed or could not be confirmed; do not retry, it will be reconciled"}
 ```
 
 The row is normally still `approved`, which a 207 backend refusal also leaves. It is
@@ -632,22 +632,41 @@ depends on how the process stops, measured on uvicorn 0.52.4 with a real server
   cancels the request and then runs the application's shutdown. The request logs one
   ERROR line, `the backend accepted <tool> and the request was cancelled while
   recording it; a background task is still recording it; a further ERROR line follows
-  if that task fails or is cancelled`, and re-raises the cancellation. The service's
+  if that task fails or is cancelled, unless the process is killed first (SIGKILL)`, and re-raises the cancellation. The service's
   shutdown then waits for the recording, for at most `SHUTDOWN_RECORD_WAIT_SECONDS`
   (`services/confirm/callback.py`). That is 25 seconds: three attempts at the default
   database timeouts come to 27.4 seconds, and the wait is capped under ECS's default
   `stopTimeout` of 30 seconds, after which the task is killed. Whether your
   `stopTimeout` is the default is not established here; if it is lower, lower the
-  constant to match, or the cap protects nothing.
-- **What is lost.** A recording still running when that wait ends is cancelled when
-  the event loop closes. A forced exit (a second SIGINT) skips uvicorn's lifespan
-  shutdown, so nothing waits, and the loop closing cancels the recording. SIGKILL,
-  including ECS killing the task at `stopTimeout`, stops everything with no line at
-  all. In the first two the task logs one ERROR line, `recording the executed state
-  was cancelled before it finished; the backend accepted the operation (<tool>); the
-  row is most likely still 'approved', check it; do not retry; reconcile by hand`,
-  with the challenge id. In every one of these the backend has accepted the write and
-  the row is most likely still `approved`.
+  constant to match, or the cap protects nothing. When the wait ends, the shutdown
+  cancels what is still recording and waits for it to unwind, still inside the
+  lifespan: under SIGTERM (what ECS and `docker stop` send) uvicorn restores the
+  default handler once its shutdown is done and re-raises the signal inside its own
+  coroutine, so the process dies (exit 143) before the event loop could cancel
+  anything. Pinned by `tests/test_shutdown_signals.py`, which runs a real child
+  process with uvicorn in the main thread; the `test_real_uvicorn_*` tests run the
+  server in a thread, where none of this happens.
+- **The time budget.** `timeout_graceful_shutdown + 0.1 + SHUTDOWN_RECORD_WAIT_SECONDS
+  < stopTimeout`. The wait starts only after uvicorn has spent its graceful phase, so
+  with a graceful timeout above about 4.9 seconds the default 30-second `stopTimeout`
+  ends before a 25-second wait does, and the constant must be lowered. **Under the
+  shipped command there is no graceful timeout**: uvicorn waits for the request
+  without bound, this wait never runs, and a SIGKILL at `stopTimeout` can drop a
+  record with no line. A second SIGTERM does not force an exit (uvicorn keeps
+  waiting); a second SIGINT does. The Dockerfile `CMD` stays as it is on purpose: a
+  graceful timeout cancels an approval that is still waiting on the backend (up to 30
+  seconds), and that request then answers the client a bare 500 and writes no
+  completion `audit_log` row, for a payment the backend may have accepted.
+- **What is lost.** A recording still running when that wait ends, and one running
+  when a forced exit (a second SIGINT) skips uvicorn's lifespan shutdown, so nothing
+  waits. The first is cancelled by the shutdown, the second by the event loop
+  closing. SIGKILL, including ECS killing the task at `stopTimeout`, and the OS
+  killing the process stop everything with no line at all. In the other cases the
+  task logs one ERROR line, `recording the executed state was cancelled before it
+  finished; the backend accepted the operation (<tool>); the row is most likely still
+  'approved', check it; do not retry; reconcile by hand`, with the challenge id. In
+  every one of these the backend has accepted the write and the row is most likely
+  still `approved`.
 
 So there are two ERROR lines to grep for besides the exhaustion line above. The
 request-side line means a task was still recording when the request was cancelled and
