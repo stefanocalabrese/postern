@@ -4,15 +4,18 @@
 ``HTTP_PROXY`` / ``HTTPS_PROXY`` / ``ALL_PROXY`` route its requests through the
 named host (measured 7 October 2026: a proxy received ``POST http://.../cancel`` with
 the signed write JWT in ``Authorization``, the ``Idempotency-Key`` and the payment
-payload, and its own 201 was recorded as ``executed``), and ``SSL_CERT_FILE`` /
-``SSL_CERT_DIR`` replace the CA bundle. Proxy environment variables are ignored;
-egress is routed by the network (PrivateLink, security groups), not by
+payload, and its own 201 was recorded as ``executed``). Proxy environment variables
+are ignored; egress is routed by the network (PrivateLink, security groups), not by
 ``HTTP_PROXY``.
 
 Each client gets two kinds of test: a real request with every proxy variable set to
 a capture server (the proxy sees zero connections and the real server sees the
-request), and construction with ``SSL_CERT_FILE`` naming a file that does not
-exist (a client that honours it raises ``FileNotFoundError``).
+request), and an assertion that the client was built with ``trust_env=False``.
+
+``trust_env=False`` is NOT what stops ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``: on Linux
+OpenSSL reads both through ``truststore`` whatever the flag says (measured in the
+``postern-confirm`` image). That is refused at startup instead, and pinned by
+``tests/test_ca_bundle_override_refused.py``.
 
 ``tests/test_http_clients_trust_env_scan.py`` is the net for a client added later.
 """
@@ -198,7 +201,7 @@ async def test_the_confirm_assertion_verifier_does_not_send_a_request_to_a_proxy
     _assert_direct(proxy, real)
 
 
-# -- SSL_CERT_FILE: a client that honours it cannot even be built ---------
+# -- the flag itself (the CA bundle variables are a startup refusal, not this flag) --
 
 
 @pytest.fixture
@@ -207,24 +210,24 @@ def bogus_ca_bundle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "no-such-dir"))
 
 
-def test_the_write_client_ignores_ssl_cert_file(bogus_ca_bundle: None) -> None:
+def test_the_write_client_is_built_with_trust_env_off(bogus_ca_bundle: None) -> None:
     client = BackendWriteClient("https://payments.test", _Minter(), before_backend_request=None)
     assert client._client.trust_env is False
 
 
-def test_the_facade_client_ignores_ssl_cert_file(bogus_ca_bundle: None) -> None:
+def test_the_facade_client_is_built_with_trust_env_off(bogus_ca_bundle: None) -> None:
     client = BackendClient("https://backend.test", lambda c, a: "t", before_backend_request=None)
     assert client._client.trust_env is False
 
 
-def test_the_vault_client_ignores_ssl_cert_file(bogus_ca_bundle: None) -> None:
+def test_the_vault_client_is_built_with_trust_env_off(bogus_ca_bundle: None) -> None:
     source = VaultTransitKeySource(
         address="https://vault.test:8200", key_name="k", kid="postern-read", token=_VAULT_TOKEN
     )
     assert source._client.trust_env is False
 
 
-def test_both_jwks_verifier_clients_ignore_ssl_cert_file(bogus_ca_bundle: None) -> None:
+def test_both_jwks_verifier_clients_are_built_with_trust_env_off(bogus_ca_bundle: None) -> None:
     settings = Settings(
         backend_base_url="https://backend.test",
         customer_jwks_uri="https://issuer.test/jwks.json",

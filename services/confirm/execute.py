@@ -241,15 +241,21 @@ def resolve_endpoint(tool_name: str, payload: dict[str, Any]) -> tuple[str, str,
 # ---------------------------------------------------------------------------
 
 
-#: The whole header phase of one write call, in seconds: connect, send and wait
-#: for a complete status line and header block. The client's own `timeout=10.0`
-#: applies to each read separately and so bounds nothing in total. 30 is ECS's
-#: default `stopTimeout`: an approval in flight when a task is stopped is given
-#: the same 30 seconds to finish as the container is, so no call outlives the
-#: SIGKILL that follows. The outcome on expiry is ambiguous, as for every
-#: transport failure (the backend may have received and committed the write): the
-#: row stays `approved`, the audit detail is `TotalTimeout`, and the operator
-#: reconciles by `Idempotency-Key`.
+#: The header phase of one write call, in seconds: connect, TLS and the response
+#: header block. The client's own `timeout=10.0` applies to each read separately
+#: and so bounds nothing in total. It does NOT bound the Vault mint (up to four
+#: times `POSTERN_VAULT_TIMEOUT_SECONDS`) or the `before_backend_request` audit
+#: commit, which run before it starts, or the `approved -> executed` recording,
+#: which runs after it, and it is not a promise that no call outlives a SIGKILL
+#: (30 is ECS's default `stopTimeout`, but nothing here is sized against it).
+#:
+#: THE RESIDUAL GAP, stated plainly: under the shipped uvicorn command shutdown
+#: waits for in-flight requests, so a SIGTERM shortly after the call starts,
+#: followed by a 201 near t=30, can be SIGKILLed before the record lands. Money
+#: moves, the row stays `approved`, and SIGKILL logs nothing. Reconcile by
+#: `Idempotency-Key`. The outcome on expiry is ambiguous in the same way, as for
+#: every transport failure: the row stays `approved`, the audit detail is
+#: `TotalTimeout`.
 WRITE_TOTAL_TIMEOUT_SECONDS = 30.0
 
 
@@ -300,9 +306,12 @@ class BackendWriteClient:
             follow_redirects=False,
             # `HTTP_PROXY` and friends would send this request, with the write
             # JWT, the Idempotency-Key and the payment payload, to whatever host
-            # the variable names, and `SSL_CERT_FILE` / `SSL_CERT_DIR` would
-            # swap the CA bundle. Proxy environment variables are ignored: route
-            # egress with the network (PrivateLink, security groups).
+            # the variable names. Proxy environment variables are ignored: route
+            # egress with the network (PrivateLink, security groups). This flag
+            # does NOT stop `SSL_CERT_FILE` / `SSL_CERT_DIR` on Linux (OpenSSL
+            # reads them); the service REFUSES TO START with either set
+            # (`enforce_no_ca_bundle_override`), so the trust anchors are the
+            # image's system store.
             trust_env=False,
         )
 

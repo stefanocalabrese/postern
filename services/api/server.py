@@ -262,9 +262,18 @@ def build_server(
             # fastmcp's own default client for this fetch is
             # `httpx2.AsyncClient(timeout=Timeout(10.0))`, which trusts the
             # environment: `HTTP_PROXY` would let whoever runs the proxy answer
-            # the key-set fetch and plant a key, and `SSL_CERT_FILE` would swap
-            # the CA bundle. Same timeout, `trust_env=False`.
-            http_client=httpx2.AsyncClient(timeout=httpx2.Timeout(10.0), trust_env=False),
+            # the key-set fetch and plant a key. Same timeout, `trust_env=False`
+            # (proxy variables ignored). That flag does NOT stop `SSL_CERT_FILE` /
+            # `SSL_CERT_DIR` on Linux; the service REFUSES TO START with either
+            # set (`enforce_no_ca_bundle_override`).
+            # No kept-alive connection: fetches are 30 to 300 s apart, so reuse buys
+            # nothing and a connection the server closed in between fails one fetch
+            # with RemoteProtocolError.
+            http_client=httpx2.AsyncClient(
+                timeout=httpx2.Timeout(10.0),
+                trust_env=False,
+                limits=httpx2.Limits(max_keepalive_connections=0),
+            ),
         )
         auth = verifier
     if auth_override is not None:

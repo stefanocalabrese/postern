@@ -19,7 +19,10 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CLIENT_NAMES = {"AsyncClient", "Client"}
+#: The transports are scanned too: a transport builds its own SSL context from its own
+#: `trust_env`, so `AsyncHTTPTransport()` handed to a `trust_env=False` client re-opens it.
+CLIENT_NAMES = {"AsyncClient", "Client", "AsyncHTTPTransport", "HTTPTransport"}
+HTTP_MODULES = {"httpx", "httpx2"}
 ALLOWLIST: frozenset[str] = frozenset()
 
 #: Every directory of Python this repository ships or runs outside `tests/`.
@@ -37,22 +40,64 @@ def _scanned_files() -> list[Path]:
     ]
 
 
+def _bindings(tree: ast.AST) -> tuple[set[str], dict[str, str], set[str], set[str]]:
+    """Names this module binds to an httpx module, a client class, or `functools.partial`."""
+    modules: set[str] = set()
+    classes: dict[str, str] = {}
+    partial_names: set[str] = set()
+    functools_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in HTTP_MODULES:
+                    modules.add(alias.asname or alias.name)
+                if alias.name == "functools":
+                    functools_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if node.module in HTTP_MODULES and alias.name in CLIENT_NAMES:
+                    classes[alias.asname or alias.name] = alias.name
+                if node.module == "functools" and alias.name == "partial":
+                    partial_names.add(alias.asname or alias.name)
+    return modules, classes, partial_names, functools_names
+
+
 def _client_constructions(source: str) -> list[ast.Call]:
+    """Calls that build an httpx client or transport, directly or through `partial`.
+
+    A name counts only when this module imported it from `httpx`/`httpx2`, under
+    whatever alias, so `fastmcp.Client` (a transport-taking class, not an HTTP
+    client) is not flagged.
+    """
+    tree = ast.parse(source)
+    modules, classes, partial_names, functools_names = _bindings(tree)
+
+    def is_client(node: ast.expr) -> bool:
+        if isinstance(node, ast.Attribute):
+            return (
+                isinstance(node.value, ast.Name)
+                and node.value.id in modules
+                and node.attr in CLIENT_NAMES
+            )
+        return isinstance(node, ast.Name) and node.id in classes
+
+    def is_partial(node: ast.expr) -> bool:
+        if isinstance(node, ast.Attribute):
+            return (
+                isinstance(node.value, ast.Name)
+                and node.value.id in functools_names
+                and node.attr == "partial"
+            )
+        return isinstance(node, ast.Name) and node.id in partial_names
+
     calls: list[ast.Call] = []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-        if name not in CLIENT_NAMES:
-            continue
-        # `httpx2.AsyncClient(...)` or a bare imported name; `fastmcp.Client` takes
-        # a transport, not a URL, and is not an HTTP client.
-        if isinstance(func, ast.Attribute) and not (
-            isinstance(func.value, ast.Name) and func.value.id in {"httpx", "httpx2"}
+        if is_client(node.func) or (
+            is_partial(node.func) and node.args and is_client(node.args[0])
         ):
-            continue
-        calls.append(node)
+            calls.append(node)
     return calls
 
 
@@ -105,3 +150,45 @@ def test_a_client_added_under_tools_stub_or_migrations_would_be_flagged() -> Non
     for top in ("tools", "stub", "migrations"):
         label = f"{top}/new_module.py"
         assert _violations("import httpx2\nhttpx2.AsyncClient()\n", label) == [f"{label}@2"]
+
+
+def test_the_scan_follows_aliases_partials_and_transports() -> None:
+    """Each evasion the first version of this scan missed, one synthetic case apiece."""
+    flagged = {
+        "module alias": "import httpx2 as h\nh.AsyncClient()\n",
+        "class alias": "from httpx2 import AsyncClient as AC\nAC()\n",
+        "partial": (
+            "import functools\nimport httpx2\nfunctools.partial(httpx2.AsyncClient, timeout=1)()\n"
+        ),
+        "partial alias module": (
+            "import functools as ft\nimport httpx2\nft.partial(httpx2.AsyncClient)()\n"
+        ),
+        "partial alias name": (
+            "from functools import partial as p\nfrom httpx2 import AsyncClient\np(AsyncClient)()\n"
+        ),
+        "async transport": "import httpx2\nhttpx2.AsyncHTTPTransport()\n",
+        "sync transport": "import httpx2\nhttpx2.HTTPTransport(retries=1)\n",
+        "transport class alias": "from httpx2 import HTTPTransport as T\nT()\n",
+        "httpx module": "import httpx\nhttpx.AsyncClient()\n",
+    }
+    for case, source in flagged.items():
+        assert _violations(source, "x.py"), case
+
+
+def test_the_scan_accepts_the_same_shapes_when_they_set_the_flag() -> None:
+    clean = [
+        "import httpx2 as h\nh.AsyncClient(trust_env=False)\n",
+        "from httpx2 import AsyncClient as AC\nAC(trust_env=False)\n",
+        "import functools\nimport httpx2\n"
+        "functools.partial(httpx2.AsyncClient, trust_env=False)()\n",
+        "import httpx2\nhttpx2.AsyncHTTPTransport(trust_env=False)\n",
+        "import httpx2\nhttpx2.HTTPTransport(trust_env=False)\n",
+    ]
+    for source in clean:
+        assert _violations(source, "x.py") == [], source
+
+
+def test_a_client_class_that_is_not_httpx_is_not_flagged() -> None:
+    assert _violations("from fastmcp import Client\nClient(object())\n", "x.py") == []
+    assert _violations("import other\nother.AsyncClient()\n", "x.py") == []
+    assert _violations("import functools\nfunctools.partial(print, 1)()\n", "x.py") == []

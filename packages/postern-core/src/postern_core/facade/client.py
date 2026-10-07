@@ -218,10 +218,13 @@ class BackendClient:
             # must not carry the `Authorization` header to wherever
             # `Location` points.
             follow_redirects=False,
-            # Proxy environment variables are ignored (and `SSL_CERT_FILE` /
-            # `SSL_CERT_DIR` cannot swap the CA bundle): the bearer token would
+            # Proxy environment variables are ignored: the bearer token would
             # go to whatever host `HTTP_PROXY` names. Route egress with the
             # network (PrivateLink, security groups), not with the environment.
+            # This flag does NOT stop `SSL_CERT_FILE` / `SSL_CERT_DIR` on Linux
+            # (OpenSSL reads them); a service REFUSES TO START with either set
+            # (`enforce_no_ca_bundle_override`), so the trust anchors are the
+            # image's system store.
             trust_env=False,
         )
 

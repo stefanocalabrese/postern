@@ -232,6 +232,55 @@ async def test_execute_success_202() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Which statuses are "executed". 200, 201 and 202 and NOTHING else: every other
+# 2xx is filed as a refusal, which is what the backend contract in
+# docs/user-guide/components/confirm-service.md tells an operator.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [200, 201, 202])
+async def test_exactly_200_201_and_202_are_accepted(status: int) -> None:
+    client = BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=_transport(lambda request: httpx2.Response(status)),
+        before_backend_request=None,
+    )
+    assert await asyncio.wait_for(_execute_plain(client), timeout=5) == status
+    await client.aclose()
+
+
+@pytest.mark.parametrize("status", [203, 204, 205, 206, 207, 208, 226])
+async def test_every_other_2xx_is_filed_as_a_refusal(status: int) -> None:
+    """A backend that commits and answers 204 is recorded as having refused.
+
+    That is the documented behaviour, pinned so that nobody widens it to "any 2xx"
+    without rewriting the contract: the row stays `approved` and the operator is
+    told the backend refused.
+    """
+    client = BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=_transport(lambda request: httpx2.Response(status)),
+        before_backend_request=None,
+    )
+    with pytest.raises(BackendWriteError) as excinfo:
+        await asyncio.wait_for(_execute_plain(client), timeout=5)
+    assert excinfo.value.status == status
+    await client.aclose()
+
+
+async def _execute_plain(client: BackendWriteClient) -> int:
+    return await client.execute(
+        customer_ref="cust_7f3a",
+        audience="payments.svc",
+        path="/payments",
+        body={},
+        challenge_id="chal_status",
+    )
+
+
+# ---------------------------------------------------------------------------
 # BackendWriteClient — error paths.
 # ---------------------------------------------------------------------------
 
@@ -627,8 +676,13 @@ async def _execute(client: BackendWriteClient) -> int:
     )
 
 
-def test_the_total_bound_is_inside_the_ecs_stop_timeout() -> None:
-    """30 s is ECS's default ``stopTimeout``; the per-read bound stays 10 s."""
+def test_the_header_phase_bound_and_the_per_read_bound() -> None:
+    """The header phase is bounded at 30 s; the per-read bound stays 10 s.
+
+    30 s bounds connect, TLS and the response header block. It does not bound the
+    Vault mint, the pre-call audit commit or the `approved -> executed` recording,
+    so it is NOT a promise that no call outlives a SIGKILL.
+    """
     assert execute_module.WRITE_TOTAL_TIMEOUT_SECONDS == 30.0
     assert BackendWriteClient.__init__.__kwdefaults__["timeout"] == 10.0  # type: ignore[index]
 
@@ -651,6 +705,19 @@ async def test_a_backend_that_never_finishes_its_headers_is_cut_off_at_the_total
     assert exc.__cause__ is None
     assert exc.__context__ is None
     assert exc.__suppress_context__ is True
+    await client.aclose()
+
+
+async def test_a_timeout_error_that_is_not_the_total_bound_propagates_as_itself() -> None:
+    """Only OUR deadline becomes `TotalTimeout`; `if not total.expired(): raise` is why."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise TimeoutError("not ours")
+
+    client = _client(handler)
+    with pytest.raises(TimeoutError, match="not ours") as excinfo:
+        await asyncio.wait_for(_execute(client), timeout=5)
+    assert not isinstance(excinfo.value, BackendTransportError)
     await client.aclose()
 
 

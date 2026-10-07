@@ -84,7 +84,7 @@ from postern_core.auth.redis_preflight import run_redis_preflight
 from postern_core.auth.refresh_sessions import create_refresh_session_store
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement, redis_url_from_env
-from postern_core.env_inventory import enforce_known_environment
+from postern_core.env_inventory import enforce_known_environment, enforce_no_ca_bundle_override
 from postern_core.log_safety import install_sql_safe_logging, pin_http_client_loggers
 from postern_core.modules.enrichers import load_network_enricher
 from postern_core.risk.pairing_network import NetworkEnricher
@@ -182,10 +182,18 @@ def _assertion_verifier(settings: ConfirmSettings) -> AssertionVerifier:
         # fastmcp's own default client for this fetch is
         # `httpx2.AsyncClient(timeout=Timeout(10.0))`, which trusts the
         # environment: `HTTP_PROXY` would let whoever runs the proxy answer the
-        # key-set fetch and plant a key that signs a banking-app assertion, and
-        # `SSL_CERT_FILE` would swap the CA bundle. Same timeout,
-        # `trust_env=False`.
-        http_client=httpx2.AsyncClient(timeout=httpx2.Timeout(10.0), trust_env=False),
+        # key-set fetch and plant a key that signs a banking-app assertion.
+        # Same timeout, `trust_env=False` (proxy variables ignored). That flag
+        # does NOT stop `SSL_CERT_FILE` / `SSL_CERT_DIR` on Linux; the service
+        # REFUSES TO START with either set (`enforce_no_ca_bundle_override`).
+        # No kept-alive connection: fetches are 30 to 300 s apart, so reuse buys
+        # nothing and a connection the server closed in between fails one fetch
+        # with RemoteProtocolError.
+        http_client=httpx2.AsyncClient(
+            timeout=httpx2.Timeout(10.0),
+            trust_env=False,
+            limits=httpx2.Limits(max_keepalive_connections=0),
+        ),
     )
 
 
@@ -400,6 +408,10 @@ def create_confirm_app(
     # operator to check a line they already wrote correctly. It costs one pass
     # over os.environ and builds nothing.
     enforce_known_environment(service="confirm")
+    # The trust anchors are the image's system store: `SSL_CERT_FILE` and
+    # `SSL_CERT_DIR` would replace them for every TLS client, `trust_env=False`
+    # notwithstanding (measured on Linux). See `enforce_no_ca_bundle_override`.
+    enforce_no_ca_bundle_override(service="confirm")
     settings = settings or ConfirmSettings.from_env()
     verifier = assertion_verifier or _assertion_verifier(settings)
     # AFTER the assertion guard, so an operator missing both is told about

@@ -263,10 +263,13 @@ class VaultTransitKeySource:
                 pool=timeout_seconds,
             ),
             transport=transport,
-            # Proxy environment variables are ignored (and `SSL_CERT_FILE` /
-            # `SSL_CERT_DIR` cannot swap the CA bundle): the Vault token and
+            # Proxy environment variables are ignored: the Vault token and
             # every signing request would go to whatever host `HTTP_PROXY`
             # names. Route egress with the network, not with the environment.
+            # This flag does NOT stop `SSL_CERT_FILE` / `SSL_CERT_DIR` on Linux
+            # (OpenSSL reads them); a service REFUSES TO START with either set
+            # (`enforce_no_ca_bundle_override`), so the trust anchors are the
+            # image's system store.
             trust_env=False,
         )
 

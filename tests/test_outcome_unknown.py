@@ -131,6 +131,7 @@ class Calls:
             p.stop()
 
 
+_CALL_GUARD_SECONDS = 10.0
 CASES = ["ConnectError", "ReadTimeout", "RemoteProtocolError", "TotalTimeout"]
 
 
@@ -167,16 +168,29 @@ async def _run_case(
         port = backend.port
     try:
         with Calls(port, timeout) as calls:
-            first = await post(
-                app, cid, await signed(app, cid), bearer(key_pair, OWNER), as_a_server_would=True
-            )
-            if second_approval:
-                second = await post(
+            # `wait_for`, because a regression in the total bound (the TotalTimeout
+            # case dribbles for ever) would otherwise hang the suite instead of
+            # failing it. The bound under test is 1 s; 10 s is the margin.
+            first = await asyncio.wait_for(
+                post(
                     app,
                     cid,
                     await signed(app, cid),
                     bearer(key_pair, OWNER),
                     as_a_server_would=True,
+                ),
+                timeout=_CALL_GUARD_SECONDS,
+            )
+            if second_approval:
+                second = await asyncio.wait_for(
+                    post(
+                        app,
+                        cid,
+                        await signed(app, cid),
+                        bearer(key_pair, OWNER),
+                        as_a_server_would=True,
+                    ),
+                    timeout=_CALL_GUARD_SECONDS,
                 )
     finally:
         if backend is not None:

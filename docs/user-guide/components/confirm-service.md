@@ -482,7 +482,7 @@ an application log line or in an exception message: a backend response can carry
 connection string or a token, and scrubbing PAN and IBAN shapes out of it never made it
 safe to forward. Three mechanisms hold that line:
 
-- **Only the status line is read.** The request is sent as a stream and the client
+- **Only the status is read.** The request is sent as a stream and the client
   takes `status_code` and nothing else: not the body, not the headers, not the reason
   phrase. Leaving the block closes the connection with the body unread, so a body of
   any size, a corrupt gzip body or a short `Content-Length` changes nothing. An
@@ -504,12 +504,19 @@ safe to forward. Three mechanisms hold that line:
   operator lowers the root logger.
 
 **What the write endpoint must guarantee.** The write endpoint must make the operation
-durable BEFORE it sends the status line, and must answer 2xx only for an operation it
-has committed. Confirm closes the connection after reading the status line and never
-reads the body; a response is acknowledged only by its status. A backend that commits
-after streaming its response, or rolls back when the client disconnects, leaves confirm
+durable BEFORE it sends the status line, and must answer 200, 201 or 202 only for an
+operation it has committed (a 202 is filed as executed too, although HTTP reads it as
+"accepted, not completed"). Those three are the only statuses filed as executed: any
+other 2xx (203, 204, 205, 206 and so on) is filed as a refusal, the 207 below, so a
+backend that commits and answers 204 leaves the row `approved` while confirm tells the
+app the backend refused. Answer with one of the three when the operation is committed.
+Confirm closes the connection after reading the response header block, skipping 1xx
+interim responses (measured: a `100` followed by a `201` is a 201), and never reads the
+body; a response is acknowledged only by its status. A backend that commits after
+streaming its response, or rolls back when the client disconnects, leaves confirm
 recording `executed` for money that did not move. The `Idempotency-Key` header carries
-the challenge id: de-duplicate on it.
+the challenge id: de-duplicate on it. This repository requires that of the backend and
+cannot verify it.
 
 **Status-line edge cases.** Each is a measured behaviour of the parser, not a promise
 the backend may lean on:
@@ -521,13 +528,21 @@ the backend may lean on:
   `Transfer-Encoding: gzip, chunked`) is reported as a transport failure (502) with the
   row left `approved`, even though the backend accepted the write. Reconcile by
   `Idempotency-Key`.
+- A `201` with a duplicate `Content-Length` header is a transport failure too
+  (`RemoteProtocolError`, measured 7 October 2026): 502, row left `approved`.
 
-**The whole call is bounded at 30 seconds.** `timeout=10.0` on the client applies to
+**The header phase is bounded at 30 seconds.** `timeout=10.0` on the client applies to
 each read separately, so a backend sending one header byte every nine seconds never
 trips it; measured before the bound, a byte per 2 seconds held an approval pending at
-40 seconds and the ceiling was days. `WRITE_TOTAL_TIMEOUT_SECONDS` (30, ECS's default
-`stopTimeout`) bounds connecting, sending and receiving the status line and header
-block. On expiry with no status taken, the client raises `BackendTransportError` with
+40 seconds and the ceiling was days. `WRITE_TOTAL_TIMEOUT_SECONDS` (30) bounds
+connecting, TLS and receiving the response header block, and nothing else: not the Vault
+mint (up to four times `POSTERN_VAULT_TIMEOUT_SECONDS`) and not the pre-call audit
+commit, which run before it starts, and not the `approved -> executed` recording, which
+runs after it. It is therefore not a promise that no call outlives ECS's SIGKILL, and
+there is a residual gap: under the shipped uvicorn command shutdown waits for in-flight
+requests, so a SIGTERM shortly after the call starts, followed by a slow success near
+the 30 s mark, can be SIGKILLed before the record lands. Money moves, the row stays
+`approved`, and SIGKILL logs nothing. Reconcile by `Idempotency-Key`. On expiry with no status taken, the client raises `BackendTransportError` with
 `kind="TotalTimeout"`. The outcome is as ambiguous as every transport failure, because
 the backend may have received and committed the write: the row stays `approved`, the
 completion `audit_log` row is `raised` with `detail` `TotalTimeout`, and the operator
@@ -537,14 +552,27 @@ outer cancellation (the caller going away) still propagates as a cancellation. O
 inside the client is a bug in this process and fails loudly through the generic path
 (a bare 500, not the 502).
 
-**Proxy environment variables are ignored.** Every outbound HTTP client in this
-repository (the write client, the api's read facade, the Vault client and both JWKS
-fetchers) is built with `trust_env=False`, so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
-`NO_PROXY`, `SSL_CERT_FILE` and `SSL_CERT_DIR` have no effect on them. Route egress with
-the network (PrivateLink, security groups), not with `HTTP_PROXY`. Measured before the
-change: with `HTTP_PROXY` set, a proxy received the write request with the signed write
-JWT, the `Idempotency-Key` and the payment payload, and its own 201 was recorded as
-`executed`. There is no setting to turn this back on.
+**Proxy environment variables are ignored, and a CA bundle override refuses startup.**
+Every outbound HTTP client in this repository (the write client, the api's read facade,
+the Vault client and both JWKS fetchers) is built with `trust_env=False`, so
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` have no effect on them. Route
+egress with the network (PrivateLink, security groups), not with `HTTP_PROXY`. Measured
+before the change: with `HTTP_PROXY` set, a proxy received the write request with the
+signed write JWT, the `Idempotency-Key` and the payment payload, and its own 201 was
+recorded as `executed`.
+
+`trust_env=False` does not stop `SSL_CERT_FILE` and `SSL_CERT_DIR` on Linux: `httpx2`
+builds its context with `truststore`, whose Linux backend asks OpenSSL for its default
+verify paths, and OpenSSL reads both variables (redis-py's TLS connection does the
+same through `ssl.create_default_context()`). Measured 7 October 2026 in the
+`postern-confirm` image: with `SSL_CERT_FILE` naming a throwaway CA, the write client,
+the Vault client and a JWKS client all accepted a server certificate that CA signed.
+macOS `truststore` ignores both variables, so a developer's machine cannot show it. So
+both services **refuse to start** when either variable is set in the process
+environment (`enforce_no_ca_bundle_override`), with one error naming the variable and
+never its value, and there is no setting to turn that off. The TLS trust anchors are the
+image's system store: install a private CA into it at build time. `REQUESTS_CA_BUNDLE`
+and `CURL_CA_BUNDLE` are not refused, because nothing in this stack reads them.
 
 The one log line per refusal is a WARNING naming the challenge id, the operation and
 the numeric status. The row stays `approved` and the completion `audit_log` row is
@@ -566,7 +594,8 @@ kind, because the app cannot tell "never sent" from "sent and possibly committed
 Before this response existed the exception left the handler and the app got Starlette's
 bare text 500, indistinguishable from an internal crash. Now the claim stays committed
 and the row stays `approved` (no status change), the backend is not called again (the
-repository documents no backend dedupe behind the `Idempotency-Key`), and the
+repository requires the backend to de-duplicate on the `Idempotency-Key` and cannot
+verify that it does), and the
 completion `audit_log` row is `raised` with `detail` set to the original kind
 (`ConnectError`, `ReadTimeout`, `RemoteProtocolError`, `TotalTimeout`), paired with the
 `reaching` row. If that completion row cannot be written the request still fails with a
@@ -598,8 +627,8 @@ re-reads failing too (the row is `executed`), or something else can have moved t
 row. The ERROR line therefore says "could not be confirmed as executed; check the
 row" and does not claim the status. The completion `audit_log` row is `raised` with
 `detail` `executed_unrecorded`, paired with the `reaching` row. **A caller must never
-retry a 202.** The repository documents no backend dedupe behind the
-`Idempotency-Key` it sends, so a second approval attempt (which would be refused 409
+retry a 202.** The repository requires the backend to de-duplicate on the
+`Idempotency-Key` it sends and cannot verify that it does, so a second approval attempt (which would be refused 409
 `already_terminal` anyway) or any re-drive risks paying twice. What an operator does:
 find the challenge id in the ERROR log line "the backend accepted ... and recording it
 as executed failed or could not be confirmed as executed; check the row", join the two

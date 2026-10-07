@@ -113,6 +113,7 @@ from collections.abc import Mapping
 
 __all__ = [
     "ALLOWED_UNREAD_ENV",
+    "CA_BUNDLE_OVERRIDE_ENV",
     "ENV_PREFIX",
     "REQUIRED_ENV",
     "INVENTORY",
@@ -123,6 +124,7 @@ __all__ = [
     "UnknownName",
     "classify_environment",
     "enforce_known_environment",
+    "enforce_no_ca_bundle_override",
     "names_read_by",
 ]
 
@@ -385,6 +387,10 @@ class EnvironmentReport:
     blank: tuple[str, ...] = ()
     unsatisfiable: tuple[UnknownName, ...] = ()
     unenforceable: tuple[str, ...] = ()
+    #: Names from `CA_BUNDLE_OVERRIDE_ENV` that are present. Not part of the seven
+    #: above: it is not about the ``POSTERN_`` namespace, it is read here only
+    #: because this is the one function licensed to enumerate the environment.
+    ca_override: tuple[str, ...] = ()
 
 
 def _split_names(raw: str | None) -> frozenset[str]:
@@ -501,6 +507,7 @@ def classify_environment(
         tuple(blank),
         tuple(unsatisfiable),
         tuple(unenforceable),
+        tuple(name for name in CA_BUNDLE_OVERRIDE_ENV if name in snapshot),
     )
 
 
@@ -634,3 +641,49 @@ def enforce_known_environment(*, service: str) -> None:
     if not sections:
         return
     raise RuntimeError("\n\n".join(sections))
+
+
+#: The variables that replace the trust anchors of every TLS client a service opens.
+#:
+#: Exactly the two OpenSSL reads. Measured 7 October 2026 on Linux: ``httpx2``
+#: builds its context with ``truststore.SSLContext``, whose Linux backend calls
+#: ``ssl.get_default_verify_paths()`` and ``set_default_verify_paths()``, and
+#: redis-py's TLS connection calls ``ssl.create_default_context()``; all of them
+#: read ``SSL_CERT_FILE`` and ``SSL_CERT_DIR``, and ``trust_env=False`` does not
+#: stop it. ``REQUESTS_CA_BUNDLE`` and ``CURL_CA_BUNDLE`` are not here because
+#: nothing in this stack reads them. macOS ``truststore`` uses Security.framework
+#: and ignores both, which is why a developer's machine cannot observe the defect.
+CA_BUNDLE_OVERRIDE_ENV: tuple[str, ...] = ("SSL_CERT_FILE", "SSL_CERT_DIR")
+
+
+def enforce_no_ca_bundle_override(*, service: str) -> None:
+    """Refuse to start when a CA bundle override is set in the process environment.
+
+    Args:
+        service: Which deployable is starting. One of `SERVICES`; used only to
+            reject a mistyped caller, the check is the same for both.
+
+    Raises:
+        RuntimeError: when any name in `CA_BUNDLE_OVERRIDE_ENV` is present. The
+            message names the variable and never its value. There is no opt-out
+            setting: the trust anchors are the image's system store.
+        ValueError: if ``service`` is not one of `SERVICES`.
+
+    Presence refuses, an empty value included: an empty ``SSL_CERT_FILE`` is a
+    template that rendered nothing, and the fix is the same.
+    """
+    # Through `classify_environment`, the one function licensed to enumerate the
+    # environment (`tests/test_settings_bounds.py`'s sweep): a second reader here
+    # would be a second place that touches `os.environ` without a resolvable name.
+    # It also rejects an unknown service.
+    present = classify_environment(service).ca_override
+    if not present:
+        return
+    raise RuntimeError(
+        f"{', '.join(present)} {'is' if len(present) == 1 else 'are'} set in the "
+        f"environment of the {service} service. A CA bundle override replaces the trust "
+        "anchors of every TLS client this service opens (Vault, the backend, JWKS "
+        "fetches, Redis), and `trust_env=False` on the HTTP clients does not stop it on "
+        "Linux. Unset it and install a private CA into the image's system trust store at "
+        "build time instead. The value is not shown here."
+    )

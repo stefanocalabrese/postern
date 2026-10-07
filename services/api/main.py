@@ -68,7 +68,7 @@ from postern_core.auth.read_minter import JtiReplayCache, ReadTokenMinter
 from postern_core.auth.redis_preflight import run_redis_preflight
 from postern_core.auth.revocation import create_revocation_store, decision_scope
 from postern_core.config import bool_from_env, enforce_redis_requirement
-from postern_core.env_inventory import enforce_known_environment
+from postern_core.env_inventory import enforce_known_environment, enforce_no_ca_bundle_override
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.log_safety import install_sql_safe_logging, pin_http_client_loggers
@@ -272,6 +272,10 @@ def create_app(
     # `postern_core/env_inventory.py` carries the three populations, why only
     # the third refuses, and why the escape hatch cannot be the hole.
     enforce_known_environment(service="api")
+    # The trust anchors are the image's system store: `SSL_CERT_FILE` and
+    # `SSL_CERT_DIR` would replace them for every TLS client, `trust_env=False`
+    # notwithstanding (measured on Linux). See `enforce_no_ca_bundle_override`.
+    enforce_no_ca_bundle_override(service="api")
     # The operator's backend's text, at INFO and DEBUG: `pin_http_client_loggers`.
     pin_http_client_loggers()
     # An uncaught SQL driver error is logged by uvicorn with its statement,
