@@ -134,15 +134,15 @@ that reaches neither this handler nor the table.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import time
 import unicodedata
 import uuid
 from datetime import UTC, datetime
-from typing import Any, NoReturn
+from typing import Any
 
+from postern_core.json_strict import loads_finite
 from postern_core.store.challenges import get_challenge, update_challenge_status
 from postern_core.store.engine import Database
 from starlette.requests import Request
@@ -1006,22 +1006,20 @@ async def _read_body(request: Request) -> dict[str, Any] | None:
     Without that middleware this function would be reading an unbounded body
     into memory in order to refuse it.
     """
-    # Parsed here rather than by `request.json()`, which accepts the JSON
-    # extensions `NaN`, `Infinity` and `-Infinity`. A float like that reaches
+    # Parsed with `loads_finite` rather than `request.json()`, which accepts
+    # the JSON extensions `NaN`, `Infinity` and `-Infinity` (and a literal like
+    # `1e999` decodes to infinity). A float like that reaches
     # `audit_log.arguments` and PostgreSQL refuses it as a JSONB token, so
     # the audit write failed and a request, including a cross-customer probe,
     # ended with no row at all. Refused at parse time they are a malformed
-    # body, which gets its row before any challenge is looked at.
+    # body (`NonFiniteJsonError` is a `ValueError`), which gets its row before
+    # any challenge is looked at. Every other JSON body this service reads
+    # goes through the same function.
     try:
-        parsed = json.loads(await request.body(), parse_constant=_refuse_constant)
+        parsed = loads_finite(await request.body())
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) else None
-
-
-def _refuse_constant(name: str) -> NoReturn:
-    """``json.loads``'s ``parse_constant`` hook: a non-finite number is not accepted."""
-    raise ValueError(f"non-finite JSON number {name}")
 
 
 async def _refused_transition_response(

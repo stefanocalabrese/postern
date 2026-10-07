@@ -369,7 +369,9 @@ def raw_with(record: ChallengeRecord, field: str, constant: str) -> bytes:
     return ('{"signature": "' + signature + '", "' + field + '": ' + constant + "}").encode()
 
 
-NON_FINITE = ["NaN", "Infinity", "-Infinity"]
+#: `1e999` and `-1e999` are the same hazard spelled as a number: `json.loads`
+#: decodes them to infinity without calling `parse_constant`.
+NON_FINITE = ["NaN", "Infinity", "-Infinity", "1e999", "-1e999"]
 FIELDS = ["confirming_device", "verification_result"]
 
 

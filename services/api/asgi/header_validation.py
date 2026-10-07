@@ -13,9 +13,11 @@ FastMCP exposes no way to set the HTTP status from a tool or hook.
 import json
 from typing import Any
 
+from postern_core.json_strict import NonFiniteJsonError, loads_finite
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 HEADER_MISMATCH = -32020
+PARSE_ERROR = -32700
 
 _NAME_FROM_PARAM = {"tools/call": "name", "prompts/get": "name", "resources/read": "uri"}
 
@@ -54,7 +56,11 @@ class HeaderBodyValidation:
         except _BodyTooLarge:
             await _reject_too_large(send)
             return
-        problem = self._check(_headers(scope), body)
+        try:
+            problem = self._check(_headers(scope), body)
+        except NonFiniteJsonError:
+            await _reject_parse_error(send)
+            return
         if problem is not None:
             await _reject(problem, body, scope, send)
             return
@@ -189,7 +195,15 @@ def _parse(body: bytes) -> dict[str, Any] | None:
     this one rejects.
     """
     try:
-        payload = json.loads(body)
+        payload = loads_finite(body)
+    except NonFiniteJsonError:
+        # NOT `None`. FastMCP's own parser accepts `NaN`, `Infinity` and a
+        # literal like `1e999` (measured 2026-10-07: a `tools/call` carrying
+        # `NaN` in `_meta` reached the tool and wrote its audit row), so
+        # passing such a body through is passing it to a handler. `__call__`
+        # refuses it with the JSON-RPC answer the dispatcher gives a body that
+        # is not JSON.
+        raise
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -260,6 +274,29 @@ async def _reject_too_large(send: Send) -> None:
         {
             "type": "http.response.start",
             "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(raw)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": raw})
+
+
+async def _reject_parse_error(send: Send) -> None:
+    """HTTP 400 with JSON-RPC -32700, the answer FastMCP gives a body that is not JSON.
+
+    Same status, code and `id: null` as the dispatcher's own, without the
+    parser's detail text: the detail of a refused number is not a thing a
+    caller needs.
+    """
+    raw = json.dumps(
+        {"jsonrpc": "2.0", "id": None, "error": {"code": PARSE_ERROR, "message": "Parse error"}}
+    ).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 400,
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(raw)).encode()),

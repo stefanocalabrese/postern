@@ -93,7 +93,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hmac
-import json
 import logging
 import time
 import uuid
@@ -126,6 +125,7 @@ from postern_core.auth.refresh_sessions import (
 from postern_core.auth.resource_uri import normalize_resource
 from postern_core.auth.revocation import RevocationStoreBase, RevocationStoreUnavailable
 from postern_core.identity import CustomerRef
+from postern_core.json_strict import loads_finite
 from postern_core.risk.pairing_network import (
     MatchResult,
     NetworkEnricher,
@@ -486,9 +486,12 @@ async def device_authorization(request: Request) -> JSONResponse:
     # three copies of ``_scrub``.
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
+        # `loads_finite`, not `request.json()`: `NaN`, `Infinity` and a literal
+        # like `1e999` are refused as a body that is not JSON. `ValueError`
+        # covers the decode error, bad UTF-8 and that refusal alike.
         try:
-            body = await request.json()
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = loads_finite(await request.body())
+        except ValueError:
             return _error(400, "invalid_request", "body must be JSON")
         if not isinstance(body, dict):
             return _error(400, "invalid_request", "body must be a JSON object")
@@ -2078,8 +2081,8 @@ async def _pair(
         )
 
     try:
-        body = await request.json()
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = loads_finite(await request.body())
+    except ValueError:
         return _Pairing(_error(400, "invalid_request", "body must be JSON"), recorded=False)
     if not isinstance(body, dict):
         return _Pairing(
@@ -2535,8 +2538,8 @@ async def _scan(
         )
 
     try:
-        body = await request.json()
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = loads_finite(await request.body())
+    except ValueError:
         return _Scanned(_error(400, "invalid_request", "body must be JSON"), recorded=False)
     if not isinstance(body, dict):
         return _Scanned(

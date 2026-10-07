@@ -83,6 +83,9 @@ Enforces MCP Streamable HTTP spec compliance:
 
 - Rejects requests where `Mcp-Method` / `Mcp-Name` headers don't match body values
   (HTTP 400 + JSON-RPC `-32020`)
+- Answers a body holding `NaN`, `Infinity`, `-Infinity` or an overflowing literal such as
+  `1e999` with HTTP 400 and JSON-RPC `-32700` "Parse error", the answer FastMCP gives a body
+  that is not JSON, before any tool or audit row (FastMCP's own parser accepts them)
 - Bounds request body to `POSTERN_MAX_BODY_BYTES` (default 1 MiB)
 - Prevents request smuggling via header/body mismatch
 
