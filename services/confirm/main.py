@@ -72,6 +72,8 @@ and ``services.confirm.callback`` for the challenge approval handler.
 import asyncio
 import enum
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -98,6 +100,7 @@ from services.confirm.customer_rate_limit import (
     create_customer_rate_limit_store,
     customer_limits_from_settings,
 )
+from services.confirm.database_clock import run_database_clock_check
 from services.confirm.device_auth import (
     PAIRING_ENRICHMENT_SLOTS,
     TokenResponseHeaders,
@@ -264,6 +267,17 @@ class _ConfirmApp(Starlette):
 
     def build_middleware_stack(self) -> ASGIApp:
         return TokenResponseHeaders(super().build_middleware_stack())
+
+
+@asynccontextmanager
+async def _lifespan(app: Starlette) -> AsyncIterator[None]:
+    """Startup: warn when confirm and Postgres disagree on the time.
+
+    Never blocks and never raises (`services/confirm/database_clock.py`). Nothing
+    runs at shutdown, which is what it did before this existed.
+    """
+    await run_database_clock_check(app.state.postern_database)
+    yield
 
 
 def create_confirm_app(
@@ -501,6 +515,7 @@ def create_confirm_app(
 
     app = _ConfirmApp(
         routes=routes,
+        lifespan=_lifespan,
         middleware=[
             # AHEAD OF THE BODY LIMIT, AND THEREFORE AHEAD OF EVERYTHING.
             # A request this refuses must not first be drained: behind
