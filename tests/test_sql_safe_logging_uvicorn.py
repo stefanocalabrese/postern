@@ -29,8 +29,8 @@ import httpx2
 import pytest
 import uvicorn
 from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
+from postern_core import log_safety
 from postern_core.domain.verification import VerificationTier
-from postern_core.log_safety import SqlSafeExceptionFilter
 from postern_core.store import challenges as store
 from postern_core.store.engine import Database
 from postern_core.store.models import AuditEntry
@@ -61,15 +61,17 @@ MESSAGE = "Exception in ASGI application"
 
 
 @pytest.fixture
-def _uvicorn_filters_restored() -> Iterator[None]:
-    """Start each test with no filter on uvicorn's loggers, put them back after."""
-    names = ("uvicorn.error", "uvicorn")
-    saved = {n: list(logging.getLogger(n).filters) for n in names}
-    for n in names:
-        logging.getLogger(n).filters[:] = []
+def _uvicorn_filters_restored(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Start each test with no sanitising record factory, put the previous one back after.
+
+    (The name is kept from the design this replaced, a filter on uvicorn's two
+    loggers; what is reset now is the process-wide record factory.)
+    """
+    previous = logging.getLogRecordFactory()
+    logging.setLogRecordFactory(logging.LogRecord)
+    monkeypatch.setattr(log_safety, "_installed_factory", None)
     yield
-    for n in names:
-        logging.getLogger(n).filters[:] = saved[n]
+    logging.setLogRecordFactory(previous)
 
 
 @asynccontextmanager
@@ -212,9 +214,7 @@ async def test_confirm_without_the_filter_the_driver_message_reaches_the_log(
     assert response.status_code == 500
     assert MESSAGE in text_out
     assert PARAM_SENTINEL in text_out, text_out
-    assert not any(
-        isinstance(f, SqlSafeExceptionFilter) for f in logging.getLogger("uvicorn.error").filters
-    )
+    assert not getattr(logging.getLogRecordFactory(), "_postern_sql_safe_factory", False)
 
 
 @pytest.mark.usefixtures("_uvicorn_filters_restored")
@@ -307,18 +307,26 @@ async def test_api_with_the_filter_nothing_a_statement_bound_reaches_the_log(
 # ---------------------------------------------------------------------------
 
 
+def _wrappers() -> int:
+    count = 0
+    factory: object = logging.getLogRecordFactory()
+    while factory is not None:
+        if getattr(factory, "_postern_sql_safe_factory", False):
+            count += 1
+        factory = getattr(factory, "__wrapped__", None)
+    return count
+
+
 @pytest.mark.usefixtures("_uvicorn_filters_restored")
-def test_create_app_installs_the_filter_on_both_uvicorn_loggers() -> None:
+def test_create_app_installs_the_record_factory() -> None:
     create_app(Settings.for_testing())
-    for name in ("uvicorn.error", "uvicorn"):
-        assert any(isinstance(f, SqlSafeExceptionFilter) for f in logging.getLogger(name).filters)
+    assert _wrappers() == 1
 
 
 @pytest.mark.usefixtures("_uvicorn_filters_restored")
-def test_create_confirm_app_installs_the_filter_on_both_uvicorn_loggers(
+def test_create_confirm_app_installs_the_record_factory_once(
     pg_url: str, key_pair: RSAKeyPair
 ) -> None:
     _confirm_app(pg_url, key_pair)
-    for name in ("uvicorn.error", "uvicorn"):
-        mine = [f for f in logging.getLogger(name).filters if isinstance(f, SqlSafeExceptionFilter)]
-        assert len(mine) == 1, name
+    _confirm_app(pg_url, key_pair)
+    assert _wrappers() == 1

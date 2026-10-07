@@ -125,6 +125,9 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        # A failed migration statement's error text then carries no bound
+        # values, as for the two services' engines.
+        hide_parameters=True,
     )
 
     async with connectable.connect() as connection:

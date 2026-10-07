@@ -234,6 +234,7 @@ from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.auth import AuthContext
 from fastmcp.server.dependencies import get_http_request
 from postern_core.identity import CustomerRef
+from postern_core.log_safety import describe_exception, exc_info_for_log
 from postern_core.store import consents
 from postern_core.store.engine import Database
 from postern_core.store.models import (
@@ -617,15 +618,15 @@ def consent_for(domain: str, db: Database) -> Callable[[AuthContext], Awaitable[
                     logger.error(
                         "consent store unreachable, denying every consent-gated tool "
                         "for this request: %s",
-                        type(cause).__name__,
-                        exc_info=cause,
+                        describe_exception(cause),
+                        exc_info=exc_info_for_log(cause),
                     )
                 else:
                     logger.error(
                         "consent check FAULTED, denying every consent-gated tool for "
                         "this request: %s. The store answered; this software is wrong",
-                        type(cause).__name__,
-                        exc_info=cause,
+                        describe_exception(cause),
+                        exc_info=exc_info_for_log(cause),
                     )
             _refuse(ctx, failure.reason)
             return False

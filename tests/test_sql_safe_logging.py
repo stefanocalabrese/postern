@@ -21,14 +21,18 @@ the whole stack through a real uvicorn server.
 
 import io
 import logging
-import re
+import signal
 from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 
+import anyio
 import asyncpg  # type: ignore[import-untyped]
 import pytest
 from postern_core.log_safety import (
     SqlSafeExceptionFilter,
-    install_sql_safe_logging,
+    chain_holds_driver_error,
+    describe_exception,
+    exc_info_for_log,
 )
 from postern_core.store.engine import Database
 from sqlalchemy import text
@@ -69,6 +73,17 @@ def _render(exc: BaseException, *, with_filter: bool = True) -> str:
     log, buffer = _logger(with_filter=with_filter)
     log.error("Exception in ASGI application", exc_info=exc)
     return buffer.getvalue()
+
+
+@pytest.fixture(autouse=True)
+def _plain_record_factory() -> Iterator[None]:
+    """These tests measure `SqlSafeExceptionFilter` and the unfiltered baseline on
+    private loggers; a record factory installed by an earlier test (any `create_app`)
+    would sanitise the baseline too, so none is installed here. Put back after."""
+    previous = logging.getLogRecordFactory()
+    logging.setLogRecordFactory(logging.LogRecord)
+    yield
+    logging.setLogRecordFactory(previous)
 
 
 @pytest.fixture
@@ -150,7 +165,10 @@ async def test_a_bound_parameter_error_keeps_frames_types_and_sqlstate_only(
     exc = await _param_error(engine)
     assert isinstance(exc, DBAPIError)
     sqlstate = exc.orig.sqlstate  # type: ignore[union-attr]
+    # Raised by asyncpg while ENCODING the parameter: no server was involved, and
+    # the class attribute below says 22000 anyway.
     assert sqlstate == "22000"
+    assert "sqlstate" not in vars(exc.orig.__cause__)  # type: ignore[union-attr]
 
     rendered = _render(exc)
 
@@ -158,7 +176,9 @@ async def test_a_bound_parameter_error_keeps_frames_types_and_sqlstate_only(
     assert "Exception in ASGI application" in rendered
     assert "sqlalchemy.exc.DBAPIError" in rendered
     assert "asyncpg.exceptions.DataError" in rendered
-    assert "22000" in rendered
+    assert "client-side" in rendered
+    assert "22000" not in rendered
+    assert "sqlstate=" not in rendered
     assert WITHHELD in rendered
     assert "test_sql_safe_logging.py" in rendered  # a traceback frame of this file
     assert "[SQL:" not in rendered
@@ -173,7 +193,7 @@ async def test_a_unique_violation_detail_does_not_reach_the_log(engine: AsyncEng
     rendered = _render(exc)
 
     _assert_clean(rendered)
-    assert "23505" in rendered
+    assert "sqlstate=23505" in rendered
     assert "asyncpg.exceptions.UniqueViolationError" in rendered
     assert "already exists" not in rendered
     assert "duplicate key" not in rendered
@@ -185,7 +205,7 @@ async def test_an_invalid_byte_sequence_does_not_reach_the_log(engine: AsyncEngi
 
     _assert_clean(rendered)
     # What Postgres really answers for a NUL in a text parameter.
-    assert re.search(r"\b22021\b", rendered), rendered
+    assert "sqlstate=22021" in rendered, rendered
     assert "invalid byte sequence" not in rendered
 
 
@@ -258,17 +278,48 @@ async def test_a_deep_chain_with_the_driver_error_at_the_root_is_sanitised(
     assert "sqlalchemy.exc.DBAPIError" in rendered
 
 
+@contextmanager
+def _time_bound(seconds: int) -> Iterator[None]:
+    """Fail the test, rather than hang the run, if the body does not finish.
+
+    A regression here (the bound ignored) used to hang the suite for about 19
+    minutes inside `traceback`'s rendering of a 400-deep chain.
+    """
+
+    def on_alarm(signum: int, frame: object) -> None:
+        raise TimeoutError(f"did not finish within {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def test_a_chain_deeper_than_the_bound_is_withheld_whole() -> None:
     """Past the bound the tail is unknown, and unknown is treated as SQL."""
     current: BaseException = ValueError(MESSAGE_SENTINEL)
-    for _ in range(400):
-        try:
-            raise ValueError(MESSAGE_SENTINEL) from current
-        except ValueError as err:
-            current = err
-    rendered = _render(current)
-    _assert_clean(rendered)
-    assert WITHHELD in rendered
+    with _time_bound(30):
+        for _ in range(400):
+            try:
+                raise ValueError(MESSAGE_SENTINEL) from current
+            except ValueError as err:
+                current = err
+        # NOT rendered through a logger: if the bound were ignored, logging's
+        # own formatting of a 400-deep chain is what hung the suite, and its
+        # `handleError` formats the TimeoutError again. The record is inspected
+        # instead, so a regression fails here, fast.
+        record = logging.LogRecord(
+            "t", logging.ERROR, __file__, 1, "msg", None, (type(current), current, None)
+        )
+        SqlSafeExceptionFilter().filter(record)
+        assert chain_holds_driver_error(current) is True
+    assert record.exc_info is None
+    assert record.exc_text is not None
+    _assert_clean(record.exc_text)
+    assert WITHHELD in record.exc_text
 
 
 def test_a_bare_asyncpg_exception_without_the_sqlalchemy_wrapper_is_sanitised() -> None:
@@ -278,7 +329,9 @@ def test_a_bare_asyncpg_exception_without_the_sqlalchemy_wrapper_is_sanitised() 
     rendered = _render(bare)
     _assert_clean(rendered)
     assert "asyncpg.exceptions.UniqueViolationError" in rendered
-    assert "23505" in rendered  # the class attribute, readable without a message
+    # Built in the client: the class says 23505, no server said it.
+    assert "client-side" in rendered
+    assert "23505" not in rendered
 
     try:
         raise RuntimeError("wrapper") from bare
@@ -320,6 +373,114 @@ def test_a_hostile_attribute_falls_back_to_type_names_only() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Exception groups: a task group wraps what its children raised.
+# ---------------------------------------------------------------------------
+
+
+async def test_an_exception_group_holding_a_driver_error_is_sanitised(
+    engine: AsyncEngine,
+) -> None:
+    inner = await _param_error(engine)
+    group = ExceptionGroup("tg", [inner])
+    rendered = _render(group)
+    _assert_clean(rendered)
+    assert "sqlalchemy.exc.DBAPIError" in rendered
+    assert chain_holds_driver_error(group) is True
+
+
+async def test_a_nested_base_exception_group_is_sanitised(engine: AsyncEngine) -> None:
+    inner = await _param_error(engine)
+    nested = BaseExceptionGroup("outer", [KeyboardInterrupt(), ExceptionGroup("mid", [inner])])
+    rendered = _render(nested)
+    _assert_clean(rendered)
+    assert "sqlalchemy.exc.DBAPIError" in rendered
+
+
+async def test_a_real_anyio_task_group_leaks_nothing(engine: AsyncEngine) -> None:
+    driver_error = await _param_error(engine)
+
+    async def child() -> None:
+        raise driver_error
+
+    caught: BaseExceptionGroup[Exception] | None = None
+    try:
+        async with anyio.create_task_group() as group:
+            group.start_soon(child)
+    except BaseExceptionGroup as raised:
+        caught = raised
+    assert caught is not None
+    rendered = _render(caught)
+    _assert_clean(rendered)
+    assert "sqlalchemy.exc.DBAPIError" in rendered
+    assert WITHHELD in rendered
+
+
+def test_a_non_sql_exception_group_is_left_alone() -> None:
+    group = ExceptionGroup("tg", [ValueError("plain detail")])
+    assert _render(group) == _render(group, with_filter=False)
+    assert chain_holds_driver_error(group) is False
+
+
+# ---------------------------------------------------------------------------
+# What the SQLSTATE position can say.
+# ---------------------------------------------------------------------------
+
+
+def test_a_value_bearing_sqlstate_is_never_printed() -> None:
+    forged = asyncpg.exceptions.UniqueViolationError("m")
+    forged.sqlstate = f"23505'{MESSAGE_SENTINEL}"
+    rendered = _render(forged)
+    _assert_clean(rendered)
+    assert "23505'" not in rendered
+    assert "client-side" in rendered
+
+
+def test_a_sqlstate_set_only_on_the_wrapped_orig_is_read() -> None:
+    orig = Exception(MESSAGE_SENTINEL)
+    orig.sqlstate = "40001"  # type: ignore[attr-defined]
+    wrapper = DBAPIError("SELECT 1", None, orig)
+    rendered = _render(wrapper)
+    _assert_clean(rendered)
+    assert "sqlalchemy.exc.DBAPIError sqlstate=40001" in rendered
+
+
+def test_a_wrong_length_or_lowercase_sqlstate_on_the_orig_is_not_printed() -> None:
+    for bad in ("4000", "400011", "4000a", "40 01"):
+        orig = Exception(MESSAGE_SENTINEL)
+        orig.sqlstate = bad  # type: ignore[attr-defined]
+        rendered = _render(DBAPIError("SELECT 1", None, orig))
+        assert "sqlstate=" not in rendered, bad
+
+
+async def test_describe_exception_is_type_and_sqlstate_only(engine: AsyncEngine) -> None:
+    client_side = await _param_error(engine)
+    described = describe_exception(client_side)
+    assert described == ("sqlalchemy.exc.DBAPIError, asyncpg.exceptions.DataError client-side")
+    server_side = await _unique_error(engine)
+    assert describe_exception(server_side) == (
+        "sqlalchemy.exc.IntegrityError, asyncpg.exceptions.UniqueViolationError sqlstate=23505"
+    )
+    for text_out in (described, describe_exception(server_side)):
+        _assert_clean(text_out)
+
+
+def test_describe_exception_never_raises_and_names_a_plain_exception_by_type() -> None:
+    class Hostile(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError(MESSAGE_SENTINEL)
+
+    assert describe_exception(Hostile(MESSAGE_SENTINEL)).endswith("Hostile")
+    assert describe_exception(None) == "<no exception>"
+
+
+def test_exc_info_for_log_keeps_ordinary_exceptions_and_drops_driver_errors() -> None:
+    plain = ValueError("plain")
+    assert exc_info_for_log(plain) is plain
+    assert exc_info_for_log(None) is None
+    assert exc_info_for_log(asyncpg.exceptions.DataError("m")) is None
+
+
+# ---------------------------------------------------------------------------
 # What it leaves alone.
 # ---------------------------------------------------------------------------
 
@@ -350,31 +511,6 @@ def test_a_record_without_exc_info_is_untouched() -> None:
 def test_the_filter_never_drops_a_record() -> None:
     record = logging.LogRecord("t", logging.ERROR, __file__, 1, "msg", None, None)
     assert SqlSafeExceptionFilter().filter(record) is True
-
-
-# ---------------------------------------------------------------------------
-# Install.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def _clean_uvicorn_filters() -> Iterator[None]:
-    names = ("uvicorn.error", "uvicorn")
-    saved = {n: list(logging.getLogger(n).filters) for n in names}
-    for n in names:
-        logging.getLogger(n).filters[:] = []
-    yield
-    for n in names:
-        logging.getLogger(n).filters[:] = saved[n]
-
-
-@pytest.mark.usefixtures("_clean_uvicorn_filters")
-def test_install_attaches_exactly_one_filter_per_logger_however_often_it_runs() -> None:
-    for _ in range(3):
-        install_sql_safe_logging()
-    for name in ("uvicorn.error", "uvicorn"):
-        mine = [f for f in logging.getLogger(name).filters if isinstance(f, SqlSafeExceptionFilter)]
-        assert len(mine) == 1, name
 
 
 # ---------------------------------------------------------------------------

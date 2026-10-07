@@ -55,14 +55,15 @@ Production starts the process with: `uvicorn services.api.main:app`.
 8. **Server builder**, FastMCP server with middleware chain
 9. **JWKS route**, appended to router at `/.well-known/jwks.json`
 
-### Uncaught driver errors in the log
+### Driver errors in the client's reply and in the log
 
-A SQL driver error that escapes a handler is logged by uvicorn as `Exception in
-ASGI application`. Both database engines hide bound parameters, and `create_app`
-installs `postern_core.log_safety.SqlSafeExceptionFilter` on `uvicorn.error` and
-`uvicorn`: the log keeps the traceback frames, each exception's type and its
-SQLSTATE, and withholds the driver's message, the SQL and the parameters. The
-driver's message text is in Postgres' own log.
+The server is built with `mask_error_details=True`: an exception a tool raises other than a `ToolError`
+reaches the client as `Error calling tool 'x'`, and `AuditMiddleware` replaces any other exception whose
+chain holds a SQL driver error (a completion-row audit failure, for one) with `ToolError("internal
+error")`, so neither the driver's message nor the bound value is in the model's channel. Both database
+engines hide bound parameters, and `create_app` calls `postern_core.log_safety.install_sql_safe_logging()`,
+which sanitises every log record in the process: the traceback frames and each exception's type and
+SQLSTATE stay, the driver's message, the SQL and the parameters do not. For an error Postgres raised, its own log has the message, the DETAIL and the statement at the same time (with `log_min_error_statement` at its default `error`; to match on a SQLSTATE put `%e` in `log_line_prefix`, the default `%m [%p] ` carries none). Errors asyncpg raises in the client while encoding a parameter (for example `DataError`, "invalid input for query argument") never reach the server and leave no record anywhere; the sanitised line says `client-side` for them. Postgres' log then holds the values these logs withhold (DETAIL `Failing row contains (...)`): treat it as customer data.
 
 ## ASGI Middleware Chain
 

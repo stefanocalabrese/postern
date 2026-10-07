@@ -148,10 +148,14 @@ determined.
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 
 from mcp.types import REQUEST_TIMEOUT
+from postern_core.log_safety import describe_exception
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -315,6 +319,7 @@ class RequestDeadline:
             # does not await it. `BaseException` because `CancelledError` is
             # one.
             task.cancel()
+            task.add_done_callback(_retrieve_outcome)
             raise
         if task in done:
             # Re-raises whatever the inner app raised, so Starlette's
@@ -331,7 +336,28 @@ class RequestDeadline:
         # produce: this request has already been answered.
         response.expired = True
         task.cancel()
+        task.add_done_callback(_retrieve_outcome)
         await _expire(response, send, self.seconds)
+
+
+def _retrieve_outcome(task: "asyncio.Task[None]") -> None:
+    """Retrieve what a task this middleware abandoned finally raised.
+
+    A task cancelled at the deadline (or by an outer cancellation) is nobody's
+    to await, and asyncio reports an exception no one retrieved as `Task
+    exception was never retrieved` with the exception object in the message:
+    for a driver error that is the SQL, its parameters and the driver's text.
+    Retrieved here and logged by type and SQLSTATE only, as
+    `services/confirm/callback.py` does for its background task. A task that
+    was cancelled, or that finished without raising, logs nothing.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "a request abandoned at its deadline raised afterwards: %s", describe_exception(exc)
+        )
 
 
 def _guard(send: Send, response: _Response) -> Send:

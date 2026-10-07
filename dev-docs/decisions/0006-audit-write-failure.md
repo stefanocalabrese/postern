@@ -420,41 +420,54 @@ with a spool.
 
 ---
 
-## Amendment, 7 October 2026: the re-raise stays, and the log it produces is sanitised
+## Amendment, 7 October 2026: the re-raise stays, and neither the client's reply nor any log carries the driver's text
 
-Nothing in this record's decision changes. The approval callback still writes
-its `raised` audit row and then re-raises the approval's own exception, and
-`tests/test_audit_reserve.py` still pins the escaping class (`TimeoutError`,
-`ConnectionRefusedError`). The request still fails with 500.
+Nothing in this record's decision changes. The approval callback still writes its `raised` audit row and then
+re-raises the approval's own exception, `tests/test_audit_reserve.py` still pins the escaping class
+(`TimeoutError`, `ConnectionRefusedError`), and the request still fails with 500. The api still fails closed on
+an audit-write failure.
 
-What changed is the line that escape produces. Measured through a real uvicorn
-server, an uncaught SQL driver error was logged as `Exception in ASGI
-application` with SQLAlchemy's `[SQL: ...]` and `[parameters: (...)]`, and with
-the asyncpg message under it, which names the offending value (for a unique
-violation, the `Key (a, b)=(x, y)` detail). `hide_parameters=True` on both
-`Database` engines removes the `[parameters: ...]` line and does not touch the
-driver's own message, which `tests/test_sql_safe_logging.py` measures: a value
-cast to an integer is named in asyncpg's message with parameters hidden.
+What changed is what that failure TELLS anyone. Measured against the real `create_app`, a real HTTP `tools/call`
+and a real Postgres, before this amendment: an entry-write failure came back as HTTP 200
+`result.content[0].text` = `Error calling tool 'accounts.list': (sqlalchemy.dialects.postgresql.asyncpg.Error)
+... invalid input for query argument $1: '<value>' ... [SQL: ...]`, and a completion-write failure came back as a
+JSON-RPC `error.message` carrying the same text, both into the model's channel and so an AI vendor's chat
+history. `hide_parameters=True` removes the `[parameters: ...]` line only: asyncpg's own message names the
+value, and a NOT NULL violation puts `DETAIL: Failing row contains (<the whole row>)` into the text.
 
-So `postern_core.log_safety.SqlSafeExceptionFilter` rewrites the rendering of
-any record on `uvicorn.error` or `uvicorn` whose exception chain holds a
-SQLAlchemy `StatementError` or an asyncpg exception: traceback frames, one line
-per exception with its type and SQLSTATE, and a literal saying the message, SQL
-and parameters were withheld. `tests/test_sql_safe_logging_uvicorn.py` drives it
-through a real uvicorn server, the confirm approval callback and an api route,
-with the filter off (the sentinel is in the log) and on (it is nowhere).
+THREE LAYERS, each pinned by its own test (`tests/test_api_driver_error_client_text.py`,
+`tests/test_sql_safe_logging*.py`):
 
-WHERE IT IS INSTALLED, stated for the shipped image. `create_confirm_app` and
-`create_app` both call `install_sql_safe_logging()`. The Dockerfile's `CMD` for
-the `api` and `confirm` targets is `uvicorn services.<name>.main:app` with no
-`--log-config`. uvicorn applies its logging config in `Config.__init__` and
-imports the application afterwards, in `Config.load()`, so on the shipped
-command the filter is installed after uvicorn's config and is not removed by it.
-An operator who replaces uvicorn's logging after the app exists (a `dictConfig`
-run from their own wrapper module, after importing the app) can drop it and must
-call `install_sql_safe_logging()` again after that. An operator who serves the
-app under a different server (a gunicorn worker class with its own loggers) is
-not covered, because the filter attaches to uvicorn's two loggers only.
+1. `FastMCP(mask_error_details=True)`. Read in fastmcp 4.0.3 (`server.py`, `call_tool`): a `FastMCPError`
+   (so `ToolError`) is re-raised unchanged, which is why the tools' own fixed refusals still reach the client;
+   any other exception becomes `ToolError("Error calling tool 'x'")` with no detail, except that an HTTP-429-shaped
+   or timeout-shaped exception gets one of two fixed texts. It does NOT cover the completion-row failure: that
+   exception leaves `AuditMiddleware` after the tool returned, and reaches the client as a JSON-RPC
+   `error.message` that masking never sees (measured: with masking on and the middleware guard off, the sentinel
+   was in the reply).
+2. `AuditMiddleware._client_safe`: an exception that leaves the middleware with a SQL driver error anywhere in its
+   chain (cause, context, exception groups) is replaced by `ToolError("internal error")`. The call still fails. A
+   `ToolError` is exempt, because with (1) its text is safe by construction.
+3. `postern_core.log_safety.install_sql_safe_logging()`, called by `create_app` and `create_confirm_app`, wraps the
+   process-wide log record factory so that every record on every logger is sanitised when created (frames, each
+   exception's type and SQLSTATE, a withheld marker). The first design was a filter on `uvicorn.error` and
+   `uvicorn`; it missed `fastmcp.server.server` (its own handler, `propagate = False`), the MCP dispatcher, and
+   every `exc_info=` and `%s` of an exception in the application's own loggers, so it was replaced, not kept
+   alongside: a filter that cannot see a record adds nothing the factory does not. The application's own log calls
+   also stopped relying on it: they log `describe_exception(exc)` and pass `exc_info_for_log(exc)`.
 
-What an operator loses: the driver's message text in the application log. The
-SQLSTATE and the time identify the statement in Postgres' own log.
+`services/api/asgi/request_deadline.py` now retrieves the outcome of a task it abandoned and logs
+`describe_exception` only, because asyncio's `Task exception was never retrieved` embeds the task's `repr`,
+which ends `exception=DBAPIError('<driver text>')`.
+
+WHERE IT IS INSTALLED, stated for the shipped image. The factory is process-wide and does not depend on uvicorn's
+loggers or on any logging config. Both app factories install it; on the shipped `CMD` (`uvicorn
+services.<name>.main:app`, no `--log-config`) that happens when uvicorn imports the app, and every worker process of
+`--workers`, `--reload` or a gunicorn `UvicornWorker` imports it, so installs it, by reading uvicorn's code; those
+server shapes were not run for this design (a review measured them for the filter design this replaced, which a
+`dictConfig` could not remove either). What IS pinned, in `tests/test_sql_safe_logging_factory.py`: a `dictConfig`
+after the install, including `disable_existing_loggers: True`, leaves the factory in place and still sanitising.
+What would remove it is code that calls `logging.setLogRecordFactory` AFTER the app is built with a factory that
+does not chain to the previous one. `disable_existing_loggers: True` silences a logger; it does not make one leak.
+
+What an operator loses: the driver's message text in the application log. For an error Postgres raised, its own log has the message, the DETAIL and the statement at the same time (with `log_min_error_statement` at its default `error`; to match on a SQLSTATE put `%e` in `log_line_prefix`, the default `%m [%p] ` carries none). Errors asyncpg raises in the client while encoding a parameter (for example `DataError`, "invalid input for query argument") never reach the server and leave no record anywhere; the sanitised line says `client-side` for them. Postgres' log then holds the values these logs withhold (DETAIL `Failing row contains (...)`): treat it as customer data.

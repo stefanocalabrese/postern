@@ -126,6 +126,7 @@ from postern_core.auth.resource_uri import normalize_resource
 from postern_core.auth.revocation import RevocationStoreBase, RevocationStoreUnavailable
 from postern_core.identity import CustomerRef
 from postern_core.json_strict import loads_finite
+from postern_core.log_safety import describe_exception, exc_info_for_log
 from postern_core.risk.pairing_network import (
     MatchResult,
     NetworkEnricher,
@@ -962,8 +963,8 @@ async def _token_response(request: Request) -> JSONResponse:
             logger.error(
                 "audit write failed for a device-grant token exchange after it raised %s: %s",
                 type(exc).__name__,
-                audit_exc,
-                exc_info=audit_exc,
+                describe_exception(audit_exc),
+                exc_info=exc_info_for_log(audit_exc),
             )
             raise exc from audit_exc
         raise
@@ -981,9 +982,10 @@ async def _token_response(request: Request) -> JSONResponse:
     except Exception as audit_exc:
         logger.error(
             "audit write failed for a device-grant token exchange that answered %d; "
-            "failing the request",
+            "failing the request: %s",
             response.status_code,
-            exc_info=audit_exc,
+            describe_exception(audit_exc),
+            exc_info=exc_info_for_log(audit_exc),
         )
         raise
     return response
@@ -1382,8 +1384,8 @@ async def _refresh_grant(
             logger.error(
                 "audit write failed for a session refresh after it raised %s: %s",
                 type(exc).__name__,
-                audit_exc,
-                exc_info=audit_exc,
+                describe_exception(audit_exc),
+                exc_info=exc_info_for_log(audit_exc),
             )
             raise exc from audit_exc
         raise
@@ -1395,9 +1397,10 @@ async def _refresh_grant(
             await audit.refused(detail)
     except Exception as audit_exc:
         logger.error(
-            "audit write failed for a session refresh that answered %d; failing the request",
+            "audit write failed for a session refresh that answered %d; failing the request: %s",
             response.status_code,
-            exc_info=audit_exc,
+            describe_exception(audit_exc),
+            exc_info=exc_info_for_log(audit_exc),
         )
         raise
     return response
@@ -1886,8 +1889,8 @@ async def approve_callback(request: Request) -> JSONResponse:
             logger.error(
                 "audit write failed for a device pairing after it raised %s: %s",
                 type(exc).__name__,
-                audit_exc,
-                exc_info=audit_exc,
+                describe_exception(audit_exc),
+                exc_info=exc_info_for_log(audit_exc),
             )
             raise exc from audit_exc
         raise
@@ -1918,9 +1921,10 @@ async def approve_callback(request: Request) -> JSONResponse:
             )
         logger.error(
             "audit write failed for a device pairing that answered %d; "
-            "failing the request because the pairing could not be recorded",
+            "failing the request because the pairing could not be recorded: %s",
             outcome.response.status_code,
-            exc_info=audit_exc,
+            describe_exception(audit_exc),
+            exc_info=exc_info_for_log(audit_exc),
         )
         raise
     return outcome.response
@@ -1983,8 +1987,8 @@ async def _withdraw_pairing(
                 "device code %s is %s with no audit_log row behind it: %s",
                 device_code_handle(device_code_value),
                 state,
-                revoke_exc,
-                exc_info=revoke_exc,
+                describe_exception(revoke_exc),
+                exc_info=exc_info_for_log(revoke_exc),
             )
         elif cause == "cancelled":
             logger.error(
@@ -1993,8 +1997,8 @@ async def _withdraw_pairing(
                 "with no audit_log row behind it (the request was cancelled): %s",
                 device_code_handle(device_code_value),
                 state,
-                revoke_exc,
-                exc_info=revoke_exc,
+                describe_exception(revoke_exc),
+                exc_info=exc_info_for_log(revoke_exc),
             )
         else:
             logger.error(
@@ -2003,8 +2007,8 @@ async def _withdraw_pairing(
                 "records a refusal: %s",
                 device_code_handle(device_code_value),
                 state,
-                revoke_exc,
-                exc_info=revoke_exc,
+                describe_exception(revoke_exc),
+                exc_info=exc_info_for_log(revoke_exc),
             )
 
 
@@ -2429,8 +2433,8 @@ async def scan_callback(request: Request) -> JSONResponse:
             logger.error(
                 "audit write failed for a device pairing scan after it raised %s: %s",
                 type(exc).__name__,
-                audit_exc,
-                exc_info=audit_exc,
+                describe_exception(audit_exc),
+                exc_info=exc_info_for_log(audit_exc),
             )
             raise exc from audit_exc
         raise
@@ -2455,9 +2459,10 @@ async def scan_callback(request: Request) -> JSONResponse:
             )
         logger.error(
             "audit write failed for a device pairing scan that answered %d; "
-            "failing the request because the scan could not be recorded",
+            "failing the request because the scan could not be recorded: %s",
             outcome.response.status_code,
-            exc_info=audit_exc,
+            describe_exception(audit_exc),
+            exc_info=exc_info_for_log(audit_exc),
         )
         raise
     except BaseException:

@@ -87,6 +87,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -94,6 +95,11 @@ from fastmcp.tools import ToolResult
 from mcp.types import CallToolRequestParams
 from postern_core.domain.masking import redaction_budget, scrub_tree
 from postern_core.identity import CustomerRef
+from postern_core.log_safety import (
+    chain_holds_driver_error,
+    describe_exception,
+    exc_info_for_log,
+)
 from postern_core.risk.session import get_current_session
 from postern_core.store import audit
 from postern_core.store.audit import (
@@ -613,9 +619,10 @@ class _PendingEntry:
                 # the exception to do it.
                 logger.error(
                     "audit entry write failed for tool %r; the backend request "
-                    "it precedes will not be made",
+                    "it precedes will not be made: %s",
                     self.tool_name,
-                    exc_info=audit_exc,
+                    describe_exception(audit_exc),
+                    exc_info=exc_info_for_log(audit_exc),
                 )
                 raise
 
@@ -805,6 +812,34 @@ async def record_data_touch() -> None:
             "installed on any server whose BackendClient carries this hook"
         )
     await entry.record()
+
+
+#: What the model's channel gets when an exception that leaves this middleware
+#: carries a SQL driver error anywhere in its chain. Fixed text: the driver's
+#: message names the bound value, and `DETAIL: Failing row contains (...)` is
+#: the whole row, both of which land in an AI vendor's chat history.
+INTERNAL_ERROR_TEXT = "internal error"
+
+
+def _client_safe(exc: BaseException) -> ToolError | None:
+    """A fixed-text `ToolError` to raise in place of ``exc``, or None to keep it.
+
+    Replaces an exception whose chain (`__cause__`, `__context__`, exception
+    groups) holds a SQL driver error, so the call still FAILS CLOSED and the
+    client reads `INTERNAL_ERROR_TEXT` instead of the driver's text.
+
+    A `ToolError` is exempt, because by the time one reaches here its text is
+    safe by construction: this server is built with `mask_error_details=True`,
+    so FastMCP turns every other exception a tool raised into
+    ``Error calling tool 'x'`` with no detail, and this repository's tools
+    raise only fixed strings. The exemption is what makes a deliberate
+    refusal (`CHALLENGE_NOT_FOUND` and the like) reach the client unchanged.
+    """
+    if isinstance(exc, ToolError):
+        return None
+    if chain_holds_driver_error(exc):
+        return ToolError(INTERNAL_ERROR_TEXT)
+    return None
 
 
 class AuditMiddleware(Middleware):
@@ -1027,6 +1062,9 @@ class AuditMiddleware(Middleware):
             # audit write's own database round trip is never attributed to
             # the tool.
             duration_ms = _elapsed_ms(started)
+            # WHAT LEAVES THIS MIDDLEWARE, decided once and before any audit
+            # write can add a second exception. See `_client_safe`.
+            outgoing = _client_safe(exc)
             # Read here and not before `call_next`, because the consent
             # check runs INSIDE it: FastMCP evaluates a tool's `auth=` in
             # `fastmcp/server/server.py::_get_tool`, which the dispatch this
@@ -1107,10 +1145,14 @@ class AuditMiddleware(Middleware):
                     "audit write failed for tool %r after it raised %s: %s",
                     name,
                     type(exc).__name__,
-                    audit_exc,
-                    exc_info=audit_exc,
+                    describe_exception(audit_exc),
+                    exc_info=exc_info_for_log(audit_exc),
                 )
+                if outgoing is not None:
+                    raise outgoing from None
                 raise exc from audit_exc
+            if outgoing is not None:
+                raise outgoing from None
             raise
         # Same reading, taken before the write for the reason the raised
         # path above states: `_write`'s own database round trip is not the
@@ -1183,10 +1225,14 @@ class AuditMiddleware(Middleware):
             # alternative (write-through-and-log) and the reasoning.
             logger.error(
                 "audit write failed for tool %r after it returned successfully; "
-                "failing the call because the audit row could not be written",
+                "failing the call because the audit row could not be written: %s",
                 name,
-                exc_info=audit_exc,
+                describe_exception(audit_exc),
+                exc_info=exc_info_for_log(audit_exc),
             )
+            safe = _client_safe(audit_exc)
+            if safe is not None:
+                raise safe from None
             raise
         return result
 

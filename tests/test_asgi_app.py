@@ -625,7 +625,11 @@ async def test_a_tool_call_fails_closed_when_the_audit_database_is_unreachable()
     assert "error" not in body  # a tool error now, not a JSON-RPC protocol error
     assert body["result"]["isError"] is True
     message = body["result"]["content"][0]["text"]
-    assert "127.0.0.1" in message  # leaks the connection target
+    # `mask_error_details=True` on the server: this used to assert that the
+    # connection target ("127.0.0.1") WAS in the client's text, which pinned
+    # the leak. The model's channel now gets the fixed masked text.
+    assert message == "Error calling tool 'accounts.list'"
+    assert "127.0.0.1" not in message
     assert "postern:postern" not in message  # not the DSN's credentials
     assert reached == [], "an unrecordable call must not reach the operator's backend"
 

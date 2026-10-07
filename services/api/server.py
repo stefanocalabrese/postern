@@ -272,6 +272,13 @@ def build_server(
         auth=auth,
         cache_scope="private",
         cache_ttl=settings.cache_ttl_seconds,
+        # An exception a tool raises other than a `ToolError` reaches the client
+        # as `Error calling tool 'x'` and nothing else. Without this FastMCP
+        # appends `: <str(e)>`, and for a SQL driver error that is the driver's
+        # message with the bound value in it (and `DETAIL: Failing row contains
+        # (...)`), straight into the model's channel. A `ToolError` is
+        # re-raised unchanged, so the tools' own fixed refusals still arrive.
+        mask_error_details=True,
     )
     if backend is not None:
         context = ReadContext(resolver=resolver, backend=backend)
