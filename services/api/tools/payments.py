@@ -290,9 +290,12 @@ def build_get_payment_status(resolver: CustomerResolver, runtime: PaymentsRuntim
         """Status of a payment proposed with `payments.create_payment`.
 
         `pending` until the customer acts in their banking app, then `approved`
-        or `executed`, or `expired` once the deadline passes. `approved` does not
-        mean the bank executed it: an approval whose execution failed stays
-        `approved`.
+        or `executed`, or `expired` once the deadline passes. `approved` does NOT
+        mean the bank refused it, and does not mean it was executed: the customer
+        approved, and either the bank refused it, or the outcome is unknown, or
+        the bank accepted it and the record failed. Do not propose the same
+        payment again unless the customer explicitly asks. Tell the customer the
+        outcome is unconfirmed and to check their account or ask their bank.
         """
         customer = resolver()
         if not _CHALLENGE_ID.fullmatch(challenge_id):

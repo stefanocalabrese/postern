@@ -40,7 +40,7 @@ from postern_core.store.models import (
     AuditEntry,
     ChallengeRecord,
 )
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from starlette.applications import Starlette
 
 from services.confirm import callback
@@ -536,32 +536,56 @@ async def test_a_value_error_while_recording_is_not_reported_as_could_not_be_set
 
 
 # ---------------------------------------------------------------------------
-# Cancellation is never swallowed.
+# Cancellation is never swallowed, and the recording outlives the request.
 # ---------------------------------------------------------------------------
 
 
-async def test_cancellation_during_the_retry_sleep_propagates(
+async def drain_background_records() -> None:
+    """Wait, bounded, for every detached recording task to finish."""
+    pending = set(callback._BACKGROUND_RECORDS)
+    if pending:
+        done, still = await asyncio.wait(pending, timeout=30)
+        assert not still, "a recording task did not finish"
+
+
+def cancellation_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "services.confirm.callback"
+        and r.levelno == logging.ERROR
+        and "was cancelled while recording it" in r.getMessage()
+    ]
+
+
+async def test_cancellation_during_the_retry_sleep_propagates_and_the_record_completes(
     app: Starlette,
     clean: Database,
     backend: Backend,
     key_pair: RSAKeyPair,
     updates: Updates,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     await seed(clean, "chal_rec_008")
+    caplog.set_level(logging.DEBUG)
     in_sleep = asyncio.Event()
+    release = asyncio.Event()
     real_sleep = asyncio.sleep
 
     async def parked_sleep(delay: float, *a: Any, **kw: Any) -> None:
         if delay in callback.EXECUTED_RECORD_BACKOFF_SECONDS:
             in_sleep.set()
-            await asyncio.Event().wait()
+            await release.wait()
+            return
         await real_sleep(delay)
 
     monkeypatch.setattr(asyncio, "sleep", parked_sleep)
 
     async def first_raises(n: int, real: Any, session: Any, cid: str, kw: dict[str, Any]) -> Any:
-        raise RuntimeError(SENTINEL)
+        if n == 1:
+            raise RuntimeError(SENTINEL)
+        return await real(session, cid, **kw)
 
     updates.on_executed = first_raises
     task = asyncio.create_task(post(app, "chal_rec_008", key_pair))
@@ -573,20 +597,103 @@ async def test_cancellation_during_the_retry_sleep_propagates(
     assert done, "the cancellation was swallowed: the request went on"
     assert task.cancelled()
 
-    assert updates.executed_calls == 1
+    (line,) = cancellation_lines(caplog)
+    assert "'chal_rec_008'" in line.getMessage() and TOOL in line.getMessage()
+
+    # The recording is still alive after the request is gone, and finishes.
+    assert callback._BACKGROUND_RECORDS
+    release.set()
+    await drain_background_records()
+    assert await status_of(clean, "chal_rec_008") == "executed"
     assert len(backend.calls) == 1
-    assert await status_of(clean, "chal_rec_008") == "approved"
+    assert app.state.postern_database.engine.pool.checkedout() == 0
+    assert callback._BACKGROUND_RECORDS == set()
 
 
-async def test_cancellation_inside_an_attempt_propagates(
+async def test_cancellation_during_an_attempt_propagates_and_the_record_completes(
     app: Starlette,
     clean: Database,
     backend: Backend,
     key_pair: RSAKeyPair,
     updates: Updates,
     sleeps: Sleeps,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    await seed(clean, "chal_rec_012")
+    caplog.set_level(logging.DEBUG)
+    in_attempt = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_first(n: int, real: Any, session: Any, cid: str, kw: dict[str, Any]) -> Any:
+        if n == 1:
+            in_attempt.set()
+            await release.wait()
+            raise RuntimeError(SENTINEL)
+        return await real(session, cid, **kw)
+
+    updates.on_executed = slow_first
+    task = asyncio.create_task(post(app, "chal_rec_012", key_pair))
+    await asyncio.wait_for(in_attempt.wait(), timeout=30)
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=30)
+    assert done and task.cancelled()
+    assert len(cancellation_lines(caplog)) == 1
+
+    release.set()
+    await drain_background_records()
+    assert await status_of(clean, "chal_rec_012") == "executed"
+    assert len(backend.calls) == 1
+    assert app.state.postern_database.engine.pool.checkedout() == 0
+    assert SENTINEL not in caplog.text
+
+
+async def test_a_detached_recording_that_exhausts_logs_the_unrecorded_line_once(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    updates: Updates,
+    sleeps: Sleeps,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await seed(clean, "chal_rec_013")
+    caplog.set_level(logging.DEBUG)
+    in_attempt = asyncio.Event()
+    release = asyncio.Event()
+
+    async def always_fails(n: int, real: Any, session: Any, cid: str, kw: dict[str, Any]) -> Any:
+        if n == 1:
+            in_attempt.set()
+            await release.wait()
+        raise RuntimeError(SENTINEL)
+
+    updates.on_executed = always_fails
+    task = asyncio.create_task(post(app, "chal_rec_013", key_pair))
+    await asyncio.wait_for(in_attempt.wait(), timeout=30)
+    task.cancel()
+    await asyncio.wait({task}, timeout=30)
+    release.set()
+    await drain_background_records()
+
+    assert await status_of(clean, "chal_rec_013") == "approved"
+    assert len(backend.calls) == 1
+    assert len(cancellation_lines(caplog)) == 1
+    assert len(callback_records(caplog, logging.ERROR)) == 1
+    assert SENTINEL not in caplog.text
+
+
+async def test_cancellation_inside_the_recording_task_itself_propagates(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    updates: Updates,
+    sleeps: Sleeps,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The task being cancelled (a closing loop) is not retried or swallowed."""
     await seed(clean, "chal_rec_009")
+    caplog.set_level(logging.DEBUG)
 
     async def cancelled(n: int, real: Any, session: Any, cid: str, kw: dict[str, Any]) -> Any:
         raise asyncio.CancelledError
@@ -598,6 +705,41 @@ async def test_cancellation_inside_an_attempt_propagates(
     assert updates.executed_calls == 1, "a cancelled attempt must not be retried"
     assert len(backend.calls) == 1
     assert sleeps.delays == []
+    assert len(cancellation_lines(caplog)) == 1
+
+
+async def test_a_row_that_left_approved_for_something_else_is_not_reported_executed(
+    app: Starlette,
+    clean: Database,
+    backend: Backend,
+    key_pair: RSAKeyPair,
+    updates: Updates,
+    sleeps: Sleeps,
+) -> None:
+    """None after a failed attempt is a success only if the row now says executed."""
+    await seed(clean, "chal_rec_014")
+
+    async def declined_between_attempts(
+        n: int, real: Any, session: Any, cid: str, kw: dict[str, Any]
+    ) -> Any:
+        if n == 1:
+            async with clean.sessionmaker() as other:
+                await other.execute(
+                    update(ChallengeRecord)
+                    .where(ChallengeRecord.challenge_id == cid)
+                    .values(status="declined")
+                )
+                await other.commit()
+            raise RuntimeError(SENTINEL)
+        return await real(session, cid, **kw)
+
+    updates.on_executed = declined_between_attempts
+    resp = await post(app, "chal_rec_014", key_pair)
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"challenge_id": "chal_rec_014", **EXPECTED_202}
+    assert await status_of(clean, "chal_rec_014") == "declined"
+    assert len(backend.calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +766,8 @@ async def test_no_sleep_is_taken_when_the_first_attempt_succeeds(
     }
     assert updates.executed_calls == 1
     assert sleeps.delays == []
+    await asyncio.sleep(0)
+    assert callback._BACKGROUND_RECORDS == set(), "the happy path left a task behind"
     assert [e.outcome for e in await audit_rows(clean)] == [OUTCOME_REACHING, OUTCOME_RETURNED]
 
 

@@ -464,7 +464,29 @@ twice. What an operator does: find the challenge id in the ERROR log line "the b
 accepted ... and recording it as executed failed", join the two `audit_log` rows by
 `call_id` for that challenge, ask the payments backend what it did for the
 `Idempotency-Key` equal to the challenge id, then settle the `challenges` row by hand.
-Nothing reconciles it automatically. If the completion audit row also cannot be
+Nothing reconciles it automatically.
+
+Who can settle it, and what is left behind: `postern_app` (what both services run as)
+holds `UPDATE` on `challenges` and could write the row, but you should not run an
+operator's hand-edit as the application role. `postern_owner` owns the tables and is the
+role to use (`sql/02-grants.sql`, `sql/01-roles.sql`); the bootstrap superuser can do
+anything and should do nothing here. **Either way the settling write leaves no
+`audit_log` row**: nothing in this repository records a hand-made `challenges` update, so
+keep your own record of it (an incident note with the challenge id, the old and new
+status, who and when, and what the backend said). The `audit_log` rows stay as they are:
+`reaching`, then `raised` / `executed_unrecorded`.
+
+**Recording outlives the request.** The `executed` record runs in a background task
+that a cancelled request (client disconnect, graceful shutdown) does not stop. If the
+request is cancelled while it runs, the server logs one ERROR line,
+`the backend accepted <tool> and the request was cancelled while recording it; the
+record continues in the background and may need reconciliation`, with the challenge id,
+and re-raises the cancellation. Grep for that line next to the
+`the backend accepted <tool> and recording it as executed failed` line: the first means
+the record may still land (check the row's status), the second means it did not. If the
+event loop itself is closing (a process stop), the task is cancelled with it and nothing
+can finish it: the row stays `approved` with no response and no line beyond the
+cancellation one, which is a case this repository cannot test beyond cancellation. If the completion audit row also cannot be
 written, the request fails with a bare 500 instead (decision 0006).
 
 Ordering: step 2d runs after the revocation, ownership, signature and tier checks, so

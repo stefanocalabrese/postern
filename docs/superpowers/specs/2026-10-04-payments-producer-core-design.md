@@ -118,7 +118,7 @@ Flow:
 4. Fail closed on an unreadable payload: if it is not an object, or `amount`, `currency` or `payee_name` is missing or not a string, raise `ToolError("the payment status could not be read")` (`reference` stays optional).
 5. Return `{challenge_id, status, expires_at, amount, currency, payee_name, reference}` from the stored payload. Never the signature, `confirming_device`, `verification_result`, the fingerprint, `client_id`, `session_jti` or the raw payload.
 
-An approved row whose backend call failed (the callback answers 207) stays `approved`. No status is invented; the documentation says an `approved` payment may not have executed.
+An approved row whose backend call failed (the callback answers 207) stays `approved`. No status is invented; the documentation says an `approved` payment may not have executed. Since 7 October 2026 `approved` can also mean the backend accepted the write and recording `executed` failed (the callback answered 202 `accepted_unrecorded`), so the tool description tells the model that `approved` does not mean the bank refused, that it must not propose the payment again unless the customer explicitly asks, and that the outcome is unconfirmed.
 
 ## 7. Token claims
 

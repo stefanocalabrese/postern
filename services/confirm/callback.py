@@ -800,19 +800,9 @@ async def _approve(
         # transition, and deliberately NOT conditional on the deadline: the
         # money has moved, so a clock that ran out while the backend was
         # answering must not be able to strand the row in ``approved``.
-        if not await _record_executed(db, challenge_id):
-            # The backend accepted and the row still says `approved`. Never
-            # re-drive the backend from here: this repository documents no
-            # dedupe behind the `Idempotency-Key` it sends, so a second call
-            # may move the money twice. This is the line an operator
-            # reconciles from, and it carries no exception text, no payload
-            # and no customer reference.
-            logger.error(
-                "challenge %r: the backend accepted %s and recording it as executed "
-                "failed; the row stays 'approved', do not retry, reconcile by hand",
-                challenge_id,
-                updated.tool_name,
-            )
+        if not await _record_executed_detached(db, challenge_id, updated.tool_name):
+            # The ERROR line an operator reconciles from was logged by the
+            # recording task itself (`_record_and_report`), once.
             return (
                 _json(
                     202,
@@ -842,6 +832,65 @@ async def _approve(
         )
 
 
+#: Strong references to the recording tasks in flight. The event loop keeps
+#: only weak references to tasks, so a detached task nobody else holds can be
+#: garbage collected mid-run; each task removes itself when it finishes.
+_BACKGROUND_RECORDS: set[asyncio.Task[bool]] = set()
+
+
+def _forget_record(task: asyncio.Task[bool]) -> None:
+    _BACKGROUND_RECORDS.discard(task)
+    if not task.cancelled():
+        # Retrieved so an exception nobody awaited is not reported as "never
+        # retrieved" with its text; `_record_and_report` logs by type.
+        task.exception()
+
+
+def _log_accepted_unrecorded(challenge_id: str, tool_name: str) -> None:
+    """THE line an operator reconciles from: no exception text, payload or customer."""
+    logger.error(
+        "challenge %r: the backend accepted %s and recording it as executed "
+        "failed; the row stays 'approved', do not retry, reconcile by hand",
+        challenge_id,
+        tool_name,
+    )
+
+
+async def _record_and_report(db: Database, challenge_id: str, tool_name: str) -> bool:
+    """Run the recording and log the exhaustion line, in the task that outlives the request."""
+    recorded = await _record_executed(db, challenge_id)
+    if not recorded:
+        _log_accepted_unrecorded(challenge_id, tool_name)
+    return recorded
+
+
+async def _record_executed_detached(db: Database, challenge_id: str, tool_name: str) -> bool:
+    """Record ``executed`` in a task a cancelled request cannot stop.
+
+    The record phase can last tens of seconds under database trouble. If the
+    request is cancelled during it (client disconnect, graceful shutdown), the
+    backend has already accepted the write, so the recording goes on in the
+    background and ONE ERROR line says so; the cancellation is then re-raised,
+    never swallowed. The task opens its own sessions and holds nothing that
+    dies with the request. A loop that is closing cancels the task too, and
+    nothing here can finish that recording.
+    """
+    task = asyncio.ensure_future(_record_and_report(db, challenge_id, tool_name))
+    _BACKGROUND_RECORDS.add(task)
+    task.add_done_callback(_forget_record)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        logger.error(
+            "challenge %r: the backend accepted %s and the request was cancelled while "
+            "recording it; the record continues in the background and may need "
+            "reconciliation",
+            challenge_id,
+            tool_name,
+        )
+        raise
+
+
 async def _record_executed(db: Database, challenge_id: str) -> bool:
     """Record ``approved -> executed`` after the backend accepted; ``True`` if it landed.
 
@@ -851,10 +900,10 @@ async def _record_executed(db: Database, challenge_id: str) -> bool:
     connection is held at a time. THIS NEVER CALLS THE BACKEND: the retry is of
     the local record only. The ``UPDATE`` is conditional on ``approved``, so a
     repeat after an attempt that committed but failed on the way back matches
-    no row; ``None`` after an earlier failure therefore means that attempt
-    landed and counts as success, while ``None`` on the FIRST attempt means
-    the row was not in ``approved`` (something else moved it) and is not
-    retried.
+    no row. ``None`` on the FIRST attempt means the row was not in ``approved``
+    (something else moved it) and is not retried. ``None`` after an earlier
+    failure is believed only if a fresh read shows the row ``executed``: a row
+    that left ``approved`` for anything else is not a success.
 
     ``Exception`` per attempt and never ``BaseException``: a cancellation, in
     a query or in the sleep between attempts, must propagate. Failures are
@@ -873,6 +922,10 @@ async def _record_executed(db: Database, challenge_id: str) -> bool:
                     expected_status="approved",
                 )
                 await attempt_session.commit()
+            if executed is None and attempt > 1:
+                async with db.sessionmaker() as read_session:
+                    current = await get_challenge(read_session, challenge_id, refresh=True)
+                return current is not None and current.status == "executed"
         except Exception as exc:
             logger.warning(
                 "challenge %r: recording the executed transition failed on attempt %d of %d: %s",
@@ -882,10 +935,7 @@ async def _record_executed(db: Database, challenge_id: str) -> bool:
                 type(exc).__name__,
             )
             continue
-        if executed is not None:
-            return True
-        # Matched no row. After a failed earlier attempt, that attempt landed.
-        return attempt > 1
+        return executed is not None
     return False
 
 

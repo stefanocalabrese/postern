@@ -218,6 +218,24 @@ async def test_the_registered_tool_declares_exactly_these_annotations(
     ) == (False, False, True, False)
 
 
+async def test_the_status_tool_tells_the_model_not_to_re_propose_an_approved_payment(
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
+) -> None:
+    """`approved` can be accepted-but-unrecorded, so a model told it means failure pays twice."""
+    await grant(payments_produced, OWNER, "payments")
+    app = producer_app(pg_url, payments_key_pair)
+    response = await post_rpc(app, token_for(payments_key_pair, OWNER), "tools/list", {})
+    (tool,) = [
+        t for t in json.loads(response.text)["result"]["tools"] if t["name"] == PAYMENT_STATUS_TOOL
+    ]
+    description = " ".join(tool["description"].split())
+    assert "does NOT mean the bank refused it" in description
+    assert (
+        "Do not propose the same payment again unless the customer explicitly asks" in description
+    )
+    assert "outcome is unconfirmed" in description
+
+
 async def test_over_http_an_unreadable_stored_payload_is_the_fixed_text(
     pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:

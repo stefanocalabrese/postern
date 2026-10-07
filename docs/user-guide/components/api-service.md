@@ -114,7 +114,7 @@ Refusals are fixed strings: `account not found`, `payee not found`, `amount must
 positive decimal with at most 4 decimal places`, `reference is limited to 140 characters`,
 `reference may contain only printable characters`, `challenge not found`,
 `the payment could not be recorded`, `the payment status could not be read`. An `approved`
-status means the customer approved; it does not mean the bank executed the payment.
+status means the customer approved; it does not mean the bank executed the payment, and it does not mean the bank refused it: the bank may have refused it, the outcome may be unknown, or the bank may have accepted it while recording `executed` failed (the confirm service's 202 `accepted_unrecorded`). The tool description tells the model not to propose the same payment again unless the customer explicitly asks, and to tell the customer the outcome is unconfirmed.
 
 ### Tool handler pattern
 
