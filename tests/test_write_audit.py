@@ -785,6 +785,50 @@ async def test_a_backend_error_records_a_pair_whose_completion_raised(
     assert len(backend.calls) == 1
 
 
+async def test_nothing_the_backend_said_reaches_the_207_or_the_audit_rows(
+    app: Starlette, clean: Database, backend: Backend, key_pair: RSAKeyPair
+) -> None:
+    """A hostile 5xx body: the 207 and both rows carry none of it."""
+    needles = (
+        "4111111111111111",
+        "GB82WEST12345698765432",
+        "postgresql://svc:hunter2@10.0.3.4:5432/payments",
+        "hunter2",
+        "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig",
+        "SENTINEL-7f3c9a-backend-text",
+    )
+    hostile = " ".join(needles)
+    backend.responder = lambda _: httpx2.Response(500, json={"detail": hostile})
+    await seed(clean, "chal_207_hostile")
+
+    resp = await post(
+        app,
+        "chal_207_hostile",
+        await signed(app, "chal_207_hostile"),
+        bearer(key_pair, OWNER),
+    )
+
+    assert resp.status_code == 207
+    assert resp.json() == {
+        "challenge_id": "chal_207_hostile",
+        "status": "approved",
+        "message": "approval recorded, backend execution failed",
+        "backend_status": 500,
+    }
+    entry, completion = await rows(clean)
+    # EVERY column of both rows, so a text field added later is covered too.
+    stored = json.dumps(
+        [
+            {c.name: getattr(r, c.name) for c in AuditEntry.__table__.columns}
+            for r in (entry, completion)
+        ],
+        default=str,
+    )
+    for needle in needles:
+        assert needle not in resp.text
+        assert needle not in stored
+
+
 # ---------------------------------------------------------------------------
 # 5. Subject and client columns.
 # ---------------------------------------------------------------------------

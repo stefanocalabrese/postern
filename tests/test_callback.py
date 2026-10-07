@@ -33,6 +33,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -832,28 +833,110 @@ async def test_207_response_includes_backend_status() -> None:
 
 
 # ---------------------------------------------------------------------------
-# PAN/IBAN scrubbing on backend error detail.
+# The 207 carries no text derived from the backend's response.
 # ---------------------------------------------------------------------------
 
+FIXED_207_MESSAGE = "approval recorded, backend execution failed"
 
-async def test_backend_error_detail_scrubs_pan() -> None:
-    """PAN in backend error detail is scrubbed before reaching response."""
+_PAN = "4111111111111111"
+_IBAN = "GB82WEST12345698765432"
+_DSN = "postgresql://svc:hunter2@10.0.3.4:5432/payments"
+_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"
+_SENTINEL = "SENTINEL-7f3c9a-backend-text"
+_HOSTILE_TEXT = f"db error {_DSN} token={_JWT} card {_PAN} to {_IBAN} {_SENTINEL}"
+_HOSTILE_NEEDLES = (_PAN, _IBAN, _DSN, "hunter2", _JWT, _SENTINEL)
+
+
+async def _post_with_backend(response: httpx2.Response) -> Any:
     rec = _pending_record()
-    TEST_PAN = "4111111111111111"
-
-    state, patches = _make_state(
-        challenge_record=rec,
-        backend_response=httpx2.Response(400, json={"detail": f"card {TEST_PAN} declined"}),
-    )
-
+    state, patches = _make_state(challenge_record=rec, backend_response=response)
     req = _make_request(record=rec)
     with _applied(patches):
         req.scope["app"] = type("FakeApp", (), {"state": state})()
-        resp = await approve_challenge(req)
+        return await approve_challenge(req)
+
+
+@pytest.mark.parametrize("status", [204, 301, 307, 400, 404, 409, 422, 500, 503])
+async def test_207_body_for_every_non_accepted_status_is_exactly_the_fixed_shape(
+    status: int,
+) -> None:
+    """Only 200, 201 and 202 are acceptance; every other status is a 207."""
+    resp = await _post_with_backend(httpx2.Response(status, json={"detail": _HOSTILE_TEXT}))
 
     assert resp.status_code == 207
-    data = json.loads(_resp_body(resp).decode())
-    assert TEST_PAN not in data["message"]
+    assert json.loads(_resp_body(resp).decode()) == {
+        "challenge_id": "chal_abc123",
+        "status": "approved",
+        "message": FIXED_207_MESSAGE,
+        "backend_status": status,
+    }
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx2.Response(500, content=b"A" * 2_000_000),
+        httpx2.Response(500, content=bytes(range(256)) * 40),
+        httpx2.Response(
+            500,
+            content=b'{"detail": "unterminated',
+            headers={"content-type": "application/json"},
+        ),
+        httpx2.Response(500, content=b""),
+        httpx2.Response(500, json=[_HOSTILE_TEXT, {"detail": _SENTINEL}]),
+    ],
+    ids=["huge", "binary", "invalid-json", "empty", "json-array"],
+)
+async def test_207_body_shape_is_the_same_for_any_kind_of_backend_body(
+    response: httpx2.Response,
+) -> None:
+    resp = await _post_with_backend(response)
+
+    assert resp.status_code == 207
+    assert json.loads(_resp_body(resp).decode()) == {
+        "challenge_id": "chal_abc123",
+        "status": "approved",
+        "message": FIXED_207_MESSAGE,
+        "backend_status": 500,
+    }
+
+
+async def test_nothing_the_backend_said_reaches_the_207_or_any_log_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A PAN, an IBAN, a DSN, a JWT and a sentinel in the backend body: none escapes."""
+    caplog.set_level(logging.DEBUG)
+
+    resp = await _post_with_backend(httpx2.Response(500, json={"detail": _HOSTILE_TEXT}))
+
+    assert resp.status_code == 207
+    body = _resp_body(resp).decode()
+    logged = "\n".join(f"{r.name} {r.getMessage()} {r.args!r} {r.exc_text}" for r in caplog.records)
+    for needle in _HOSTILE_NEEDLES:
+        assert needle not in body
+        assert needle not in logged
+
+
+async def test_one_warning_per_backend_refusal_names_challenge_tool_and_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    await _post_with_backend(httpx2.Response(503, json={"detail": _HOSTILE_TEXT}))
+
+    refusals = [
+        r
+        for r in caplog.records
+        if r.name == "services.confirm.callback"
+        and r.levelno == logging.WARNING
+        and "backend refused" in r.getMessage()
+    ]
+    assert len(refusals) == 1
+    message = refusals[0].getMessage()
+    assert "'chal_abc123'" in message
+    assert "standing_orders.cancel" in message
+    assert "503" in message
+    assert _SENTINEL not in message
 
 
 # ---------------------------------------------------------------------------

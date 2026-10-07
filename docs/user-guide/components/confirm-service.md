@@ -446,6 +446,23 @@ and `Zp`). The refusals, with their `audit_log.detail`:
 | The claiming update raised | 500 `internal_error`, "the approval could not be recorded" | the exception type |
 | `resolve_endpoint` refused the claimed row | 500 `internal_error`, "the approved operation could not be set up" | the exception type |
 
+**The 207 response, when the backend answers anything but 200, 201 or 202.** The
+approval is recorded and the write was not accepted (3xx, 4xx, 5xx and 204 all count):
+
+```json
+{"challenge_id": "<id>", "status": "approved",
+ "message": "approval recorded, backend execution failed", "backend_status": 503}
+```
+
+`backend_status` is the integer from the backend's HTTP status line. The `message` is
+a fixed text, and no text derived from the backend's response body appears in the
+response, in the audit rows or in any log line: a backend body can carry a connection
+string or a token, and scrubbing PAN and IBAN shapes out of it never made it safe to
+forward. The one log line per refusal is a WARNING naming the challenge id, the
+operation and the numeric status. The row stays `approved` and the completion
+`audit_log` row is `raised` with `detail` `BackendWriteError`; what the backend said is
+in the backend's own logs, found by the `Idempotency-Key`, which equals the challenge id.
+
 **The 202 `accepted_unrecorded` response.** Not a refusal: the backend accepted the
 write (money may have moved) and recording `approved -> executed` failed on every
 attempt:

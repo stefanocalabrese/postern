@@ -557,6 +557,9 @@ async def test_backend_write_error_returns_207(
     data = json.loads(resp.content.decode())
     assert data["status"] == "approved"
     assert "backend_status" in data
+    # Fixed text: whatever the backend (or the transport) said is not in it.
+    assert data["message"] == "approval recorded, backend execution failed"
+    assert set(data) == {"challenge_id", "status", "message", "backend_status"}
 
 
 async def test_standing_orders_cancel_path(

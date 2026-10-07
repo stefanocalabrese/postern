@@ -41,6 +41,19 @@ the write and recording ``executed`` failed on every attempt::
 
 A caller must never retry a 202: the money may already have moved.
 
+HTTP 207 is sent when the approval is recorded and the backend answered
+anything but 200, 201 or 202::
+
+    {
+        "challenge_id": "...",
+        "status": "approved",
+        "message": "approval recorded, backend execution failed",
+        "backend_status": <integer from the backend's HTTP status line>
+    }
+
+The message is fixed. No text derived from the backend's response body goes
+into the response, the audit row or a log line.
+
 The confirmation payload is built server-side from the stored challenge
 row — never re-sent or re-specified by the agent (handoff §6.3).
 
@@ -758,18 +771,26 @@ async def _approve(
             # since a challenge sitting in `approved` may or may not have been
             # partially processed on the other side.
             #
-            # `exc.detail` is already scrubbed by `_scrub_response`, but it is
-            # still a backend MESSAGE, so what reaches the table is the
-            # exception type alone. The status code lives in the response, and
-            # the `Idempotency-Key` in the backend's own access log is what
-            # joins this row to what actually happened there.
+            # NOTHING DERIVED FROM THE BACKEND'S RESPONSE BODY goes anywhere
+            # from here: not the response, not the log, not the audit row.
+            # `BackendWriteError` does not hold it. What reaches the table is
+            # the exception type alone; the numeric status is in the response
+            # and the log line below, and the `Idempotency-Key` in the
+            # backend's own access log is what joins this row to what
+            # actually happened there.
+            logger.warning(
+                "challenge approve: %r: the backend refused the write: tool=%s status=%d",
+                challenge_id,
+                updated.tool_name,
+                exc.status,
+            )
             return (
                 _json(
                     207,
                     {
                         "challenge_id": challenge_id,
                         "status": "approved",  # Approved but not executed.
-                        "message": f"approval recorded, backend execution failed: {exc.detail}",
+                        "message": "approval recorded, backend execution failed",
                         "backend_status": exc.status,
                     },
                 ),

@@ -32,7 +32,6 @@ import re
 from typing import Any, Protocol
 
 import httpx2
-from postern_core.domain.masking import scrub_text
 from postern_core.domain.verification import VerificationTier
 
 # The same Protocol `BackendClient` uses for the same job, imported rather
@@ -60,16 +59,12 @@ class _MinterProtocol(Protocol):
     ) -> str: ...
 
 
-# A LIVE GAP CLOSED, not a tidy-up. This module used to carry its own
-# `_scrub`, `TypeAdapter(FreeText).validate_python(text)`, which is
-# `postern_core.domain.masking.scrub_text` MINUS the NUL strip. That omission
-# was exploitable on exactly one path and it is the money path: a NUL byte
-# planted inside a PAN in a backend error body splits the digits into two runs
-# that `_PAN_IN_TEXT_RE` (`\d{12,}`) individually fails to match, so
-# `_scrub_response` below found nothing to redact and the raw PAN reached
-# `BackendWriteError.detail` -- and from there the 207 response body this
-# service returns. `scrub_text` strips the NUL first, so the contiguous run is
-# there to match. Its docstring carries the full ordering argument.
+# NO BACKEND TEXT LEAVES THIS MODULE. This module used to scrub a backend
+# error body (NUL, PAN and IBAN shapes, cut to 200 characters) and hand it on
+# as `BackendWriteError.detail`, and from there into the 207 response. A
+# scrubber that knows two shapes does not make a body safe: a DSN or a bearer
+# token in it went through untouched. `BackendWriteError` now carries the
+# numeric status and nothing else, and the body is never read.
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +357,11 @@ class BackendWriteClient:
         )
 
         if response.status_code not in (200, 201, 202):
-            raise BackendWriteError(
-                status=response.status_code,
-                detail=_scrub_response(response),
-            )
+            # The status line only. The response BODY is never read here: a
+            # backend body is attacker- or bug-controlled text (a DSN, a
+            # token, a stack trace) and scrubbing it for PAN and IBAN shapes
+            # never made it safe to forward.
+            raise BackendWriteError(status=response.status_code)
 
         return response
 
@@ -374,26 +370,15 @@ class BackendWriteClient:
 
 
 class BackendWriteError(RuntimeError):
-    """A backend write endpoint returned an error."""
+    """A backend write endpoint answered outside 200, 201 and 202.
 
-    def __init__(self, *, status: int, detail: str) -> None:
-        super().__init__(f"{status}: {detail}")
-        self.status = status
-        self.detail = detail
-
-
-def _scrub_response(response: httpx2.Response) -> str:
-    """Scrubbed, length-capped summary of a backend error body.
-
-    Mirrors ``postern_core.facade.client._detail`` but for write responses.
-    Scrubbing runs on the full body *before* the 200-character cut: cutting
-    first could split a PAN or IBAN in half, leaving an unmasked digit
-    fragment past the cut instead of a masked value before it.
+    Carries the numeric HTTP status and NOTHING from the response body, in
+    ``str``, ``repr``, ``args`` or any attribute. There is deliberately no
+    ``detail`` field: it held a scrubbed copy of the body, and every place it
+    could travel (the 207 response, a log line, an exception traceback) was a
+    place a backend's internal credential could travel too.
     """
-    try:
-        body = response.json()
-    except ValueError:
-        text = response.text
-    else:
-        text = str(body.get("detail", body)) if isinstance(body, dict) else str(body)
-    return scrub_text(text)[:200]
+
+    def __init__(self, *, status: int) -> None:
+        super().__init__(f"backend write endpoint answered {status}")
+        self.status = status

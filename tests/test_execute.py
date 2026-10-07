@@ -5,7 +5,7 @@ Tests for ``services.confirm.execute``:
 - ``resolve_endpoint`` — known tools, unknown tool error, missing path params.
 - ``BackendWriteClient.execute`` — success (200/201/202), error response →
   ``BackendWriteError``, JWT injection, challenge_id claim.
-- ``_scrub_response`` — PAN/IBAN scrubbing on error bodies.
+- ``BackendWriteError`` carries the numeric status and no text from the response body.
 
 Backend mocking is at the transport layer with ``httpx2.MockTransport``, per
 ``dev-docs/decisions/0001-facade-http-client.md``. ``respx`` is not installed and
@@ -21,7 +21,6 @@ from services.confirm.execute import (
     TOOL_REGISTRY,
     BackendWriteClient,
     BackendWriteError,
-    _scrub_response,
     resolve_endpoint,
 )
 
@@ -450,112 +449,39 @@ async def test_distinct_challenges_carry_distinct_idempotency_keys() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_backend_write_error_scrubs_pan_from_json_detail() -> None:
-    """PAN in a JSON error detail is scrubbed."""
-
-    def handler(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(400, json={"detail": f"card {_TEST_PAN} declined"})
-
-    client = BackendWriteClient(
-        base_url="https://backend.test",
-        minter=_StubWriteMinter(),
-        transport=_transport(handler),
-        before_backend_request=None,
-    )
-    with pytest.raises(BackendWriteError) as excinfo:
-        await client.execute(
-            customer_ref="cust_7f3a",
-            audience="payments.svc",
-            path="/payments",
-            body={},
-            challenge_id="chal_abc",
-        )
-    assert _TEST_PAN not in excinfo.value.detail
-    await client.aclose()
+_HOSTILE_DSN = "postgresql://svc:hunter2@10.0.3.4:5432/payments"
+_HOSTILE_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"
+_HOSTILE_SENTINEL = "SENTINEL-7f3c9a-backend-text"
 
 
-async def test_backend_write_error_scrubs_iban_from_json_detail() -> None:
-    """IBAN in a JSON error detail is scrubbed."""
-
-    def handler(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(400, json={"detail": f"transfer to {_TEST_IBAN} rejected"})
-
-    client = BackendWriteClient(
-        base_url="https://backend.test",
-        minter=_StubWriteMinter(),
-        transport=_transport(handler),
-        before_backend_request=None,
-    )
-    with pytest.raises(BackendWriteError) as excinfo:
-        await client.execute(
-            customer_ref="cust_7f3a",
-            audience="payments.svc",
-            path="/payments",
-            body={},
-            challenge_id="chal_abc",
-        )
-    assert _TEST_IBAN not in excinfo.value.detail
-    await client.aclose()
-
-
-async def test_backend_write_error_scrubs_pan_from_json_body_no_detail_key() -> None:
-    """When there is no 'detail' key, the whole body is scrubbed."""
-
-    def handler(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(400, json={"pan": _TEST_PAN, "reason": "duplicate"})
-
-    client = BackendWriteClient(
-        base_url="https://backend.test",
-        minter=_StubWriteMinter(),
-        transport=_transport(handler),
-        before_backend_request=None,
-    )
-    with pytest.raises(BackendWriteError) as excinfo:
-        await client.execute(
-            customer_ref="cust_7f3a",
-            audience="payments.svc",
-            path="/payments",
-            body={},
-            challenge_id="chal_abc",
-        )
-    assert _TEST_PAN not in excinfo.value.detail
-    await client.aclose()
-
-
-async def test_backend_write_error_scrubs_iban_from_non_json_body() -> None:
-    """Non-JSON error body is also scrubbed."""
-
-    def handler(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx2.Response(
+            400,
+            json={
+                "detail": (
+                    f"{_TEST_PAN} {_TEST_IBAN} {_HOSTILE_DSN} token={_HOSTILE_JWT} "
+                    f"{_HOSTILE_SENTINEL}"
+                )
+            },
+        ),
+        httpx2.Response(
             502,
-            text=f"upstream gateway error for account {_TEST_IBAN}",
+            text=f"{_TEST_PAN} {_TEST_IBAN} {_HOSTILE_DSN} {_HOSTILE_JWT} {_HOSTILE_SENTINEL}",
             headers={"content-type": "text/plain"},
-        )
-
-    client = BackendWriteClient(
-        base_url="https://backend.test",
-        minter=_StubWriteMinter(),
-        transport=_transport(handler),
-        before_backend_request=None,
-    )
-    with pytest.raises(BackendWriteError) as excinfo:
-        await client.execute(
-            customer_ref="cust_7f3a",
-            audience="payments.svc",
-            path="/payments",
-            body={},
-            challenge_id="chal_abc",
-        )
-    assert _TEST_IBAN not in excinfo.value.detail
-    await client.aclose()
-
-
-async def test_backend_write_error_detail_is_capped_at_200_chars() -> None:
-    """Error detail is truncated to 200 characters."""
-    long_detail = "x" * 300
+        ),
+        httpx2.Response(500, json=[_TEST_PAN, _HOSTILE_DSN, _HOSTILE_JWT, _HOSTILE_SENTINEL]),
+    ],
+    ids=["json-detail", "plain-text", "json-array"],
+)
+async def test_backend_write_error_carries_nothing_the_backend_said(
+    response: httpx2.Response,
+) -> None:
+    """Neither ``str``, ``repr``, ``args`` nor an attribute holds the body text."""
 
     def handler(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(500, json={"detail": long_detail})
+        return response
 
     client = BackendWriteClient(
         base_url="https://backend.test",
@@ -571,7 +497,11 @@ async def test_backend_write_error_detail_is_capped_at_200_chars() -> None:
             body={},
             challenge_id="chal_abc",
         )
-    assert len(excinfo.value.detail) <= 200
+    exc = excinfo.value
+    carried = f"{exc!s} {exc!r} {exc.args!r} {vars(exc)!r}"
+    for needle in (_TEST_PAN, _TEST_IBAN, _HOSTILE_DSN, "hunter2", _HOSTILE_JWT, _HOSTILE_SENTINEL):
+        assert needle not in carried
+    assert exc.status == response.status_code
     await client.aclose()
 
 
@@ -581,58 +511,20 @@ async def test_backend_write_error_detail_is_capped_at_200_chars() -> None:
 
 
 class TestBackendWriteError:
-    """BackendWriteError carries status and detail."""
+    """BackendWriteError carries the numeric status and nothing else."""
 
     def test_status_attribute(self) -> None:
-        exc = BackendWriteError(status=403, detail="forbidden")
+        exc = BackendWriteError(status=403)
         assert exc.status == 403
 
-    def test_detail_attribute(self) -> None:
-        exc = BackendWriteError(status=502, detail="bad gateway")
-        assert exc.detail == "bad gateway"
+    def test_string_representation_is_the_status_only(self) -> None:
+        exc = BackendWriteError(status=400)
+        assert str(exc) == "backend write endpoint answered 400"
 
-    def test_string_representation(self) -> None:
-        exc = BackendWriteError(status=400, detail="bad request")
-        assert str(exc) == "400: bad request"
-
-
-# ---------------------------------------------------------------------------
-# _scrub_response — unit test the scrubbing function directly.
-# ---------------------------------------------------------------------------
-
-
-class TestScrubResponse:
-    """_scrub_response strips PAN/IBAN from error bodies."""
-
-    def test_json_detail_with_pan_is_scrubbed(self) -> None:
-        response = httpx2.Response(400, json={"detail": f"card {_TEST_PAN} on file"})
-        assert _TEST_PAN not in _scrub_response(response)
-
-    def test_json_detail_with_iban_is_scrubbed(self) -> None:
-        response = httpx2.Response(400, json={"detail": f"transfer to {_TEST_IBAN}"})
-        assert _TEST_IBAN not in _scrub_response(response)
-
-    def test_non_json_text_with_pan_is_scrubbed(self) -> None:
-        ct = {"content-type": "text/plain"}
-        response = httpx2.Response(502, text=f"error {_TEST_PAN}", headers=ct)
-        assert _TEST_PAN not in _scrub_response(response)
-
-    def test_non_json_text_with_iban_is_scrubbed(self) -> None:
-        ct = {"content-type": "text/plain"}
-        response = httpx2.Response(502, text=f"error {_TEST_IBAN}", headers=ct)
-        assert _TEST_IBAN not in _scrub_response(response)
-
-    def test_result_is_capped_at_200_chars(self) -> None:
-        response = httpx2.Response(500, json={"detail": "y" * 300})
-        assert len(_scrub_response(response)) <= 200
-
-    def test_empty_body_returns_empty_string(self) -> None:
-        response = httpx2.Response(500, text="")
-        assert _scrub_response(response) == ""
-
-    def test_dict_body_without_detail_key_is_scrubbed(self) -> None:
-        response = httpx2.Response(400, json={"pan": _TEST_PAN})
-        assert _TEST_PAN not in _scrub_response(response)
+    def test_there_is_no_detail_field_to_fill(self) -> None:
+        with pytest.raises(TypeError):
+            BackendWriteError(status=400, detail="x")  # type: ignore[call-arg]
+        assert not hasattr(BackendWriteError(status=400), "detail")
 
 
 # ---------------------------------------------------------------------------
