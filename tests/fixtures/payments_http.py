@@ -195,7 +195,7 @@ def offline_runtime() -> PaymentsRuntime:
 # -- Shared by the four `tests/test_payments_*.py` files ---------------------------
 #
 # Moved here when the producer's single test file was split by what it
-# exercises. Each test file imports what it uses; `key_pair` and `produced`
+# exercises. Each test file imports what it uses; `payments_key_pair` and `payments_produced`
 # are fixtures, loaded through `pytest_plugins` in each of the four.
 
 ARGS: dict[str, str] = {"from_account_ref": "acc_7f3a", "payee_ref": "pay_nw01", "amount": "340.50"}
@@ -239,12 +239,12 @@ async def rows(database: Database) -> list[ChallengeRecord]:
 
 
 @pytest.fixture(scope="module")
-def key_pair() -> RSAKeyPair:
+def payments_key_pair() -> RSAKeyPair:
     return RSAKeyPair.generate()
 
 
 @pytest_asyncio.fixture
-async def produced(database: Database) -> AsyncIterator[Database]:
+async def payments_produced(database: Database) -> AsyncIterator[Database]:
     """No produced challenge and no consent row before or after each test."""
     await delete_produced_challenges(database)
     await revoke_all_consents(database)
@@ -269,7 +269,7 @@ async def insert_row(
 ) -> str:
     """A pending row the producer did not make through its handler: another
     customer's, or another tool's, or one with a payload of any shape.
-    Fingerprinted, so the `produced` fixture deletes it. `past_deadline` moves
+    Fingerprinted, so the `payments_produced` fixture deletes it. `past_deadline` moves
     `expires_at` into the past, still `pending`."""
     challenge_id = uuid.uuid4().hex
     async with database.sessionmaker() as s:

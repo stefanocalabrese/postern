@@ -39,7 +39,7 @@ from tests.fixtures.payments_http import (
     stub_backend,
 )
 
-# `key_pair` and `produced` live in the shared module; loading it as a plugin
+# `payments_key_pair` and `payments_produced` live in the shared module; loading it as a plugin
 # registers them without importing the names into every signature's scope.
 pytest_plugins = ["tests.fixtures.payments_http"]
 
@@ -67,9 +67,9 @@ def test_canonical_amount(raw: str, expected: str) -> None:
 
 
 async def test_a_proposal_returns_a_pending_challenge_and_its_summary(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
-    result = await create_payment(produced)(**ARGS)
+    result = await create_payment(payments_produced)(**ARGS)
     assert set(result) == {"challenge_id", "status", "expires_at", "human_summary"}
     assert result["status"] == "pending"
     assert len(result["challenge_id"]) == 32
@@ -77,10 +77,10 @@ async def test_a_proposal_returns_a_pending_challenge_and_its_summary(
 
 
 async def test_the_stored_row_is_built_from_server_resolved_data_only(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
-    result = await create_payment(produced)(**ARGS, reference="Rent October")
-    (row,) = await rows(produced)
+    result = await create_payment(payments_produced)(**ARGS, reference="Rent October")
+    (row,) = await rows(payments_produced)
     assert row.challenge_id == result["challenge_id"]
     assert row.payload == {
         "from_account_ref": "acc_7f3a",
@@ -104,27 +104,29 @@ async def test_the_stored_row_is_built_from_server_resolved_data_only(
 
 
 async def test_a_repeat_inside_the_window_returns_the_same_challenge(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
-    handler = create_payment(produced)
+    handler = create_payment(payments_produced)
     first = await handler(**ARGS)
     second = await handler(**ARGS)
     assert (second["challenge_id"], second["expires_at"]) == (
         first["challenge_id"],
         first["expires_at"],
     )
-    assert len(await rows(produced)) == 1
+    assert len(await rows(payments_produced)) == 1
 
 
-async def test_two_spellings_of_one_amount_are_one_challenge(produced: Database) -> None:
-    handler = create_payment(produced)
+async def test_two_spellings_of_one_amount_are_one_challenge(payments_produced: Database) -> None:
+    handler = create_payment(payments_produced)
     first = await handler(**{**ARGS, "amount": "340.5"})
     second = await handler(**{**ARGS, "amount": "340.50"})
     assert first["challenge_id"] == second["challenge_id"]
 
 
-async def test_a_different_amount_or_reference_is_a_new_challenge(produced: Database) -> None:
-    handler = create_payment(produced)
+async def test_a_different_amount_or_reference_is_a_new_challenge(
+    payments_produced: Database,
+) -> None:
+    handler = create_payment(payments_produced)
     base = await handler(**ARGS)
     other_amount = await handler(**{**ARGS, "amount": "340.51"})
     with_reference = await handler(**ARGS, reference="Rent October")
@@ -132,20 +134,20 @@ async def test_a_different_amount_or_reference_is_a_new_challenge(produced: Data
     assert len(ids) == 3
 
 
-async def test_two_concurrent_calls_make_one_row(produced: Database) -> None:
+async def test_two_concurrent_calls_make_one_row(payments_produced: Database) -> None:
     first, second = await asyncio.gather(
-        create_payment(produced)(**ARGS), create_payment(produced)(**ARGS)
+        create_payment(payments_produced)(**ARGS), create_payment(payments_produced)(**ARGS)
     )
     assert first["challenge_id"] == second["challenge_id"]
-    assert len(await rows(produced)) == 1
+    assert len(await rows(payments_produced)) == 1
 
 
 async def test_a_stale_pending_row_is_expired_and_a_new_challenge_created(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
-    handler = create_payment(produced)
+    handler = create_payment(payments_produced)
     first = await handler(**ARGS)
-    async with produced.sessionmaker() as s:
+    async with payments_produced.sessionmaker() as s:
         await s.execute(
             text(
                 "UPDATE challenges SET expires_at = now() - interval '1 second' "
@@ -156,26 +158,28 @@ async def test_a_stale_pending_row_is_expired_and_a_new_challenge_created(
         await s.commit()
     second = await handler(**ARGS)
     assert second["challenge_id"] != first["challenge_id"]
-    statuses = {row.challenge_id: row.status for row in await rows(produced)}
+    statuses = {row.challenge_id: row.status for row in await rows(payments_produced)}
     assert statuses == {first["challenge_id"]: "expired", second["challenge_id"]: "pending"}
 
 
 @pytest.mark.parametrize("account", ["acc_9b21", "acc_nope"], ids=["foreign", "invented"])
 async def test_a_foreign_or_invented_account_is_one_refusal(
-    produced: Database, account: str
+    payments_produced: Database, account: str
 ) -> None:
     with pytest.raises(ToolError) as refused:
-        await create_payment(produced)(**{**ARGS, "from_account_ref": account})
+        await create_payment(payments_produced)(**{**ARGS, "from_account_ref": account})
     assert str(refused.value) == ACCOUNT_NOT_FOUND
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
 
 
 @pytest.mark.parametrize("payee", ["pay_ll02", "pay_none"], ids=["foreign", "invented"])
-async def test_a_foreign_or_invented_payee_is_one_refusal(produced: Database, payee: str) -> None:
+async def test_a_foreign_or_invented_payee_is_one_refusal(
+    payments_produced: Database, payee: str
+) -> None:
     with pytest.raises(ToolError) as refused:
-        await create_payment(produced)(**{**ARGS, "payee_ref": payee})
+        await create_payment(payments_produced)(**{**ARGS, "payee_ref": payee})
     assert str(refused.value) == PAYEE_NOT_FOUND
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
 
 
 @pytest.mark.parametrize(
@@ -197,28 +201,28 @@ async def test_a_foreign_or_invented_payee_is_one_refusal(produced: Database, pa
     ],
 )
 async def test_an_amount_that_is_not_a_positive_short_decimal_is_refused(
-    produced: Database, amount: str
+    payments_produced: Database, amount: str
 ) -> None:
     with pytest.raises(ToolError) as refused:
-        await create_payment(produced)(**{**ARGS, "amount": amount})
+        await create_payment(payments_produced)(**{**ARGS, "amount": amount})
     assert str(refused.value) == AMOUNT_INVALID
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
 
 
 async def test_a_reference_over_140_characters_is_refused_before_scrubbing(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
     with pytest.raises(ToolError) as refused:
-        await create_payment(produced)(**ARGS, reference="a" * 141)
+        await create_payment(payments_produced)(**ARGS, reference="a" * 141)
     assert str(refused.value) == REFERENCE_TOO_LONG
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
 
 
-async def test_a_reference_of_140_characters_is_accepted(produced: Database) -> None:
+async def test_a_reference_of_140_characters_is_accepted(payments_produced: Database) -> None:
     reference = "Rent " * 28
     assert len(reference) == 140
-    await create_payment(produced)(**ARGS, reference=reference)
-    (row,) = await rows(produced)
+    await create_payment(payments_produced)(**ARGS, reference=reference)
+    (row,) = await rows(payments_produced)
     assert row.payload["reference"] == reference
 
 
@@ -258,25 +262,25 @@ async def test_a_reference_of_140_characters_is_accepted(produced: Database) -> 
     ],
 )
 async def test_a_reference_with_a_non_printable_character_is_refused(
-    produced: Database, reference: str
+    payments_produced: Database, reference: str
 ) -> None:
     with pytest.raises(ToolError) as refused:
-        await create_payment(produced)(**ARGS, reference=reference)
+        await create_payment(payments_produced)(**ARGS, reference=reference)
     assert str(refused.value) == REFERENCE_NOT_PRINTABLE
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
 
 
 async def test_a_reference_with_accents_and_plain_emoji_is_accepted_unchanged(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
     reference = "Café été \u2615 \U0001f389 Müller"
-    await create_payment(produced)(**ARGS, reference=reference)
-    (row,) = await rows(produced)
+    await create_payment(payments_produced)(**ARGS, reference=reference)
+    (row,) = await rows(payments_produced)
     assert row.payload["reference"] == reference
 
 
 async def test_a_malformed_amount_or_long_reference_makes_no_backend_request(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
     requests: list[str] = []
 
@@ -285,7 +289,7 @@ async def test_a_malformed_amount_or_long_reference_makes_no_backend_request(
         return httpx2.Response(500)
 
     backend = stub_backend(httpx2.MockTransport(counting))
-    handler = create_payment(produced, backend=backend)
+    handler = create_payment(payments_produced, backend=backend)
     with pytest.raises(ToolError) as bad_amount:
         await handler(**{**ARGS, "amount": "abc"})
     with pytest.raises(ToolError) as long_reference:
@@ -298,29 +302,31 @@ async def test_a_malformed_amount_or_long_reference_makes_no_backend_request(
     assert requests == []
 
 
-async def test_a_reference_is_stored_as_the_customer_will_see_it(produced: Database) -> None:
-    await create_payment(produced)(**ARGS, reference=f"Invoice {stub.FULL_PAN}")
-    (row,) = await rows(produced)
+async def test_a_reference_is_stored_as_the_customer_will_see_it(
+    payments_produced: Database,
+) -> None:
+    await create_payment(payments_produced)(**ARGS, reference=f"Invoice {stub.FULL_PAN}")
+    (row,) = await rows(payments_produced)
     assert row.payload["reference"] == "Invoice •••• 1111"
 
 
-async def test_absent_or_overlong_claims_are_stored_as_null(produced: Database) -> None:
+async def test_absent_or_overlong_claims_are_stored_as_null(payments_produced: Database) -> None:
     def no_claims() -> TokenClaims:
         return TokenClaims(client_id=None, jti=None)
 
     def long_claims() -> TokenClaims:
         return TokenClaims(client_id="c" * 129, jti="j" * 129)
 
-    await create_payment(produced, claims=no_claims)(**ARGS)
-    await create_payment(produced, claims=long_claims)(**{**ARGS, "amount": "1.00"})
-    assert [(row.client_id, row.session_jti) for row in await rows(produced)] == [
+    await create_payment(payments_produced, claims=no_claims)(**ARGS)
+    await create_payment(payments_produced, claims=long_claims)(**{**ARGS, "amount": "1.00"})
+    assert [(row.client_id, row.session_jti) for row in await rows(payments_produced)] == [
         (None, None),
         (None, None),
     ]
 
 
 async def test_an_unreachable_store_is_a_fixed_refusal_and_creates_nothing(
-    produced: Database, caplog: pytest.LogCaptureFixture
+    payments_produced: Database, caplog: pytest.LogCaptureFixture
 ) -> None:
     runtime = offline_runtime()
     caplog.set_level(logging.DEBUG)
@@ -331,7 +337,7 @@ async def test_an_unreachable_store_is_a_fixed_refusal_and_creates_nothing(
     finally:
         await runtime.db.close()
     assert str(refused.value) == NOT_RECORDED
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
     # The log names the exception type and nothing of the payload or customer.
     ours = [r for r in caplog.records if r.name == "services.api.tools.payments"]
     assert len(ours) == 1
@@ -349,33 +355,35 @@ async def test_an_unreachable_store_is_a_fixed_refusal_and_creates_nothing(
 
 
 async def test_a_store_that_returns_nothing_is_a_fixed_refusal_and_creates_nothing(
-    produced: Database, monkeypatch: pytest.MonkeyPatch
+    payments_produced: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def nothing(*args: object, **kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(store, "create_pending_challenge_once", nothing)
     with pytest.raises(ToolError) as refused:
-        await create_payment(produced)(**ARGS)
+        await create_payment(payments_produced)(**ARGS)
     assert str(refused.value) == NOT_RECORDED
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
 
 
 async def test_the_stored_currency_is_the_payer_accounts_not_a_default(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
     def gbp(request: httpx2.Request) -> httpx2.Response:
         if request.url.path.startswith("/payees/"):
             return httpx2.Response(200, json=stub.PAYEE)
         return httpx2.Response(200, json={**stub.BALANCE, "currency": "GBP"})
 
-    result = await create_payment(produced, backend=stub_backend(httpx2.MockTransport(gbp)))(**ARGS)
-    (row,) = await rows(produced)
+    result = await create_payment(
+        payments_produced, backend=stub_backend(httpx2.MockTransport(gbp))
+    )(**ARGS)
+    (row,) = await rows(payments_produced)
     assert row.payload["currency"] == "GBP"
     assert result["human_summary"].startswith("Approve GBP 340.50 to ")
 
 
-async def test_any_other_backend_failure_keeps_the_facade_text(produced: Database) -> None:
+async def test_any_other_backend_failure_keeps_the_facade_text(payments_produced: Database) -> None:
     def payee_down(request: httpx2.Request) -> httpx2.Response:
         if request.url.path.startswith("/payees/"):
             return httpx2.Response(503, json={"detail": "payees unavailable"})
@@ -383,6 +391,6 @@ async def test_any_other_backend_failure_keeps_the_facade_text(produced: Databas
 
     backend = stub_backend(httpx2.MockTransport(payee_down))
     with pytest.raises(BackendError) as failed:
-        await create_payment(produced, backend=backend)(**ARGS)
+        await create_payment(payments_produced, backend=backend)(**ARGS)
     assert failed.value.status == 503
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []

@@ -46,7 +46,7 @@ from tests.fixtures.payments_http import (
     token_for,
 )
 
-# `key_pair` and `produced` live in the shared module; loading it as a plugin
+# `payments_key_pair` and `payments_produced` live in the shared module; loading it as a plugin
 # registers them without importing the names into every signature's scope.
 pytest_plugins = ["tests.fixtures.payments_http"]
 
@@ -96,29 +96,29 @@ async def test_payments_without_a_backend_is_refused_at_build_time() -> None:
 
 
 async def test_over_http_a_consented_customer_gets_the_proposal(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
-    await grant(produced, OWNER, "payments")
+    await grant(payments_produced, OWNER, "payments")
     response = await call_tool(
-        pg_url, key_pair, token_for(key_pair, OWNER), CREATE_PAYMENT_TOOL, ARGS
+        pg_url, payments_key_pair, token_for(payments_key_pair, OWNER), CREATE_PAYMENT_TOOL, ARGS
     )
     result = result_of(response)
     assert result["isError"] is False, response.text
     assert result["structuredContent"]["status"] == "pending"
     assert result["structuredContent"]["human_summary"] == SUMMARY
-    (row,) = await rows(produced)
+    (row,) = await rows(payments_produced)
     assert row.challenge_id == result["structuredContent"]["challenge_id"]
     assert (row.client_id, row.session_jti) == ("claude-code", "jti-test-1")
 
 
 async def test_over_http_a_refusal_is_its_fixed_message_and_nothing_else(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
-    await grant(produced, OWNER, "payments")
+    await grant(payments_produced, OWNER, "payments")
     response = await call_tool(
         pg_url,
-        key_pair,
-        token_for(key_pair, OWNER),
+        payments_key_pair,
+        token_for(payments_key_pair, OWNER),
         CREATE_PAYMENT_TOOL,
         {**ARGS, "from_account_ref": "acc_9b21"},
     )
@@ -128,66 +128,66 @@ async def test_over_http_a_refusal_is_its_fixed_message_and_nothing_else(
 
 
 async def test_without_payments_consent_the_tool_is_unlisted_and_unknown(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
-    await grant(produced, OWNER, "accounts")
-    token = token_for(key_pair, OWNER)
-    assert CREATE_PAYMENT_TOOL not in await list_tool_names(pg_url, key_pair, token)
-    response = await call_tool(pg_url, key_pair, token, CREATE_PAYMENT_TOOL, ARGS)
+    await grant(payments_produced, OWNER, "accounts")
+    token = token_for(payments_key_pair, OWNER)
+    assert CREATE_PAYMENT_TOOL not in await list_tool_names(pg_url, payments_key_pair, token)
+    response = await call_tool(pg_url, payments_key_pair, token, CREATE_PAYMENT_TOOL, ARGS)
     assert [block["text"] for block in result_of(response)["content"]] == [
         f"Unknown tool: '{CREATE_PAYMENT_TOOL}'"
     ]
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
 
 
 async def test_without_payments_consent_the_status_tool_is_unlisted_and_unknown(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
-    await grant(produced, OWNER, "accounts")
+    await grant(payments_produced, OWNER, "accounts")
     expired = await insert_row(
-        produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
+        payments_produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
     )
-    token = token_for(key_pair, OWNER)
-    assert PAYMENT_STATUS_TOOL not in await list_tool_names(pg_url, key_pair, token)
+    token = token_for(payments_key_pair, OWNER)
+    assert PAYMENT_STATUS_TOOL not in await list_tool_names(pg_url, payments_key_pair, token)
     response = await call_tool(
-        pg_url, key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": expired}
+        pg_url, payments_key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": expired}
     )
     assert [block["text"] for block in result_of(response)["content"]] == [
         f"Unknown tool: '{PAYMENT_STATUS_TOOL}'"
     ]
-    assert await status_of(produced, expired) == "pending"
+    assert await status_of(payments_produced, expired) == "pending"
 
 
 async def test_with_payments_consent_the_tool_is_listed(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
-    await grant(produced, OWNER, "payments")
-    names = await list_tool_names(pg_url, key_pair, token_for(key_pair, OWNER))
+    await grant(payments_produced, OWNER, "payments")
+    names = await list_tool_names(pg_url, payments_key_pair, token_for(payments_key_pair, OWNER))
     assert CREATE_PAYMENT_TOOL in names
 
 
 async def test_with_the_flag_off_the_producer_is_not_registered(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
-    await grant(produced, OWNER, "payments")
+    await grant(payments_produced, OWNER, "payments")
     names = await list_tool_names(
-        pg_url, key_pair, token_for(key_pair, OWNER), payments_enabled=False
+        pg_url, payments_key_pair, token_for(payments_key_pair, OWNER), payments_enabled=False
     )
     assert names == {"start_session"}
 
 
 async def test_a_proposal_completes_through_a_pool_of_one(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
     """No reserve, one connection, no overflow: the consent probe, the entry
     audit row, the tool's transaction and the completion row must each take
     the connection and give it back, because any overlap waits out the pool
     timeout and fails the call."""
-    await grant(produced, OWNER, "payments")
+    await grant(payments_produced, OWNER, "payments")
     response = await call_tool(
         pg_url,
-        key_pair,
-        token_for(key_pair, OWNER),
+        payments_key_pair,
+        token_for(payments_key_pair, OWNER),
         CREATE_PAYMENT_TOOL,
         ARGS,
         database_pool_size=1,
@@ -199,11 +199,15 @@ async def test_a_proposal_completes_through_a_pool_of_one(
 
 @pytest.mark.parametrize("tool_name", [CREATE_PAYMENT_TOOL, PAYMENT_STATUS_TOOL])
 async def test_the_registered_tool_declares_exactly_these_annotations(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP, tool_name: str
+    pg_url: str,
+    payments_key_pair: RSAKeyPair,
+    payments_produced: Database,
+    audit_server: FastMCP,
+    tool_name: str,
 ) -> None:
-    await grant(produced, OWNER, "payments")
-    app = producer_app(pg_url, key_pair)
-    response = await post_rpc(app, token_for(key_pair, OWNER), "tools/list", {})
+    await grant(payments_produced, OWNER, "payments")
+    app = producer_app(pg_url, payments_key_pair)
+    response = await post_rpc(app, token_for(payments_key_pair, OWNER), "tools/list", {})
     (tool,) = [t for t in json.loads(response.text)["result"]["tools"] if t["name"] == tool_name]
     annotations = tool["annotations"]
     assert (
@@ -215,19 +219,19 @@ async def test_the_registered_tool_declares_exactly_these_annotations(
 
 
 async def test_over_http_an_unreadable_stored_payload_is_the_fixed_text(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
-    await grant(produced, OWNER, "payments")
-    token = token_for(key_pair, OWNER)
+    await grant(payments_produced, OWNER, "payments")
+    token = token_for(payments_key_pair, OWNER)
     ids = [
         await insert_row(
-            produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, payload=payload
+            payments_produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, payload=payload
         )
         for payload in (["a"], "EUR 1.00", {"amount": "1.00", "payee_name": "P"})
     ]
     ids.append(
         await insert_row(
-            produced,
+            payments_produced,
             customer_ref=OWNER,
             tool_name=CREATE_PAYMENT_TOOL,
             payload={"amount": "1.00", "currency": "EUR", "payee_name": 5},
@@ -235,7 +239,7 @@ async def test_over_http_an_unreadable_stored_payload_is_the_fixed_text(
     )
     for challenge_id in ids:
         response = await call_tool(
-            pg_url, key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
+            pg_url, payments_key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
         )
         result = result_of(response)
         assert result["isError"] is True, response.text
@@ -243,26 +247,30 @@ async def test_over_http_an_unreadable_stored_payload_is_the_fixed_text(
 
 
 async def test_over_http_both_tools_are_listed_with_payments_consent(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
-    await grant(produced, OWNER, "payments")
-    names = await list_tool_names(pg_url, key_pair, token_for(key_pair, OWNER))
+    await grant(payments_produced, OWNER, "payments")
+    names = await list_tool_names(pg_url, payments_key_pair, token_for(payments_key_pair, OWNER))
     assert {CREATE_PAYMENT_TOOL, PAYMENT_STATUS_TOOL} <= names
 
 
 async def test_over_http_the_ownership_refusals_are_byte_identical(
-    pg_url: str, key_pair: RSAKeyPair, produced: Database, audit_server: FastMCP
+    pg_url: str, payments_key_pair: RSAKeyPair, payments_produced: Database, audit_server: FastMCP
 ) -> None:
     """A foreign id, another tool's id and an invented id must answer the same
     bytes: anything else confirms which ids exist to a holder of one valid
     customer token."""
-    await grant(produced, OWNER, "payments")
-    foreign = await insert_row(produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL)
-    not_a_payment = await insert_row(produced, customer_ref=OWNER, tool_name="accounts.rename")
+    await grant(payments_produced, OWNER, "payments")
+    foreign = await insert_row(payments_produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL)
+    not_a_payment = await insert_row(
+        payments_produced, customer_ref=OWNER, tool_name="accounts.rename"
+    )
     unknown = uuid.uuid4().hex
-    token = token_for(key_pair, OWNER)
+    token = token_for(payments_key_pair, OWNER)
     responses = [
-        await call_tool(pg_url, key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": cid})
+        await call_tool(
+            pg_url, payments_key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": cid}
+        )
         for cid in (foreign, not_a_payment, unknown)
     ]
     assert len({response.text for response in responses}) == 1

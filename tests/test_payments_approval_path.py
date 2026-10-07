@@ -48,7 +48,7 @@ from tests.fixtures.payments_http import (
     token_for,
 )
 
-# `key_pair` and `produced` live in the shared module; loading it as a plugin
+# `payments_key_pair` and `payments_produced` live in the shared module; loading it as a plugin
 # registers them without importing the names into every signature's scope.
 pytest_plugins = ["tests.fixtures.payments_http"]
 
@@ -63,19 +63,19 @@ async def audit_rows(session: AsyncSession) -> list[AuditEntry]:
 
 async def test_a_proposal_writes_one_reaching_row_and_one_completion_row(
     pg_url: str,
-    key_pair: RSAKeyPair,
-    produced: Database,
+    payments_key_pair: RSAKeyPair,
+    payments_produced: Database,
     audit_server: FastMCP,
     session: AsyncSession,
 ) -> None:
     """Two backend reads, one entry row: `_PendingEntry` writes at most once
     per call. The challenge insert is the tool's own write and not an audit
     row, and the returned challenge id is not recorded (a non-goal)."""
-    await grant(produced, OWNER, "payments")
+    await grant(payments_produced, OWNER, "payments")
     response = await call_tool(
         pg_url,
-        key_pair,
-        token_for(key_pair, OWNER),
+        payments_key_pair,
+        token_for(payments_key_pair, OWNER),
         CREATE_PAYMENT_TOOL,
         {**ARGS, "reference": "Rent October"},
     )
@@ -102,16 +102,16 @@ async def test_a_proposal_writes_one_reaching_row_and_one_completion_row(
 
 async def test_a_pan_and_an_iban_in_the_reference_are_not_stored_in_the_audit_arguments(
     pg_url: str,
-    key_pair: RSAKeyPair,
-    produced: Database,
+    payments_key_pair: RSAKeyPair,
+    payments_produced: Database,
     audit_server: FastMCP,
     session: AsyncSession,
 ) -> None:
-    await grant(produced, OWNER, "payments")
+    await grant(payments_produced, OWNER, "payments")
     response = await call_tool(
         pg_url,
-        key_pair,
-        token_for(key_pair, OWNER),
+        payments_key_pair,
+        token_for(payments_key_pair, OWNER),
         CREATE_PAYMENT_TOOL,
         {**ARGS, "reference": f"Invoice {stub.FULL_PAN} to {stub.GROUPED_IBAN}"},
     )
@@ -127,14 +127,14 @@ async def test_a_pan_and_an_iban_in_the_reference_are_not_stored_in_the_audit_ar
 
 async def test_a_call_refused_by_consent_writes_one_row(
     pg_url: str,
-    key_pair: RSAKeyPair,
-    produced: Database,
+    payments_key_pair: RSAKeyPair,
+    payments_produced: Database,
     audit_server: FastMCP,
     session: AsyncSession,
 ) -> None:
-    await grant(produced, OWNER, "accounts")
+    await grant(payments_produced, OWNER, "accounts")
     response = await call_tool(
-        pg_url, key_pair, token_for(key_pair, OWNER), CREATE_PAYMENT_TOOL, ARGS
+        pg_url, payments_key_pair, token_for(payments_key_pair, OWNER), CREATE_PAYMENT_TOOL, ARGS
     )
     assert [block["text"] for block in result_of(response)["content"]] == [
         "Unknown tool: 'payments.create_payment'"
@@ -143,7 +143,7 @@ async def test_a_call_refused_by_consent_writes_one_row(
     assert [(e.tool_name, e.outcome, e.detail, e.refusal_reason) for e in entries] == [
         (CREATE_PAYMENT_TOOL, "raised", "NotFoundError", REFUSAL_DOMAIN_NOT_CONSENTED)
     ]
-    assert await rows(produced) == []
+    assert await rows(payments_produced) == []
 
 
 # -- The stored row is what a phone signs ------------------------------------------
@@ -156,10 +156,10 @@ IDV_VALUE = "postern-test-idv"
 
 
 async def test_the_stored_payload_signs_and_verifies_as_an_approval_message(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
-    await create_payment(produced)(**ARGS, reference="Rent October")
-    (row,) = await rows(produced)
+    await create_payment(payments_produced)(**ARGS, reference="Rent October")
+    (row,) = await rows(payments_produced)
     assert all(isinstance(value, str) for value in row.payload.values())
     assert set(row.payload) == {
         "from_account_ref",
@@ -185,7 +185,7 @@ async def test_the_stored_payload_signs_and_verifies_as_an_approval_message(
 
     # The same signature must stop verifying once the stored payload changes:
     # the message is rebuilt from the re-read row, as the callback does.
-    async with produced.sessionmaker() as s:
+    async with payments_produced.sessionmaker() as s:
         await s.execute(
             text(
                 "UPDATE challenges SET payload = jsonb_set(payload, '{currency}', '\"GBP\"') "
@@ -194,7 +194,7 @@ async def test_the_stored_payload_signs_and_verifies_as_an_approval_message(
             {"c": row.challenge_id},
         )
         await s.commit()
-    (altered,) = await rows(produced)
+    (altered,) = await rows(payments_produced)
     assert altered.payload["currency"] == "GBP"
     altered_message = canonical_approval_message(
         challenge_id=altered.challenge_id,
@@ -212,7 +212,7 @@ async def test_the_stored_payload_signs_and_verifies_as_an_approval_message(
     )
 
 
-def confirm_app(pg_url: str, key_pair: RSAKeyPair) -> Starlette:
+def confirm_app(pg_url: str, payments_key_pair: RSAKeyPair) -> Starlette:
     settings = ConfirmSettings(
         backend_base_url="https://backend.test",
         database_url=pg_url,
@@ -221,7 +221,7 @@ def confirm_app(pg_url: str, key_pair: RSAKeyPair) -> Starlette:
         idv_value=IDV_VALUE,
     )
     verifier = JWTVerifier(
-        public_key=key_pair.public_key, issuer=CONFIRM_ISSUER, audience=CONFIRM_AUDIENCE
+        public_key=payments_key_pair.public_key, issuer=CONFIRM_ISSUER, audience=CONFIRM_AUDIENCE
     )
     return create_confirm_app(
         settings,
@@ -232,8 +232,8 @@ def confirm_app(pg_url: str, key_pair: RSAKeyPair) -> Starlette:
 
 async def test_a_produced_challenge_is_approved_and_executes_the_stored_payload(
     pg_url: str,
-    key_pair: RSAKeyPair,
-    produced: Database,
+    payments_key_pair: RSAKeyPair,
+    payments_produced: Database,
     audit_server: FastMCP,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -243,18 +243,18 @@ async def test_a_produced_challenge_is_approved_and_executes_the_stored_payload(
     payload. The row is tier 2, so the assertion carries the four claims
     decision record 0023 requires, and the row stores the assertion's jti as
     its verification_result."""
-    await grant(produced, OWNER, "payments")
+    await grant(payments_produced, OWNER, "payments")
     created = result_of(
         await call_tool(
             pg_url,
-            key_pair,
-            token_for(key_pair, OWNER),
+            payments_key_pair,
+            token_for(payments_key_pair, OWNER),
             CREATE_PAYMENT_TOOL,
             {**ARGS, "reference": "Rent October"},
         )
     )
     challenge_id = created["structuredContent"]["challenge_id"]
-    (row,) = await rows(produced)
+    (row,) = await rows(payments_produced)
 
     sent: list[httpx2.Request] = []
 
@@ -272,9 +272,9 @@ async def test_a_produced_challenge_is_approved_and_executes_the_stored_payload(
     # The tier the callback enforces below.
     assert row.tier == PAYMENT_TIER
 
-    app = confirm_app(pg_url, key_pair)
+    app = confirm_app(pg_url, payments_key_pair)
     jti = "producer-approval-0001"
-    assertion = key_pair.create_token(
+    assertion = payments_key_pair.create_token(
         subject=OWNER,
         issuer=CONFIRM_ISSUER,
         audience=CONFIRM_AUDIENCE,
@@ -303,19 +303,19 @@ async def test_a_produced_challenge_is_approved_and_executes_the_stored_payload(
         # Refused before the claim: a key that is not enrolled, and an
         # enrolled key signing bytes other than the stored row's.
         for bad in (
-            await approval_body(produced, challenge_id, other_private),
+            await approval_body(payments_produced, challenge_id, other_private),
             {"signature": altered_signature},
         ):
             refused = await client.post(approve, json=bad, headers=headers)
             assert refused.status_code == 403, refused.text
             assert refused.json()["error"] == "invalid_signature"
-            async with produced.sessionmaker() as s:
+            async with payments_produced.sessionmaker() as s:
                 still = await store.get_challenge(s, challenge_id)
             assert still is not None
             assert still.status == "pending"
             assert sent == []
 
-        body = await approval_body(produced, challenge_id, DEVICE_PRIVATE)
+        body = await approval_body(payments_produced, challenge_id, DEVICE_PRIVATE)
         response = await client.post(approve, json=body, headers=headers)
         assert response.status_code == 200, response.text
         (request,) = sent
@@ -338,9 +338,9 @@ async def test_a_produced_challenge_is_approved_and_executes_the_stored_payload(
         assert again.status_code == 409, again.text
         assert again.json()["error"] == "already_terminal"
         assert len(sent) == 1
-    status = await payment_status(produced)(challenge_id=challenge_id)
+    status = await payment_status(payments_produced)(challenge_id=challenge_id)
     assert status["status"] == "executed"
-    async with produced.sessionmaker() as s:
+    async with payments_produced.sessionmaker() as s:
         final = await store.get_challenge(s, challenge_id)
     assert final is not None
     assert final.verification_result == jti

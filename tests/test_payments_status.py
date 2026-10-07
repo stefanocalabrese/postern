@@ -41,7 +41,7 @@ from tests.fixtures.payments_http import (
     token_for,
 )
 
-# `key_pair` and `produced` live in the shared module; loading it as a plugin
+# `payments_key_pair` and `payments_produced` live in the shared module; loading it as a plugin
 # registers them without importing the names into every signature's scope.
 pytest_plugins = ["tests.fixtures.payments_http"]
 
@@ -60,10 +60,10 @@ STATUS_FIELDS = {
 
 
 async def test_status_reports_a_pending_proposal_from_the_stored_row(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
-    created = await create_payment(produced)(**ARGS, reference="Rent October")
-    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    created = await create_payment(payments_produced)(**ARGS, reference="Rent October")
+    status = await payment_status(payments_produced)(challenge_id=created["challenge_id"])
     assert status == {
         "challenge_id": created["challenge_id"],
         "status": "pending",
@@ -75,15 +75,15 @@ async def test_status_reports_a_pending_proposal_from_the_stored_row(
     }
 
 
-async def test_status_without_a_reference_reports_none(produced: Database) -> None:
-    created = await create_payment(produced)(**ARGS)
-    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+async def test_status_without_a_reference_reports_none(payments_produced: Database) -> None:
+    created = await create_payment(payments_produced)(**ARGS)
+    status = await payment_status(payments_produced)(challenge_id=created["challenge_id"])
     assert status["reference"] is None
 
 
-async def test_status_expires_a_row_past_its_deadline(produced: Database) -> None:
-    created = await create_payment(produced)(**ARGS)
-    async with produced.sessionmaker() as s:
+async def test_status_expires_a_row_past_its_deadline(payments_produced: Database) -> None:
+    created = await create_payment(payments_produced)(**ARGS)
+    async with payments_produced.sessionmaker() as s:
         await s.execute(
             text(
                 "UPDATE challenges SET expires_at = now() - interval '1 second' "
@@ -92,19 +92,19 @@ async def test_status_expires_a_row_past_its_deadline(produced: Database) -> Non
             {"c": created["challenge_id"]},
         )
         await s.commit()
-    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    status = await payment_status(payments_produced)(challenge_id=created["challenge_id"])
     assert status["status"] == "expired"
-    (row,) = await rows(produced)
+    (row,) = await rows(payments_produced)
     assert row.status == "expired"
 
 
 async def test_an_approved_row_whose_execution_failed_stays_approved(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
     """The callback answers 207 and leaves the row `approved` when the backend
     write fails. No status is invented on top of that."""
-    created = await create_payment(produced)(**ARGS)
-    async with produced.sessionmaker() as s:
+    created = await create_payment(payments_produced)(**ARGS)
+    async with payments_produced.sessionmaker() as s:
         await store.update_challenge_status(
             s,
             created["challenge_id"],
@@ -113,15 +113,15 @@ async def test_an_approved_row_whose_execution_failed_stays_approved(
             expiry="unexpired",
         )
         await s.commit()
-    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    status = await payment_status(payments_produced)(challenge_id=created["challenge_id"])
     assert status["status"] == "approved"
 
 
 async def test_status_never_returns_the_approval_or_the_session_record(
-    produced: Database,
+    payments_produced: Database,
 ) -> None:
-    created = await create_payment(produced)(**ARGS)
-    async with produced.sessionmaker() as s:
+    created = await create_payment(payments_produced)(**ARGS)
+    async with payments_produced.sessionmaker() as s:
         await store.update_challenge_status(
             s,
             created["challenge_id"],
@@ -133,9 +133,9 @@ async def test_status_never_returns_the_approval_or_the_session_record(
             signature="sig_secret_1",
         )
         await s.commit()
-    status = await payment_status(produced)(challenge_id=created["challenge_id"])
+    status = await payment_status(payments_produced)(challenge_id=created["challenge_id"])
     assert set(status) == STATUS_FIELDS
-    (row,) = await rows(produced)
+    (row,) = await rows(payments_produced)
     rendered = json.dumps(status)
     for withheld in (
         "dev_secret_1",
@@ -155,14 +155,18 @@ async def test_status_never_returns_the_approval_or_the_session_record(
     ["unknown", "foreign", "not_a_payment", "malformed", "nul", "traversal", "space"],
 )
 async def test_unknown_foreign_non_payment_and_malformed_ids_are_one_refusal(
-    produced: Database, case: str
+    payments_produced: Database, case: str
 ) -> None:
     if case == "unknown":
         challenge_id = uuid.uuid4().hex
     elif case == "foreign":
-        challenge_id = await insert_row(produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL)
+        challenge_id = await insert_row(
+            payments_produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL
+        )
     elif case == "not_a_payment":
-        challenge_id = await insert_row(produced, customer_ref=OWNER, tool_name="accounts.rename")
+        challenge_id = await insert_row(
+            payments_produced, customer_ref=OWNER, tool_name="accounts.rename"
+        )
     elif case == "nul":
         challenge_id = "a\x00b"
     elif case == "traversal":
@@ -172,33 +176,35 @@ async def test_unknown_foreign_non_payment_and_malformed_ids_are_one_refusal(
     else:
         challenge_id = "x" * 37
     with pytest.raises(ToolError) as refused:
-        await payment_status(produced)(challenge_id=challenge_id)
+        await payment_status(payments_produced)(challenge_id=challenge_id)
     assert str(refused.value) == CHALLENGE_NOT_FOUND
 
 
-async def test_a_foreign_expired_row_is_refused_and_left_pending(produced: Database) -> None:
+async def test_a_foreign_expired_row_is_refused_and_left_pending(
+    payments_produced: Database,
+) -> None:
     """The expiry UPDATE must not run for a row the caller does not own: it
     would let one customer change another's row, and its outcome would differ
     from an unknown id's."""
     foreign = await insert_row(
-        produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
+        payments_produced, customer_ref=OTHER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
     )
     statements: list[str] = []
 
     def record(conn: object, cursor: object, statement: str, *rest: object) -> None:
         statements.append(statement.lstrip().split(None, 1)[0].upper())
 
-    sync_engine = produced.engine.sync_engine
+    sync_engine = payments_produced.engine.sync_engine
     event.listen(sync_engine, "before_cursor_execute", record)
     try:
         with pytest.raises(ToolError) as refused:
-            await payment_status(produced)(challenge_id=foreign)
+            await payment_status(payments_produced)(challenge_id=foreign)
     finally:
         event.remove(sync_engine, "before_cursor_execute", record)
     assert str(refused.value) == CHALLENGE_NOT_FOUND
     assert statements
     assert set(statements) == {"SELECT"}
-    assert await status_of(produced, foreign) == "pending"
+    assert await status_of(payments_produced, foreign) == "pending"
 
 
 @pytest.mark.parametrize(
@@ -223,14 +229,14 @@ async def test_a_foreign_expired_row_is_refused_and_left_pending(produced: Datab
     ],
 )
 async def test_an_unreadable_stored_payload_is_one_fixed_refusal(
-    produced: Database, payload: object, caplog: pytest.LogCaptureFixture
+    payments_produced: Database, payload: object, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.DEBUG)
     challenge_id = await insert_row(
-        produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, payload=payload
+        payments_produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, payload=payload
     )
     with pytest.raises(ToolError) as refused:
-        await payment_status(produced)(challenge_id=challenge_id)
+        await payment_status(payments_produced)(challenge_id=challenge_id)
     assert str(refused.value) == CHALLENGE_UNREADABLE
     ours = [r for r in caplog.records if r.name == "services.api.tools.payments"]
     assert len(ours) == 1
@@ -240,8 +246,8 @@ async def test_an_unreadable_stored_payload_is_one_fixed_refusal(
 
 async def test_over_http_an_approval_that_races_the_expiry_update_is_reported_approved(
     pg_url: str,
-    key_pair: RSAKeyPair,
-    produced: Database,
+    payments_key_pair: RSAKeyPair,
+    payments_produced: Database,
     audit_server: FastMCP,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -254,10 +260,10 @@ async def test_over_http_an_approval_that_races_the_expiry_update_is_reported_ap
     The interleaving is forced, not timed: `update_challenge_status` is wrapped
     so that its first call from the status handler commits the approval through
     a separate session before running the real UPDATE."""
-    await grant(produced, OWNER, "payments")
-    token = token_for(key_pair, OWNER)
+    await grant(payments_produced, OWNER, "payments")
+    token = token_for(payments_key_pair, OWNER)
     challenge_id = await insert_row(
-        produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
+        payments_produced, customer_ref=OWNER, tool_name=CREATE_PAYMENT_TOOL, past_deadline=True
     )
     real_update = store.update_challenge_status
     raced: list[str] = []
@@ -265,7 +271,7 @@ async def test_over_http_an_approval_that_races_the_expiry_update_is_reported_ap
     async def approve_first(session: AsyncSession, cid: str, **kwargs: Any) -> Any:
         if kwargs.get("status") == "expired" and not raced:
             raced.append(cid)
-            async with produced.sessionmaker() as other:
+            async with payments_produced.sessionmaker() as other:
                 # Plain SQL: the row is past its deadline, which the store's
                 # own transition would refuse, and this test needs it committed.
                 await other.execute(
@@ -280,13 +286,13 @@ async def test_over_http_an_approval_that_races_the_expiry_update_is_reported_ap
 
     monkeypatch.setattr(store, "update_challenge_status", approve_first)
     response = await call_tool(
-        pg_url, key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
+        pg_url, payments_key_pair, token, PAYMENT_STATUS_TOOL, {"challenge_id": challenge_id}
     )
     assert raced == [challenge_id]
     result = result_of(response)
     assert result.get("isError") is not True, response.text
     assert result["structuredContent"]["status"] == "approved", response.text
-    assert await status_of(produced, challenge_id) == "approved"
+    assert await status_of(payments_produced, challenge_id) == "approved"
 
 
 async def test_status_on_an_unreachable_store_is_a_fixed_refusal(
