@@ -650,3 +650,32 @@ def test_a_failing_scan_withholds_every_non_plain_argument_and_extra(
     extra_out = _extra_output({"err": [driver_error], "n": 1})
     _clean(extra_out)
     assert "<list withheld>" in extra_out
+
+
+# ---------------------------------------------------------------------------
+# `_children` reads at most `limit` items of a container, not the whole of it:
+# the cap is what keeps a 1,000,000-key dict or a 1,000,000-argument exception
+# from costing a record its time and memory.
+# ---------------------------------------------------------------------------
+
+
+def test_an_exception_with_a_huge_args_tuple_yields_at_most_the_limit() -> None:
+    huge = ValueError(*range(100_000))
+    assert len(log_safety._children(huge, 7)) == 7
+    assert len(log_safety._children(huge, 0)) == 0
+
+
+def test_a_huge_dict_is_read_only_up_to_the_limit() -> None:
+    """Counted by allocation: reading every item builds a list of them all, a
+    capped read builds a handful. The dict is built before tracing starts."""
+    import tracemalloc
+
+    huge = {index: index for index in range(300_000)}
+    tracemalloc.start()
+    try:
+        children = log_safety._children(huge, 5)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert children == [0, 0, 1, 1, 2]
+    assert peak < 20_000, f"a capped read of a dict allocated {peak} bytes"

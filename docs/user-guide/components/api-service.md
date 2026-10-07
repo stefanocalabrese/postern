@@ -133,6 +133,16 @@ Postgres-backed consent check:
 | `transactions.list` | transactions.svc | Yes | Lists transactions with date range filter |
 | `cards.list` | cards.svc | Yes | Lists customer cards |
 
+A backend 404 or 403 on a read tool's caller-chosen `account_ref` reaches the model as the
+fixed sentence `not found` (`services/api/tools/not_found.py`). A 403 also writes one warning
+to the `services.api.tools.not_found` logger, `backend answered 403 on a caller-chosen ref;
+reported to the model as not found. A 403 on every call means the api's token is rejected:
+check the minter's audience and scope.`, at most once per 60 seconds per process, with no
+ref, argument or backend body in it. Grep the api's logs for `backend answered 403`: a 404
+writes nothing, and the audit row of a 403 is identical to a 404's, so that line is the
+only trace. The backend contract is still to answer 404 for a foreign ref. A line on every
+call, not on a typo, is a misconfigured minter.
+
 ### Payments producer (behind `POSTERN_PAYMENTS_ENABLED`)
 
 Two more tools, registered only with the flag on and always gated on the `payments`

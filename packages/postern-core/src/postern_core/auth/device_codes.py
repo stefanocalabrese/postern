@@ -343,7 +343,8 @@ class DeviceCode:
 
     # repr=False: the polling secret `/token` exchanges, never to be printed.
     device_code: str = field(repr=False)
-    user_code: str
+    # repr=False: the 30-bit pairing code `/approve` accepts, and a credential.
+    user_code: str = field(repr=False)
     verification_uri: str
     expires_at: datetime
     interval: int = 5
@@ -353,7 +354,7 @@ class DeviceCode:
     approved_at: datetime | None = None
     customer_ref: str = ""
     exchanged_at: datetime | None = None
-    display_handle: str = ""
+    display_handle: str = field(default="", repr=False)
     qr_secret: bytes = field(default=b"", repr=False)
     creator_ip: str | None = None
     scanned_by: str = ""

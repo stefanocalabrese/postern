@@ -100,16 +100,22 @@ def test_a_device_code_does_not_print_its_polling_secret() -> None:
         user_code="ABCD-EFGH",
         verification_uri="https://x/v",
         expires_at=expires,
+        display_handle="HANDLE-VISIBLE-IN-NO-REPR",
     )
     for rendered in _renderings(code):
         assert BEARER not in rendered
-    assert "ABCD-EFGH" in repr(code)
+        # The 30-bit user code is what `/approve` accepts: it is not printed
+        # either. Nor is the display handle the QR page's state carries.
+        assert "ABCD-EFGH" not in rendered
+        assert "HANDLE-VISIBLE-IN-NO-REPR" not in rendered
     assert code.device_code == BEARER
+    assert code.user_code == "ABCD-EFGH"
     assert code == DeviceCode(
         device_code=BEARER,
         user_code="ABCD-EFGH",
         verification_uri="https://x/v",
         expires_at=expires,
+        display_handle="HANDLE-VISIBLE-IN-NO-REPR",
     )
     assert code != DeviceCode(
         device_code="other",

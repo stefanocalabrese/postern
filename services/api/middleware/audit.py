@@ -864,8 +864,10 @@ def _fixed_permission_error(exc: BaseException) -> bool:
     """A `PermissionError` this repository built from one sentence.
 
     Not every `PermissionError`, and not a subclass of one: the exact type, with
-    ONE string argument. The operating system raises one with an errno, a
-    strerror and a path (three arguments), so the single-argument test is what
+    ONE string argument. The operating system raises one with an errno and a
+    strerror (two arguments: `open('/etc/master.passwd')` gives `args ==
+    (13, 'Permission denied')`, and the path is held on `.filename`, not in
+    `args`), so the single-argument test is what
     keeps an OS-built error out; an `exc.errno is None` check beside it would be
     redundant (`OSError(1 arg)` has no errno, and an OS-built one never has one
     argument), so there is none.

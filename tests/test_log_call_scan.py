@@ -25,8 +25,9 @@ What it flags in such a call:
   an f-string holding it, `str(X)`, `exc_info=X`, `**{"exc_info": X}` and a
   tuple or list holding it are all flagged);
 * `exc_info=True`, any other truthy constant (`exc_info=1`), and
-  `exc_info=sys.exc_info()`, and `.exception(...)`, which implies it, because
-  all of them render whatever exception is being handled;
+  `exc_info=sys.exc_info()`, any `exc_info()` call inside an argument
+  (`logger.error("x %s", sys.exc_info()[1])`), and `.exception(...)`, which
+  implies it, because all of them render whatever exception is being handled;
 * a call to `traceback.format_exc`, `format_exception`, `format_exception_only`,
   `format_tb` or `print_exc` anywhere in the arguments, bound name or not;
 * nothing else. Arguments that merely mention a name which is not an exception
@@ -56,9 +57,12 @@ error, a JSON error) or the call is a deliberate use of the raw exception whose
 type this repository controls. Each entry is keyed on the source text of the
 call itself (`ast.unparse`), not on its function, so a NEW unsafe call inside
 an allowlisted function is flagged, and editing a listed call re-opens its
-review. The flagged set and the allowlist must be EQUAL: a flagged call that is
-not listed fails, and a listed call that is no longer flagged (deleted or
-rewritten) fails too, so the list cannot rot.
+review. The key also carries the type of the `except` clause the call sits in
+(`ast.unparse(handler.type)`), because an entry is safe only for the exception
+that clause catches: widening `except DeviceCodeStoreContended` to `except
+Exception` makes the call unlisted and its entry stale. The flagged set and
+the allowlist must be EQUAL: a flagged call that is not listed fails, and a
+listed call that is no longer flagged (deleted or rewritten) fails too, so the list cannot rot.
 """
 
 import ast
@@ -79,7 +83,12 @@ TRACEBACK_TEXT = frozenset(
     {"format_exc", "format_exception", "format_exception_only", "format_tb", "print_exc"}
 )
 
-Key = tuple[str, str, str, str]  # (path, enclosing function, rule, unparsed call)
+#: (path, enclosing function, rule, unparsed call, the innermost enclosing
+#: `except` clause's type as source text: `DeviceCodeStoreContended`,
+#: `(A, B)`, `<bare>`, or `<none>` outside any handler). The type is in the key
+#: because an entry's safety rests on WHICH exception it catches.
+Key = tuple[str, str, str, str, str]
+Found = tuple[str, str, str, str, str, int]  # a Key and the line number
 
 _ARG = "raw exception argument"
 _SRC = "packages/postern-core/src/postern_core"
@@ -93,18 +102,21 @@ ALLOWLIST: dict[Key, tuple[int, str]] = {
         "logger.warning('Redis maxmemory-policy cannot be verified (CONFIG was refused: %s). "
         "The ZT-7 revocation sets carry no TTL, so check by hand that the instance runs "
         "maxmemory-policy noeviction; an evicting policy can silently drop revocations.', exc)",
+        "ResponseError",
     ): (1, "a redis ResponseError for CONFIG; no SQL"),
     (
         f"{_SRC}/auth/revocation.py",
         "revoke_session",
         "exc_info=<current exception>",
         "logger.warning('session revocation prune failed; the revoke stands', exc_info=True)",
+        "Exception",
     ): (2, "a prune failure against Redis; no SQL (two sites, identical text)"),
     (
         f"{_SRC}/auth/revoke_cli.py",
         "_run",
         _ARG,
         "print(f'prune-sessions failed: {exc}', file=err or sys.stderr)",
+        "RevocationStoreUnavailable",
     ): (1, "the operator CLI's own terminal; a Redis error from a prune, no SQL, no client"),
     (
         f"{_SRC}/store/audit.py",
@@ -112,6 +124,7 @@ ALLOWLIST: dict[Key, tuple[int, str]] = {
         _ARG,
         "logger.warning('the connection pool is at its ceiling; writing this audit row on "
         "the reserve connection instead: %s', saturated)",
+        "sa_exc.TimeoutError",
     ): (
         1,
         "sqlalchemy.exc.TimeoutError, the pool's 'QueuePool limit' sentence; it is not a "
@@ -123,18 +136,21 @@ ALLOWLIST: dict[Key, tuple[int, str]] = {
         _ARG,
         "logger.warning('challenge approve: %r: the backend refused the write: tool=%s "
         "status=%d', challenge_id, updated.tool_name, exc.status)",
+        "BackendWriteError",
     ): (1, "logs `exc.status`, the numeric HTTP status of a BackendWriteError; no text"),
     (
         "services/confirm/device_auth.py",
         "_exchange",
         _ARG,
         "logger.warning('device grant: %s; refusing to mint', exc)",
+        "RefreshSessionStoreFull",
     ): (1, "RefreshSessionStoreFull, a fixed sentence this repository writes"),
     (
         "services/confirm/device_auth.py",
         "device_authorization",
         _ARG,
         "logger.warning('device authorization refused: %s', exc)",
+        "DeviceCodeStoreContended",
     ): (1, "DeviceCodeStoreContended, whose text is a fixed sentence this repository writes"),
     (
         "services/confirm/device_auth.py",
@@ -142,6 +158,7 @@ ALLOWLIST: dict[Key, tuple[int, str]] = {
         _ARG,
         "logger.warning('device authorization refused: the device code store holds %d codes, "
         "its cap', exc.held)",
+        "DeviceCodeStoreFull",
     ): (1, "DeviceCodeStoreFull `exc.held`, an int"),
 }
 
@@ -261,6 +278,15 @@ def _renders_current_exception(value: ast.expr) -> bool:
     return isinstance(value, ast.Call) and _terminal_name(value.func) == "exc_info"
 
 
+def _calls_exc_info(node: ast.AST) -> bool:
+    """A `sys.exc_info()` / `exc_info()` call anywhere inside ``node``: the
+    exception being handled, wherever the call sits in the argument."""
+    return any(
+        isinstance(sub, ast.Call) and _terminal_name(sub.func) == "exc_info"
+        for sub in ast.walk(node)
+    )
+
+
 class _Scan(ast.NodeVisitor):
     def __init__(
         self, path: str, aliases: dict[str, str], known: frozenset[str] = frozenset()
@@ -273,12 +299,17 @@ class _Scan(ast.NodeVisitor):
         # (`saved = e`), one set per function, the module being the first.
         self.tainted: list[set[str]] = [set()]
         self.functions: list[str] = []
-        self.found: list[tuple[str, str, str, str, int]] = []
+        # The `except` clauses enclosing the node being visited, one list per
+        # function, the module being the first.
+        self.handlers: list[list[str]] = [[]]
+        self.found: list[Found] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.functions.append(node.name)
         self.tainted.append(set())
+        self.handlers.append([])
         self.generic_visit(node)
+        self.handlers.pop()
         self.tainted.pop()
         self.functions.pop()
 
@@ -287,7 +318,9 @@ class _Scan(ast.NodeVisitor):
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         if node.name:
             self.bound.append(node.name)
+        self.handlers[-1].append(ast.unparse(node.type) if node.type else "<bare>")
         self.generic_visit(node)
+        self.handlers[-1].pop()
         if node.name:
             self.bound.pop()
 
@@ -325,7 +358,8 @@ class _Scan(ast.NodeVisitor):
 
     def _flag(self, rule: str, node: ast.Call) -> None:
         function = self.functions[-1] if self.functions else "<module>"
-        self.found.append((self.path, function, rule, ast.unparse(node), node.lineno))
+        handler = self.handlers[-1][-1] if self.handlers[-1] else "<none>"
+        self.found.append((self.path, function, rule, ast.unparse(node), handler, node.lineno))
 
     def _check(self, node: ast.Call, method: str) -> None:
         bound = self._names()
@@ -336,9 +370,12 @@ class _Scan(ast.NodeVisitor):
             self._flag(_ARG, node)
         if any(_has_traceback_text(value) for value in values):
             self._flag("traceback text", node)
+        # One flag, whichever of the two shapes (or both) is present: the
+        # keyword with a truthy value, or any `exc_info()` call anywhere in an
+        # argument (`logger.error("x %s", sys.exc_info()[1])`).
         if any(
             kw.arg == "exc_info" and _renders_current_exception(kw.value) for kw in node.keywords
-        ):
+        ) or any(_calls_exc_info(value) for value in values):
             self._flag("exc_info=<current exception>", node)
 
 
@@ -353,15 +390,17 @@ def _logging_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
-def violations(source: str, path: str) -> list[tuple[str, str, str, str, int]]:
+def violations(source: str, path: str) -> list[Found]:
     tree = ast.parse(source)
     scan = _Scan(path, _logging_aliases(tree), _logger_names(tree))
     scan.visit(tree)
     return scan.found
 
 
-def _counted(found: list[tuple[str, str, str, str, int]]) -> Counter[Key]:
-    return Counter((path, function, rule, call) for path, function, rule, call, _ in found)
+def _counted(found: list[Found]) -> Counter[Key]:
+    return Counter(
+        (path, func, rule, call, handler) for path, func, rule, call, handler, _ in found
+    )
 
 
 def unlisted(found: Counter[Key], allowlist: dict[Key, tuple[int, str]]) -> list[Key]:
@@ -381,8 +420,8 @@ def _scanned_files() -> list[Path]:
     ]
 
 
-def _all_violations() -> list[tuple[str, str, str, str, int]]:
-    found: list[tuple[str, str, str, str, int]] = []
+def _all_violations() -> list[Found]:
+    found: list[Found] = []
     for path in _scanned_files():
         relative = str(path.relative_to(ROOT))
         found.extend(violations(path.read_text(), relative))
@@ -423,7 +462,7 @@ def test_a_new_unsafe_call_in_an_allowlisted_function_is_flagged() -> None:
     grown = _LISTED_MODULE + "        logger.error('leak %s', str(e))\n"
     found = _counted(violations(grown, _SYNTHETIC_PATH))
     assert unlisted(found, allowlist) == [
-        (_SYNTHETIC_PATH, "f", _ARG, "logger.error('leak %s', str(e))")
+        (_SYNTHETIC_PATH, "f", _ARG, "logger.error('leak %s', str(e))", "Exception")
     ]
 
 
@@ -439,7 +478,9 @@ def test_deleting_one_of_two_allowlisted_calls_is_stale() -> None:
     two = _LISTED_MODULE + "        logger.error('b %s', e.status)\n"
     allowlist = _allowlist_for(two)
     one = _counted(violations(_LISTED_MODULE, _SYNTHETIC_PATH))
-    assert stale(one, allowlist) == [(_SYNTHETIC_PATH, "f", _ARG, "logger.error('b %s', e.status)")]
+    assert stale(one, allowlist) == [
+        (_SYNTHETIC_PATH, "f", _ARG, "logger.error('b %s', e.status)", "Exception")
+    ]
 
 
 def test_deleting_one_of_two_identical_allowlisted_calls_is_stale() -> None:
@@ -447,6 +488,40 @@ def test_deleting_one_of_two_identical_allowlisted_calls_is_stale() -> None:
     allowlist = _allowlist_for(two, count=2)
     one = _counted(violations(_LISTED_MODULE, _SYNTHETIC_PATH))
     assert stale(one, allowlist)
+
+
+# An entry's safety rests on WHICH exception its handler catches (a fixed
+# sentence this repository wrote), so the handler's type is part of the key:
+# widening `except DeviceCodeStoreContended` to `except Exception` re-opens it.
+_NARROW = (
+    "def f():\n"
+    "    try:\n"
+    "        pass\n"
+    "    except DeviceCodeStoreContended as e:\n"
+    "        logger.error('a %s', e)\n"
+)
+
+
+def test_widening_the_except_type_of_a_listed_call_is_unlisted_and_stale() -> None:
+    allowlist = _allowlist_for(_NARROW)
+    widened = _NARROW.replace("DeviceCodeStoreContended", "Exception")
+    found = _counted(violations(widened, _SYNTHETIC_PATH))
+    assert unlisted(found, allowlist), "the widened handler must re-open the entry"
+    assert stale(found, allowlist), "the narrow entry no longer matches anything"
+
+
+def test_the_same_call_under_the_same_except_type_stays_listed() -> None:
+    allowlist = _allowlist_for(_NARROW)
+    found = _counted(violations(_NARROW, _SYNTHETIC_PATH))
+    assert not unlisted(found, allowlist)
+    assert not stale(found, allowlist)
+
+
+def test_a_tuple_of_except_types_is_keyed_whole() -> None:
+    two = _NARROW.replace("DeviceCodeStoreContended", "(A, B)")
+    allowlist = _allowlist_for(two)
+    widened = two.replace("(A, B)", "(A, B, Exception)")
+    assert unlisted(_counted(violations(widened, _SYNTHETIC_PATH)), allowlist)
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +543,9 @@ SYNTHETIC_FLAGGED = {
     "exc_info=True": _handled('logger.warning("x", exc_info=True)', bind=False),
     "exc_info=1": _handled('logger.warning("x", exc_info=1)', bind=False),
     "exc_info=sys.exc_info()": _handled('logger.warning("x", exc_info=sys.exc_info())', bind=False),
+    "positional sys.exc_info()[1]": _handled('logger.error("x %s", sys.exc_info()[1])', bind=False),
+    "positional exc_info()": _handled('logger.error("x %s", exc_info())', bind=False),
+    "f-string of sys.exc_info()": _handled('logger.error(f"x {sys.exc_info()}")', bind=False),
     "exc_info=name": _handled('logger.error("x", exc_info=e)'),
     "starred dict": _handled('logger.error("x", **{"exc_info": e})'),
     "tuple argument": _handled('logger.error("x %s", (1, e))'),
@@ -547,6 +625,9 @@ SYNTHETIC_CLEAN = {
     "type name": _handled('logger.error("x %s", type(e).__name__)'),
     "exc_info_for_log": _handled('logger.error("x", exc_info=exc_info_for_log(e))'),
     "exc_info=False": _handled('logger.error("x", exc_info=False)', bind=False),
+    "a name that merely contains exc_info": _handled(
+        'logger.error("x %s", exc_info_label)', bind=False
+    ),
     "not an exception": 'value = 1\nlogger.error("x %s", value)\n',
     "not a logger": _handled("results.append(e)"),
     "print of a non-exception": _handled('print("done", file=out)'),

@@ -15,13 +15,17 @@ through the handle function.
 """
 
 import ast
+import hashlib
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 from postern_core.auth.device_codes import RedisDeviceCodeStore, _device_code_handle
 from redis.exceptions import WatchError
+
+from tests.test_log_call_scan import _log_method, _logger_names, _logging_aliases
 
 ROOT = Path(__file__).resolve().parent.parent
 SENTINEL = "zzdevcode_sentinel_7741_abcdefghijklmnopqrstuv"
@@ -127,11 +131,62 @@ async def test_approve_scanned_logs_the_handle_on_a_corrupt_value(
 # A scan: no logger call hands a secret-named value over except as a handle.
 # ---------------------------------------------------------------------------
 
-SECRET_NAMES = frozenset({"device_code", "user_code", "refresh_token", "token", "secret"})
-HANDLE_CALLS = frozenset({"_device_code_handle", "device_code_handle"})
-LOG_METHODS = frozenset(
-    {"debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"}
+#: A name that SOUNDS like a credential: matched as a substring of an
+#: identifier, an attribute in a chain, a string subscript (`form["device_code"]`)
+#: or a called function's name. Substring, not equality, because the exact-name
+#: scan this replaces let `device_code_value`, `access_token` and
+#: `form["device_code"]` through.
+SECRET_RE = re.compile(
+    r"device_code|user_code|refresh|token|secret|assertion|signature|password|private"
+    r"|pem|bearer|authorization|jwt",
+    re.IGNORECASE,
 )
+
+#: Calls whose RESULT is safe to log whatever they were given: the whole call,
+#: arguments included, is skipped. Each says why.
+SAFE_CALLS: dict[str, str] = {
+    "_device_code_handle": "SHA-256 prefix of the device code (64 bits of a 256-bit secret)",
+    "device_code_handle": "the same function, public spelling (services/confirm/audit.py)",
+}
+
+#: Identifiers that match `SECRET_RE` and are safe as a logged value. Each says
+#: why. Derived by running the scan over `services/`, `packages/*/src`, `tools/`
+#: and `stub/` and reading every hit (four on 7 October 2026); a hit is added
+#: here only if it is not a credential.
+SAFE_NAMES: dict[str, str] = {
+    "device_code_handle": (
+        "the RefreshSession field, filled from `device_code_handle(code.device_code)` "
+        "when the family is created in `services/confirm/device_auth.py`: the SHA-256 "
+        "prefix, never the code"
+    ),
+    "ASSERTION_CLOCK_SKEW_SECONDS": "an int constant, the tier-2 auth_time tolerance in seconds",
+    "pem_env_var": (
+        "the NAME of the environment variable that holds a PEM path "
+        "(`POSTERN_READ_KEY_PEM_PATH`), not the PEM"
+    ),
+}
+
+
+def _secret_mentions(node: ast.AST) -> list[str]:
+    """Every credential-sounding name ``node`` mentions outside a safe call."""
+    if isinstance(node, ast.Call):
+        callee = _terminal(node.func)
+        if callee in SAFE_CALLS:
+            return []
+    hits: list[str] = []
+    if isinstance(node, ast.Name):
+        hits.append(node.id)
+    elif isinstance(node, ast.Attribute):
+        hits.append(node.attr)
+    elif (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    ):
+        hits.append(node.slice.value)
+    for child in ast.iter_child_nodes(node):
+        hits.extend(_secret_mentions(child))
+    return [name for name in hits if SECRET_RE.search(name) and name not in SAFE_NAMES]
 
 
 def _terminal(node: ast.expr) -> str:
@@ -142,46 +197,38 @@ def _terminal(node: ast.expr) -> str:
     return ""
 
 
-def _is_log_call(node: ast.Call) -> bool:
-    func = node.func
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr in LOG_METHODS
-        and "log" in _terminal(func.value).lower()
-    )
-
-
-def _names_a_secret(node: ast.AST) -> bool:
-    """True if ``node`` mentions a secret-named value outside a handle call."""
-    if isinstance(node, ast.Call) and _terminal(node.func) in HANDLE_CALLS:
-        return False
-    if isinstance(node, ast.Name):
-        return node.id in SECRET_NAMES
-    if isinstance(node, ast.Attribute) and node.attr in SECRET_NAMES:
-        return True
-    return any(_names_a_secret(child) for child in ast.iter_child_nodes(node))
-
-
 def secret_log_calls(source: str) -> list[int]:
-    """Line numbers of logger calls that pass a secret-named value raw."""
+    """Line numbers of logging calls that pass a credential-named value raw.
+
+    What counts as a logging call is `test_log_call_scan._log_method`: a
+    `getLogger(...)` receiver, a name bound from one, `print`, `warnings.warn`,
+    `sys.stderr.write`, `getattr(logger, "error")(...)`, an imported alias.
+    """
+    tree = ast.parse(source)
+    aliases = _logging_aliases(tree)
+    known = _logger_names(tree)
     found: list[int] = []
-    for node in ast.walk(ast.parse(source)):
-        if not (isinstance(node, ast.Call) and _is_log_call(node)):
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
             continue
-        values = [*node.args, *(kw.value for kw in node.keywords)]
-        if any(_names_a_secret(value) for value in values):
+        if _log_method(node, aliases, known) is None:
+            continue
+        values = [*node.args, *(kw.value for kw in node.keywords if kw.arg != "exc_info")]
+        if any(_secret_mentions(value) for value in values):
             found.append(node.lineno)
     return found
 
 
 def _scanned() -> list[Path]:
     return [
-        *sorted((ROOT / "packages/postern-core/src/postern_core/auth").rglob("*.py")),
-        *sorted((ROOT / "services/confirm").rglob("*.py")),
+        *sorted((ROOT / "services").rglob("*.py")),
+        *sorted(ROOT.glob("packages/*/src/**/*.py")),
+        *sorted((ROOT / "tools").rglob("*.py")),
+        *sorted((ROOT / "stub").rglob("*.py")),
     ]
 
 
-def test_no_logger_call_in_auth_or_confirm_passes_a_secret_raw() -> None:
+def test_no_logging_call_in_the_repo_passes_a_credential_raw() -> None:
     offenders = [
         f"{path.relative_to(ROOT)}:{line}"
         for path in _scanned()
@@ -200,6 +247,21 @@ def test_no_logger_call_in_auth_or_confirm_passes_a_secret_raw() -> None:
         'self.logger.error("x", refresh_token)',
         'logger.debug("x %s", token)',
         'logger.warning("x", extra={"k": secret})',
+        # The shapes the exact-name scan let through.
+        'logger.warning("x %s", device_code_value)',
+        'logger.warning("x %s", access_token)',
+        'logger.warning("x %s", session_token)',
+        'logger.warning("x %s", refresh)',
+        'logger.warning("x %s", form["device_code"])',
+        'logging.getLogger(__name__).warning("x %s", device_code)',
+        "print(device_code)",
+        'warnings.warn(f"x {device_code}")',
+        "sys.stderr.write(device_code)",
+        'logger.warning("x %s", str(device_code_value))',
+        'logger.warning("x %s", family.refresh_hash)',
+        'logger.warning("x %s", request.headers.authorization)',
+        'logger.warning("x %s", load_private_key())',
+        'logger.warning("x %s", handle_of(device_code))',
     ],
 )
 def test_the_secret_scan_flags(call: str) -> None:
@@ -213,7 +275,35 @@ def test_the_secret_scan_flags(call: str) -> None:
         'logger.warning("x %s", device_code_handle(code.device_code))',
         'logger.warning("x %s", handle)',
         "results.append(device_code)",
+        'logger.warning("x %s", family.device_code_handle)',
+        'logger.warning("x %s", family.sid)',
+        'logger.warning("x %s", display_handle)',
+        'logger.warning("x %s", ASSERTION_CLOCK_SKEW_SECONDS)',
+        'warnings.warn(f"x {pem_env_var} is unset")',
+        'logging.getLogger(__name__).warning("x %s", device_code_handle(device_code_value))',
+        'print("tokens are fine in a message string")',
+        'logger.warning("x", exc_info=refresh_failure)',
     ],
 )
 def test_the_secret_scan_passes(call: str) -> None:
     assert not secret_log_calls(call + "\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The two device_auth.py sites a raw `device_code_value` left unflagged.
+        'logger.warning("approved with no customer reference: %s", device_code_value)',
+        'logger.error("could not be audited AND could not be withdrawn: %s", device_code_value)',
+    ],
+)
+def test_the_secret_scan_flags_the_surviving_mutants(line: str) -> None:
+    assert secret_log_calls(line + "\n")
+
+
+def test_the_handle_is_a_sha256_prefix_not_a_slice_of_the_code() -> None:
+    """The handle must be unlinkable to the code by anything but a hash."""
+    handle = _device_code_handle(SENTINEL)
+    assert handle == hashlib.sha256(SENTINEL.encode()).hexdigest()[:16]
+    assert SENTINEL[:8] not in handle
+    assert SENTINEL[:4] not in handle

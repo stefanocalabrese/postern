@@ -24,17 +24,56 @@ against the real stub and against a backend that answers 403.
 
 `payments.py` keeps its own sentences (``account not found``, ``payee not
 found``) and maps the same `NOT_FOUND_STATUSES` (403 and 404) on its own refs.
+
+A 403 LEAVES ONE LOG LINE, A 404 NONE. Mapping 403 to `not found` hides a
+misconfigured minter (wrong audience or scope: the backend rejects every token
+this service sends) behind what reads as customers mistyping refs: the audit
+row of a 403 (`reaching`, then `raised` / ``ToolError``) is a 404's, and
+FastMCP's own line (`Error calling tool 'x'`) names no status. So a 403, and
+only a 403, logs a fixed warning on this module's logger, grep for ``backend
+answered 403 on a caller-chosen ref``. The audit schema is not changed: the
+log line is the signal. The line carries no ref, no tool argument and no body,
+and is limited to one per `_WARN_INTERVAL_SECONDS` per process so a caller who
+probes refs cannot flood the log. A 403 on EVERY call means the api's token is
+rejected.
 """
 
-from collections.abc import AsyncIterator
+import logging
+import time
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from fastmcp.exceptions import ToolError
 from postern_core.facade.client import BackendError
 
+logger = logging.getLogger(__name__)
+
 NOT_FOUND = "not found"
 #: Public: `tools/payments.py` maps the same two statuses to its own sentences.
 NOT_FOUND_STATUSES = frozenset({403, 404})
+
+#: At most one 403 warning per this many seconds per process.
+_WARN_INTERVAL_SECONDS = 60.0
+#: Injectable for tests; monotonic, so a wall-clock step cannot reopen the window.
+_clock: Callable[[], float] = time.monotonic
+#: When the last 403 warning was written; None until the first.
+_last_warned_at: float | None = None
+
+_FORBIDDEN_WARNING = (
+    "backend answered 403 on a caller-chosen ref; reported to the model as not found. "
+    "A 403 on every call means the api's token is rejected: check the minter's "
+    "audience and scope."
+)
+
+
+def _warn_forbidden() -> None:
+    """Write the 403 warning unless one was written within the window."""
+    global _last_warned_at
+    now = _clock()
+    if _last_warned_at is not None and now - _last_warned_at < _WARN_INTERVAL_SECONDS:
+        return
+    _last_warned_at = now
+    logger.warning(_FORBIDDEN_WARNING)
 
 
 @asynccontextmanager
@@ -44,5 +83,7 @@ async def not_found_is_a_fixed_refusal() -> AsyncIterator[None]:
         yield
     except BackendError as exc:
         if exc.status in NOT_FOUND_STATUSES:
+            if exc.status == 403:
+                _warn_forbidden()
             raise ToolError(NOT_FOUND) from None
         raise
