@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import reprlib
 from importlib.metadata import EntryPoint, entry_points
 from typing import Any
 
@@ -57,6 +58,12 @@ WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 _TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)?$")
 _PLACEHOLDER_RE = re.compile(r"\{([^{}]*)\}")
+
+#: Caps the repr of a declared tier. The default `reprlib.repr` cuts an
+#: arbitrary object's repr at 30 characters, which turns the enum member
+#: ``<VerificationTier.SESSION_ONLY: 0>`` into ``<Verification...SSION_ONLY: 0>``
+#: and hides which member was declared.
+_TIER_REPR = reprlib.Repr(maxother=80, maxstring=80)
 
 
 class WriteSeamViolation(RuntimeError):
@@ -100,9 +107,10 @@ class WriteOperation:
             )
         if not isinstance(self.tier, VerificationTier) or self.tier < VerificationTier.APP_APPROVAL:
             raise ValueError(
-                f"write operation {self.tool_name!r} declares tier {self.tier!r}; a write "
-                "operation declares VerificationTier.APP_APPROVAL (1) or "
-                "VerificationTier.APP_IDENTITY_VERIFICATION (2)"
+                f"write operation {self.tool_name!r} declares tier "
+                f"{_TIER_REPR.repr(self.tier)} ({type(self.tier).__qualname__}); a write "
+                "operation declares a VerificationTier member, APP_APPROVAL or "
+                "APP_IDENTITY_VERIFICATION"
             )
         if not self.audience:
             raise ValueError(f"write operation {self.tool_name!r} declares no audience")

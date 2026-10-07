@@ -122,3 +122,13 @@ sent that is not PAN- or IBAN-shaped; a tool description is text the model treat
 as instruction; a mis-declared consent domain gates a tool on the wrong customer
 decision; a module that never records records leaves ZT-5's budget blind to bulk
 extraction through it.
+
+## Amendment, 7 October 2026: the tier is read at approval, and validated at construction
+
+The line above saying `WriteOperation.tier` "is read only by the surface file
+today" went stale on 6 October 2026: `check_tier` in `services/confirm/tier_proof.py`
+compares each stored challenge row's tier with the declared one on every
+approval. Since 7 October 2026 `WriteOperation` also refuses, on construction, a
+tier that is not `VerificationTier.APP_APPROVAL` or `APP_IDENTITY_VERIFICATION`,
+so a module declaring tier 0, a bare int, `None` or a string fails to load as a
+`WriteSeamViolation` instead of disabling the floor or failing at an approval.

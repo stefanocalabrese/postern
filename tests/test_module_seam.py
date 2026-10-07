@@ -486,6 +486,32 @@ def test_a_write_operation_refuses_a_tier_that_is_not_one_or_two(tier: Any) -> N
 
 
 @pytest.mark.parametrize(
+    ("tier", "type_name"),
+    [(2, "int"), (True, "bool"), ("2", "str"), (VerificationTier.SESSION_ONLY, "VerificationTier")],
+)
+def test_the_tier_refusal_names_the_type_of_what_was_declared(tier: Any, type_name: str) -> None:
+    """A bare 2 and `APP_IDENTITY_VERIFICATION` print alike, so the message must
+    say which one was declared or it reads as contradicting itself."""
+    with pytest.raises(ValueError, match="tier") as caught:
+        WriteOperation(
+            tool_name="x.y", audience="a.svc", path_template="/x", method="POST", tier=tier
+        )
+    assert f"({type_name})" in str(caught.value)
+
+
+def test_a_write_operation_checks_the_tool_name_before_the_tier() -> None:
+    """Both wrong: the tool-name refusal is the one raised, which pins the order."""
+    with pytest.raises(ValueError, match="not a usable tool name"):
+        WriteOperation(
+            tool_name="Bad Name",
+            audience="a.svc",
+            path_template="/x",
+            method="POST",
+            tier=None,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
     ("tier", "value"),
     [(VerificationTier.APP_APPROVAL, 1), (VerificationTier.APP_IDENTITY_VERIFICATION, 2)],
 )
@@ -525,7 +551,7 @@ def test_a_module_declaring_a_bad_tier_is_refused_at_load(installed: Path) -> No
         """,
         entry_points={WRITE_GROUP: {"badtier": "fixture_module_bad_tier_write:MODULE"}},
     )
-    with pytest.raises(WriteSeamViolation, match="badtier.do"):
+    with pytest.raises(WriteSeamViolation, match=r"badtier\.do.*declares tier.*SESSION_ONLY"):
         load_write_modules()
 
 
