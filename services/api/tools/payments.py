@@ -20,6 +20,9 @@ check, even where `build_server` gives the read tools its no-auth stand-in.
 With no verified token the check refuses, so a server without customer auth
 lists these tools to nobody.
 
+A BACKEND 403 IS A 404 HERE, as in `not_found.py`: a foreign payer account or
+payee must read exactly as an unknown one, whatever the backend answers.
+
 EVERY REFUSAL IS A FIXED STRING raised as `ToolError`, which FastMCP 4.0.3
 renders as an `isError` result whose one text block is exactly that string.
 Any other exception reaches the client as "Error calling tool" followed by its
@@ -58,6 +61,7 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from services.api.consent import consent_for
+from services.api.tools.not_found import NOT_FOUND_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -226,13 +230,13 @@ def build_create_payment(
         try:
             balance = await accounts_facade.get_balance(backend, customer, from_account_ref)
         except BackendError as exc:
-            if exc.status == 404:
+            if exc.status in NOT_FOUND_STATUSES:
                 raise ToolError(ACCOUNT_NOT_FOUND) from None
             raise
         try:
             payee = await payments_facade.get_payee(backend, customer, payee_ref)
         except BackendError as exc:
-            if exc.status == 404:
+            if exc.status in NOT_FOUND_STATUSES:
                 raise ToolError(PAYEE_NOT_FOUND) from None
             raise
         currency = balance.amount.currency

@@ -23,7 +23,7 @@ against the real stub and against a backend that answers 403.
 `from None` drops the `BackendError`, whose text is the scrubbed backend body.
 
 `payments.py` keeps its own sentences (``account not found``, ``payee not
-found``) for the same mapping on its own refs.
+found``) and maps the same `NOT_FOUND_STATUSES` (403 and 404) on its own refs.
 """
 
 from collections.abc import AsyncIterator
@@ -33,7 +33,8 @@ from fastmcp.exceptions import ToolError
 from postern_core.facade.client import BackendError
 
 NOT_FOUND = "not found"
-_NOT_FOUND_STATUSES = frozenset({403, 404})
+#: Public: `tools/payments.py` maps the same two statuses to its own sentences.
+NOT_FOUND_STATUSES = frozenset({403, 404})
 
 
 @asynccontextmanager
@@ -42,6 +43,6 @@ async def not_found_is_a_fixed_refusal() -> AsyncIterator[None]:
     try:
         yield
     except BackendError as exc:
-        if exc.status in _NOT_FOUND_STATUSES:
+        if exc.status in NOT_FOUND_STATUSES:
             raise ToolError(NOT_FOUND) from None
         raise

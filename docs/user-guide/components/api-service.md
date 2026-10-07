@@ -143,7 +143,7 @@ They live in `services/api/tools/payments.py` and are not a module.
 Refusals are fixed strings: `account not found`, `payee not found`, `amount must be a
 positive decimal with at most 4 decimal places`, `reference is limited to 140 characters`,
 `reference may contain only printable characters`, `challenge not found`,
-`the payment could not be recorded`, `the payment status could not be read`. An `approved`
+`the payment could not be recorded`, `the payment status could not be read`. `account not found` and `payee not found` answer a backend 404 and a backend 403 alike, as the read tools' `not found` does, so a payer account or payee that belongs to another customer reads exactly as an unknown one (`tests/test_payments_not_found.py`). Any other backend status stays masked as `Error calling tool`. An `approved`
 status means the customer approved; it does not mean the bank executed the payment, and it does not necessarily mean the bank refused it: the bank may have refused it, execution may still be in flight, the outcome may be unknown, or the bank may have accepted it while recording `executed` failed (the confirm service's 202 `accepted_unrecorded`). For an `approved` status the tool description tells the model not to propose the same payment again unless the customer asks directly in the conversation, and to tell the customer the outcome is unconfirmed.
 
 ### Tool handler pattern
