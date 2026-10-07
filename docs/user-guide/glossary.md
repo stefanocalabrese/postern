@@ -272,7 +272,7 @@ Three levels of customer verification:
 |------|------|-------------|
 | 0 | `SESSION_ONLY` | Session token only. Read operations. |
 | 1 | `APP_APPROVAL` | Device-bound key + PIN/biometric. Tier-1 operations. |
-| 2 | `APP_IDENTITY_VERIFICATION` | Tier 1 plus server-side selfie matching with liveness. Tier-2 operations. |
+| 2 | `APP_IDENTITY_VERIFICATION` | Tier 1 plus server-side selfie matching with liveness. Tier-2 operations. For a tier-2 challenge this repository enforces four claims in the banking-app assertion (`idv`, `challenge_id`, `jti`, `auth_time`); the selfie match is performed and vouched for by the operator's backend, which this repository cannot check (decision 0023). |
 
 ## Z
 

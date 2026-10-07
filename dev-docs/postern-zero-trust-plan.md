@@ -107,6 +107,8 @@ Ranked by severity. Detail and acceptance criteria in §4.
 | **Malicious insider** with Vault access | Can mint tokens for any subject |
 | **Compromised backend service** | Whatever that service can reach |
 
+**Note, 7 October 2026, on the stolen-device row:** "cannot pass tier-2 identity verification" holds only as far as the app backend refuses to mint the verification claims. For a tier-2 challenge this repository checks four claims in the banking-app assertion (`idv`, `challenge_id`, `jti`, `auth_time`) and cannot check the selfie match behind them; decision record 0023 has the rule and what it leaves to the backend.
+
 ### 3.2 Attack scenarios and current coverage
 
 | # | Scenario | Current mitigation | Residual |

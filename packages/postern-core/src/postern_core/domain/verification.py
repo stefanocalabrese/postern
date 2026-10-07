@@ -108,6 +108,12 @@ class Challenge:
     payload sent to the phone is built server-side from this stored row,
     never re-sent or re-specified by the agent.
 
+    This dataclass is not used by the approval callback, which works on the
+    stored ``ChallengeRecord`` row. The tier-2 rule enforced at approval is
+    ``services/confirm/tier_proof.py`` (four claims of the banking-app
+    assertion; decision record 0023), not the ``approve`` check below, which
+    only requires a non-empty ``verification_result`` argument.
+
     Attributes:
         challenge_id: Opaque unique identifier. The idempotency key for
             ``create_payment`` — calling again with identical parameters
@@ -191,7 +197,12 @@ class Challenge:
         Args:
             device_id: The confirming device identifier.
             signature: Device-bound key signature over the payload.
-            verification_result: Tier-2 verification reference (selfie match).
+            verification_result: Opaque reference recorded with the approval.
+                This model is NOT what the approval callback runs: the
+                callback in ``services/confirm`` enforces tier 2 through
+                ``services/confirm/tier_proof.py``, which reads claims of the
+                banking-app assertion and stores its ``jti`` (decision record
+                0023). The check below is this dataclass's own, older rule.
 
         Returns:
             A new ``Challenge`` with updated state.

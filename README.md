@@ -27,7 +27,10 @@ work safely across machines:
   hard-fail the call and end the session
 - **Three-tier verification** — `SESSION_ONLY` (reads) → `APP_APPROVAL`
   (device-bound key + PIN/biometric) → `APP_IDENTITY_VERIFICATION` (tier 1 plus
-  server-side selfie matching with liveness)
+  server-side selfie matching with liveness). For a tier-2 challenge this repository
+  enforces four claims in the banking-app assertion (`idv`, `challenge_id`, `jti`,
+  `auth_time`); the selfie match itself is performed and vouched for by the operator's
+  backend, which this repository cannot check (decision 0023)
 - **Fail-closed auditing** — every tool call writes two rows (entry before backend
   touch, completion after); a failed audit write fails the call
 - **Key split architecture** — read and write keys are completely separate,

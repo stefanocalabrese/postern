@@ -151,7 +151,9 @@ was found by reading the code, not by a test.
 THE CONSTANTS ARE THE SAME ON BOTH PATHS, deliberately, though the two
 argument trees are nothing alike -- the read path's is an agent's arbitrary
 `tools/call` arguments, the write path's is five fixed keys of which two
-are caller-supplied. The deciding reason is not the trees, it is the table:
+are caller-supplied (six on a tier-2 approval row, which also carries
+`assertion_jti`, a validated value from the verified assertion). The
+deciding reason is not the trees, it is the table:
 `services/confirm/audit.py`'s module docstring records that NO COLUMN OF
 `audit_log` NAMES THE SERVICE THAT WROTE THE ROW, so a query filtering
 `arguments @> '{"postern.arguments_truncated": {}}'` returns both services'
@@ -166,8 +168,10 @@ whole legitimate tree is `route` (a 33-character constant),
 longer can name no challenge that exists), `signature_present` (a boolean),
 and the app's own `confirming_device` and `verification_result` --
 `challenges.confirming_device` is `String(128)`, which is inside
-`MAX_ARGUMENT_VALUE` with 384 characters to spare. A maximal legitimate
-write-path tree is under 300 bytes against an 8,192-byte bound.
+`MAX_ARGUMENT_VALUE` with 384 characters to spare. (A tier-2 approval row
+adds `assertion_jti`, at most 128 printable characters.) A maximal
+legitimate write-path tree is under 300 bytes against an 8,192-byte bound
+for the five keys, and about 150 bytes more with `assertion_jti`.
 """
 
 import json
@@ -322,7 +326,7 @@ MAX_ARGUMENTS_BYTES = 8_192
 # unambiguously -- `WHERE arguments @> '{"postern.arguments_truncated":
 # true}'` -- and so it does not collide with an argument name any tool in
 # this repository declares, or with any of the five keys the write path's
-# tree carries.
+# tree carries (or the sixth, `assertion_jti`, on a tier-2 approval row).
 #
 # It is NOT unforgeable, and that limit is the same one `TRUNCATED`'s own
 # comment states for itself: an argument name is arbitrary client-chosen
@@ -332,8 +336,9 @@ MAX_ARGUMENTS_BYTES = 8_192
 # forgery buys is a row that overstates its own loss, never one that
 # understates it: a row that really was capped always carries this key,
 # because the capped tree is built by `cap_arguments` and contains nothing
-# else. The write path is immune to even that, since its five keys are named
-# by this repository and not by the caller.
+# else. The write path is immune to even that, since its five keys (six with
+# `assertion_jti` on a tier-2 row) are named by this repository and not by
+# the caller.
 ARGUMENTS_TRUNCATED_KEY = "postern.arguments_truncated"
 
 # Room held back from `MAX_ARGUMENTS_BYTES` for the marker itself, so the
@@ -417,8 +422,9 @@ def clip_tree(value: Any) -> Any:
     distinct keys can clip onto the same string and one then wins the dict
     comprehension -- the same collision `scrub_tree` already documents for
     masking, accepted here for the same reason and now reachable one
-    additional way. The write path's five keys are fixed literals, so that
-    collision is reachable only inside a caller-supplied sub-tree there.
+    additional way. The write path's keys are fixed literals (five, and a sixth,
+    `assertion_jti`, on a tier-2 approval row), so that collision is reachable
+    only inside a caller-supplied sub-tree there.
 
     AFTER MASKING, never before, which is the ordering both services spell
     out at length for their other clamped columns: masking reaches
@@ -474,7 +480,9 @@ def cap_arguments(tree: dict[str, Any]) -> dict[str, Any]:
     builds `route`, `challenge_id`, `signature_present`,
     `confirming_device`, `verification_result` in that order, and the first
     three are small and server-chosen while the last two are the
-    caller-supplied ones. First-fit therefore keeps exactly the three that
+    caller-supplied ones. (A tier-2 approval then inserts `assertion_jti`
+    right after the three, in `_with_assertion_jti`, so it too is kept ahead
+    of the two.) First-fit therefore keeps exactly the three that
     identify the request and drops the two that carried the junk. Reordering
     that literal would silently change which fields survive an attack.
 

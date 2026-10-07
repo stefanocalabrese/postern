@@ -45,7 +45,11 @@ def upgrade() -> None:
             tier-2=300s.
         confirming_device (VARCHAR 128, nullable): device ID once approved.
         verification_result (TEXT, nullable): tier-2 selfie match reference;
-            never stores the captured image itself.
+            never stores the captured image itself. (Clarification, 7 October
+            2026: since 6 October 2026 a tier-2 row stores the ``jti`` of the
+            banking-app assertion that vouched for the verification, and the
+            selfie match itself is done by the operator's backend; see
+            decision record 0023.)
         signature (TEXT, nullable): device-bound key signature over payload.
 
     CHECK constraints enforce tier ∈ {0,1,2} and status in the five legal
