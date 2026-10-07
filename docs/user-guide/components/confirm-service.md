@@ -75,6 +75,22 @@ customer token good enough to read a balance would be good enough to approve a
 payment. Neither process can detect the collision, so it is an operator
 requirement.
 
+### Startup clock check
+
+In its lifespan confirm runs one `SELECT statement_timestamp()` through its own
+database engine, the clock that stamps a challenge's `created_at`, and compares the
+answer with its own `time.time()` at the midpoint of the query's round trip. The query
+has a 1.0 second timeout and the whole check, connect included, a 1.5 second bound.
+If the skew exceeds 5.0 seconds either way it logs one WARNING on logger
+`services.confirm.database_clock` with its direction. Database ahead of confirm:
+legitimate tier-2 approvals may be refused as the skew nears the 30 second window.
+Database behind confirm: the `auth_time` freshness window is widened by that much. A
+check that cannot be measured (database unreachable, query timed out or stalled, answer
+not a timezone-aware datetime) logs one WARNING saying so and carries on. It never
+blocks startup, runs once per worker process, and happens at boot only, so drift after
+boot is not detected. See
+[`services/confirm/database_clock.py`](../../../services/confirm/database_clock.py).
+
 ### Keys
 
 The confirm service holds the **write** key and the **session** key, and no read key.
@@ -402,11 +418,39 @@ section 12 lists what it must do.
 
 Clock caveat: the lower bound compares `auth_time`, which the app backend sets from
 its own clock, with the challenge's `created_at`, which Postgres stamped; the upper
-bound compares it with confirm's own clock. No startup check measures skew between
-confirm and Postgres. If confirm's clock lags the app backend's by more than about
+bound compares it with confirm's own clock. A startup check warns about skew between
+confirm and Postgres (see "Startup clock check" above) and nothing detects drift after
+boot. If confirm's clock lags the app backend's by more than about
 30 seconds, or the database's clock leads the backend's by more than about 30
 seconds, legitimate tier-2 approvals are refused, which is a liveness failure and
 not a safety one. Keep the three clocks within a few seconds with NTP.
+
+**Body checks and fixed error texts.** After the tier check and before the row is
+claimed (step 2d), the callback validates the body fields the claim will write.
+`confirming_device`, when present and not `null`, must be a string of 1 to 128
+characters; for a tier-1 row `verification_result`, when present and not `null`, must
+be a string (a tier-2 row ignores it and stores the assertion's `jti`). Neither may
+contain a Unicode control, format or line-separator character (categories `C*`, `Zl`
+and `Zp`). The refusals, with their `audit_log.detail`:
+
+| Case | Response | `detail` |
+|---|---|---|
+| Body field malformed (step 2d) | 400 `invalid_request`, "`<field>` is not a well formed value", naming the field and never echoing the value | `body_field_invalid` |
+| Body is not a JSON object, or holds JSON `NaN`, `Infinity` or `-Infinity` | 400 `invalid_request`, "body must be a JSON object" | `malformed_body` |
+| `signature` missing, empty or not a string | 400 `invalid_request`, "signature is required" | `missing_signature` |
+| Path challenge id outside `[A-Za-z0-9_-]{1,36}` | the same 404 `not_found` body as an unknown id, no database lookup | `challenge_not_found` |
+| The claiming update raised | 500 `internal_error`, "the approval could not be recorded" | the exception type |
+| `resolve_endpoint` refused the claimed row | 500 `internal_error`, "the approved operation could not be set up" | the exception type |
+
+Ordering: step 2d runs after the revocation, ownership, signature and tier checks, so
+a caller who fails any of those learns nothing from the 400, and it runs before the
+claim's status and deadline test. A refused body leaves the row `pending`; an expired
+row with a bad body gets this 400 and is not retired (with a good body it gets 410 and
+the expiry transition), and an `executed` row with a bad body gets 400, not 409. No
+exception's text reaches a response, an audit row or an application log line, only its
+type. `NaN` and its two siblings are refused when the body is parsed, and an audit
+row cannot fail on a non-finite number because the row's argument tree turns one into
+a string.
 
 What this does **not** establish: that a human looked at the payment, or that
 the phone itself is uncompromised. Both depend on the device's secure element

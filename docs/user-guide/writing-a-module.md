@@ -134,7 +134,9 @@ approval and the default for writes; tier 2 adds server-side identity
 verification and is for payments, new payees, high value and limit increases.
 `tier` must be `VerificationTier.APP_APPROVAL` or
 `VerificationTier.APP_IDENTITY_VERIFICATION`; a module declaring anything else
-(tier 0, a bare int, `None`, a string) fails to load with the seam error.
+(tier 0, a bare int, `None`, a string) fails to load with the seam error. The other
+four fields, `tool_name`, `audience`, `path_template` and `method`, must be strings:
+a `WriteOperation` built with any other type raises `ValueError` at construction.
 
 ## What the host gives you, and what it takes
 
