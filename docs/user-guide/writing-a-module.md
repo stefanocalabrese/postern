@@ -132,6 +132,9 @@ handler.
 or minting raises. `tier` is declared, never derived from `method`: tier 1 is app
 approval and the default for writes; tier 2 adds server-side identity
 verification and is for payments, new payees, high value and limit increases.
+`tier` must be `VerificationTier.APP_APPROVAL` or
+`VerificationTier.APP_IDENTITY_VERIFICATION`; a module declaring anything else
+(tier 0, a bare int, `None`, a string) fails to load with the seam error.
 
 ## What the host gives you, and what it takes
 

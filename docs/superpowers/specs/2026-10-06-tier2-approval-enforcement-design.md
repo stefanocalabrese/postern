@@ -61,7 +61,7 @@ Required tier. `declared = WRITE_OPERATIONS[row.tool_name].tier` when the tool i
 |---|---|
 | 1 | Unchanged. The body's `verification_result` and `confirming_device` are stored as today |
 | 2 | The proof below. The body's `verification_result` is ignored; the stored `verification_result` is the assertion's `jti` |
-| 0 | Refused with 403, `tier_unsupported`, row stays `pending`. Tier 0 is a read tier, no producer creates a tier-0 write row, and the column's CHECK allows 0, so the callback must say what it does with one. A `WriteOperation` that declared tier 0 would become unapprovable; none does (every declared tier is 1 or 2). Because the tier-mismatch check runs first, a tier-0 row is refused as `tier_mismatch` whenever its tool is declared, so `tier_unsupported` is reachable only for a tool confirm does not declare |
+| 0 | Refused with 403, `tier_unsupported`, row stays `pending`. Tier 0 is a read tier, no producer creates a tier-0 write row, and the column's CHECK allows 0, so the callback must say what it does with one. A `WriteOperation` can no longer declare tier 0: construction refuses a tier that is not `APP_APPROVAL` or `APP_IDENTITY_VERIFICATION`, so a tier-0 row of a declared operation is always a `tier_mismatch`. Because the tier-mismatch check runs first, a tier-0 row is refused as `tier_mismatch` whenever its tool is declared, so `tier_unsupported` is reachable only for a tool confirm does not declare |
 
 The proof for tier 2, with `claims = verified_claims(request)` and `expected = settings.idv_value`:
 

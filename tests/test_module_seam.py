@@ -462,6 +462,73 @@ def test_a_write_operation_refuses_a_relative_path_template() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "tier",
+    [None, "2", 3, True, 2, 1.0, VerificationTier.SESSION_ONLY, 0],
+    ids=["none", "string", "three", "bool", "bare-int", "float", "session-only", "zero"],
+)
+def test_a_write_operation_refuses_a_tier_that_is_not_one_or_two(tier: Any) -> None:
+    """`tier` was annotated and never checked. Tier 0 silently disabled the
+    tier floor for the tool, None and a string made the approval raise
+    TypeError at the one approval that reached them, and 3 refused every
+    approval. Only a `VerificationTier` member of value 1 or 2 constructs: a
+    bool, a bare int and a float all compare like a tier and are not one.
+    """
+    with pytest.raises(ValueError, match="tier") as caught:
+        WriteOperation(
+            tool_name="x.y",
+            audience="a.svc",
+            path_template="/x",
+            method="POST",
+            tier=tier,
+        )
+    assert "'x.y'" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("tier", "value"),
+    [(VerificationTier.APP_APPROVAL, 1), (VerificationTier.APP_IDENTITY_VERIFICATION, 2)],
+)
+def test_a_write_operation_accepts_tier_one_and_two(tier: VerificationTier, value: int) -> None:
+    operation = WriteOperation(
+        tool_name="x.y",
+        audience="a.svc",
+        path_template="/x",
+        method="POST",
+        tier=tier,
+    )
+    assert operation.as_dict()["tier"] == value
+
+
+def test_a_module_declaring_a_bad_tier_is_refused_at_load(installed: Path) -> None:
+    """The entry point's import raises the `ValueError`; `_load` wraps it."""
+    _write_distribution(
+        installed,
+        dist_name="fixture-bad-tier-write",
+        module_name="fixture_module_bad_tier_write",
+        source="""
+        from postern_core.domain.verification import VerificationTier
+        from postern_core.modules.write import WriteModule, WriteOperation
+
+        MODULE = WriteModule(
+            name="badtier",
+            operations=(
+                WriteOperation(
+                    tool_name="badtier.do",
+                    audience="badtier.svc",
+                    path_template="/x",
+                    method="POST",
+                    tier=VerificationTier.SESSION_ONLY,
+                ),
+            ),
+        )
+        """,
+        entry_points={WRITE_GROUP: {"badtier": "fixture_module_bad_tier_write:MODULE"}},
+    )
+    with pytest.raises(WriteSeamViolation, match="badtier.do"):
+        load_write_modules()
+
+
 def test_a_read_tool_name_must_be_dotted_and_lowercase() -> None:
     with pytest.raises(ValueError, match="tool name"):
         ReadTool(name="Cards List", consent_domain="cards", build=_noop_build)

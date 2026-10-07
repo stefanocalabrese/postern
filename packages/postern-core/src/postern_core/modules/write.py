@@ -23,7 +23,8 @@ tier on the tool definition. Never derive it from the HTTP verb." A module
 declaring ``method="POST"`` for a large search body and ``method="PATCH"`` for a
 rename says nothing about how hard the customer has to confirm; the tier does,
 and `tool-surface.json` records it so a module raising its own operation from
-tier 2 to tier 1 shows up in a diff.
+tier 2 to tier 1 shows up in a diff. The tier must be 1 or 2 and is validated
+on construction of the `WriteOperation`.
 """
 
 from __future__ import annotations
@@ -79,7 +80,10 @@ class WriteOperation:
             from the stored challenge payload and from nothing else.
         method: One of `WRITE_METHODS`.
         tier: The verification tier this operation requires. Declared, never
-            derived from ``method``.
+            derived from ``method``. It must be
+            ``VerificationTier.APP_APPROVAL`` or
+            ``VerificationTier.APP_IDENTITY_VERIFICATION``, and construction
+            refuses anything else.
     """
 
     tool_name: str
@@ -93,6 +97,12 @@ class WriteOperation:
             raise ValueError(
                 f"{self.tool_name!r} is not a usable tool name: lowercase letters, "
                 "digits and underscores, at most one dot (e.g. 'cards.freeze_card')"
+            )
+        if not isinstance(self.tier, VerificationTier) or self.tier < VerificationTier.APP_APPROVAL:
+            raise ValueError(
+                f"write operation {self.tool_name!r} declares tier {self.tier!r}; a write "
+                "operation declares VerificationTier.APP_APPROVAL (1) or "
+                "VerificationTier.APP_IDENTITY_VERIFICATION (2)"
             )
         if not self.audience:
             raise ValueError(f"write operation {self.tool_name!r} declares no audience")
