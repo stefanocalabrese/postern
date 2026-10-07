@@ -191,6 +191,7 @@ __all__ = [
     "DETAIL_DEVICE_CODE_NOT_FOUND",
     "DETAIL_DEVICE_CODE_SPENT",
     "DETAIL_DEVICE_NOT_ENROLLED",
+    "DETAIL_EXECUTED_UNRECORDED",
     "DETAIL_EXPIRED",
     "DETAIL_ISSUANCE_DISABLED",
     "DETAIL_INVALID_SUBJECT",
@@ -292,6 +293,14 @@ DETAIL_ALREADY_TERMINAL = "already_terminal"
 DETAIL_EXPIRED = "expired"
 DETAIL_CHALLENGE_VANISHED = "challenge_vanished"
 DETAIL_UPDATE_MATCHED_NO_ROW = "update_matched_no_row"
+#: The backend accepted the write and the ``approved -> executed`` record
+#: failed on every attempt (or the row was no longer ``approved`` on the first).
+#: The challenge row says ``approved``, which a 207 refusal also leaves, so this
+#: is the label that tells "the backend accepted" from "the backend refused".
+#: The completion row is ``raised`` with this detail and pairs with the
+#: ``reaching`` row; reconcile with the backend by ``Idempotency-Key`` =
+#: challenge id.
+DETAIL_EXECUTED_UNRECORDED = "executed_unrecorded"
 #: THE FOUR THE TIER CHECK OWNS (decision record 0023), each decided after the
 #: device signature verified and before the claim, so none of them moves the
 #: challenge. The caller sees two codes for the first two and one each for the

@@ -362,7 +362,11 @@ Handles verification challenge approvals for write operations (payments, card wr
 - d. Validates state (must be "pending" + not expired)
 - e. Marks challenge as "approved" in Postgres
 - f. Executes backend write endpoint server-side (POST to payments.svc)
-- g. Marks challenge as "executed"
+- g. Marks challenge as "executed". The backend has accepted the write by now, so this
+  record is attempted up to 3 times, each on a fresh database session, with 0.1 s and
+  0.3 s pauses between attempts. The backend is never called again. If all three fail,
+  or the row is no longer `approved` on the first attempt, the answer is the 202 in
+  "The 202 `accepted_unrecorded` response" below.
 
 Step (c) returns the **same 404 body** as an unknown challenge id, deliberately:
 a distinct 403 would be an existence oracle for ids that travel back through the
@@ -441,6 +445,27 @@ and `Zp`). The refusals, with their `audit_log.detail`:
 | Path challenge id outside `[A-Za-z0-9_-]{1,36}` | the same 404 `not_found` body as an unknown id, no database lookup | `challenge_not_found` |
 | The claiming update raised | 500 `internal_error`, "the approval could not be recorded" | the exception type |
 | `resolve_endpoint` refused the claimed row | 500 `internal_error`, "the approved operation could not be set up" | the exception type |
+
+**The 202 `accepted_unrecorded` response.** Not a refusal: the backend accepted the
+write (money may have moved) and recording `approved -> executed` failed on every
+attempt:
+
+```json
+{"challenge_id": "<id>", "status": "approved", "execution": "accepted_unrecorded",
+ "message": "the backend accepted the operation but recording it failed; do not retry, it will be reconciled"}
+```
+
+The row stays `approved`, which a 207 backend refusal also leaves, and the completion
+`audit_log` row is `raised` with `detail` `executed_unrecorded`, paired with the
+`reaching` row. **A caller must never retry a 202.** The repository documents no
+backend dedupe behind the `Idempotency-Key` it sends, so a second approval attempt
+(which would be refused 409 `already_terminal` anyway) or any re-drive risks paying
+twice. What an operator does: find the challenge id in the ERROR log line "the backend
+accepted ... and recording it as executed failed", join the two `audit_log` rows by
+`call_id` for that challenge, ask the payments backend what it did for the
+`Idempotency-Key` equal to the challenge id, then settle the `challenges` row by hand.
+Nothing reconciles it automatically. If the completion audit row also cannot be
+written, the request fails with a bare 500 instead (decision 0006).
 
 Ordering: step 2d runs after the revocation, ownership, signature and tier checks, so
 a caller who fails any of those learns nothing from the 400, and it runs before the

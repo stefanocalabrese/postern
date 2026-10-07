@@ -340,6 +340,8 @@ Anything else is refused with 403 `verification_required` and a fixed descriptio
 - `verification_result`, for a tier-1 challenge, if sent, is a string under the same character rule. For a tier-2 challenge it is ignored (the stored value is the assertion's `jti`) and not validated.
 - The path `challenge_id` is the id the server issued, 1 to 36 of `A-Za-z0-9_-`; anything else gets the 404 an unknown id gets.
 
+A 202 with `"execution": "accepted_unrecorded"` means the payment was accepted by the backend and the server failed to record it. The app must show it as accepted, must not retry, and must not offer the customer a retry. The operator reconciles it.
+
 A 500 from this endpoint carries one of two fixed texts, "the approval could not be recorded" or "the approved operation could not be set up", and no detail the app can act on.
 
 Nothing in this repository verifies that the match happened, that `auth_time` is true, that the `jti` is unique, or the order of events; the operator's backend owns all of them. The lower bound is measured against the database's clock and the upper bound against confirm's, while the backend sets `auth_time` from its own, so keep all three within a few seconds. If confirm's clock lags the app backend's by more than about 30 seconds, or the database's clock leads the backend's by more than about 30 seconds, legitimate tier-2 approvals are refused: a liveness failure, not a safety one. How the app asks its backend for a tier-2 assertion, and what that backend accepts as input, is not established here and is not part of this contract.

@@ -29,6 +29,18 @@ Response format::
         "message": "<human-readable summary>"
     }
 
+The one other success-shaped answer is HTTP 202, sent when the backend accepted
+the write and recording ``executed`` failed on every attempt::
+
+    {
+        "challenge_id": "...",
+        "status": "approved",
+        "execution": "accepted_unrecorded",
+        "message": "the backend accepted the operation but recording it failed; ..."
+    }
+
+A caller must never retry a 202: the money may already have moved.
+
 The confirmation payload is built server-side from the stored challenge
 row — never re-sent or re-specified by the agent (handoff §6.3).
 
@@ -108,6 +120,7 @@ that reaches neither this handler nor the table.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -128,6 +141,7 @@ from services.confirm.audit import (
     DETAIL_CHALLENGE_NOT_FOUND,
     DETAIL_CHALLENGE_NOT_OWNED,
     DETAIL_CHALLENGE_VANISHED,
+    DETAIL_EXECUTED_UNRECORDED,
     DETAIL_EXPIRED,
     DETAIL_MALFORMED_BODY,
     DETAIL_MISSING_SIGNATURE,
@@ -208,11 +222,12 @@ async def approve_challenge(request: Request) -> JSONResponse:
     audit write that fails fails the request, which means a failed completion
     write turns a 200 into a 500 AFTER the backend write succeeded and the
     money moved. That is deliberate and it is the same bargain the read path
-    already makes (it fails a call whose tool returned). What makes it safe to
-    retry is the ``Idempotency-Key: <challenge_id>`` header
-    ``BackendWriteClient`` sends, plus the ``approved -> executed`` transition
-    being conditional: the backend sees the same key and the row is already
-    out of ``pending``. Do not "fix" this into a logged warning.
+    already makes (it fails a call whose tool returned). Retrying is NOT safe
+    on that evidence: ``BackendWriteClient`` sends ``Idempotency-Key:
+    <challenge_id>`` but this repository documents no dedupe behind it and no
+    code here calls the backend twice. The only retry in this function is of
+    the local ``approved -> executed`` record (``_record_executed``). Do not
+    "fix" the audit failure into a logged warning.
     """
     # FIRST TWO STATEMENTS, before anything is inspected. `at` is a wall clock
     # because it has to be comparable with `reaching_at`; `started` is
@@ -731,47 +746,6 @@ async def _approve(
             finally:
                 await write_client.aclose()
 
-            # Mark as executed on success. Conditional on ``approved`` like
-            # every other transition, and deliberately NOT conditional on the
-            # deadline: the money has moved, so a clock that ran out while the
-            # backend was answering must not be able to strand the row in
-            # ``approved`` and leave the execution unrecorded.
-            executed = await update_challenge_status(
-                session,
-                challenge_id,
-                status="executed",
-                expected_status="approved",
-            )
-            if executed is None:
-                # Unreachable while this handler is the only writer of the
-                # approved -> executed edge: nothing else moves a row out of
-                # ``approved``. Logged rather than returned, because the
-                # backend write already succeeded and the caller must not be
-                # told otherwise -- what is wrong here is the audit trail, and
-                # silence is how that goes unnoticed.
-                logger.error(
-                    "challenge %s executed at the backend but was not in 'approved' "
-                    "when the executed transition ran; the row does not record the "
-                    "execution",
-                    challenge_id,
-                )
-            await session.commit()
-
-            # THE ONLY EXIT THAT RECORDS `returned`. It is reached when, and
-            # only when, the backend accepted the write, so `outcome` on this
-            # row means the money moved -- not that the server answered.
-            return (
-                _json(
-                    200,
-                    {
-                        "challenge_id": challenge_id,
-                        "status": "executed",
-                        "message": f"{updated.tool_name} executed successfully",
-                    },
-                ),
-                None,
-            )
-
         except BackendWriteError as exc:
             # Execution failed — challenge is approved but not executed.
             # The backend may have partially processed the request; audit trail
@@ -816,6 +790,103 @@ async def _approve(
                 _error(500, "internal_error", EXECUTION_SETUP_FAILED_DESCRIPTION),
                 type(exc).__name__,
             )
+
+        # REACHED ONLY WHEN THE BACKEND ACCEPTED THE WRITE: both `except` arms
+        # above return. Outside the `try` on purpose, so a `ValueError` raised
+        # while recording the transition below cannot be filed as "could not
+        # be set up" by the arm above, which would say nothing was reached.
+        #
+        # Mark as executed. Conditional on ``approved`` like every other
+        # transition, and deliberately NOT conditional on the deadline: the
+        # money has moved, so a clock that ran out while the backend was
+        # answering must not be able to strand the row in ``approved``.
+        if not await _record_executed(db, challenge_id):
+            # The backend accepted and the row still says `approved`. Never
+            # re-drive the backend from here: this repository documents no
+            # dedupe behind the `Idempotency-Key` it sends, so a second call
+            # may move the money twice. This is the line an operator
+            # reconciles from, and it carries no exception text, no payload
+            # and no customer reference.
+            logger.error(
+                "challenge %r: the backend accepted %s and recording it as executed "
+                "failed; the row stays 'approved', do not retry, reconcile by hand",
+                challenge_id,
+                updated.tool_name,
+            )
+            return (
+                _json(
+                    202,
+                    {
+                        "challenge_id": challenge_id,
+                        "status": "approved",
+                        "execution": "accepted_unrecorded",
+                        "message": EXECUTED_UNRECORDED_MESSAGE,
+                    },
+                ),
+                DETAIL_EXECUTED_UNRECORDED,
+            )
+
+        # THE ONLY EXIT THAT RECORDS `returned`. It is reached when, and
+        # only when, the backend accepted the write, so `outcome` on this
+        # row means the money moved -- not that the server answered.
+        return (
+            _json(
+                200,
+                {
+                    "challenge_id": challenge_id,
+                    "status": "executed",
+                    "message": f"{updated.tool_name} executed successfully",
+                },
+            ),
+            None,
+        )
+
+
+async def _record_executed(db: Database, challenge_id: str) -> bool:
+    """Record ``approved -> executed`` after the backend accepted; ``True`` if it landed.
+
+    Up to ``EXECUTED_RECORD_ATTEMPTS`` attempts, each on its OWN session from
+    ``db.sessionmaker()`` (the approval's session may be poisoned by whatever
+    failed) and each committing inside the attempt, so at most one pooled
+    connection is held at a time. THIS NEVER CALLS THE BACKEND: the retry is of
+    the local record only. The ``UPDATE`` is conditional on ``approved``, so a
+    repeat after an attempt that committed but failed on the way back matches
+    no row; ``None`` after an earlier failure therefore means that attempt
+    landed and counts as success, while ``None`` on the FIRST attempt means
+    the row was not in ``approved`` (something else moved it) and is not
+    retried.
+
+    ``Exception`` per attempt and never ``BaseException``: a cancellation, in
+    a query or in the sleep between attempts, must propagate. Failures are
+    logged by exception TYPE only, since a driver error carries its SQL and
+    bound parameters.
+    """
+    for attempt in range(1, EXECUTED_RECORD_ATTEMPTS + 1):
+        if attempt > 1:
+            await asyncio.sleep(EXECUTED_RECORD_BACKOFF_SECONDS[attempt - 2])
+        try:
+            async with db.sessionmaker() as attempt_session:
+                executed = await update_challenge_status(
+                    attempt_session,
+                    challenge_id,
+                    status="executed",
+                    expected_status="approved",
+                )
+                await attempt_session.commit()
+        except Exception as exc:
+            logger.warning(
+                "challenge %r: recording the executed transition failed on attempt %d of %d: %s",
+                challenge_id,
+                attempt,
+                EXECUTED_RECORD_ATTEMPTS,
+                type(exc).__name__,
+            )
+            continue
+        if executed is not None:
+            return True
+        # Matched no row. After a failed earlier attempt, that attempt landed.
+        return attempt > 1
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +1044,15 @@ async def _refused_transition_response(
 #: error carries the statement and its bound parameters.
 APPROVAL_UPDATE_FAILED_DESCRIPTION = "the approval could not be recorded"
 EXECUTION_SETUP_FAILED_DESCRIPTION = "the approved operation could not be set up"
+EXECUTED_UNRECORDED_MESSAGE = (
+    "the backend accepted the operation but recording it failed; "
+    "do not retry, it will be reconciled"
+)
+
+#: Attempts at recording ``approved -> executed`` after the backend accepted,
+#: and the pause before each repeat (so one fewer than the attempts).
+EXECUTED_RECORD_ATTEMPTS = 3
+EXECUTED_RECORD_BACKOFF_SECONDS = (0.1, 0.3)
 
 #: Line and paragraph separators (U+2028, U+2029) are `Zl` and `Zp`, outside `C*`.
 _REFUSED_CATEGORIES_EXTRA = frozenset({"Zl", "Zp"})

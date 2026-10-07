@@ -109,10 +109,10 @@ What the customer sees, per service:
   500. The challenge is untouched and still `pending`, so the phone can retry
   once the pressure clears. If instead the pool empties at the completion row
   AFTER the backend accepted the write, the customer gets a 500 for a payment
-  that went through, and the `Idempotency-Key` plus the conditional
-  `approved -> executed` transition are what make the retry safe. That
-  asymmetry is the reason this service's headroom matters more than its raw
-  number.
+  that went through. That asymmetry is the reason this service's headroom
+  matters more than its raw number. (The sentence that stood here said the
+  `Idempotency-Key` plus the conditional transition made a retry safe; see the
+  amendment of 7 October 2026 below.)
 
 ## The options, and why sizing was the answer
 
@@ -353,3 +353,26 @@ Guarded by an existing test rather than only a new one: routing the entry row
 through the reserve fails
 `tests/test_pool_sizing.py::TestAnApprovalNeverHoldsTwoPooledConnectionsAtOnce::test_a_successful_approval_completes_through_a_pool_of_one`,
 because the approval's four application-pool checkouts become three.
+
+---
+
+## Amendment, 7 October 2026: a retry of the executed record is not a retry of the payment
+
+The paragraph on `services/confirm` above said that, when the pool empties at the
+completion row after the backend accepted the write, "the `Idempotency-Key` plus the
+conditional `approved -> executed` transition are what make the retry safe". That was
+wrong on one count and misleading on another. `BackendWriteClient` sends the key, but
+this repository documents no dedupe behind it on the payments backend, and no code here
+calls the backend twice, so re-driving a payment is not known to be safe and is not
+done. The conditional transition makes a repeat of the LOCAL record safe (it matches no
+row once an earlier attempt landed), which is a different claim.
+
+What shipped is a retry of the local record only: after the backend accepts, the
+`approved -> executed` UPDATE is attempted up to 3 times, each on a fresh session
+(`EXECUTED_RECORD_ATTEMPTS`, `EXECUTED_RECORD_BACKOFF_SECONDS` in
+`services/confirm/callback.py`), one pooled connection at a time so the pool-of-one
+test still holds. When every attempt fails the caller gets 202 `accepted_unrecorded`
+and the completion audit row carries detail `executed_unrecorded`. A pool that is
+empty at that moment is one of the ways the attempts fail; the 500 for a payment that
+went through remains possible only when the completion audit row also fails
+(decision 0006).
