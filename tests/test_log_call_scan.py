@@ -4,10 +4,14 @@ The record factory (`postern_core.log_safety`) is the net. This scan is the
 plan: a log call inside `services/` or `packages/` must not hand an exception to
 the logger raw. What it treats as a log call:
 
-* `<something named like a logger>.<debug|info|warning|warn|error|exception|
-  critical|fatal|log>(...)`, where "named like a logger" means the receiver's
-  last name contains `log`, or the receiver is a `getLogger(...)` call
-  (`logging.getLogger(__name__).error(e)`);
+* `<logger>.<debug|info|warning|warn|error|exception|critical|fatal|log>(...)`,
+  where a receiver is a logger when ANY of these holds: its last name contains
+  `log`; it is a `getLogger(...)` call (`logging.getLogger(__name__).error(e)`);
+  or, by DATAFLOW, it is a name or attribute (`sink`, `self._audit`) assigned
+  anywhere in the module from `logging.getLogger(...)`, `getLogger(...)`,
+  `logging.Logger(...)`, `structlog.get_logger()` / `get_logger()`, from
+  `.getChild(...)` / `.bind(...)` of a logger, or from another such name
+  (`out = sink`, in any order);
 * `getattr(<logger>, "error")(...)`;
 * a name imported `from logging import error as report`, called as `report(...)`;
 * `warnings.warn(...)`, `print(...)` and `sys.stderr.write(...)` /
@@ -17,7 +21,7 @@ What it flags in such a call:
 
 * any argument, or keyword value, that mentions an identifier bound by an
   enclosing `except ... as X`, unless the mention sits inside a call to
-  `describe_exception`, `exc_info_for_log` or `type` (so `%s` of the exception,
+  `describe_exception`, `exc_info_for_log`, `type` or `_exception_name` (so `%s` of the exception,
   an f-string holding it, `str(X)`, `exc_info=X`, `**{"exc_info": X}` and a
   tuple or list holding it are all flagged);
 * `exc_info=True`, any other truthy constant (`exc_info=1`), and
@@ -28,13 +32,23 @@ What it flags in such a call:
 * nothing else. Arguments that merely mention a name which is not an exception
   are not looked at.
 
-THE SCAN IS HEURISTIC, and says so. It looks at names, not at types, so it
-misses a logger whose receiver is not named with `log` (`self.audit.error(e)`,
-`out = logger; out.error(e)`), an exception copied to another name before the
-call (`saved = e` then `logger.error("%s", saved)`), an exception carried in a
-container built earlier, and any call routed through a helper that logs on the
-caller's behalf. It is a net for the shapes this codebase writes, not a proof
-that no handled exception reaches a log.
+TAINT. A name assigned from the handled exception, or from a name that holds it
+(`saved = e`, `saved = e.args`, `pair, other = e, 1`, `b = a`), is treated as the
+exception from there to the end of the enclosing function (the module counts as
+one), until it is assigned from something else. An assignment through
+`describe_exception`, `exc_info_for_log`, `type` or `_exception_name` does not
+taint.
+
+THE SCAN IS STILL HEURISTIC, and says so. It looks at names and assignments, not
+at types, so it misses a logger that arrives as a parameter or an attribute
+under a name without `log` that no assignment in the module explains
+(`def f(out): out.error(e)`), an exception carried in a container built earlier
+(`items.append(e)` then `logger.error("%s", items)`), taint through a call
+(`saved = wrap(e)` is flagged, but a helper that stores `e` elsewhere is not
+followed), taint across functions, and any call routed through a helper that
+logs on the caller's behalf. `str(e)` and f-strings are flagged here and are
+the one shape the record factory cannot fix. It is a net for the shapes this
+codebase writes, not a proof that no handled exception reaches a log.
 
 THE ALLOWLIST below is explicit and every entry says why it is safe: the
 exception can never be a SQL driver error (a parse error, a Redis or Vault
@@ -58,7 +72,9 @@ ROOT = Path(__file__).resolve().parent.parent
 LOG_METHODS = frozenset(
     {"debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"}
 )
-SAFE_CALLS = frozenset({"describe_exception", "exc_info_for_log", "type"})
+#: `_exception_name` (services/confirm/callback.py) returns a type name, or the
+#: `kind` a BackendTransportError carries (a class name such as `ReadTimeout`).
+SAFE_CALLS = frozenset({"describe_exception", "exc_info_for_log", "type", "_exception_name"})
 TRACEBACK_TEXT = frozenset(
     {"format_exc", "format_exception", "format_exception_only", "format_tb", "print_exc"}
 )
@@ -138,18 +154,68 @@ def _terminal_name(node: ast.expr) -> str:
     return ""
 
 
-def _is_logger_like(node: ast.expr) -> bool:
-    """A receiver named like a logger, or a `getLogger(...)` call."""
+#: Calls whose result is a logger.
+_LOGGER_SOURCES = frozenset({"getlogger", "get_logger"})
+
+#: Methods that return another logger from a logger.
+_LOGGER_DERIVERS = frozenset({"getchild", "bind", "new", "unbind", "with_name"})
+
+
+def _is_logger_like(node: ast.expr, known: frozenset[str] = frozenset()) -> bool:
+    """A receiver that is a logger: named like one, a `getLogger(...)` call, or
+    (by dataflow) a name or attribute assigned from a logger source anywhere in
+    the module (`known`, from `_logger_names`)."""
     if isinstance(node, ast.Call):
-        return "getlogger" in _terminal_name(node.func).lower()
+        terminal = _terminal_name(node.func).lower()
+        if terminal in _LOGGER_SOURCES:
+            return True
+        if terminal == "logger" and ast.unparse(node.func) == "logging.Logger":
+            return True
+        return (
+            terminal in _LOGGER_DERIVERS
+            and isinstance(node.func, ast.Attribute)
+            and _is_logger_like(node.func.value, known)
+        )
+    if isinstance(node, ast.Name | ast.Attribute) and ast.unparse(node) in known:
+        return True
     return "log" in _terminal_name(node).lower()
 
 
-def _log_method(node: ast.Call, aliases: dict[str, str]) -> str | None:
+def _assignment_targets(node: ast.AST) -> list[ast.expr]:
+    if isinstance(node, ast.Assign):
+        return list(node.targets)
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return [node.target]
+    return []
+
+
+def _logger_names(tree: ast.AST) -> frozenset[str]:
+    """Names and attributes (`sink`, `self._audit`) assigned, anywhere in the
+    module, from a logger source, or from another such name. A fixed point, so
+    `out = sink` after `sink = logging.getLogger(...)` is found in any order."""
+    known: set[str] = set()
+    while True:
+        before = len(known)
+        for node in ast.walk(tree):
+            value = getattr(node, "value", None)
+            if value is None or not isinstance(value, ast.expr):
+                continue
+            targets = _assignment_targets(node)
+            if targets and _is_logger_like(value, frozenset(known)):
+                known.update(
+                    ast.unparse(t) for t in targets if isinstance(t, ast.Name | ast.Attribute)
+                )
+        if len(known) == before:
+            return frozenset(known)
+
+
+def _log_method(
+    node: ast.Call, aliases: dict[str, str], known: frozenset[str] = frozenset()
+) -> str | None:
     """The logging method this call is, or ``None`` if it is not a log call."""
     func = node.func
     if isinstance(func, ast.Attribute):
-        if func.attr in LOG_METHODS and _is_logger_like(func.value):
+        if func.attr in LOG_METHODS and _is_logger_like(func.value, known):
             return func.attr
         if func.attr == "warn" and _terminal_name(func.value) == "warnings":
             return "warn"
@@ -166,7 +232,7 @@ def _log_method(node: ast.Call, aliases: dict[str, str]) -> str | None:
         and len(func.args) >= 2
         and isinstance(func.args[1], ast.Constant)
         and func.args[1].value in LOG_METHODS
-        and _is_logger_like(func.args[0])
+        and _is_logger_like(func.args[0], known)
     ):
         return str(func.args[1].value)
     return None
@@ -196,16 +262,24 @@ def _renders_current_exception(value: ast.expr) -> bool:
 
 
 class _Scan(ast.NodeVisitor):
-    def __init__(self, path: str, aliases: dict[str, str]) -> None:
+    def __init__(
+        self, path: str, aliases: dict[str, str], known: frozenset[str] = frozenset()
+    ) -> None:
         self.path = path
         self.aliases = aliases
+        self.known = known
         self.bound: list[str] = []
+        # Names that hold the handled exception or something taken from it
+        # (`saved = e`), one set per function, the module being the first.
+        self.tainted: list[set[str]] = [set()]
         self.functions: list[str] = []
         self.found: list[tuple[str, str, str, str, int]] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.functions.append(node.name)
+        self.tainted.append(set())
         self.generic_visit(node)
+        self.tainted.pop()
         self.functions.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
@@ -217,8 +291,34 @@ class _Scan(ast.NodeVisitor):
         if node.name:
             self.bound.pop()
 
+    def _names(self) -> frozenset[str]:
+        return frozenset(self.bound) | frozenset(self.tainted[-1])
+
+    def _assigned(self, node: ast.Assign | ast.AnnAssign) -> None:
+        """Track `saved = e`: a name assigned from the exception, or from a name
+        that holds it, holds it too, until it is assigned something else."""
+        value = node.value
+        if value is None:
+            return
+        taints = bool(self._names()) and _mentions(value, self._names())
+        for target in _assignment_targets(node):
+            for name in ast.walk(target):
+                if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store):
+                    if taints:
+                        self.tainted[-1].add(name.id)
+                    else:
+                        self.tainted[-1].discard(name.id)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.generic_visit(node)
+        self._assigned(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.generic_visit(node)
+        self._assigned(node)
+
     def visit_Call(self, node: ast.Call) -> None:
-        method = _log_method(node, self.aliases)
+        method = _log_method(node, self.aliases, self.known)
         if method is not None:
             self._check(node, method)
         self.generic_visit(node)
@@ -228,7 +328,7 @@ class _Scan(ast.NodeVisitor):
         self.found.append((self.path, function, rule, ast.unparse(node), node.lineno))
 
     def _check(self, node: ast.Call, method: str) -> None:
-        bound = frozenset(self.bound)
+        bound = self._names()
         if method == "exception":
             self._flag("exception()", node)
         values = [*node.args, *(kw.value for kw in node.keywords)]
@@ -255,7 +355,7 @@ def _logging_aliases(tree: ast.AST) -> dict[str, str]:
 
 def violations(source: str, path: str) -> list[tuple[str, str, str, str, int]]:
     tree = ast.parse(source)
-    scan = _Scan(path, _logging_aliases(tree))
+    scan = _Scan(path, _logging_aliases(tree), _logger_names(tree))
     scan.visit(tree)
     return scan.found
 
@@ -384,6 +484,62 @@ SYNTHETIC_FLAGGED = {
     "print(traceback.format_exc())": _handled("print(traceback.format_exc())", bind=False),
     "sys.stderr.write": _handled("sys.stderr.write(str(e))"),
     "warnings.warn(str(e))": _handled("warnings.warn(str(e))"),
+    # A logger known by where it came from, not by its name.
+    "sink bound from logging.getLogger": _handled(
+        'sink.error("x %s", e)', header="sink = logging.getLogger(__name__)\n"
+    ),
+    "sink bound from a bare getLogger": _handled(
+        'sink.error("x %s", e)', header="sink = getLogger(__name__)\n"
+    ),
+    "sink bound from logging.Logger": _handled(
+        'sink.error("x %s", e)', header='sink = logging.Logger("a")\n'
+    ),
+    "sink bound from structlog.get_logger": _handled(
+        'sink.error("x %s", e)', header="sink = structlog.get_logger()\n"
+    ),
+    "annotated sink": _handled(
+        'sink.error("x %s", e)', header="sink: logging.Logger = logging.getLogger('a')\n"
+    ),
+    "self attribute bound in another method": (
+        "class A:\n"
+        "    def __init__(self):\n"
+        '        self._audit = logging.getLogger("a")\n'
+        "    def run(self):\n"
+        "        try:\n"
+        "            pass\n"
+        "        except Exception as e:\n"
+        '            self._audit.error("x", e)\n'
+    ),
+    "child logger": _handled(
+        'sink.error("x %s", e)', header='sink = logging.getLogger("a").getChild("b")\n'
+    ),
+    "logger alias": _handled(
+        'out.error("x %s", e)', header="out = logger\nlogger = logging.getLogger('a')\n"
+    ),
+    "alias of a sink": _handled(
+        'out.error("x %s", e)', header="sink = logging.getLogger('a')\nout = sink\n"
+    ),
+    "bound structlog logger": _handled(
+        'sink.error("x %s", e)',
+        header="base = structlog.get_logger()\nsink = base.bind(a=1)\n",
+    ),
+    "module-level logging.error": _handled('logging.error("x %s", e)'),
+    # Taint: the exception copied to another name.
+    "alias of the exception": (
+        "def f():\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as e:\n"
+        "        saved = e\n"
+        '    logger.error("x %s", saved)\n'
+    ),
+    "alias inside the handler": _handled('saved = e\n    logger.error("x %s", saved)'),
+    "args of the exception": _handled('saved = e.args\n    logger.error("x %s", saved)'),
+    "tuple unpack": _handled('pair, other = e, 1\n    logger.error("x %s", pair)'),
+    "alias of an alias": _handled('a = e\n    b = a\n    logger.error("x %s", b)'),
+    "alias and a sink together": _handled(
+        'saved = e\n    sink.error("x %s", saved)', header="sink = logging.getLogger('a')\n"
+    ),
 }
 
 SYNTHETIC_CLEAN = {
@@ -395,6 +551,28 @@ SYNTHETIC_CLEAN = {
     "not a logger": _handled("results.append(e)"),
     "print of a non-exception": _handled('print("done", file=out)'),
     "warnings.warn of a fixed sentence": _handled('warnings.warn("fixed")'),
+    "sink that is not a logger": _handled('sink.error("x %s", e)', header="sink = make_sink()\n"),
+    "a call on a name never bound to a logger": _handled('sink.error("x %s", e)'),
+    "alias scrubbed through describe_exception": _handled(
+        'saved = describe_exception(e)\n    logger.error("x %s", saved)'
+    ),
+    "alias to a type name": _handled('saved = type(e)\n    logger.error("x %s", saved)'),
+    "taint does not cross functions": (
+        "def f():\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as e:\n"
+        "        saved = e\n"
+        "def g(saved):\n"
+        '    logger.error("x %s", saved)\n'
+    ),
+    "an alias that is reassigned is no longer the exception": _handled(
+        'saved = e\n    saved = 1\n    logger.error("x %s", saved)'
+    ),
+    "a name assigned from something unrelated": (
+        "saved = 1\ntry:\n    pass\nexcept Exception as e:\n    other = e\n"
+        'logger.error("x %s", saved)\n'
+    ),
 }
 
 

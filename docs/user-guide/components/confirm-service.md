@@ -82,7 +82,11 @@ error can reach uvicorn's `Exception in ASGI application` line. Both database en
 and `create_confirm_app` calls `postern_core.log_safety.install_sql_safe_logging()`, which wraps the
 process-wide log record factory: for such an error every log record, on any logger, keeps the traceback
 frames and each exception's type and SQLSTATE (`client-side` for an error asyncpg raised without a server),
-and withholds the driver's message, the SQL and the parameters. For an error Postgres raised, its own log has the message, the DETAIL and the statement at the same time (with `log_min_error_statement` at its default `error`; to match on a SQLSTATE put `%e` in `log_line_prefix`, the default `%m [%p] ` carries none). Errors asyncpg raises in the client while encoding a parameter (for example `DataError`, "invalid input for query argument") never reach the server and leave no record anywhere; the sanitised line says `client-side` for them. Postgres' log then holds the values these logs withhold (DETAIL `Failing row contains (...)`): treat it as customer data.
+and withholds the driver's message, the SQL and the parameters, wherever the error sits in the record's
+arguments within a scan bound (nested containers, sets, an object's attributes), in an `extra=` attribute, in
+a record from `logging.makeLogRecord`, and in a SQLAlchemy warning's text. Not covered: `str(e)` or an f-string
+built at a call site, an exception past the 2,000-item budget, and a wrapper exception whose own text embeds
+the driver's. For an error Postgres raised, its own log has the message, the DETAIL and the statement at the same time (with `log_min_error_statement` at its default `error`; to match on a SQLSTATE put `%e` in `log_line_prefix`, the default `%m [%p] ` carries none). Errors asyncpg raises in the client while encoding a parameter (for example `DataError`, "invalid input for query argument") never reach the server and leave no record anywhere; the sanitised line says `client-side` for them. Postgres' log then holds the values these logs withhold (DETAIL `Failing row contains (...)`): treat it as customer data.
 
 ### Startup clock check
 

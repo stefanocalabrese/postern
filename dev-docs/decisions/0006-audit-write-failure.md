@@ -465,12 +465,18 @@ THREE LAYERS, each pinned by its own test (`tests/test_api_driver_error_client_t
 3. `postern_core.log_safety.install_sql_safe_logging()`, called by `create_app` and `create_confirm_app`, wraps the
    process-wide log record factory so that a record created through `Logger._log`, on any logger, is sanitised
    when created (frames, each exception's type and SQLSTATE, a withheld marker) when its `exc_info`, an
-   argument or its message is an exception, or is inside ONE tuple, list or mapping that is itself an argument
-   (`_scrub_value`: depth one container, at most 1,000 items per container), whose chain (cause, context,
-   exception groups) holds a driver error, and asyncio's embedded `repr` of an unretrieved task exception.
-   NOT covered, measured: `[[e]]`, sets, dataclasses and other wrapper objects, anything past the 1,000th
-   item, a non-chained wrapper whose own text embeds the driver's, `str(e)` or an f-string built at the call
-   site, `extra={...}` rendered by a custom formatter, `logging.makeLogRecord`, and `warnings.warn`. The first design was a filter on `uvicorn.error` and
+   argument or its message is an exception, or sits inside the arguments within the scan's bounds (`_scrub_value`:
+   an iterative walk, 2,000 items and 20 levels, over nested tuples, lists, sets, frozensets, deques and dicts,
+   the `__dict__` and `__slots__` of an object, and the `args` of a non-driver exception), or is an `extra=`
+   attribute, or is in a record built by `logging.makeLogRecord`, whose chain (cause, context, exception
+   groups) holds a driver error, and asyncio's embedded `repr` of an unretrieved task exception. `warnings.warn`
+   goes through `py.warnings` (`captureWarnings`) with a SQLAlchemy warning's message withheld.
+   `migrations/env.py` installs the same factory and replaces a driver error that escapes `alembic upgrade`
+   with a fixed `RuntimeError` naming its type and SQLSTATE.
+   NOT covered, measured: an exception beyond the budget or depth cap, a non-chained wrapper whose own text
+   embeds the driver's, `str(e)` or an f-string built at the call site, a non-dict `Mapping`, a record made by
+   `Logger.handle` or by hand, and anything recorded outside `logging` (an exporter: `tests/test_no_exception_exporters.py`
+   fails if one is added). The first design was a filter on `uvicorn.error` and
    `uvicorn`; it missed `fastmcp.server.server` (its own handler, `propagate = False`), the MCP dispatcher, and
    every `exc_info=` and `%s` of an exception in the application's own loggers, so it was replaced, not kept
    alongside: a filter that cannot see a record adds nothing the factory does not. The application's own log calls

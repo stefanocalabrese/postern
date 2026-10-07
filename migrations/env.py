@@ -1,10 +1,16 @@
 import asyncio
 import os
+from collections.abc import Callable
 from logging.config import fileConfig
 
 import postern_core.store.models  # noqa: F401  registers the tables on the metadata
 from alembic import context
 from postern_core.env_inventory import enforce_known_environment
+from postern_core.log_safety import (
+    chain_holds_driver_error,
+    describe_exception,
+    install_sql_safe_logging,
+)
 from postern_core.store.base import Base
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -64,6 +70,46 @@ if (url := os.environ.get("POSTERN_DATABASE_URL")) is not None:
 if config.config_file_name is not None and os.path.exists(config.config_file_name):
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
+# After `fileConfig`, so everything it configures is already in place. The
+# record factory is process-global and `fileConfig` replaces handlers, not the
+# factory. This process is not a service, so no app factory installed it:
+# without this call a record a migration logs about a driver error reaches the
+# console handler raw. It also routes `warnings.warn` through logging, with a
+# SQLAlchemy warning's text withheld.
+install_sql_safe_logging()
+
+
+def _fail_without_the_driver_text(run: Callable[[], None]) -> None:
+    """Run ``run``; a driver error that escapes it is replaced by a fixed error.
+
+    An uncaught failure is printed by the interpreter, not by `logging`, so the
+    factory above never sees it: the traceback would carry the exception chain's
+    text, `[SQL: ...]` (a migration's literal values included) and a constraint
+    violation's `DETAIL: Key (a)=(value) already exists`. What the operator needs
+    to act is the type, the SQLSTATE and which revision was running, and they
+    have all three: `describe_exception` and the `Running upgrade X -> Y` line
+    alembic logs at INFO before it runs. The rest is in Postgres' own log.
+
+    The replacement is raised OUTSIDE the `except` block, so the original is
+    neither the `__cause__` nor the `__context__` of what propagates and no
+    traceback frame of it is printed. Anything that is not a driver error is
+    re-raised as it came, so a bug in a revision keeps its message.
+    """
+    failure: str | None = None
+    try:
+        run()
+    except Exception as exc:
+        if not chain_holds_driver_error(exc):
+            raise
+        failure = describe_exception(exc)
+    if failure is not None:
+        raise RuntimeError(
+            f"migration failed: {failure}. The statement, its parameters and the "
+            "driver's message are withheld from this output; read the database's "
+            "own log for them (treat it as customer data). The last "
+            "'Running upgrade' line above names the revision that was running."
+        )
+
 # add your model's MetaData object here
 # for 'autogenerate' support
 # from myapp import mymodel
@@ -97,7 +143,7 @@ def run_migrations_offline() -> None:
     )
 
     with context.begin_transaction():
-        context.run_migrations()
+        _fail_without_the_driver_text(context.run_migrations)
 
 
 def do_run_migrations(connection: Connection) -> None:
@@ -139,7 +185,7 @@ async def run_async_migrations() -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
 
-    asyncio.run(run_async_migrations())
+    _fail_without_the_driver_text(lambda: asyncio.run(run_async_migrations()))
 
 
 if context.is_offline_mode():

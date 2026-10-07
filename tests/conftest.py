@@ -10,6 +10,7 @@ from alembic import command
 from alembic.config import Config
 from docker.errors import DockerException
 from fastmcp import FastMCP
+from postern_core import log_safety
 from postern_core.identity import CustomerRef, CustomerResolver
 from postern_core.store.engine import Database
 from sqlalchemy import make_url
@@ -103,6 +104,24 @@ def _run_script(url: str, script: str) -> None:
             await engine.dispose()
 
     asyncio.run(go())
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_warning_capture_in_the_pytest_process() -> Iterator[None]:
+    """`install_sql_safe_logging` also routes `warnings.warn` through logging.
+
+    Every `create_app` in the suite calls it, inside a test, where pytest has
+    already replaced the warning machinery to record warnings for its summary:
+    installing ours there would send the rest of that test's warnings to the log
+    and drop them from the summary. So the warning half is a no-op in this
+    process. It is exercised in a fresh interpreter in
+    `tests/test_sql_safe_logging_reach.py`, which calls `_showwarning` directly
+    and runs `install_sql_safe_logging` in a subprocess.
+    """
+    patch = pytest.MonkeyPatch()
+    patch.setattr(log_safety, "install_warning_capture", lambda: None)
+    yield
+    patch.undo()
 
 
 @pytest.fixture

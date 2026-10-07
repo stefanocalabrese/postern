@@ -1,4 +1,6 @@
-"""Every ``httpx2`` client built in ``services/`` and ``packages/`` passes ``trust_env=False``.
+"""Every ``httpx2`` client built outside ``tests/`` passes ``trust_env=False``.
+
+Scanned: ``services/``, ``packages/``, ``tools/``, ``stub/`` and ``migrations/``.
 
 The per-client behaviour is measured in ``tests/test_http_clients_ignore_proxy_env.py``.
 This is the net for a client added later: a construction that leaves the default
@@ -19,6 +21,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CLIENT_NAMES = {"AsyncClient", "Client"}
 ALLOWLIST: frozenset[str] = frozenset()
+
+#: Every directory of Python this repository ships or runs outside `tests/`.
+#: `tools/`, `stub/` and `migrations/` build no client today: they are listed so
+#: that the first one anyone adds is held to the same rule.
+SCANNED = ("services", "packages", "tools", "stub", "migrations")
+
+
+def _scanned_files() -> list[Path]:
+    return [
+        path
+        for top in SCANNED
+        for path in sorted((ROOT / top).rglob("*.py"))
+        if ".venv" not in path.parts
+    ]
 
 
 def _client_constructions(source: str) -> list[ast.Call]:
@@ -52,12 +68,7 @@ def _violations(source: str, label: str) -> list[str]:
 
 
 def test_every_production_http_client_sets_trust_env_false() -> None:
-    files = [
-        path
-        for top in ("services", "packages")
-        for path in sorted((ROOT / top).rglob("*.py"))
-        if ".venv" not in path.parts
-    ]
+    files = _scanned_files()
     assert files
     constructed = 0
     violations: list[str] = []
@@ -76,3 +87,21 @@ def test_the_scan_sees_a_client_without_the_flag() -> None:
     assert _violations("import httpx2\nhttpx2.Client(trust_env=True)\n", "x.py") == ["x.py@2"]
     assert _violations("from httpx2 import AsyncClient\nAsyncClient()\n", "x.py") == ["x.py@2"]
     assert _violations("import httpx2\nhttpx2.AsyncClient(trust_env=False)\n", "x.py") == []
+
+
+def test_the_scan_covers_tools_stub_and_migrations_and_finds_no_unlisted_client() -> None:
+    files = _scanned_files()
+    covered = {path.relative_to(ROOT).parts[0] for path in files}
+    assert covered == set(SCANNED), covered
+    for top in ("tools", "stub", "migrations"):
+        in_top = [path for path in files if path.relative_to(ROOT).parts[0] == top]
+        assert in_top, top
+        for path in in_top:
+            source = path.read_text()
+            assert _violations(source, str(path.relative_to(ROOT))) == [], path
+
+
+def test_a_client_added_under_tools_stub_or_migrations_would_be_flagged() -> None:
+    for top in ("tools", "stub", "migrations"):
+        label = f"{top}/new_module.py"
+        assert _violations("import httpx2\nhttpx2.AsyncClient()\n", label) == [f"{label}@2"]

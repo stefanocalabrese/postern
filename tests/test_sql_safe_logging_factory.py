@@ -25,6 +25,7 @@ import pytest
 from postern_core import log_safety
 from postern_core.log_safety import install_sql_safe_logging
 from sqlalchemy import text
+from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from tests.test_sql_safe_logging import (
@@ -254,17 +255,17 @@ def _first_arg(arg: Any) -> Any:
 
 
 @pytest.mark.usefixtures("installed")
-def test_a_huge_container_argument_is_scanned_only_up_to_the_cap(
+def test_a_huge_container_argument_is_scanned_only_up_to_the_budget(
     driver_error: Exception,
 ) -> None:
-    """1,000,000 items cost 60 ms per record before the cap. Counted, not timed."""
+    """1,000,000 items cost 60 ms per record before any cap. Counted, not timed."""
     items = _CountingList([0] * 1_000_000)
     _CountingList.iterated = 0
     record = _record(items)
-    assert _CountingList.iterated <= log_safety._MAX_ITEMS
+    assert _CountingList.iterated <= 5000  # the budget, as a literal: see the reach file
     assert record.args == (items,)
 
-    # An exception inside the first `_MAX_ITEMS` items is replaced...
+    # An exception inside the budget is replaced...
     inside = _CountingList([0] * 999 + [driver_error] + [0] * 5000)
     replaced = _first_arg(inside)
     assert all(not isinstance(item, BaseException) for item in replaced)
@@ -273,66 +274,38 @@ def test_a_huge_container_argument_is_scanned_only_up_to_the_cap(
 
     # ...and one past it is NOT: the documented residual, pinned so it is not
     # mistaken for coverage.
-    beyond = _CountingList([0] * log_safety._MAX_ITEMS + [driver_error])
+    beyond = _CountingList([0] * 6000 + [driver_error])
     assert _first_arg(beyond)[-1] is driver_error
 
 
-class _CountingDict(dict[Any, Any]):
-    """A mapping whose `values()` and `items()` stream ``total`` items and count each.
-
-    One real entry keeps it truthy (`LogRecord` unwraps a sole mapping argument
-    only when it is); everything the scrub iterates is the lazy stream, so the
-    count is how many items it looked at, and no 1,000,000-entry dict is built.
-    """
-
-    iterated = 0
-
-    def __init__(self, total: int, planted: dict[int, Any]) -> None:
-        super().__init__({"real": 0})
-        self.total = total
-        self.planted = planted
-
-    def _stream(self) -> Iterator[tuple[int, Any]]:
-        for index in range(self.total):
-            type(self).iterated += 1
-            yield index, self.planted.get(index, 0)
-
-    def values(self) -> Any:
-        return (item for _, item in self._stream())
-
-    def items(self) -> Any:
-        return self._stream()
-
-
 @pytest.mark.usefixtures("installed")
-def test_a_huge_sole_mapping_argument_is_scanned_only_up_to_the_cap(
+def test_a_huge_sole_mapping_argument_is_scanned_only_up_to_the_budget(
     driver_error: Exception,
 ) -> None:
-    """The pre-check iterated EVERY value of a sole dict (41 ms a record at 1M)."""
-    _CountingDict.iterated = 0
-    record = _record(_CountingDict(1_000_000, {}))
-    assert _CountingDict.iterated <= 2 * log_safety._MAX_ITEMS
-
-    # An exception at the last scanned index is still found and replaced.
-    inside = _CountingDict(1_000_000, {log_safety._MAX_ITEMS - 1: driver_error})
-    args: Any = _record(inside).args
-    assert "sqlalchemy.exc." in args[log_safety._MAX_ITEMS - 1]
-    assert record.args is not None
+    """A real 1,000,000-entry dict: the scan takes the first entries only."""
+    big: dict[int, Any] = dict.fromkeys(range(1_000_000), 0)
+    big[100] = driver_error
+    late = StatementError("late", "SELECT 1", None, Exception("x"))
+    big[999_999] = late
+    args: Any = _record(big).args
+    assert "sqlalchemy.exc." in args[100]
+    assert args[999_999] is late  # past the budget: the residual
+    assert big[100] is driver_error  # the caller's dict is never mutated
 
 
 @pytest.mark.usefixtures("installed")
-def test_a_sole_mapping_holding_a_huge_list_is_scanned_only_up_to_the_cap() -> None:
+def test_a_sole_mapping_holding_a_huge_list_is_scanned_only_up_to_the_budget() -> None:
     items = _CountingList([0] * 1_000_000)
     _CountingList.iterated = 0
     _record({"k": items})
-    assert _CountingList.iterated <= log_safety._MAX_ITEMS
+    assert _CountingList.iterated <= 5000  # the budget, as a literal: see the reach file
 
 
 @pytest.mark.usefixtures("installed")
-def test_the_depth_the_scrub_reaches_is_one_container_and_no_more(
+def test_the_reach_of_the_scrub_includes_what_the_one_level_scrub_missed(
     driver_error: Exception,
 ) -> None:
-    """Pins `_scrub_value`'s documented reach. `[[e]]` and a set are NOT covered."""
+    """`[[e]]` and a set were the documented residuals of the one-level scrub."""
     assert isinstance(_first_arg(driver_error), str)
     for one_container in ([driver_error], (driver_error,)):
         scrubbed = _first_arg(one_container)
@@ -341,8 +314,8 @@ def test_the_depth_the_scrub_reaches_is_one_container_and_no_more(
     mapping_record = _record({"k": driver_error})
     assert isinstance(mapping_record.args, dict)
     assert isinstance(mapping_record.args["k"], str)
-    assert _first_arg([[driver_error]])[0][0] is driver_error
-    assert _first_arg({driver_error}) == {driver_error}
+    assert isinstance(_first_arg([[driver_error]])[0][0], str)
+    assert all(isinstance(item, str) for item in _first_arg({driver_error}))
 
 
 @pytest.mark.usefixtures("installed")

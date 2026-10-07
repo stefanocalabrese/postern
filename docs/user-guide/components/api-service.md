@@ -63,7 +63,11 @@ chain holds a SQL driver error (a completion-row audit failure, for one) with `T
 error")`, so neither the driver's message nor the bound value is in the model's channel. Both database
 engines hide bound parameters, and `create_app` calls `postern_core.log_safety.install_sql_safe_logging()`,
 which sanitises every log record in the process: the traceback frames and each exception's type and
-SQLSTATE stay, the driver's message, the SQL and the parameters do not. For an error Postgres raised, its own log has the message, the DETAIL and the statement at the same time (with `log_min_error_statement` at its default `error`; to match on a SQLSTATE put `%e` in `log_line_prefix`, the default `%m [%p] ` carries none). Errors asyncpg raises in the client while encoding a parameter (for example `DataError`, "invalid input for query argument") never reach the server and leave no record anywhere; the sanitised line says `client-side` for them. Postgres' log then holds the values these logs withhold (DETAIL `Failing row contains (...)`): treat it as customer data.
+SQLSTATE stay, the driver's message, the SQL and the parameters do not, wherever the error sits in the record's
+arguments within a scan bound (nested containers, sets, an object's attributes), in an `extra=` attribute, in a
+record from `logging.makeLogRecord`, and in a SQLAlchemy warning's text. Not covered: `str(e)` or an f-string
+built at a call site, an exception past the 2,000-item budget, and a wrapper exception whose own text embeds
+the driver's. For an error Postgres raised, its own log has the message, the DETAIL and the statement at the same time (with `log_min_error_statement` at its default `error`; to match on a SQLSTATE put `%e` in `log_line_prefix`, the default `%m [%p] ` carries none). Errors asyncpg raises in the client while encoding a parameter (for example `DataError`, "invalid input for query argument") never reach the server and leave no record anywhere; the sanitised line says `client-side` for them. Postgres' log then holds the values these logs withhold (DETAIL `Failing row contains (...)`): treat it as customer data.
 
 ## ASGI Middleware Chain
 
