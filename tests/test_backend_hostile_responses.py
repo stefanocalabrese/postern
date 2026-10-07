@@ -198,9 +198,15 @@ class HostileBackend:
     reading" from "the server hung up".
     """
 
-    def __init__(self, raw: bytes, *, hold: bool = False) -> None:
+    def __init__(self, raw: bytes, *, hold: bool = False, dribble: float | None = None) -> None:
         self._raw = raw
         self._hold = hold
+        #: Seconds between single header bytes, written forever after ``raw``.
+        self._dribble = dribble
+        #: With ``hold``: whether the client closed the connection within one
+        #: second of the response being written. A client that reads the body
+        #: it was promised does not, because it is waiting for the rest of it.
+        self.client_closed_first: bool | None = None
         self.port = 0
         self.connected = asyncio.Event()
         self._writers: list[asyncio.StreamWriter] = []
@@ -219,8 +225,21 @@ class HostileBackend:
         if self._raw:
             w.write(self._raw)
             await w.drain()
+        if self._dribble is not None:
+            try:
+                while True:
+                    w.write(b"X")
+                    await w.drain()
+                    await asyncio.sleep(self._dribble)
+            except (ConnectionError, OSError):
+                pass
         if self._hold:
-            await r.read()
+            try:
+                await asyncio.wait_for(r.read(), timeout=1.0)
+                self.client_closed_first = True
+            except TimeoutError:
+                self.client_closed_first = False
+                await r.read()
         w.close()
 
     async def __aenter__(self) -> HostileBackend:
@@ -366,6 +385,47 @@ async def test_hostile_response_over_a_real_socket(
         assert any("RemoteProtocolError" in r.getMessage() for r in errors)
 
 
+#: Status-line edge cases the operator's backend must not rely on. A transport
+#: failure leaves the row `approved` and escapes (500) EVEN IF the backend
+#: accepted the write: reconcile by `Idempotency-Key` (the challenge id).
+STATUS_LINE_EDGES: dict[str, tuple[bytes, str]] = {
+    "101_upgrade_is_a_transport_failure": (
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        ESCAPES,
+    ),
+    "http_9_9_201_is_accepted": (
+        b"HTTP/9.9 201 Created\r\nContent-Length: 0\r\n\r\n",
+        EXECUTED,
+    ),
+    "201_with_a_refused_header_block_is_a_transport_failure": (
+        b"HTTP/1.1 201 Created\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+        ESCAPES,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(STATUS_LINE_EDGES))
+async def test_status_line_edge_cases(
+    case: str,
+    app: Any,
+    clean: Any,
+    key_pair: RSAKeyPair,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw, expected = STATUS_LINE_EDGES[case]
+    cid = f"chal_e_{list(STATUS_LINE_EDGES).index(case):02d}"
+    async with HostileBackend(raw) as backend:
+        out = await _drive(app, clean, key_pair, caplog, backend, cid)
+    if expected == EXECUTED:
+        assert out.escaped is None and out.status == 200, (out.status, out.escaped)
+        assert out.challenge_status == "executed"
+    else:
+        assert out.status is None
+        assert type(out.escaped).__name__ == "BackendTransportError", repr(out.escaped)
+        assert out.challenge_status == "approved"
+        assert [e.outcome for e in out.entries] == ["reaching", "raised"]
+
+
 async def test_a_body_that_never_arrives_is_not_waited_for(
     app: Any, clean: Any, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -383,6 +443,61 @@ async def test_a_body_that_never_arrives_is_not_waited_for(
     assert out.escaped is None
     assert out.status == 200, out.body
     assert out.challenge_status == "executed"
+
+
+async def test_the_client_closes_the_connection_without_reading_the_body(
+    app: Any, clean: Any, key_pair: RSAKeyPair, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Structural, not a stopwatch: the server sees the client hang up first.
+
+    The backend promises 50 MB, sends 1 KB and waits one second for the client
+    to close. A client that read the body would still be waiting for the rest
+    when that second ended, so ``client_closed_first`` is the proof that nothing
+    reads it. The 3-second bound in the test above is a second, independent net.
+    """
+    raw = b"HTTP/1.1 200 OK\r\nContent-Length: 52428800\r\n\r\n" + b"A" * 1024
+    async with HostileBackend(raw, hold=True) as backend:
+        out = await asyncio.wait_for(
+            _drive(app, clean, key_pair, caplog, backend, "chal_h_closefirst"), timeout=60
+        )
+        assert out.status == 200, out.body
+        await asyncio.sleep(1.2)  # the server's one-second window closes
+    assert backend.client_closed_first is True
+
+
+async def test_a_backend_that_dribbles_its_headers_is_cut_off_at_the_total_bound(
+    app: Any,
+    clean: Any,
+    key_pair: RSAKeyPair,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One header byte per 0.2 s never trips the 10 s per-read timeout.
+
+    Measured before the total bound: 1 byte per 2 s kept an approval pending at
+    40 s, and the ceiling was days. The row stays `approved`, the audit detail is
+    `TotalTimeout`, and the request fails as any transport failure does.
+    """
+    from services.confirm import execute as execute_module
+
+    monkeypatch.setattr(execute_module, "WRITE_TOTAL_TIMEOUT_SECONDS", 1.0)
+    raw = b"HTTP/1.1 200 OK\r\nX-Dribble: "
+    async with HostileBackend(raw, dribble=0.2) as backend:
+        started = asyncio.get_running_loop().time()
+        out = await asyncio.wait_for(
+            _drive(app, clean, key_pair, caplog, backend, "chal_h_dribble"), timeout=8
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 6, elapsed
+    assert out.status is None
+    exc = out.escaped
+    assert type(exc).__name__ == "BackendTransportError", type(exc)
+    assert exc.kind == "TotalTimeout"  # type: ignore[union-attr]
+    assert out.challenge_status == "approved"
+    assert [e.outcome for e in out.entries] == ["reaching", "raised"]
+    assert out.entries[-1].detail == "TotalTimeout"
+    assert not _leaks(out.audit)
 
 
 async def test_a_cancelled_request_is_not_swallowed(

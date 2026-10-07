@@ -206,6 +206,11 @@ class BackendClient:
             # must not carry the `Authorization` header to wherever
             # `Location` points.
             follow_redirects=False,
+            # Proxy environment variables are ignored (and `SSL_CERT_FILE` /
+            # `SSL_CERT_DIR` cannot swap the CA bundle): the bearer token would
+            # go to whatever host `HTTP_PROXY` names. Route egress with the
+            # network (PrivateLink, security groups), not with the environment.
+            trust_env=False,
         )
 
     async def get_json(

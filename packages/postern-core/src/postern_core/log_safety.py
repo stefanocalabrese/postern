@@ -473,3 +473,19 @@ def install_sql_safe_logging() -> None:
         logging.setLogRecordFactory(_installed_factory)
     for name in _PINNED_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def pin_http_client_loggers() -> None:
+    """Hold ``httpx2`` and ``httpcore2`` at WARNING, whatever the root logger says.
+
+    The operator's backend's response is text neither service may log. ``httpx2``
+    writes ``HTTP Request: POST <url> "HTTP/1.1 500 <reason phrase>"`` at INFO,
+    and ``httpcore2`` writes every response header at DEBUG, so a deployment that
+    lowers the root logger to debug a problem would start logging the backend's
+    reason phrase and headers. Dormant at the default root level (WARNING), live
+    the moment an operator lowers it. Neither logger emits anything at WARNING or
+    above on the paths these services use. Called by both ``create_app`` and
+    ``create_confirm_app``; idempotent.
+    """
+    for name in ("httpx2", "httpcore2"):
+        logging.getLogger(name).setLevel(logging.WARNING)

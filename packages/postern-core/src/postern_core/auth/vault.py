@@ -250,6 +250,11 @@ class VaultTransitKeySource:
                 pool=timeout_seconds,
             ),
             transport=transport,
+            # Proxy environment variables are ignored (and `SSL_CERT_FILE` /
+            # `SSL_CERT_DIR` cannot swap the CA bundle): the Vault token and
+            # every signing request would go to whatever host `HTTP_PROXY`
+            # names. Route egress with the network, not with the environment.
+            trust_env=False,
         )
 
     # -- KeySource -------------------------------------------------------

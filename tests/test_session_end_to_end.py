@@ -187,7 +187,10 @@ def _api(
     verifier = app.state.postern_server.auth
     assert isinstance(verifier, SessionTokenVerifier)
     assert verifier.jwks_uri == jwks_uri
-    assert verifier._http_client is None
+    # `build_server` hands the verifier its own client, which ignores the proxy
+    # environment; this swaps it for one that reaches `jwks_app` in process.
+    assert verifier._http_client is not None
+    assert verifier._http_client.trust_env is False
     verifier._http_client = httpx2.AsyncClient(
         transport=httpx2.ASGITransport(app=app if jwks_app is None else jwks_app)
     )

@@ -18,6 +18,7 @@ from collections.abc import Callable
 import httpx2
 import pytest
 
+from services.confirm import execute as execute_module
 from services.confirm.execute import (
     TOOL_REGISTRY,
     BackendTransportError,
@@ -447,7 +448,7 @@ async def test_distinct_challenges_carry_distinct_idempotency_keys() -> None:
 
 
 # ---------------------------------------------------------------------------
-# BackendWriteClient — nothing from the response travels.
+# BackendWriteClient: nothing from the response travels.
 # ---------------------------------------------------------------------------
 
 
@@ -568,6 +569,135 @@ async def test_a_cancellation_inside_the_request_is_not_wrapped() -> None:
             body={},
             challenge_id="chal_abc",
         )
+    await client.aclose()
+
+
+async def test_a_bug_inside_the_client_is_not_wrapped_as_a_transport_failure() -> None:
+    """Only ``httpx2.HTTPError`` is a transport failure.
+
+    Anything else raised under ``stream()`` is a bug in this process, not text the
+    backend sent, so it is not relabelled ``BackendTransportError`` (which would
+    file a code defect as "the backend could not be reached") and fails loudly
+    through the generic path.
+    """
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        raise RuntimeError("SNTL-bug")
+
+    client = BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=_transport(handler),
+        before_backend_request=None,
+    )
+    with pytest.raises(RuntimeError, match="SNTL-bug") as excinfo:
+        await client.execute(
+            customer_ref="cust_7f3a",
+            audience="payments.svc",
+            path="/payments",
+            body={},
+            challenge_id="chal_abc",
+        )
+    assert type(excinfo.value) is RuntimeError
+    assert not isinstance(excinfo.value, BackendTransportError)
+    await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# The total bound on the write call.
+# ---------------------------------------------------------------------------
+
+
+def _client(handler: Callable[[httpx2.Request], object]) -> BackendWriteClient:
+    return BackendWriteClient(
+        base_url="https://backend.test",
+        minter=_StubWriteMinter(),
+        transport=httpx2.MockTransport(handler),  # type: ignore[arg-type]
+        before_backend_request=None,
+    )
+
+
+async def _execute(client: BackendWriteClient) -> int:
+    return await client.execute(
+        customer_ref="cust_7f3a",
+        audience="payments.svc",
+        path="/payments",
+        body={},
+        challenge_id="chal_total",
+    )
+
+
+def test_the_total_bound_is_inside_the_ecs_stop_timeout() -> None:
+    """30 s is ECS's default ``stopTimeout``; the per-read bound stays 10 s."""
+    assert execute_module.WRITE_TOTAL_TIMEOUT_SECONDS == 30.0
+    assert BackendWriteClient.__init__.__kwdefaults__["timeout"] == 10.0  # type: ignore[index]
+
+
+async def test_a_backend_that_never_finishes_its_headers_is_cut_off_at_the_total_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_module, "WRITE_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        await asyncio.sleep(30)
+        return httpx2.Response(201)
+
+    client = _client(handler)
+    with pytest.raises(BackendTransportError) as excinfo:
+        await asyncio.wait_for(_execute(client), timeout=5)
+    exc = excinfo.value
+    assert exc.kind == "TotalTimeout"
+    assert str(exc) == "the backend write endpoint could not be reached or answered improperly"
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert exc.__suppress_context__ is True
+    await client.aclose()
+
+
+async def test_a_fast_backend_is_unaffected_by_the_total_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_module, "WRITE_TOTAL_TIMEOUT_SECONDS", 0.5)
+    client = _client(lambda request: httpx2.Response(201, json={}))
+    assert await _execute(client) == 201
+    await client.aclose()
+
+
+async def test_a_status_taken_before_the_deadline_is_the_answer_even_if_closing_is_slow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The status was read; a slow close of the unread body changes nothing."""
+    monkeypatch.setattr(execute_module, "WRITE_TOTAL_TIMEOUT_SECONDS", 0.2)
+
+    class SlowClose(httpx2.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            yield b""
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(2)
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(201, stream=SlowClose())
+
+    client = _client(handler)
+    assert await asyncio.wait_for(_execute(client), timeout=5) == 201
+    await client.aclose()
+
+
+async def test_an_outer_cancellation_is_not_turned_into_a_total_timeout() -> None:
+    started = asyncio.Event()
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        started.set()
+        await asyncio.sleep(30)
+        return httpx2.Response(201)
+
+    client = _client(handler)
+    task = asyncio.create_task(_execute(client))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
     await client.aclose()
 
 

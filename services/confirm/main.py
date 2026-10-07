@@ -76,6 +76,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx2
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from postern_core.auth.device_codes import create_device_code_store
 from postern_core.auth.device_keys import DeviceKeyStoreBase, FileDeviceKeyStore
@@ -84,7 +85,7 @@ from postern_core.auth.refresh_sessions import create_refresh_session_store
 from postern_core.auth.revocation import create_revocation_store
 from postern_core.config import enforce_redis_requirement, redis_url_from_env
 from postern_core.env_inventory import enforce_known_environment
-from postern_core.log_safety import install_sql_safe_logging
+from postern_core.log_safety import install_sql_safe_logging, pin_http_client_loggers
 from postern_core.modules.enrichers import load_network_enricher
 from postern_core.risk.pairing_network import NetworkEnricher
 from postern_core.store.engine import Database
@@ -178,6 +179,13 @@ def _assertion_verifier(settings: ConfirmSettings) -> AssertionVerifier:
         issuer=settings.app_assertion_issuer,
         audience=settings.app_assertion_audience,
         required_scopes=None,
+        # fastmcp's own default client for this fetch is
+        # `httpx2.AsyncClient(timeout=Timeout(10.0))`, which trusts the
+        # environment: `HTTP_PROXY` would let whoever runs the proxy answer the
+        # key-set fetch and plant a key that signs a banking-app assertion, and
+        # `SSL_CERT_FILE` would swap the CA bundle. Same timeout,
+        # `trust_env=False`.
+        http_client=httpx2.AsyncClient(timeout=httpx2.Timeout(10.0), trust_env=False),
     )
 
 
@@ -292,21 +300,6 @@ async def _lifespan(app: Starlette) -> AsyncIterator[None]:
     pending = callback.pending_recordings()
     if pending:
         await asyncio.wait(pending, timeout=callback.SHUTDOWN_RECORD_WAIT_SECONDS)
-
-
-def pin_http_client_loggers() -> None:
-    """Hold ``httpx2`` and ``httpcore2`` at WARNING, whatever the root logger says.
-
-    The backend write endpoint's response is text this service must not log.
-    ``httpx2`` writes ``HTTP Request: POST <url> "HTTP/1.1 500 <reason phrase>"``
-    at INFO, and ``httpcore2`` writes every response header at DEBUG, so a
-    deployment that lowers the root logger to debug a problem would start logging
-    the backend's reason phrase and headers. Dormant at the default root level
-    (WARNING), live the moment an operator lowers it. Neither logger emits
-    anything at WARNING or above on the paths this service uses.
-    """
-    for name in ("httpx2", "httpcore2"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def create_confirm_app(

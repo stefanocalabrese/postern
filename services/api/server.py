@@ -45,6 +45,7 @@ backend itself, only passes it through to tools registered in later tasks.
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 
+import httpx2
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthContext, AuthProvider
 from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -258,6 +259,12 @@ def build_server(
             # every fetch: never a session key, whatever the key set at
             # `customer_jwks_uri` says.
             forbidden_thumbprints=forbidden_session_thumbprints,
+            # fastmcp's own default client for this fetch is
+            # `httpx2.AsyncClient(timeout=Timeout(10.0))`, which trusts the
+            # environment: `HTTP_PROXY` would let whoever runs the proxy answer
+            # the key-set fetch and plant a key, and `SSL_CERT_FILE` would swap
+            # the CA bundle. Same timeout, `trust_env=False`.
+            http_client=httpx2.AsyncClient(timeout=httpx2.Timeout(10.0), trust_env=False),
         )
         auth = verifier
     if auth_override is not None:

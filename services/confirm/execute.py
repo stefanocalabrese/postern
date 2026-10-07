@@ -28,6 +28,7 @@ boundaries, not code review.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, Protocol
 
@@ -240,6 +241,18 @@ def resolve_endpoint(tool_name: str, payload: dict[str, Any]) -> tuple[str, str,
 # ---------------------------------------------------------------------------
 
 
+#: The whole header phase of one write call, in seconds: connect, send and wait
+#: for a complete status line and header block. The client's own `timeout=10.0`
+#: applies to each read separately and so bounds nothing in total. 30 is ECS's
+#: default `stopTimeout`: an approval in flight when a task is stopped is given
+#: the same 30 seconds to finish as the container is, so no call outlives the
+#: SIGKILL that follows. The outcome on expiry is ambiguous, as for every
+#: transport failure (the backend may have received and committed the write): the
+#: row stays `approved`, the audit detail is `TotalTimeout`, and the operator
+#: reconciles by `Idempotency-Key`.
+WRITE_TOTAL_TIMEOUT_SECONDS = 30.0
+
+
 class BackendWriteClient:
     """Sends POST/PATCH requests to backend write endpoints.
 
@@ -285,6 +298,12 @@ class BackendWriteClient:
             transport=transport,
             timeout=timeout,
             follow_redirects=False,
+            # `HTTP_PROXY` and friends would send this request, with the write
+            # JWT, the Idempotency-Key and the payment payload, to whatever host
+            # the variable names, and `SSL_CERT_FILE` / `SSL_CERT_DIR` would
+            # swap the CA bundle. Proxy environment variables are ignored: route
+            # egress with the network (PrivateLink, security groups).
+            trust_env=False,
         )
 
     async def execute(
@@ -317,7 +336,10 @@ class BackendWriteClient:
             BackendTransportError: no status arrived, or the exchange failed
                 before one could be taken (unreachable, timed out, or a reply
                 the HTTP parser refused). It carries the original exception's
-                TYPE NAME as ``kind`` and no text from it.
+                TYPE NAME as ``kind`` and no text from it. ``kind`` is
+                ``"TotalTimeout"`` when `WRITE_TOTAL_TIMEOUT_SECONDS` ran out
+                before a status arrived. Any exception that is not an
+                ``httpx2.HTTPError`` is a bug and propagates unwrapped.
         """
         # Mint an internal JWT with challenge_id in claims (§7.2).
         token = self._minter.mint(
@@ -382,17 +404,34 @@ class BackendWriteClient:
         # an accepted write.
         status: int | None = None
         failure: str | None = None
+        # THE TOTAL BOUND. `timeout=` on the client is per read, so a backend
+        # dribbling one header byte every nine seconds never trips it and the
+        # approval waits for days (measured: 1 byte per 2 s held an approval at
+        # 40 s). This bounds the whole header phase. `asyncio.timeout` converts
+        # only ITS OWN cancellation to `TimeoutError`: an outer `task.cancel()`
+        # still arrives as `CancelledError`, which is why nothing below catches
+        # `BaseException` or names `CancelledError`.
+        total = asyncio.timeout(WRITE_TOTAL_TIMEOUT_SECONDS)
         try:
-            async with self._client.stream(
-                "POST",
-                path,
-                json=body,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Idempotency-Key": challenge_id,
-                },
-            ) as response:
-                status = response.status_code
+            async with total:
+                async with self._client.stream(
+                    "POST",
+                    path,
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Idempotency-Key": challenge_id,
+                    },
+                ) as response:
+                    status = response.status_code
+        except TimeoutError:
+            # Ours only: another `TimeoutError` is not this bound's and escapes
+            # as what it is. If the status was already taken, a deadline that
+            # lands while the unread body is being closed changes nothing.
+            if not total.expired():
+                raise
+            if status is None:
+                failure = "TotalTimeout"
         except httpx2.HTTPError as exc:
             # `HTTPError` only, so a cancellation (a `BaseException`) propagates.
             # If the status was already taken, a failure while closing the unread

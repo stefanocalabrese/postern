@@ -491,10 +491,54 @@ safe to forward. Three mechanisms hold that line:
   was: the exception leaves the handler (a 500 under a server), the row stays
   `approved`, and the completion `audit_log` row is `raised` with `detail` set to
   the original type name.
-- **`httpx2` and `httpcore2` are held at WARNING** by `create_confirm_app`. They log
+- **`httpx2` and `httpcore2` are held at WARNING** by `create_confirm_app` (and by
+  `create_app` in the api service), through one function,
+  `postern_core.log_safety.pin_http_client_loggers`. They log
   `HTTP Request: POST <url> "HTTP/1.1 500 <reason phrase>"` at INFO and every
   response header at DEBUG, which would start logging the backend's text the moment an
   operator lowers the root logger.
+
+**What the write endpoint must guarantee.** The write endpoint must make the operation
+durable BEFORE it sends the status line, and must answer 2xx only for an operation it
+has committed. Confirm closes the connection after reading the status line and never
+reads the body; a response is acknowledged only by its status. A backend that commits
+after streaming its response, or rolls back when the client disconnects, leaves confirm
+recording `executed` for money that did not move. The `Idempotency-Key` header carries
+the challenge id: de-duplicate on it.
+
+**Status-line edge cases.** Each is a measured behaviour of the parser, not a promise
+the backend may lean on:
+
+- A `101 Switching Protocols` answer becomes a transport failure: the exception leaves
+  the handler (500) and the row stays `approved`.
+- `HTTP/9.9 201 Created` is accepted: the version is not checked, only the status.
+- A `201` whose header block the parser refuses (for example
+  `Transfer-Encoding: gzip, chunked`) is reported as a transport failure (500) with the
+  row left `approved`, even though the backend accepted the write. Reconcile by
+  `Idempotency-Key`.
+
+**The whole call is bounded at 30 seconds.** `timeout=10.0` on the client applies to
+each read separately, so a backend sending one header byte every nine seconds never
+trips it; measured before the bound, a byte per 2 seconds held an approval pending at
+40 seconds and the ceiling was days. `WRITE_TOTAL_TIMEOUT_SECONDS` (30, ECS's default
+`stopTimeout`) bounds connecting, sending and receiving the status line and header
+block. On expiry with no status taken, the client raises `BackendTransportError` with
+`kind="TotalTimeout"`. The outcome is as ambiguous as every transport failure, because
+the backend may have received and committed the write: the row stays `approved`, the
+completion `audit_log` row is `raised` with `detail` `TotalTimeout`, and the operator
+reconciles by `Idempotency-Key`. A status taken before the deadline is the answer. An
+outer cancellation (the caller going away) still propagates as a cancellation. Only
+`httpx2.HTTPError` is reported as a transport failure: any other exception raised
+inside the client is a bug in this process and fails loudly through the generic path.
+
+**Proxy environment variables are ignored.** Every outbound HTTP client in this
+repository (the write client, the api's read facade, the Vault client and both JWKS
+fetchers) is built with `trust_env=False`, so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+`NO_PROXY`, `SSL_CERT_FILE` and `SSL_CERT_DIR` have no effect on them. Route egress with
+the network (PrivateLink, security groups), not with `HTTP_PROXY`. Measured before the
+change: with `HTTP_PROXY` set, a proxy received the write request with the signed write
+JWT, the `Idempotency-Key` and the payment payload, and its own 201 was recorded as
+`executed`. There is no setting to turn this back on.
 
 The one log line per refusal is a WARNING naming the challenge id, the operation and
 the numeric status. The row stays `approved` and the completion `audit_log` row is

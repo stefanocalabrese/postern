@@ -45,13 +45,13 @@ import pytest
 from postern_core.auth.device_keys import no_enrolled_devices
 from postern_core.auth.revocation import InMemoryRevocationStore
 from postern_core.domain.verification import VerificationTier
+from postern_core.log_safety import pin_http_client_loggers
 from postern_core.store.models import ChallengeRecord
 from starlette.requests import Request
 
 from services.confirm.auth import ASSERTION_STATE_KEY, AppAssertion
 from services.confirm.callback import approve_challenge
 from services.confirm.execute import BackendWriteClient
-from services.confirm.main import pin_http_client_loggers
 from services.confirm.settings import ConfirmSettings
 from tests.fixtures.device_keys import device_key, enrolled_store, sign_row
 

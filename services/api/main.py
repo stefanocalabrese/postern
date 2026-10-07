@@ -50,7 +50,6 @@ is a validated token's subject to check it for, since consent has nowhere to
 read a customer from otherwise.
 """
 
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -72,7 +71,7 @@ from postern_core.config import bool_from_env, enforce_redis_requirement
 from postern_core.env_inventory import enforce_known_environment
 from postern_core.facade.client import BackendClient
 from postern_core.identity import CustomerRef, CustomerResolver
-from postern_core.log_safety import install_sql_safe_logging
+from postern_core.log_safety import install_sql_safe_logging, pin_http_client_loggers
 from postern_core.store.engine import Database
 from starlette.middleware import Middleware
 
@@ -273,11 +272,8 @@ def create_app(
     # `postern_core/env_inventory.py` carries the three populations, why only
     # the third refuses, and why the escape hatch cannot be the hole.
     enforce_known_environment(service="api")
-    # `httpx2` logs `HTTP Request: GET <url> "HTTP/1.1 200 <reason phrase>"` at INFO
-    # and `httpcore2` logs every response header at DEBUG: the operator's backend's
-    # text. Dormant at the default root level, live once an operator lowers it.
-    for _http_logger in ("httpx2", "httpcore2"):
-        logging.getLogger(_http_logger).setLevel(logging.WARNING)
+    # The operator's backend's text, at INFO and DEBUG: `pin_http_client_loggers`.
+    pin_http_client_loggers()
     # An uncaught SQL driver error is logged by uvicorn with its statement,
     # bound parameters and the driver's own message; this withholds all three
     # from the log and keeps frames, types and the SQLSTATE. Idempotent.

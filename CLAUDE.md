@@ -27,6 +27,8 @@ This repo is a **framework**, not a turnkey deployment. Every company that wants
 
 **And they own the delegation token's replay check, which is on no other list.** The internal JWT this server mints is replay-protected by nothing here and cannot be: an issuer sees a token once, at creation, and never learns what happened to it. Detecting a second presentation is the recipient's job, so it belongs in your Istio gateway or your domain services, tracking `jti` values they have accepted. `JtiReplayCache` in this repository is not that control despite its name — it is fed a `uuid4` this same process generated three statements earlier, so it detects a UUID collision. Decision record 0014 has the argument. Answer this in the same week as `sub` enforcement; they are the same conversation with the same team.
 
+**And the write endpoint owns durability.** The write endpoint must make the operation durable BEFORE it sends the status line, and must answer 2xx only for an operation it has committed. Confirm closes the connection after reading the status line and never reads the body; a response is acknowledged only by its status, so a backend that commits after streaming its response, or rolls back on disconnect, leaves confirm recording `executed` for money that did not move. The `Idempotency-Key` header carries the challenge id: de-duplicate on it. A call that gets no status line within 30 seconds (`WRITE_TOTAL_TIMEOUT_SECONDS`), a `101`, or a `201` whose header block the parser refuses (for example `Transfer-Encoding: gzip, chunked`) is a transport failure: a 500, the row left `approved`, possibly with the write accepted. Reconcile by `Idempotency-Key`. `docs/user-guide/components/confirm-service.md` has the edge cases.
+
 ### 2. Infrastructure (Terraform repo — gate 5)
 This repo has zero Terraform files. You must create them:
 
@@ -34,6 +36,7 @@ This repo has zero Terraform files. You must create them:
 - **ECS cluster + services** — Fargate tasks, each referencing images by sha256 digest (not tag)
 - **Separate task roles** — read role must NOT be able to assume the write role or access its Vault path
 - **VPC / subnets** — private subnets, NAT Gateway (or egress deny per ZT-8), PrivateLink to your Istio gateway
+- **Egress is routed by the network, not by the environment** — every outbound HTTP client here is built with `trust_env=False`: proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`) and `SSL_CERT_FILE` / `SSL_CERT_DIR` are ignored, and there is no setting to turn that back on. Use PrivateLink and security groups, not `HTTP_PROXY`
 - **SSM Parameter Store** — publish ECR URIs, cluster name, service names, subnet IDs under `/postern/<env>/`
 
 ### 3. AWS-level tests (in your Terraform repo)

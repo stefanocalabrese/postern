@@ -21,3 +21,16 @@ def test_create_app_pins_the_http_client_loggers_to_warning() -> None:
 
     assert logging.getLogger("httpx2").level == logging.WARNING
     assert logging.getLogger("httpcore2").level == logging.WARNING
+
+
+def test_the_pin_is_one_function_in_the_shared_library() -> None:
+    """`services/api` and `services/confirm` call the same `postern_core` function."""
+    from postern_core.log_safety import pin_http_client_loggers
+
+    for name in ("httpx2", "httpcore2"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+    pin_http_client_loggers()
+
+    assert logging.getLogger("httpx2").level == logging.WARNING
+    assert logging.getLogger("httpcore2").level == logging.WARNING
