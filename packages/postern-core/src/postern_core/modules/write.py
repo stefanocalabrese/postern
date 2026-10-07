@@ -100,6 +100,11 @@ class WriteOperation:
     tier: VerificationTier
 
     def __post_init__(self) -> None:
+        if not isinstance(self.tool_name, str):
+            raise ValueError(
+                f"write operation {self.tool_name!r} is not a usable tool name: it must "
+                f"be a string, not {type(self.tool_name).__qualname__}"
+            )
         if not _TOOL_NAME_RE.match(self.tool_name):
             raise ValueError(
                 f"{self.tool_name!r} is not a usable tool name: lowercase letters, "
@@ -114,6 +119,17 @@ class WriteOperation:
             )
         if not self.audience:
             raise ValueError(f"write operation {self.tool_name!r} declares no audience")
+        if not isinstance(self.audience, str):
+            raise ValueError(
+                f"write operation {self.tool_name!r} declares audience {self.audience!r}: "
+                f"it must be a string, not {type(self.audience).__qualname__}"
+            )
+        if not isinstance(self.path_template, str):
+            raise ValueError(
+                f"write operation {self.tool_name!r} has path template "
+                f"{self.path_template!r}: it must be a string, not "
+                f"{type(self.path_template).__qualname__}"
+            )
         if not self.path_template.startswith("/"):
             raise ValueError(
                 f"write operation {self.tool_name!r} has path template "
@@ -121,7 +137,7 @@ class WriteOperation:
                 "backend base URL, and a relative path silently resolves against "
                 "whatever the base URL's own path happens to be"
             )
-        if self.method not in WRITE_METHODS:
+        if not isinstance(self.method, str) or self.method not in WRITE_METHODS:
             raise ValueError(
                 f"write operation {self.tool_name!r} declares method {self.method!r}; "
                 f"a write operation uses one of {sorted(WRITE_METHODS)}"

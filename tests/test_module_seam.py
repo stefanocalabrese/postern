@@ -511,6 +511,65 @@ def test_a_write_operation_checks_the_tool_name_before_the_tier() -> None:
         )
 
 
+_NON_STRING = pytest.mark.parametrize(
+    "value",
+    [123, None, b"x.y", ["POST"]],
+    ids=["int", "none", "bytes", "list"],
+)
+
+
+def _declare(**overrides: Any) -> WriteOperation:
+    fields: dict[str, Any] = {
+        "tool_name": "x.y",
+        "audience": "a.svc",
+        "path_template": "/x",
+        "method": "POST",
+        "tier": VerificationTier.APP_APPROVAL,
+    }
+    return WriteOperation(**{**fields, **overrides})
+
+
+@_NON_STRING
+def test_a_write_operation_refuses_a_non_string_tool_name_with_a_value_error(value: Any) -> None:
+    """The regexp ran first and raised `TypeError` on a non-str, so the load
+    error read unlike every other refusal."""
+    with pytest.raises(ValueError, match="not a usable tool name") as caught:
+        _declare(tool_name=value)
+    assert not isinstance(caught.value, TypeError)
+    assert "must be a string" in str(caught.value)
+
+
+@pytest.mark.parametrize("value", [123, b"a.svc", ["a.svc"]], ids=["int", "bytes", "list"])
+def test_a_write_operation_refuses_a_non_string_audience(value: Any) -> None:
+    """A truthy non-str audience used to construct and fail later, in the minter."""
+    with pytest.raises(ValueError, match="audience") as caught:
+        _declare(audience=value)
+    assert "'x.y'" in str(caught.value)
+    assert "must be a string" in str(caught.value)
+
+
+@_NON_STRING
+def test_a_write_operation_refuses_a_non_string_path_template(value: Any) -> None:
+    """`.startswith` raised `AttributeError` or `TypeError`."""
+    with pytest.raises(ValueError, match="path template") as caught:
+        _declare(path_template=value)
+    assert "'x.y'" in str(caught.value)
+    assert "must be a string" in str(caught.value)
+
+
+@_NON_STRING
+def test_a_write_operation_refuses_a_non_string_method_with_a_value_error(value: Any) -> None:
+    """A list is unhashable, so `in WRITE_METHODS` raised `TypeError`."""
+    with pytest.raises(ValueError, match="method") as caught:
+        _declare(method=value)
+    assert "'x.y'" in str(caught.value)
+
+
+def test_a_write_operation_checks_the_tool_name_type_before_the_pattern() -> None:
+    with pytest.raises(ValueError, match="must be a string"):
+        _declare(tool_name=None, tier=None)
+
+
 @pytest.mark.parametrize(
     ("tier", "value"),
     [(VerificationTier.APP_APPROVAL, 1), (VerificationTier.APP_IDENTITY_VERIFICATION, 2)],
